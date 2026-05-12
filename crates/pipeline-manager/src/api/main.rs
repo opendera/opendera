@@ -584,12 +584,27 @@ fn build_app(
         ),
     };
 
+    // Internal API consumed by the cloud activity controller. Mounted
+    // outside `/v0` and outside any tenant-auth middleware; it
+    // authenticates separately via a shared bearer token. Registered
+    // before `public_scope` (which has a catch-all empty-prefix
+    // sub-scope that would shadow it).
+    let app = app.service(internal_scope());
+
     // `public_scope` MUST be the last `.service()` registered: it contains an
     // empty-prefix sub-scope (the catch-all that serves the bundled
     // web-console static files) that would shadow any service registered
     // after it. The `public_scope_shadows_anything_registered_after_it` test
     // pins this contract.
     app.service(public_scope(api_config))
+}
+
+/// The internal API scope (no tenant auth; uses
+/// `OPENDERA_INTERNAL_API_KEY` bearer-token check inside each handler).
+fn internal_scope() -> Scope {
+    web::scope("/internal/v0")
+        .service(endpoints::internal::list_internal_pipelines)
+        .service(endpoints::internal::activity_stream)
 }
 
 // Unauthenticated public endpoints and static UI assets. CORS is scoped to
