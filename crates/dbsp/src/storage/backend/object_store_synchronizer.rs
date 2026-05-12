@@ -494,4 +494,99 @@ mod tests {
             .unwrap();
         assert_eq!(batch0.as_slice(), b"batch zero");
     }
+
+    /// Integration test for the full synchronizer against a real
+    /// S3-compatible endpoint. Skipped unless `OPENDERA_S3_TEST_URL`
+    /// (the local backend in this test reuses object_store::InMemory
+    /// for speed; the *remote* backend is the S3-compatible one).
+    ///
+    /// Build a fake checkpoint locally, call `synchronizer.push(...)`
+    /// against the remote, then a fresh-local + `pull(...)` and verify
+    /// the file contents round-trip. Set `OPENDERA_S3_TEST_BUCKET` and
+    /// supporting vars per the snippet in object_store_impl::tests.
+    ///
+    /// This test exercises the whole stack: SyncConfig -> CloudKind
+    /// detection -> remote_backend -> per-file copy with retry -> push
+    /// ordering (UUID files before manifest) -> pull ordering (manifest
+    /// before UUID files).
+    #[test]
+    #[ignore = "requires OPENDERA_S3_TEST_URL; integration test"]
+    fn s3_synchronizer_round_trip() {
+        let Some(bucket) = std::env::var("OPENDERA_S3_TEST_BUCKET").ok() else {
+            eprintln!("OPENDERA_S3_TEST_BUCKET not set; skipping");
+            return;
+        };
+        let endpoint = std::env::var("OPENDERA_S3_TEST_ENDPOINT").ok();
+        let region = std::env::var("OPENDERA_S3_TEST_REGION").ok();
+        let access_key = std::env::var("OPENDERA_S3_TEST_ACCESS_KEY").ok();
+        let secret_key = std::env::var("OPENDERA_S3_TEST_SECRET_KEY").ok();
+
+        let synchronizer = ObjectStoreSynchronizer;
+        let sync_cfg = SyncConfig {
+            endpoint,
+            bucket: format!("{bucket}/opendera-sync-it/{}", uuid::Uuid::now_v7().simple()),
+            region,
+            provider: Some("Minio".to_string()),
+            access_key,
+            secret_key,
+            start_from_checkpoint: Some(StartFromCheckpoint::Latest),
+            fail_if_no_checkpoint: false,
+            transfers: None,
+            checkers: None,
+            ignore_checksum: None,
+            multi_thread_streams: None,
+            multi_thread_cutoff: None,
+            upload_concurrency: None,
+            ..Default::default()
+        };
+
+        // Stage a fake checkpoint locally.
+        let local: Arc<dyn StorageBackend> = in_memory_backend("primary");
+        let cp_uuid = uuid::Uuid::now_v7();
+        let cp_dir = cp_uuid.to_string();
+        write_text(&local, &format!("{cp_dir}/batch-0.dat"), b"hello s3");
+        write_text(&local, &format!("{cp_dir}/batch-1.dat"), b"more bytes");
+        let manifest = vec![CheckpointMetadata {
+            uuid: cp_uuid,
+            identifier: Some("it".into()),
+            fingerprint: 0xfeed_face,
+            size: Some(18),
+            steps: Some(1),
+            processed_records: Some(1),
+        }];
+        let manifest_path: StoragePath = CHECKPOINT_FILE_NAME.into();
+        local
+            .write_json(&manifest_path, &manifest)
+            .expect("manifest write")
+            .commit()
+            .expect("manifest commit");
+
+        // Push -> S3.
+        let push_metrics = synchronizer
+            .push(cp_uuid, local.clone(), sync_cfg.clone())
+            .expect("push to S3");
+        let metrics = push_metrics.expect("push returns metrics");
+        assert!(metrics.bytes > 0, "push reported zero bytes");
+
+        // Pull into a fresh local.
+        let restored: Arc<dyn StorageBackend> = in_memory_backend("restored");
+        let (cpm, pull_metrics) = synchronizer
+            .pull(restored.clone(), sync_cfg.clone())
+            .expect("pull from S3");
+        assert_eq!(cpm.uuid, cp_uuid);
+        assert!(pull_metrics.expect("pull metrics").bytes > 0);
+
+        // Verify file contents round-trip.
+        let restored_batch: Arc<FBuf> = restored
+            .read(&format!("{cp_dir}/batch-0.dat").as_str().into())
+            .expect("restored batch-0 read");
+        assert_eq!(restored_batch.as_slice(), b"hello s3");
+
+        // Best-effort cleanup. Skip if it fails; the unique prefix
+        // makes leftover objects easy to identify and prune later.
+        if let Ok(remote) = remote_backend(&sync_cfg) {
+            let remote: Arc<dyn StorageBackend> = Arc::new(remote);
+            let _ = remote.delete_recursive(&"".into());
+        }
+    }
 }

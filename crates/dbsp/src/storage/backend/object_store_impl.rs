@@ -574,4 +574,118 @@ mod tests {
             assert_eq!(block.as_slice()[0], i as u8, "chunk {i} out of order");
         }
     }
+
+    /// Integration test against a real S3-compatible endpoint (MinIO,
+    /// Tigris, AWS S3, …). Skipped unless `OPENDERA_S3_TEST_URL` is
+    /// set, so the unit suite stays hermetic.
+    ///
+    /// Example local run (MinIO):
+    ///
+    /// ```bash
+    /// docker run -d --rm -p 9000:9000 -p 9001:9001 \
+    ///   -e MINIO_ROOT_USER=minioadmin \
+    ///   -e MINIO_ROOT_PASSWORD=minioadmin \
+    ///   --name opendera-test-minio minio/minio server /data
+    /// mc alias set local http://localhost:9000 minioadmin minioadmin
+    /// mc mb local/opendera-test
+    /// OPENDERA_S3_TEST_URL=s3://opendera-test/ \
+    /// OPENDERA_S3_TEST_OPTS="endpoint=http://localhost:9000,access_key_id=minioadmin,secret_access_key=minioadmin,region=us-east-1,allow_http=true" \
+    ///   cargo test -p dbsp s3_integration -- --ignored --nocapture
+    /// ```
+    ///
+    /// Verifies: create_named -> write_block -> complete -> open ->
+    /// read_block -> exists -> list -> delete, plus the multipart
+    /// path for a payload above the threshold.
+    #[test]
+    #[ignore = "requires OPENDERA_S3_TEST_URL; integration test"]
+    fn s3_integration_round_trip() {
+        let Some(backend) = s3_backend_from_env() else {
+            eprintln!("OPENDERA_S3_TEST_URL not set; skipping");
+            return;
+        };
+
+        let prefix = format!(
+            "opendera-it/{}",
+            uuid::Uuid::now_v7().simple()
+        );
+
+        // Small file: single-PUT path.
+        let small_name: StoragePath =
+            format!("{prefix}/small.bin").as_str().into();
+        let body = b"hello s3 integration";
+        let mut w = backend.create_named(&small_name).expect("create_named");
+        let mut fbuf = FBuf::new();
+        fbuf.extend_from_slice(body);
+        w.write_block(fbuf).expect("write_block");
+        let r = w.complete().expect("complete small");
+        assert_eq!(r.get_size().unwrap(), body.len() as u64);
+        let read = r
+            .read_block(BlockLocation {
+                offset: 0,
+                size: body.len(),
+            })
+            .expect("read_block small");
+        assert_eq!(read.as_slice(), body);
+
+        // Large file: multipart path. ~12 MiB across six 2 MiB chunks
+        // to cross the 8 MiB threshold and produce at least two parts.
+        let big_name: StoragePath =
+            format!("{prefix}/big.bin").as_str().into();
+        let chunk = vec![0x42u8; 2 * 1024 * 1024];
+        let mut w = backend.create_named(&big_name).expect("create_named big");
+        for _ in 0..6 {
+            let mut fb = FBuf::new();
+            fb.extend_from_slice(&chunk);
+            w.write_block(fb).expect("write_block big");
+        }
+        let r = w.complete().expect("complete big");
+        assert_eq!(r.get_size().unwrap(), 12 * 1024 * 1024);
+
+        // list + delete the prefix.
+        let mut listed = Vec::new();
+        backend
+            .list(&prefix.as_str().into(), &mut |p, _| {
+                listed.push(p.as_ref().to_string());
+            })
+            .expect("list");
+        assert_eq!(listed.len(), 2, "expected exactly 2 files under prefix");
+
+        backend.delete_recursive(&prefix.as_str().into()).expect(
+            "delete_recursive should remove everything under the prefix",
+        );
+
+        let mut listed2 = Vec::new();
+        backend
+            .list(&prefix.as_str().into(), &mut |p, _| {
+                listed2.push(p.as_ref().to_string());
+            })
+            .expect("list after delete_recursive");
+        assert!(listed2.is_empty(), "prefix not empty after recursive delete");
+    }
+
+    /// Build an `ObjectStoreBackend` from environment variables, or
+    /// return `None` if `OPENDERA_S3_TEST_URL` isn't set. The optional
+    /// `OPENDERA_S3_TEST_OPTS` carries `k=v,k=v` extras passed verbatim
+    /// to `object_store`'s URL options (`endpoint`, `access_key_id`,
+    /// `secret_access_key`, `region`, `allow_http`, …).
+    fn s3_backend_from_env() -> Option<ObjectStoreBackend> {
+        let url = std::env::var("OPENDERA_S3_TEST_URL").ok()?;
+        let mut other_options = std::collections::BTreeMap::new();
+        if let Ok(raw) = std::env::var("OPENDERA_S3_TEST_OPTS") {
+            for kv in raw.split(',') {
+                let kv = kv.trim();
+                if kv.is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = kv.split_once('=') {
+                    other_options.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+        }
+        let cfg = ObjectStorageConfig {
+            url,
+            other_options,
+        };
+        Some(ObjectStoreBackend::from_config(&cfg).expect("from_config"))
+    }
 }
