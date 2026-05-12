@@ -37,13 +37,17 @@ import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.backend.rust.RustFileWriter;
 import org.dbsp.sqlCompiler.compiler.frontend.TableContents;
+import org.dbsp.sqlCompiler.compiler.frontend.TableData;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.CreateRuntimeErrorWrappers;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.sqlCompiler.ir.DBSPFunction;
 import org.dbsp.sqlCompiler.ir.DBSPNode;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyMethodExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPBlockExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPEnumValue;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPQualifyTypeExpression;
@@ -82,7 +86,6 @@ import org.dbsp.sqllogictest.SqlTestPrepareViews;
 import org.dbsp.util.IndentStream;
 import org.dbsp.util.Linq;
 import org.dbsp.util.ProgramAndTester;
-import org.dbsp.util.TableValue;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
@@ -130,14 +133,14 @@ public class DBSPExecutor extends SqlSltTestExecutor {
         this.toSkip = toSkip;
     }
 
-    public TableValue[] getInputSets(DBSPCompiler compiler) throws SQLException {
+    public TableData[] getInputSets(DBSPCompiler compiler) throws SQLException {
         for (SltSqlStatement statement : this.inputPreparation.statements)
             compiler.submitStatementForCompilation(statement.statement);
         TableContents tables = compiler.getTableContents();
-        TableValue[] tableValues = new TableValue[tables.tablesCreated.size()];
+        TableData[] tableValues = new TableData[tables.tablesCreated.size()];
         for (int i = 0; i < tableValues.length; i++) {
             ProgramIdentifier table = tables.tablesCreated.get(i);
-            tableValues[i] = new TableValue(table, tables.getTableContents(table));
+            tableValues[i] = new TableData(table, tables.getTableContents(table));
         }
         return tableValues;
     }
@@ -150,7 +153,7 @@ public class DBSPExecutor extends SqlSltTestExecutor {
         }
 
         @Override
-        public TableValue[] getInputs() throws SQLException {
+        public TableData[] getInputs() throws SQLException {
             return DBSPExecutor.this.getInputSets(this.compiler);
         }
     }
@@ -216,7 +219,8 @@ public class DBSPExecutor extends SqlSltTestExecutor {
     }
 
     /** Convert a description of the data in the SLT format to a ZSet. */
-    public static DBSPZSetExpression convert(@Nullable List<String> data, DBSPTypeZSet outputType) {
+    public static DBSPZSetExpression convert(
+            DBSPCompiler compiler, @Nullable List<String> data, DBSPTypeZSet outputType) {
         if (data == null)
             data = Linq.list();
         DBSPZSetExpression result;
@@ -256,7 +260,7 @@ public class DBSPExecutor extends SqlSltTestExecutor {
             else
                 throw new RuntimeException("Unexpected type " + colType);
             if (!colType.sameType(field.getType()))
-                field = field.cast(field.getNode(), colType, false);
+                field = field.cast(field.getNode(), colType, DBSPCastExpression.CastType.SqlUnsafe);
             fields.add(field);
             col++;
             if (col == outputElementType.size()) {
@@ -272,6 +276,7 @@ public class DBSPExecutor extends SqlSltTestExecutor {
             throw new RuntimeException("Could not assign all query output values to rows. " +
                     "I have " + col + " leftover values in the last row");
         }
+        result = CreateRuntimeErrorWrappers.wrapCasts(compiler, result).to(DBSPZSetExpression.class);
         return result;
     }
 
@@ -311,7 +316,7 @@ public class DBSPExecutor extends SqlSltTestExecutor {
         DBSPTypeZSet outputType = sink.outputType.to(DBSPTypeZSet.class);
         DBSPZSetExpression expectedOutput = null;
         if (testQuery.outputDescription.hash == null) {
-            expectedOutput = DBSPExecutor.convert(testQuery.outputDescription.getQueryResults(), outputType);
+            expectedOutput = DBSPExecutor.convert(compiler, testQuery.outputDescription.getQueryResults(), outputType);
         }
 
         return createTesterCode(
@@ -328,9 +333,7 @@ public class DBSPExecutor extends SqlSltTestExecutor {
         if (files == null)
             return;
         for (File file: files) {
-            boolean deleted = file.delete();
-            if (!deleted)
-                throw new RuntimeException("Cannot delete file " + file);
+            Utilities.deleteFile(file, true);
         }
     }
 
@@ -346,13 +349,6 @@ public class DBSPExecutor extends SqlSltTestExecutor {
             throws SQLException {
         this.startTest();
         int batchSize = 500;
-        String name = file.toString();
-        if (name.contains("/"))
-            name = name.substring(name.lastIndexOf('/') + 1);
-        if (name.startsWith("select"))
-            batchSize = 20;
-        if (name.startsWith("select5"))
-            batchSize = 5;
         if (this.toSkip > 0)
             batchSize = 1;
 
@@ -470,12 +466,12 @@ public class DBSPExecutor extends SqlSltTestExecutor {
         }
         DBSPLetStatement step =
                 new DBSPLetStatement("_",
-                        new DBSPApplyMethodExpression("step", DBSPTypeAny.getDefault(),
+                        new DBSPApplyMethodExpression("transaction", DBSPTypeAny.getDefault(),
                         cas.getVarReference().field(0)).resultUnwrap());
         list.add(step);
         DBSPLetStatement outputStatement =
                 new DBSPLetStatement("out",
-                        new DBSPApplyExpression("read_output_handle", DBSPTypeAny.getDefault(),
+                        new DBSPApplyExpression("read_output_spine", DBSPTypeAny.getDefault(),
                                 streams.getVarReference().field(circuit.getInputTables().size() + outputNumber).borrow()));
         list.add(outputStatement);
         DBSPExpression sort = new DBSPEnumValue("SortOrder", description.getOrder().toString());
@@ -548,6 +544,7 @@ public class DBSPExecutor extends SqlSltTestExecutor {
         return new ProgramAndTester(circuit, function);
     }
 
+    @SuppressWarnings("UnusedReturnValue")
     public boolean statement(SltSqlStatement statement) throws SQLException {
         this.options.message("Executing " + statement + "\n", 2);
         String command = statement.statement.toLowerCase();
@@ -581,7 +578,9 @@ public class DBSPExecutor extends SqlSltTestExecutor {
         String genFileName = Main.testFileName + ".rs";
         String testFilePath = Main.getAbsoluteRustDirectory() + "/" + genFileName;
         PrintStream stream = new PrintStream(testFilePath, StandardCharsets.UTF_8);
-        RustFileWriter rust = new RustFileWriter().forSlt();
+        LateMaterializations materializations = new LateMaterializations(compiler);
+        // No need to run the materializations
+        RustFileWriter rust = new RustFileWriter(materializations).forSlt();
         rust.setOutputBuilder(new IndentStream(stream));
 
         for (DBSPFunction function : inputFunctions)

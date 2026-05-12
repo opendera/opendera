@@ -1,22 +1,29 @@
-use super::{require_persistent_id, Mailbox};
+use super::{Mailbox, require_persistent_id};
 use crate::{
+    Batch, BatchReader, Circuit, Error, Runtime, Stream,
     circuit::{
-        circuit_builder::CircuitBase,
-        operator_traits::{BinarySinkOperator, Operator, SinkOperator},
         GlobalNodeId, LocalStoreMarker, OwnershipPreference, RootCircuit, Scope,
+        circuit_builder::CircuitBase,
+        metadata::{BatchSizeStats, OUTPUT_BATCHES_STATS, OperatorMeta},
+        operator_traits::{BinarySinkOperator, Operator, SinkOperator},
     },
     storage::file::to_bytes,
-    trace::BatchReaderFactories,
-    Batch, Circuit, Error, Runtime, Stream,
+    trace::{
+        BatchReader as DynBatchReader, BatchReaderFactories, SpineSnapshot as DynSpineSnapshot,
+    },
+    typed_batch::{Spine, SpineSnapshot, TypedBatch},
 };
-use feldera_storage::StoragePath;
+use feldera_storage::{FileCommitter, StoragePath};
 use std::{
     borrow::Cow,
     fmt::Debug,
     hash::{Hash, Hasher},
     marker::PhantomData,
     mem::transmute,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use typedmap::TypedMapKey;
 
@@ -66,6 +73,65 @@ where
     pub fn output_guarded(&self, guard: &Stream<RootCircuit, bool>) -> OutputHandle<T> {
         let (output, output_handle) = OutputGuarded::new();
         self.circuit().add_binary_sink(output, self, guard);
+        output_handle
+    }
+}
+
+impl<B> Stream<RootCircuit, B>
+where
+    B: Batch + Send,
+{
+    /// Output operator that produces a single accumulated output per clock cycle.
+    #[track_caller]
+    pub fn accumulate_output(&self) -> OutputHandle<SpineSnapshot<B>> {
+        self.accumulate_output_persistent(None)
+    }
+
+    #[track_caller]
+    pub fn accumulate_output_persistent(
+        &self,
+        persistent_id: Option<&str>,
+    ) -> OutputHandle<SpineSnapshot<B>> {
+        let (handle, enable_count, _) = self.accumulate_output_persistent_with_gid(persistent_id);
+        enable_count.fetch_add(1, Ordering::AcqRel);
+        handle
+    }
+
+    /// Returns:
+    /// - The output handle.
+    /// - The enable count of the accumulator. Can be used to enable/disable the accumulator.
+    /// - The global node ID of the output operator.
+    #[track_caller]
+    pub fn accumulate_output_persistent_with_gid(
+        &self,
+        persistent_id: Option<&str>,
+    ) -> (
+        OutputHandle<SpineSnapshot<B>>,
+        Arc<AtomicUsize>,
+        GlobalNodeId,
+    ) {
+        let (output, output_handle) = AccumulateOutput::<B>::new();
+
+        let (accumulated, enable_count) = self.accumulate_with_enable_count();
+        let gid = self.circuit().add_sink(output, &accumulated);
+        self.circuit().set_persistent_node_id(&gid, persistent_id);
+
+        (output_handle, enable_count, gid)
+    }
+}
+
+impl<T> Stream<RootCircuit, Option<T>>
+where
+    T: Debug + Clone + Send + 'static,
+{
+    /// Output operator that produces the latest non-`None` output per clock
+    /// cycle.
+    #[track_caller]
+    pub fn latest_output(&self) -> OutputHandle<T> {
+        let (output, output_handle) = LatestOutput::<T>::new();
+
+        self.circuit().add_sink(output, self);
+
         output_handle
     }
 }
@@ -163,7 +229,7 @@ impl<T: Clone> OutputHandleInternal<T> {
 /// using [`take_from_all`](`OutputHandle::take_from_all`).
 /// If the stream carries relational data, the
 /// [`consolidate`](`OutputHandle::consolidate`) method can be used
-/// to combine output batches produced by all workes into a single
+/// to combine output batches produced by all workers into a single
 /// batch.
 ///
 /// Reading from a mailbox using any of these methods removes the value
@@ -187,7 +253,7 @@ where
                     .local_store()
                     .entry(OutputId::new(output_id))
                     .or_insert_with(|| {
-                        Self(Arc::new(OutputHandleInternal::new(runtime.num_workers())))
+                        Self(Arc::new(OutputHandleInternal::new(Runtime::num_workers())))
                     })
                     .value()
                     .clone()
@@ -286,6 +352,24 @@ where
     }
 }
 
+impl<T> OutputHandle<T>
+where
+    T: BatchReader<Time = ()> + Send + Clone,
+    T::Inner: Send,
+{
+    /// Concatenate outputs produced by all worker threads.
+    pub fn concat(&self) -> TypedBatch<T::Key, T::Val, T::R, DynSpineSnapshot<T::IntoBatch>> {
+        TypedBatch::new(DynSpineSnapshot::concat(
+            <T::IntoBatch as DynBatchReader>::Factories::new::<T::Key, T::Val, T::R>(),
+            self.take_from_all()
+                .into_iter()
+                .map(|b| b.into_dyn_snapshot())
+                .collect::<Vec<_>>()
+                .iter(),
+        ))
+    }
+}
+
 /// Sink operator that stores the contents of its input stream in
 /// an `OutputHandle`.
 struct Output<T> {
@@ -309,7 +393,6 @@ where
         (output, handle)
     }
 
-    /// Return the absolute path of the file for a checkpointed Window.
     fn checkpoint_file(base: &StoragePath, persistent_id: &str) -> StoragePath {
         base.child(format!("output-{}.dat", persistent_id))
     }
@@ -327,13 +410,20 @@ where
         self.global_id = global_id.clone();
     }
 
-    fn commit(&mut self, base: &StoragePath, pid: Option<&str>) -> Result<(), Error> {
+    fn checkpoint(
+        &mut self,
+        base: &StoragePath,
+        pid: Option<&str>,
+        files: &mut Vec<Arc<dyn FileCommitter>>,
+    ) -> Result<(), Error> {
         let pid = require_persistent_id(pid, &self.global_id)?;
         let as_bytes = to_bytes(&()).expect("Serializing () should work.");
 
-        Runtime::storage_backend()
-            .unwrap()
-            .write(&Self::checkpoint_file(base, pid), as_bytes)?;
+        files.push(
+            Runtime::storage_backend()
+                .unwrap()
+                .write(&Self::checkpoint_file(base, pid), as_bytes)?,
+        );
 
         Ok(())
     }
@@ -362,6 +452,163 @@ where
 
     async fn eval_owned(&mut self, val: T) {
         self.mailbox.set(Some(val));
+    }
+
+    fn input_preference(&self) -> OwnershipPreference {
+        OwnershipPreference::PREFER_OWNED
+    }
+}
+
+pub struct AccumulateOutput<B>
+where
+    B: Batch,
+{
+    global_id: GlobalNodeId,
+    mailbox: Mailbox<Option<SpineSnapshot<B>>>,
+    output_batch_stats: BatchSizeStats,
+}
+
+impl<B> AccumulateOutput<B>
+where
+    B: Batch + Send,
+{
+    pub fn new() -> (Self, OutputHandle<SpineSnapshot<B>>) {
+        let handle = OutputHandle::new();
+        let mailbox = handle.mailbox(Runtime::worker_index()).clone();
+
+        let output = Self {
+            global_id: GlobalNodeId::root(),
+            mailbox,
+            output_batch_stats: BatchSizeStats::new(),
+        };
+
+        (output, handle)
+    }
+
+    fn checkpoint_file(base: &StoragePath, persistent_id: &str) -> StoragePath {
+        base.child(format!("accumulate-output-{}.dat", persistent_id))
+    }
+}
+
+impl<B> Operator for AccumulateOutput<B>
+where
+    B: Batch + Send,
+{
+    fn name(&self) -> Cow<'static, str> {
+        Cow::from("AccumulateOutput")
+    }
+
+    fn init(&mut self, global_id: &GlobalNodeId) {
+        self.global_id = global_id.clone();
+    }
+
+    fn checkpoint(
+        &mut self,
+        base: &StoragePath,
+        pid: Option<&str>,
+        files: &mut Vec<Arc<dyn FileCommitter>>,
+    ) -> Result<(), Error> {
+        let pid = require_persistent_id(pid, &self.global_id)?;
+        let as_bytes = to_bytes(&()).expect("Serializing () should work.");
+
+        files.push(
+            Runtime::storage_backend()
+                .unwrap()
+                .write(&Self::checkpoint_file(base, pid), as_bytes)?,
+        );
+
+        Ok(())
+    }
+
+    fn restore(&mut self, base: &StoragePath, pid: Option<&str>) -> Result<(), Error> {
+        let pid = require_persistent_id(pid, &self.global_id)?;
+
+        let path = Self::checkpoint_file(base, pid);
+        let _content = Runtime::storage_backend().unwrap().read(&path)?;
+
+        Ok(())
+    }
+
+    fn metadata(&self, meta: &mut OperatorMeta) {
+        meta.extend(metadata! {
+            OUTPUT_BATCHES_STATS => self.output_batch_stats.metadata(),
+        });
+    }
+
+    fn fixedpoint(&self, _scope: Scope) -> bool {
+        true
+    }
+}
+
+impl<B> SinkOperator<Option<Spine<B>>> for AccumulateOutput<B>
+where
+    B: Batch + Send,
+{
+    async fn eval(&mut self, val: &Option<Spine<B>>) {
+        if let Some(val) = val {
+            self.output_batch_stats.add_batch(val.len());
+            self.mailbox.set(Some(val.ro_snapshot()));
+        }
+    }
+
+    async fn eval_owned(&mut self, val: Option<Spine<B>>) {
+        if let Some(val) = val {
+            self.output_batch_stats.add_batch(val.len());
+            self.mailbox.set(Some(val.ro_snapshot()));
+        }
+    }
+
+    fn input_preference(&self) -> OwnershipPreference {
+        OwnershipPreference::PREFER_OWNED
+    }
+}
+
+pub struct LatestOutput<T>
+where
+    T: Debug + Clone + Send + 'static,
+{
+    mailbox: Mailbox<Option<T>>,
+}
+
+impl<T> LatestOutput<T>
+where
+    T: Debug + Clone + Send + 'static,
+{
+    pub fn new() -> (Self, OutputHandle<T>) {
+        let handle = OutputHandle::new();
+        let mailbox = handle.mailbox(Runtime::worker_index()).clone();
+
+        let output = Self { mailbox };
+
+        (output, handle)
+    }
+}
+
+impl<T> Operator for LatestOutput<T>
+where
+    T: Debug + Clone + Send + 'static,
+{
+    fn name(&self) -> Cow<'static, str> {
+        Cow::from("LatestOutput")
+    }
+
+    fn fixedpoint(&self, _scope: Scope) -> bool {
+        true
+    }
+}
+
+impl<T> SinkOperator<Option<T>> for LatestOutput<T>
+where
+    T: Debug + Clone + Send + 'static,
+{
+    async fn eval(&mut self, val: &Option<T>) {
+        self.eval_owned(val.clone()).await;
+    }
+
+    async fn eval_owned(&mut self, val: Option<T>) {
+        if val.is_some() {
+            self.mailbox.set(val);
+        }
     }
 
     fn input_preference(&self) -> OwnershipPreference {
@@ -420,7 +667,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::{typed_batch::OrdZSet, utils::Tup2, Runtime};
+    use crate::{Runtime, typed_batch::OrdZSet, utils::Tup2};
 
     #[test]
     fn test_output_handle() {
@@ -452,7 +699,7 @@ mod test {
             let expected_output = OrdZSet::from_tuples((), input_tuples);
 
             input.append(&mut input_vec);
-            dbsp.step().unwrap();
+            dbsp.transaction().unwrap();
             let output = output.consolidate();
             assert_eq!(output, expected_output);
         }
@@ -492,13 +739,13 @@ mod test {
 
             input.append(&mut input_vec.clone());
             guard.set_for_all(false);
-            dbsp.step().unwrap();
+            dbsp.transaction().unwrap();
             let output1 = output.consolidate();
             assert_eq!(output1, OrdZSet::empty());
 
             input.append(&mut input_vec);
             guard.set_for_all(true);
-            dbsp.step().unwrap();
+            dbsp.transaction().unwrap();
             let output2 = output.consolidate();
 
             assert_eq!(output2, expected_output);

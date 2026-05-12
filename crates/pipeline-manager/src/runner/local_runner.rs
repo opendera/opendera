@@ -3,95 +3,43 @@
 
 use crate::common_error::CommonError;
 use crate::config::{CommonConfig, LocalRunnerConfig};
-use crate::db::types::pipeline::PipelineId;
+use crate::db::types::pipeline::{
+    bootstrap_policy_to_string, runtime_desired_status_to_string, PipelineId,
+};
 use crate::db::types::version::Version;
-use crate::error::ManagerError;
+use crate::error::{source_error, ManagerError};
+use crate::pipeline_env::validate_pipeline_env;
 use crate::runner::error::RunnerError;
-use crate::runner::pipeline_executor::PipelineExecutor;
-use crate::runner::pipeline_logs::LogMessage;
+use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
+use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use async_trait::async_trait;
-use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
-use log::{error, warn, Level};
+use feldera_observability::ReqwestTracingExt;
+use feldera_types::config::{
+    PipelineConfig, PipelineConfigProgramInfo, StorageCacheConfig, StorageConfig,
+};
+use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
 use reqwest::StatusCode;
+use serde_json::json;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::fs::{remove_dir_all, remove_file};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tokio::{fs, fs::create_dir_all, select, spawn};
+use tokio_stream::StreamExt;
+use tracing::{error, warn, Level};
+use uuid::Uuid;
 
-/// Retrieve the binary executable using its URL.
-pub async fn fetch_binary_ref(
-    config: &LocalRunnerConfig,
-    client: &reqwest::Client,
-    binary_ref: &str,
-    pipeline_id: PipelineId,
-    program_version: Version,
-) -> Result<String, ManagerError> {
-    let parsed =
-        url::Url::parse(binary_ref).expect("Can only be invoked with valid URLs created by us");
-    match parsed.scheme() {
-        // Access a file over HTTP/HTTPS
-        // TODO: implement retries
-        "http" | "https" => {
-            let resp = client.get(binary_ref).send().await;
-            match resp {
-                Ok(resp) => {
-                    if resp.status() != StatusCode::OK {
-                        return Err(RunnerError::RunnerProvisionError {
-                            error: format!(
-                                "response status of retrieving {} is {} instead of expected {}",
-                                binary_ref, resp.status(), StatusCode::OK
-                            ),
-                        }.into());
-                    }
-                    let resp = resp.bytes().await.expect("Binary reference should be accessible as bytes");
-                    let resp_ref = resp.as_ref();
-                    let path = config.binary_file_path(pipeline_id, program_version);
-                    let mut file = tokio::fs::File::options()
-                        .create(true)
-                        .truncate(true)
-                        .write(true)
-                        .read(true)
-                        .mode(0o760)
-                        .open(path.clone())
-                        .await
-                        .map_err(|e|
-                            ManagerError::from(CommonError::io_error(
-                                format!("File creation failed ({:?}) while saving {pipeline_id} binary fetched from '{}'", path, parsed.path()),
-                                e,
-                            ))
-                        )?;
-                    file.write_all(resp_ref).await.map_err(|e|
-                        ManagerError::from(CommonError::io_error(
-                            format!("File write failed ({:?}) while saving binary file for {pipeline_id} fetched from '{}'", path, parsed.path()),
-                            e,
-                        ))
-                    )?;
-                    file.flush().await.map_err(|e|
-                        ManagerError::from(CommonError::io_error(
-                            format!("File flush() failed ({:?}) while saving binary file for {pipeline_id} fetched from '{}'", path, parsed.path()),
-                            e,
-                        ))
-                    )?;
-                    Ok(path.into_os_string().into_string().expect("Path should be valid Unicode"))
-                }
-                Err(e) => {
-                    Err(RunnerError::RunnerProvisionError {
-                        error: format!(
-                            "Fetching URL {} for binary required by pipeline {pipeline_id} returned an error: {}",
-                            parsed.path(), e
-                        ),
-                    }.into())
-                }
-            }
-        }
-        _ => todo!("Unsupported URL scheme for binary ref"),
-    }
-}
+/// How many times to attempt to retrieve the pipeline binary.
+const BINARY_RETRIEVAL_ATTEMPTS: u64 = 5;
+
+/// Interval between binary retrieval attempts.
+const BINARY_RETRIEVAL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A runner handle to run a pipeline using a local process.
 /// During provisioning, it spawns a process, retrieves its location (port)
@@ -107,7 +55,7 @@ pub struct LocalRunner {
     config: LocalRunnerConfig,
     client: reqwest::Client,
     process: Option<Child>,
-    logs_sender: mpsc::Sender<LogMessage>,
+    logs_sender: LogsSender,
     logs_thread_terminate_sender_and_join_handle: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
 }
 
@@ -139,7 +87,7 @@ impl LocalRunner {
         pipeline_id: PipelineId,
         stdout: ChildStdout,
         stderr: ChildStderr,
-        logs_sender: mpsc::Sender<LogMessage>,
+        mut logs_sender: LogsSender,
     ) -> (oneshot::Sender<()>, JoinHandle<()>) {
         let (terminate_sender, mut terminate_receiver) = oneshot::channel::<()>();
         let join_handle = spawn(async move {
@@ -165,18 +113,30 @@ impl LocalRunner {
                             Ok(line) => match line {
                                 None => {
                                     stdout_finished = true;
-                                    logs_sender.send(LogMessage::new_from_control_plane(Level::Info, "stdout ended")).await.unwrap(); // TODO
                                 }
                                 Some(line) => {
                                     println!("{line}"); // Print to manager stdout
-                                    logs_sender.send(LogMessage::new_from_pipeline(&line)).await.unwrap(); // TODO
+                                    logs_sender
+                                        .send(LogMessage::new_from_pipeline(&line))
+                                        .await;
                                 }
                             },
                             Err(e) => {
                                 stdout_finished = true;
                                 let line = format!("stdout encountered I/O error: {e}");
-                                logs_sender.send(LogMessage::new_from_control_plane(Level::Error, &line)).await.unwrap(); // TODO
-                                error!("Logs of pipeline {pipeline_id}: {line}");
+                                logs_sender.send(LogMessage::new_from_control_plane(
+                                    module_path!(),
+                                    "runner",
+                                    String::new(),
+                                    pipeline_id.to_string(),
+                                    Level::ERROR,
+                                    &line,
+                                )).await;
+                                error!(
+                                    pipeline_id = %pipeline_id,
+                                    pipeline = "N/A",
+                                    "Logs of pipeline: {line}"
+                                );
                             }
                         }
                     }
@@ -187,18 +147,30 @@ impl LocalRunner {
                             Ok(line) => match line {
                                 None => {
                                     stderr_finished = true;
-                                    logs_sender.send(LogMessage::new_from_control_plane(Level::Info, "stderr ended")).await.unwrap(); // TODO
                                 }
                                 Some(line) => {
                                     eprintln!("{line}"); // Print to manager stderr
-                                    logs_sender.send(LogMessage::new_from_pipeline(&line)).await.unwrap(); // TODO
+                                    logs_sender
+                                        .send(LogMessage::new_from_pipeline(&line))
+                                        .await;
                                 }
                             },
                             Err(e) => {
                                 stderr_finished = true;
                                 let line = format!("stderr encountered I/O error: {e}");
-                                logs_sender.send(LogMessage::new_from_control_plane(Level::Error, &line)).await.unwrap(); // TODO
-                                error!("Logs of pipeline {pipeline_id}: {line}");
+                                logs_sender.send(LogMessage::new_from_control_plane(
+                                    module_path!(),
+                                    "runner",
+                                    String::new(),
+                                    pipeline_id.to_string(),
+                                    Level::ERROR,
+                                    &line,
+                                )).await;
+                                error!(
+                                    pipeline_id = %pipeline_id,
+                                    pipeline = "N/A",
+                                    "Logs of pipeline: {line}"
+                                );
                             }
                         }
                     }
@@ -208,9 +180,130 @@ impl LocalRunner {
         (terminate_sender, join_handle)
     }
 
+    /// Retrieves the binary executable or program info file of the pipeline from the compiler
+    /// server and stores it in the local runner working directory for that pipeline
+    /// located at `target_file_path`.
+    ///
+    /// Attempts to retrieve several times. Attempts are only made again if a sending error
+    /// occurred, not when a response was returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_url` - The URL of the file to retrieve.
+    /// * `description` - The description of the file to retrieve (e.g. "binary", "program info").
+    /// * `target_file_path` - The path to store the file.
+    /// * `mode` - File access mode for the created file.
+    async fn retrieve_pipeline_file(
+        &self,
+        file_url: &str,
+        description: &str,
+        target_file_path: &Path,
+        mode: u32,
+    ) -> Result<(), ManagerError> {
+        // URL validation
+        let parsed = url::Url::parse(file_url).map_err(|e| {
+            ManagerError::from(RunnerError::RunnerProvisionError {
+                error: format!(
+                    "pipeline {description} retrieval failed: invalid URL '{file_url}' due to: {e}"
+                ),
+            })
+        })?;
+
+        // Scheme must match either HTTP or HTTPS depending on configuration
+        let scheme = parsed.scheme();
+        if !self.common_config.enable_https && scheme != "http" {
+            return Err(RunnerError::RunnerProvisionError {
+                error: format!("pipeline {description} retrieval failed: URL '{file_url}' has scheme '{scheme}' whereas 'http' is expected"),
+            }.into());
+        }
+        if self.common_config.enable_https && parsed.scheme() != "https" {
+            return Err(RunnerError::RunnerProvisionError {
+                error: format!("pipeline {description} retrieval failed: URL '{file_url}' has scheme '{scheme}' whereas 'https' is expected"),
+            }.into());
+        }
+
+        // Perform request
+        let mut attempt = 1;
+        loop {
+            match self.client.get(file_url).with_sentry_tracing().send().await {
+                Ok(response) => {
+                    // Check status code
+                    if response.status() != StatusCode::OK {
+                        return Err(RunnerError::RunnerProvisionError {
+                            error: format!(
+                                "pipeline {description} retrieval failed: GET '{file_url}': expected response status code {} but got {}",
+                                StatusCode::OK, response.status(),
+                            ),
+                        }.into());
+                    }
+
+                    // Response body as a stream of bytes
+                    let mut body = response.bytes_stream();
+
+                    // Create and open the file
+                    let mut file = fs::File::options()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .read(true)
+                        .mode(mode)
+                        .open(target_file_path)
+                        .await
+                        .map_err(|e| {
+                            ManagerError::from(RunnerError::RunnerProvisionError {
+                                error: format!(
+                                    "pipeline {description} retrieval failed: unable to create file '{}': {e}",
+                                    target_file_path.display()
+                                ),
+                            })
+                        })?;
+
+                    // Write the file in streaming fashion
+                    while let Some(result_bytes) = body.next().await {
+                        let bytes = result_bytes.map_err(|e| ManagerError::from(RunnerError::RunnerProvisionError {
+                            error: format!("pipeline {description} retrieval failed: GET '{file_url}': could not convert response body chunk into bytes due to: {e}")
+                        }))?;
+                        file.write_all(&bytes).await.map_err(|e| {
+                            ManagerError::from(RunnerError::RunnerProvisionError {
+                                error: format!(
+                                    "pipeline {description} retrieval failed: unable to write file '{}': {e}",
+                                    target_file_path.display()
+                                ),
+                            })
+                        })?;
+                    }
+
+                    // Flush the file to be sure everything is written to disk
+                    file.flush().await.map_err(|e| {
+                        ManagerError::from(RunnerError::RunnerProvisionError {
+                            error: format!(
+                                "pipeline {description} retrieval failed: unable to flush file '{}': {e}",
+                                target_file_path.display()
+                            ),
+                        })
+                    })?;
+
+                    return Ok(());
+                }
+                Err(e) => {
+                    let error = format!(
+                        "pipeline {description} retrieval failed (attempt {attempt} / {BINARY_RETRIEVAL_ATTEMPTS}): GET '{file_url}': unable to get response: {e}, source: {}",
+                        source_error(&e)
+                    );
+                    error!("{error}");
+                    if attempt >= BINARY_RETRIEVAL_ATTEMPTS {
+                        return Err(RunnerError::RunnerProvisionError { error }.into());
+                    }
+                }
+            }
+            sleep(BINARY_RETRIEVAL_RETRY_INTERVAL).await;
+            attempt += 1;
+        }
+    }
+
     /// Checks the process and working directory of the deployment.
     /// Returns a fatal error if it is encountered.
-    async fn inner_check(&mut self) -> Result<(), String> {
+    async fn inner_check(&mut self) -> Result<serde_json::Value, String> {
         // Pipeline process status must be checkable and not have exited
         let process_check = if let Some(p) = &mut self.process {
             match p.try_wait() {
@@ -219,7 +312,7 @@ impl LocalRunner {
                         // If there is an exit status, the process has exited
                         Err(format!("Pipeline process exited prematurely with {status}"))
                     } else {
-                        Ok(())
+                        Ok("has not exited".to_string())
                     }
                 }
                 Err(e) => {
@@ -237,7 +330,7 @@ impl LocalRunner {
         // Pipeline working directory must exist
         let pipeline_dir = &self.config.pipeline_dir(self.pipeline_id);
         let working_dir_check = if Path::new(pipeline_dir).is_dir() {
-            Ok(())
+            Ok("exists".to_string())
         } else {
             Err(format!(
                 "Working directory '{}' no longer exists.",
@@ -257,21 +350,28 @@ impl LocalRunner {
         // Write to both runner and pipeline logs
         for error in &errors {
             error!(
-                "Resource error for pipeline {}: {}",
-                self.pipeline_id, error
+                pipeline_id = %self.pipeline_id,
+                pipeline = "N/A",
+                "Resources error: {error}"
             );
             self.logs_sender
                 .send(LogMessage::new_from_control_plane(
-                    Level::Error,
-                    &format!("Resource error: {error}"),
+                    module_path!(),
+                    "runner",
+                    String::new(),
+                    self.pipeline_id.to_string(),
+                    Level::ERROR,
+                    &format!("Resources error: {error}"),
                 ))
-                .await
-                .unwrap(); // TODO
+                .await;
         }
 
         // Result
         if errors.is_empty() {
-            Ok(())
+            Ok(json!({
+                "process": process_check.unwrap_or("".to_string()),
+                "working_dir": working_dir_check.unwrap_or("".to_string()),
+            }))
         } else {
             Err(errors.join("\n"))
         }
@@ -290,7 +390,7 @@ impl PipelineExecutor for LocalRunner {
         common_config: CommonConfig,
         config: Self::Config,
         client: reqwest::Client,
-        logs_sender: mpsc::Sender<LogMessage>,
+        logs_sender: LogsSender,
     ) -> Self {
         Self {
             pipeline_id,
@@ -323,11 +423,27 @@ impl PipelineExecutor for LocalRunner {
     /// - Switches to operational logging following the stdout/stderr of the process
     async fn provision(
         &mut self,
+        deployment_initial: RuntimeDesiredStatus,
+        bootstrap_policy: Option<BootstrapPolicy>,
+        deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
+        _program_info: &serde_json::Value,
         program_binary_url: &str,
+        program_info_url: Option<&str>,
         program_version: Version,
-        _suspend_info: Option<serde_json::Value>,
     ) -> Result<(), ManagerError> {
+        // Local runner does not support multihost.
+        if deployment_config.multihost.is_some() {
+            return Err(RunnerError::RunnerProvisionError {
+                error: String::from("Local runner does not support multihost deployment"),
+            }
+            .into());
+        }
+
+        if let Err(e) = validate_pipeline_env(&deployment_config.global.env) {
+            return Err(RunnerError::RunnerProvisionError { error: e }.into());
+        }
+
         // (Re-)create pipeline working directory (which will contain storage directory)
         let pipeline_dir = self.config.pipeline_dir(self.pipeline_id);
         create_dir_all(&pipeline_dir).await.map_err(|e| {
@@ -353,58 +469,158 @@ impl PipelineExecutor for LocalRunner {
             })?;
         }
 
-        // Write config.yaml
-        let config_file_path = self.config.config_file_path(self.pipeline_id);
-        let expanded_config = serde_yaml::to_string(&deployment_config)
-            .expect("Deployment configuration serialization failed");
-        fs::write(&config_file_path, &expanded_config)
-            .await
-            .map_err(|e| {
-                ManagerError::from(CommonError::io_error(
-                    format!("write config file '{}'", config_file_path.display()),
-                    e,
-                ))
-            })?;
+        // If program_info_url is provided, combine information in deployment_config and program info.
+        // TODO: This implementation ensures backward compatibility with older pipelines.
+        // Going forward, we should be able to pass program info and deployment config files
+        // as separate arguments to the pipeline instead of merging them into one JSON file.
+        let mut deployment_config = deployment_config.clone();
+        if let Some(program_info_url) = program_info_url {
+            // Retrieve and store executable in pipeline working directory
+            let program_info_file_path = self.config.program_info_file_path(self.pipeline_id);
+
+            self.retrieve_pipeline_file(
+                program_info_url,
+                "program info",
+                &program_info_file_path,
+                0o660, // User: rw, Group: rw, Others: /
+            )
+            .await?;
+
+            // Read and parse the program info file
+            let program_info_contents =
+                fs::read_to_string(&program_info_file_path)
+                    .await
+                    .map_err(|e| {
+                        ManagerError::from(CommonError::io_error(
+                            format!(
+                                "read program info file '{}'",
+                                program_info_file_path.display()
+                            ),
+                            e,
+                        ))
+                    })?;
+
+            let program_info: PipelineConfigProgramInfo =
+                serde_json::from_str(&program_info_contents).map_err(|e| {
+                    ManagerError::from(RunnerError::RunnerProvisionError {
+                        error: format!(
+                            "failed to parse program info file '{}': {e}",
+                            program_info_file_path.display()
+                        ),
+                    })
+                })?;
+
+            // Merge program info into deployment_config
+            deployment_config.inputs = program_info.inputs;
+            deployment_config.outputs = program_info.outputs;
+            deployment_config.program_ir = program_info.program_ir;
+        }
+
+        // Write config as YAML and JSON
+        //
+        // Newer pipelines will read the JSON, older ones will read the YAML.
+        let json_config = serde_json::to_string_pretty(&deployment_config)
+            .expect("JSON config serialization failed");
+        let yaml_config =
+            serde_yaml::to_string(&deployment_config).expect("YAML config serialization failed");
+        for (extension, expanded_config) in [("json", json_config), ("yaml", yaml_config)] {
+            let config_file_path = self.config.config_file_path(self.pipeline_id, extension);
+            fs::write(&config_file_path, &expanded_config)
+                .await
+                .map_err(|e| {
+                    ManagerError::from(CommonError::io_error(
+                        format!("write config file '{}'", config_file_path.display()),
+                        e,
+                    ))
+                })?;
+        }
 
         // Delete port file (which will only exist if we are restarting from a
         // checkpoint).
         let _ = remove_file(&self.config.port_file_path(self.pipeline_id)).await;
 
         // Retrieve and store executable in pipeline working directory
-        let fetched_executable = fetch_binary_ref(
-            &self.config,
-            &self.client,
+        let binary_file_path = self
+            .config
+            .binary_file_path(self.pipeline_id, program_version);
+        self.retrieve_pipeline_file(
             program_binary_url,
-            self.pipeline_id,
-            program_version,
+            "binary",
+            &binary_file_path,
+            0o760, // User: rwx, Group: rw, Others: /
         )
         .await?;
 
-        // Run executable:
-        // - Current directory: pipeline working directory
-        // - Configuration file: path to config.yaml
-        // - Stdout/stderr are piped to follow logs
-        let mut process = Command::new(fetched_executable)
-            .env(
-                "TOKIO_WORKER_THREADS",
-                deployment_config
-                    .global
-                    .io_workers
-                    .unwrap_or(deployment_config.global.workers as u64)
-                    .to_string(),
-            )
-            .current_dir(pipeline_dir)
-            .arg("--config-file")
-            .arg(&config_file_path)
-            .arg("--bind-address")
-            .arg(&self.common_config.bind_address)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| RunnerError::RunnerProvisionError {
-                error: format!("unable to spawn process due to: {e}"),
-            })?;
+        let mut retries = 0..3;
+        let mut process = loop {
+            // Run executable:
+            // - Current directory: pipeline working directory
+            // - Configuration file: path to config.yaml
+            // - Stdout/stderr are piped to follow logs
+            let mut command = Command::new(&binary_file_path);
+            command
+                .env(
+                    "TOKIO_WORKER_THREADS",
+                    deployment_config
+                        .global
+                        .io_workers
+                        .unwrap_or(deployment_config.global.workers as u64)
+                        .to_string(),
+                )
+                .envs(
+                    deployment_config
+                        .global
+                        .env
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                )
+                .current_dir(&pipeline_dir)
+                .arg("--config-file")
+                .arg(self.config.config_file_path(self.pipeline_id, "yaml"))
+                .arg("--bind-address")
+                .arg(&self.common_config.bind_address)
+                .arg("--initial")
+                .arg(runtime_desired_status_to_string(deployment_initial))
+                .arg("--deployment-id")
+                .arg(deployment_id.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            if let Some(bootstrap_policy) = bootstrap_policy {
+                command
+                    .arg("--bootstrap-policy")
+                    .arg(bootstrap_policy_to_string(bootstrap_policy));
+            }
+
+            if let Some((https_tls_cert_path, https_tls_key_path)) =
+                self.common_config.https_config()
+            {
+                command
+                    .arg("--enable-https")
+                    .arg("--https-tls-cert-path")
+                    .arg(https_tls_cert_path)
+                    .arg("--https-tls-key-path")
+                    .arg(https_tls_key_path);
+            }
+            match command.spawn() {
+                Ok(process) => break process,
+                Err(e) if e.kind() == ErrorKind::ExecutableFileBusy && retries.next().is_some() => {
+                    // This race appears very occasionally in testing.  It might
+                    // be that tokio in some cases keeps an `Arc<File>` for the
+                    // underlying file in some background task after we've
+                    // finished retrieving the binary.
+                    warn!("pipeline executable is busy, retrying in 1 second...");
+                    sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    return Err(RunnerError::RunnerProvisionError {
+                        error: format!("unable to spawn process due to: {e}"),
+                    }
+                    .into())
+                }
+            }
+        };
 
         // Spawn a thread which follows the process stdout and stderr
         let stdout = process
@@ -431,10 +647,11 @@ impl PipelineExecutor for LocalRunner {
     }
 
     /// Process deployment provisioning is completed when the port file is found and read.
-    async fn is_provisioned(&mut self) -> Result<Option<String>, ManagerError> {
-        if let Err(error) = self.inner_check().await {
-            return Err(ManagerError::from(RunnerError::RunnerCheckError { error }));
-        }
+    async fn is_provisioned(&mut self) -> Result<ProvisionStatus, ManagerError> {
+        let details = self
+            .inner_check()
+            .await
+            .map_err(|error| ManagerError::from(RunnerError::RunnerCheckError { error }))?;
 
         let port_file_path = self.config.port_file_path(self.pipeline_id);
         match fs::read_to_string(port_file_path).await {
@@ -444,26 +661,27 @@ impl PipelineExecutor for LocalRunner {
                     Ok(port) => {
                         // Pipelines run on the same host as the runner
                         let host = &self.common_config.runner_host;
-                        Ok(Some(format!("{host}:{port}")))
+                        Ok(ProvisionStatus::Provisioned {
+                            location: format!("{host}:{port}"),
+                            details,
+                        })
                     }
                     Err(e) => Err(ManagerError::from(RunnerError::RunnerProvisionError {
                         error: format!("unable to parse port file due to: {e}"),
                     })),
                 }
             }
-            Err(_) => Ok(None),
+            Err(_) => Ok(ProvisionStatus::Ongoing { details }),
         }
     }
 
     /// Checks the process and working directory is healthy.
     /// - Pipeline working directory must exist
     /// - Process status must be checkable and not be exited
-    async fn check(&mut self) -> Result<(), ManagerError> {
-        if let Err(error) = self.inner_check().await {
-            Err(ManagerError::from(RunnerError::RunnerCheckError { error }))
-        } else {
-            Ok(())
-        }
+    async fn check(&mut self) -> Result<serde_json::Value, ManagerError> {
+        self.inner_check()
+            .await
+            .map_err(|error| ManagerError::from(RunnerError::RunnerCheckError { error }))
     }
 
     /// Kills the pipeline process and terminates the thread which follows its stdout and stderr.
@@ -492,8 +710,9 @@ impl PipelineExecutor for LocalRunner {
                 Ok(_) => (),
                 Err(e) => {
                     warn!(
-                        "Failed to remove working directory for pipeline {}: {}",
-                        self.pipeline_id, e
+                        pipeline_id = %self.pipeline_id,
+                        pipeline = "N/A",
+                        "Failed to remove working directory: {e}"
                     );
                 }
             }

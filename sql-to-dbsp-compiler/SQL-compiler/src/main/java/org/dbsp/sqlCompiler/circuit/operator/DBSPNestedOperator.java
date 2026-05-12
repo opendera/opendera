@@ -5,6 +5,8 @@ import org.dbsp.sqlCompiler.circuit.ICircuit;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.circuit.annotation.Annotations;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
+import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
+import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteEmptyRel;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteRelNode;
@@ -56,6 +58,14 @@ public class DBSPNestedOperator extends DBSPOperator implements ICircuit {
         return this.internalOutputs.get(outputNumber) != null;
     }
 
+    @Override
+    public List<SourcePositionRange> getSourcePositions() {
+        ArrayList<SourcePositionRange> result = new ArrayList<>();
+        for (DBSPOperator op: this.allOperators)
+            result.addAll(op.getSourcePositions());
+        return result;
+    }
+
     public boolean contains(DBSPOperator operator) {
         return this.operators.contains(operator);
     }
@@ -86,7 +96,7 @@ public class DBSPNestedOperator extends DBSPOperator implements ICircuit {
     /** Add an output for this nested operator.  The port may be null if the corresponding output
      * has actually been deleted.
      * @param view  View corresponding to output.
-     * @param port  Output port corresponding to the view (may be in a differentiator).
+     * @param port  Output port corresponding to the view (could be in a differentiator).
      * @return      A port of this operator that corresponds
      */
     public OutputPort addOutput(ProgramIdentifier view, @Nullable OutputPort port) {
@@ -187,6 +197,11 @@ public class DBSPNestedOperator extends DBSPOperator implements ICircuit {
     @Override
     public int outputCount() {
         return this.internalOutputs.size();
+    }
+
+    @Override
+    public DBSPOperator withInputs(List<OutputPort> newInputs, boolean force) {
+        throw new InternalCompilerError("Should not be called");
     }
 
     @SuppressWarnings("unused")

@@ -13,22 +13,24 @@ import org.dbsp.sqlCompiler.compiler.backend.rust.BaseRustCodeGenerator;
 import org.dbsp.sqlCompiler.compiler.backend.rust.RustWriter;
 import org.dbsp.sqlCompiler.compiler.backend.rust.ToRustVisitor;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeStream;
 import org.dbsp.util.HashString;
 import org.dbsp.util.Utilities;
-
-import java.util.HashSet;
 
 /** Writes the implementation of a {@link DBSPNestedOperator} as a function that instantiates
  * the operator in circuit. */
 public final class NestedOperatorWriter extends BaseRustCodeGenerator {
     final DBSPNestedOperator operator;
     final DBSPCircuit circuit;
+    final LateMaterializations materializations;
 
-    public NestedOperatorWriter(DBSPNestedOperator operator, DBSPCircuit circuit) {
+    public NestedOperatorWriter(DBSPNestedOperator operator, DBSPCircuit circuit,
+                                LateMaterializations materializations) {
         this.circuit = circuit;
         this.operator = operator;
+        this.materializations = materializations;
     }
 
     private void processChild(DBSPOperator node) {
@@ -60,6 +62,8 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
         } else {
             this.builder().append("None, ");
         }
+        this.builder().append(CircuitWriter.SOURCE_MAP_VARIABLE_NAME)
+                .append(", ");
         for (var input: op.inputs) {
             name = "";
             int index = 0;
@@ -86,11 +90,12 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
 
     @Override
     public void write(DBSPCompiler compiler) {
+        boolean useHandles = compiler.options.ioOptions.emitHandles;
         this.builder()
                 .append(RustWriter.COMMON_PREAMBLE)
                 .append(RustWriter.STANDARD_PREAMBLE);
         ToRustVisitor visitor = new ToRustVisitor(
-                compiler, this.builder(), this.circuit.metadata, new HashSet<>())
+                compiler, this.builder(), this.circuit.metadata, new ProjectDeclarations(), this.materializations)
                 .withPreferHash(true);
         final String hash = this.operator.getNodeName(true);
         this.builder().newline();
@@ -101,8 +106,12 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
                 .append(hash)
                 .append("(circuit: &")
                 .append(this.dbspCircuit(true))
-                .append(", catalog: &mut Catalog,")
-                .increase();
+                .append(", ")
+                .append(CircuitWriter.SOURCE_MAP_VARIABLE_NAME)
+                .append(": &'static SourceMap, ");
+        if (!useHandles)
+            this.builder().append("catalog: &mut Catalog,");
+        this.builder().increase();
         int input = 0;
         for (var port : this.operator.inputs) {
             String n = this.inputName(input);
@@ -183,7 +192,7 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
                     this.builder().append("None;").newline();
                 } else {
                     this.builder().append("Some(")
-                            .append(Utilities.doubleQuote(hash1.toString()))
+                            .append(Utilities.doubleQuote(hash1.toString(), false))
                             .append(");")
                             .newline();
                 }

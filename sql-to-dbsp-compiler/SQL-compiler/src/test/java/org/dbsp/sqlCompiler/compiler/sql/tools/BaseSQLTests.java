@@ -27,10 +27,18 @@ import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.backend.rust.RustFileWriter;
+import org.dbsp.sqlCompiler.compiler.backend.rust.RustWriter;
+import org.dbsp.sqlCompiler.compiler.backend.rust.StubsWriter;
+import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCratesWriter;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.SqlToRelCompiler;
+import org.dbsp.sqlCompiler.compiler.sql.MultiCrateTests;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.LowerCircuitVisitor;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.monotonicity.MonotoneAnalyzer;
 import org.dbsp.sqlCompiler.ir.DBSPFunction;
+import org.dbsp.sqlCompiler.ir.expression.DBSPTupleExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPZSetExpression;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLiteral;
 import org.dbsp.util.IndentStream;
 import org.dbsp.util.Linq;
 import org.dbsp.util.Logger;
@@ -51,19 +59,30 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Base class for SQL-based tests. */
+/** Base class for SQL-based tests: collects all tests that generate Rust from a single derived class
+ * and generates a single Rust file. */
 public class BaseSQLTests {
+    public static final String CARGO_LOCK = "Cargo.lock";
+
     // Debugging: set to true to only compile SQL
     public static final boolean skipRust = false;
     // Debugging: set to only accept some tests
-    public static Predicate<CompilerCircuitStream> acceptTest = x -> true;
+    public static final Predicate<CompilerCircuitStream> acceptTest = x -> true;
+
+    public static void setupCargoLock() throws IOException {
+        Files.copy(Path.of(BaseSQLTests.PROJECT_DIRECTORY, "..", BaseSQLTests.CARGO_LOCK),
+                Path.of(BaseSQLTests.RUST_DIRECTORY, "..", BaseSQLTests.CARGO_LOCK),
+                StandardCopyOption.REPLACE_EXISTING);
+    }
 
     /** Override this method to prepare the tables on
      * which the tests are built. */
@@ -95,27 +114,27 @@ public class BaseSQLTests {
     }
 
     @SuppressWarnings("unused")
-    protected void showPlan() {
+    public static void showPlan() {
         Logger.INSTANCE.setLoggingLevel(SqlToRelCompiler.class, 2);
     }
 
     @SuppressWarnings("unused")
-    protected void instrumentApply() {
+    public static void instrumentApply() {
         Logger.INSTANCE.setLoggingLevel(LowerCircuitVisitor.class, 2);
     }
 
     @SuppressWarnings("unused")
-    protected void showMonotone() {
+    public static void showMonotone() {
         Logger.INSTANCE.setLoggingLevel(MonotoneAnalyzer.class, 2);
     }
 
     @SuppressWarnings("unused")
-    protected void showFinal() {
+    public static void showFinal() {
         Logger.INSTANCE.setLoggingLevel(DBSPCompiler.class, 1);
     }
 
     @SuppressWarnings("unused")
-    protected void showFinalVerbose(int verbosity) {
+    public static void showFinalVerbose(int verbosity) {
         Logger.INSTANCE.setLoggingLevel(DBSPCompiler.class, verbosity);
     }
 
@@ -160,7 +179,22 @@ public class BaseSQLTests {
     }
 
     public void statementsFailingInCompilation(String statements, String substring) {
+        Utilities.enforce(!substring.isEmpty(), () -> "Missing expected error string in test");
         this.statementsFailingInCompilation(statements, substring, false);
+    }
+
+    public static void compileAndTestRust(boolean quiet) throws IOException, InterruptedException {
+        if (!BaseSQLTests.skipRust) {
+            BaseSQLTests.setupCargoLock();
+            Utilities.compileAndTestRust(BaseSQLTests.RUST_DIRECTORY, quiet);
+        }
+    }
+
+    public static void compileAndCheckRust(boolean quiet) throws IOException, InterruptedException {
+        if (!BaseSQLTests.skipRust) {
+            BaseSQLTests.setupCargoLock();
+            Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, quiet);
+        }
     }
 
     /** Compile a set of statements that are expected to give a warning at compile time.
@@ -172,7 +206,7 @@ public class BaseSQLTests {
         this.prepareInputs(compiler);
         compiler.submitStatementsForCompilation(statements);
         getCircuit(compiler);
-        Assert.assertTrue(compiler.hasWarnings);
+        Assert.assertTrue("Expected some warnings; got none", compiler.hasWarnings);
         String warnings = compiler.messages.messages.stream()
                 .filter(error -> error.warning).toList().toString();
         this.shouldMatch(warnings, regex, true);
@@ -181,7 +215,7 @@ public class BaseSQLTests {
     @Rule
     public TestName currentTestName = new TestName();
 
-    String currentTestInformation = "";
+    protected String currentTestInformation = "";
 
     @Rule
     public TestWatcher testWatcher = new TestWatcher() {
@@ -196,7 +230,7 @@ public class BaseSQLTests {
 
     public static final String PROJECT_DIRECTORY = "..";
     public static final String RUST_DIRECTORY = PROJECT_DIRECTORY + "/temp/src";
-    public static final String RUST_CRATES_DIRECTORY = PROJECT_DIRECTORY + "/multi";
+    public static final String RUST_MULTI_DIRECTORY = PROJECT_DIRECTORY + "/multi";
     public static final String TEST_FILE_PATH = RUST_DIRECTORY + "/lib.rs";
 
     public static int testsExecuted = 0;
@@ -223,6 +257,34 @@ public class BaseSQLTests {
         return file;
     }
 
+    /** Enumerate the SQL files in the QA repository.
+     * The assumption is that this repository has been checked out in parallel with feldera. */
+    public static List<File> getQATests() {
+        List<File> result = new ArrayList<>();
+        String dir = "../../../feldera-qa";
+        File file = new File(dir);
+        if (file.exists()) {
+            File[] directories = file.listFiles();
+            if (directories == null)
+                return result;
+            Arrays.sort(directories);
+            for (File d: directories) {
+                File[] files = d.listFiles();
+                if (files == null)
+                    continue;
+                for (File c: files) {
+                    // The following eliminate some fda scripts
+                    if (c.getName().contains("adhoc")) continue;
+                    if (c.getName().matches("query.*view.sql")) continue;
+                    if (c.getName().endsWith(".sql")) {
+                        result.add(c);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
     public static File createInputScript(String contents) throws IOException {
         File result = File.createTempFile("script", ".sql", new File(RUST_DIRECTORY));
         return createInputFile(result, contents);
@@ -237,75 +299,94 @@ public class BaseSQLTests {
     public static void runAllTests() throws IOException, InterruptedException {
         if (testsToRun.isEmpty())
             return;
-        int testNumber = 0;
 
         List<TestCase> toRun = Linq.where(testsToRun, TestCase::hasData);
         List<TestCase> toCheck = Linq.where(testsToRun, testCase -> !testCase.hasData());
-        HashMap<Long, DBSPFunction> inputFunctions = new HashMap<>();
+        DBSPCompiler compiler = testsToRun.get(0).ccs.compiler;
 
-        if (!toRun.isEmpty()) {
-            PrintStream outputStream = new PrintStream(Files.newOutputStream(getTestFilePath()));
-            RustFileWriter writer = new RustFileWriter().withTest(true);
-            writer.setOutputBuilder(new IndentStream(outputStream));
-
-            createEmptyStubs();
-            // Use the compiler from the first test case.
-            DBSPCompiler firstCompiler = null;
-            // Map from Change id to function that generates the change
-            for (TestCase test : toRun) {
-                if (firstCompiler == null)
-                    firstCompiler = test.ccs.compiler;
-                if (!test.ccs.compiler.options.same(firstCompiler.options))
-                    throw new RuntimeException("Test " + Utilities.singleQuote(toRun.get(0).javaTestName) +
-                            " and " + Utilities.singleQuote(test.javaTestName) +
-                            " are not compiled with the same options: "
-                            + test.ccs.compiler.options.diff(firstCompiler.options));
-                test.ccs.circuit.setName("circuit" + testNumber);
-                List<DBSPFunction> testers = test.createTesterCode(testNumber, RUST_DIRECTORY, inputFunctions);
-                writer.add(test.ccs.circuit);
-                for (var tester: testers)
-                    if (acceptTest.test(test.ccs))
-                        writer.add(tester);
-                BaseSQLTests.testsExecuted++;
-                testNumber++;
-            }
-            Utilities.enforce(firstCompiler != null);
-            writer.write(firstCompiler);
-            outputStream.close();
-            if (!skipRust)
-                Utilities.compileAndTestRust(RUST_DIRECTORY, true);
-        }
-
-        if (!toCheck.isEmpty()) {
-            createEmptyStubs();
-            PrintStream outputStream = new PrintStream(Files.newOutputStream(getTestFilePath()));
-            RustFileWriter writer = new RustFileWriter().withTest(true);
-            writer.setOutputBuilder(new IndentStream(outputStream));
-            DBSPCompiler firstCompiler = null;
-            for (TestCase test : toCheck) {
-                if (firstCompiler == null)
-                    firstCompiler = test.ccs.compiler;
-                if (!test.ccs.compiler.options.same(firstCompiler.options))
-                    throw new RuntimeException("Test " + Utilities.singleQuote(toCheck.get(0).javaTestName) +
-                            " and " + Utilities.singleQuote(test.javaTestName) +
-                            " are not compiled with the same options: "
-                            + test.ccs.compiler.options.diff(firstCompiler.options));
-                test.ccs.circuit.setName("circuit" + testNumber);
-                List<DBSPFunction> testers = test.createTesterCode(testNumber, RUST_DIRECTORY, inputFunctions);
-                writer.add(test.ccs.circuit);
-                for (var tester: testers)
-                    if (acceptTest.test(test.ccs))
-                        writer.add(tester);
-                BaseSQLTests.testsChecked++;
-                testNumber++;
-            }
-            Utilities.enforce(firstCompiler != null);
-            writer.write(firstCompiler);
-            outputStream.close();
-            if (!skipRust)
-                Utilities.compileAndCheckRust(RUST_DIRECTORY, true);
-        }
+        int testNumber = runTests(toRun, 0, compiler, false);
+        runTests(toCheck, testNumber, compiler, true);
         testsToRun.clear();
+    }
+
+    static int runTests(List<TestCase> toRun, int testNumber, DBSPCompiler compiler, boolean check)
+            throws IOException, InterruptedException {
+        if (toRun.isEmpty())
+            return testNumber;
+
+        boolean multiCrates = compiler.options.ioOptions.multiCrates();
+        HashMap<Long, DBSPFunction> inputFunctions = new HashMap<>();
+        PrintStream outputStream = null;
+        RustWriter writer;
+        String directory;
+        Path stubsDir;
+        String testCrate = "";
+
+        if (!multiCrates) {
+            outputStream = new PrintStream(Files.newOutputStream(getTestFilePath()));
+            // We do not need to run the LateMaterializations
+            writer = new RustFileWriter(new LateMaterializations(compiler)).withTest(true);
+            writer.setOutputBuilder(new IndentStream(outputStream));
+            directory = RUST_DIRECTORY;
+            stubsDir = Paths.get(directory);
+            createEmptyStubs();
+        } else {
+            directory = RUST_MULTI_DIRECTORY;
+            MultiCratesWriter multiWriter = new MultiCratesWriter(directory, "x", true);
+            testCrate = MultiCratesWriter.getTestName();
+            writer = multiWriter;
+            stubsDir = multiWriter.stubsDirectory();
+        }
+        StubsWriter stubsWriter = new StubsWriter(stubsDir.resolve(DBSPCompiler.STUBS_FILE_NAME));
+
+        // Map from Change id to function that generates the change
+        for (TestCase test : toRun) {
+            if (!test.ccs.compiler.options.same(compiler.options))
+                throw new RuntimeException("Test " + Utilities.singleQuote(toRun.get(0).javaTestName) +
+                        " and " + Utilities.singleQuote(test.javaTestName) +
+                        " are not compiled with the same options: "
+                        + test.ccs.compiler.options.diff(compiler.options));
+            test.ccs.circuit.setName("circuit" + testNumber);
+            List<DBSPFunction> testers = test.createTesterCode(testNumber, RUST_DIRECTORY, inputFunctions);
+            writer.add(test.ccs.circuit);
+            if (multiCrates) {
+                stubsWriter.add(test.ccs.circuit);
+            }
+            for (var tester: testers)
+                if (acceptTest.test(test.ccs))
+                    writer.addTest(tester);
+            if (check)
+                BaseSQLTests.testsChecked++;
+            else
+                BaseSQLTests.testsExecuted++;
+            testNumber++;
+        }
+        writer.write(compiler);
+        if (outputStream !=null)
+            outputStream.close();
+        stubsWriter.write(compiler);
+        if (!skipRust) {
+            if (multiCrates) {
+                MultiCrateTests.setupCargoLock();
+            } else {
+                BaseSQLTests.setupCargoLock();
+            }
+            if (check) {
+                Utilities.compileAndCheckRust(directory, true, testCrate);
+            } else {
+                String[] extraArgs;
+                if (testCrate.isEmpty())
+                    extraArgs = new String[] {};
+                else {
+                    extraArgs = new String[2];
+                    extraArgs[0] = "--package";
+                    extraArgs[1] = testCrate;
+                }
+                Utilities.compileAndTestRust(directory, true, extraArgs);
+            }
+        }
+
+        return testNumber;
     }
 
     void addRustTestCase(CompilerCircuitStream ccs) {
@@ -329,11 +410,17 @@ public class BaseSQLTests {
 
     public CompilerOptions testOptions() {
         CompilerOptions options = new CompilerOptions();
+        if (Utilities.inCI())
+            // Set to compile to multiple crates
+            options.ioOptions.crates = "x";
+        options.ioOptions.testing = true;
         options.languageOptions.throwOnError = true;
         options.languageOptions.generateInputForEveryTable = true;
         options.ioOptions.quiet = true;
         options.ioOptions.emitHandles = true;
-        options.ioOptions.verbosity = 2;
+        if (!options.ioOptions.multiCrates())
+            // Comments can interfere with multi-crates, generating hash collisions
+            options.ioOptions.verbosity = 2;
         options.languageOptions.incrementalize = false;
         options.languageOptions.unrestrictedIOTypes = true;
         options.languageOptions.optimizationLevel = 2;
@@ -378,5 +465,35 @@ public class BaseSQLTests {
 
     protected CompilerCircuitStream getCCSFailing(DBSPCompiler compiler, String message) {
         return new CompilerCircuitStream(compiler, this, message);
+    }
+
+    /** Convert a positive Z-set to a script for inserting in a database */
+    public static String zsetToDBScript(String table, DBSPZSetExpression expression) {
+        if (expression.isEmpty())
+            return "";
+        StringBuilder builder = new StringBuilder();
+        builder.append("INSERT INTO ")
+                .append(table)
+                .append(" VALUES");
+        boolean first = true;
+        for (var entry: expression.data.entrySet()) {
+            Long weight = entry.getValue();
+            Utilities.enforce(weight != null && weight > 0);
+            for (long l = 0; l < weight; l++) {
+                if (!first)
+                    builder.append(", ");
+                first = false;
+                builder.append("(");
+                DBSPTupleExpression tuple = entry.getKey().to(DBSPTupleExpression.class);
+                for (int i = 0; i < tuple.size(); i++) {
+                    if (i > 0)
+                        builder.append(", ");
+                    builder.append(tuple.field(i).to(DBSPLiteral.class).toSqlString());
+                }
+                builder.append(")");
+            }
+        }
+        builder.append(";");
+        return builder.toString();
     }
 }

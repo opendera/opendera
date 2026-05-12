@@ -2,16 +2,19 @@
 
 use crate::circuit::checkpointer::Checkpoint;
 use crate::circuit::circuit_builder::StreamId;
+use crate::dynamic::Erase;
+use crate::typed_batch::TypedBatch;
+use crate::{ChildCircuit, DBData, DBWeight, Timestamp};
 use crate::{
-    algebra::{AddAssignByRef, AddByRef, HasZero},
+    NumEntries,
+    algebra::{AddAssignByRef, AddByRef, HasZero, IndexedZSet as DynIndexedZSet},
     circuit::{Circuit, OwnershipPreference, Stream},
     circuit_cache_key,
     operator::{
+        Plus,
         differentiate::DifferentiateId,
         z1::{DelayedFeedback, DelayedNestedFeedback},
-        Plus,
     },
-    NumEntries,
 };
 use size_of::SizeOf;
 
@@ -68,7 +71,7 @@ where
     /// .0;
     ///
     /// for _ in 0..5 {
-    ///     circuit.step().unwrap();
+    ///     circuit.transaction().unwrap();
     /// }
     /// ```
     ///
@@ -173,15 +176,33 @@ where
     }
 }
 
+impl<C, T, K, V, R, B> Stream<ChildCircuit<C, T>, TypedBatch<K, V, R, B>>
+where
+    C: Clone + 'static,
+    T: Timestamp,
+    K: DBData + Erase<B::Key>,
+    V: DBData + Erase<B::Val>,
+    R: DBWeight + Erase<B::R>,
+    B: DynIndexedZSet + Checkpoint,
+{
+    /// Integrate the input stream, updating the output once per clock tick.
+    pub fn accumulate_integrate(&self) -> Stream<ChildCircuit<C, T>, TypedBatch<K, V, R, B>> {
+        self.circuit()
+            .non_incremental(self, |_child_circuit, stream| Ok(stream.integrate()))
+            .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::{
+        Circuit, RootCircuit, ZWeight,
         algebra::HasZero,
         monitor::TraceMonitor,
         operator::{DelayedFeedback, Generator},
         typed_batch::OrdZSet,
         utils::Tup2,
-        zset, Circuit, RootCircuit, ZWeight,
+        zset,
     };
 
     #[test]
@@ -199,7 +220,7 @@ mod test {
         .0;
 
         for _ in 0..100 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 
@@ -240,7 +261,7 @@ mod test {
         .0;
 
         for _ in 0..100 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 
@@ -297,7 +318,7 @@ mod test {
         .0;
 
         for _ in 0..4 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 }

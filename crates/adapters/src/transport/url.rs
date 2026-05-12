@@ -1,37 +1,39 @@
 use super::{
     InputConsumer, InputEndpoint, InputReader, InputReaderCommand, TransportInputEndpoint,
 };
-use crate::{ensure_default_crypto_provider, format::StreamSplitter, InputBuffer, Parser};
+use crate::{InputBuffer, Parser, ensure_default_crypto_provider, format::StreamSplitter};
 use actix::System;
 use actix_web::http::StatusCode;
 use actix_web::{
     dev::{Decompress, Payload},
-    http::header::{ByteRangeSpec, ContentRangeSpec, Range as ActixRange, CONTENT_RANGE},
+    http::header::{ByteRangeSpec, CONTENT_RANGE, ContentRangeSpec, Range as ActixRange},
 };
-use anyhow::{anyhow, bail, Result as AnyResult};
+use anyhow::{Result as AnyResult, anyhow, bail};
 use awc::error::HeaderValue;
-use awc::{http::header::HeaderMap, Client, ClientResponse, Connector};
+use awc::{Client, ClientResponse, Connector, http::header::HeaderMap};
 use bytes::Bytes;
-use feldera_adapterlib::transport::{InputCommandReceiver, Resume};
+use chrono::{DateTime, Utc};
+use feldera_adapterlib::format::BufferSize;
+use feldera_adapterlib::transport::{InputCommandReceiver, Resume, Watermark};
 use feldera_types::config::FtModel;
 use feldera_types::program_schema::Relation;
 use feldera_types::transport::url::UrlInputConfig;
-use futures::{future::OptionFuture, StreamExt};
+use futures::{StreamExt, future::OptionFuture};
 use serde::{Deserialize, Serialize};
+use std::thread;
 use std::{
-    cmp::{min, Ordering},
+    cmp::{Ordering, min},
     collections::VecDeque,
     hash::Hasher,
     ops::Range,
     str::FromStr,
     sync::Arc,
-    thread::spawn,
     time::Duration,
 };
 use tokio::{
     select,
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    time::{sleep_until, Instant},
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    time::{Instant, sleep_until},
 };
 use tracing::{info_span, warn};
 use xxhash_rust::xxh3::Xxh3Default;
@@ -60,11 +62,13 @@ impl TransportInputEndpoint for UrlInputEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         _schema: Relation,
+        seek: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(UrlInputReader::new(
             &self.config,
             consumer,
             parser,
+            seek,
         )?))
     }
 }
@@ -96,7 +100,10 @@ struct UrlStream<'a> {
 fn get_response_starting_offset(status: StatusCode, headers: &HeaderMap) -> AnyResult<u64> {
     if status != StatusCode::PARTIAL_CONTENT {
         if headers.get(CONTENT_RANGE).is_some() {
-            bail!("HTTP response contains the Content-Range header but its status code ({}) is not 206 Partial Content", status);
+            bail!(
+                "HTTP response contains the Content-Range header but its status code ({}) is not 206 Partial Content",
+                status
+            );
         }
         Ok(0)
     } else {
@@ -111,14 +118,21 @@ fn get_response_starting_offset(status: StatusCode, headers: &HeaderMap) -> AnyR
                     ..
                 } => Ok(start),
                 ContentRangeSpec::Bytes { range: None, .. } => {
-                    bail!("HTTP response is 206 Partial Content but has a Content-Range which indicates it is unsatisfiable");
+                    bail!(
+                        "HTTP response is 206 Partial Content but has a Content-Range which indicates it is unsatisfiable"
+                    );
                 }
                 other => {
-                    bail!("expected byte range in HTTP response Content-Range header, instead received: {other}");
+                    bail!(
+                        "expected byte range in HTTP response Content-Range header, instead received: {other}"
+                    );
                 }
             },
             _ => {
-                bail!("HTTP response should have only a single Content-Range header, but {} are present", content_range_values.len());
+                bail!(
+                    "HTTP response should have only a single Content-Range header, but {} are present",
+                    content_range_values.len()
+                );
             }
         }
     }
@@ -172,7 +186,9 @@ impl<'a> UrlStream<'a> {
                 // info!("HTTP response status code: {}", status);
 
                 if status.as_u16() == StatusCode::RANGE_NOT_SATISFIABLE {
-                    warn!("Received HTTP status code 416 (RANGE_NOT_SATISFIABLE)--connector has reached the end of input.");
+                    warn!(
+                        "Received HTTP status code 416 (RANGE_NOT_SATISFIABLE)--connector has reached the end of input."
+                    );
                     return Ok(None);
                 }
 
@@ -255,21 +271,31 @@ impl UrlInputReader {
         config: &Arc<UrlInputConfig>,
         consumer: Box<dyn InputConsumer>,
         mut parser: Box<dyn Parser>,
+        seek: Option<serde_json::Value>,
     ) -> AnyResult<Self> {
         let (sender, receiver) = unbounded_channel();
-        spawn({
-            let config = config.clone();
-            move || {
-                let _guard = info_span!("url_input", path = config.path.clone()).entered();
-                System::new().block_on(async move {
-                    if let Err(error) =
-                        Self::worker_thread(config, &mut parser, receiver, consumer.as_ref()).await
-                    {
-                        consumer.error(true, error);
-                    };
-                });
-            }
-        });
+        thread::Builder::new()
+            .name("url-connector".to_string())
+            .spawn({
+                let config = config.clone();
+                move || {
+                    let _guard = info_span!("url_input", path = config.path.clone()).entered();
+                    System::new().block_on(async move {
+                        if let Err(error) = Self::worker_thread(
+                            config,
+                            &mut parser,
+                            receiver,
+                            consumer.as_ref(),
+                            seek,
+                        )
+                        .await
+                        {
+                            consumer.error(true, error, None);
+                        };
+                    });
+                }
+            })
+            .expect("failed to spawn URL connector thread");
 
         Ok(Self { sender })
     }
@@ -279,11 +305,14 @@ impl UrlInputReader {
         parser: &mut Box<dyn Parser>,
         command_receiver: UnboundedReceiver<InputReaderCommand>,
         consumer: &dyn InputConsumer,
+        seek: Option<serde_json::Value>,
     ) -> AnyResult<()> {
         ensure_default_crypto_provider();
 
         let mut command_receiver = InputCommandReceiver::<Metadata, ()>::new(command_receiver);
-        let offset = if let Some(metadata) = command_receiver.recv_seek().await? {
+        let offset = if let Some(metadata) = seek {
+            let metadata = serde_json_path_to_error::from_value::<Metadata>(metadata)
+                .map_err(|e| anyhow!("error deserializing checkpointed connector metadata: {e}"))?;
             metadata.offsets.end
         } else {
             0
@@ -298,7 +327,7 @@ impl UrlInputReader {
             stream.seek(offsets.start);
             splitter.seek(offsets.start);
             let mut remainder = (offsets.end - offsets.start) as usize;
-            let mut num_records = 0;
+            let mut total = BufferSize::empty();
             let mut hasher = Xxh3Default::new();
             while remainder > 0 {
                 let bytes = stream.read(remainder).await?;
@@ -308,18 +337,18 @@ impl UrlInputReader {
                 splitter.append(&bytes);
                 remainder -= bytes.len();
                 while let Some(chunk) = splitter.next(remainder == 0) {
-                    let (mut buffer, errors) = parser.parse(chunk);
+                    let (mut buffer, errors) = parser.parse(chunk, None);
                     consumer.parse_errors(errors);
-                    consumer.buffered(buffer.len(), chunk.len());
-                    num_records += buffer.len();
+                    consumer.buffered(buffer.len());
+                    total += buffer.len();
                     buffer.hash(&mut hasher);
                     buffer.flush();
                 }
             }
-            consumer.replayed(num_records, hasher.finish());
+            consumer.replayed(total, hasher.finish());
         }
 
-        let mut queue = VecDeque::<(Range<u64>, Box<dyn InputBuffer>)>::new();
+        let mut queue = VecDeque::<(Range<u64>, Box<dyn InputBuffer>, DateTime<Utc>)>::new();
 
         // The time at which we will disconnect from the server, if we are
         // paused when this time arrives.
@@ -339,13 +368,17 @@ impl UrlInputReader {
             }
             let disconnect: OptionFuture<_> = deadline.map(sleep_until).into();
 
+            // Use timestamp before we start reading data from the stream as ingestion timestamp
+            // for all records derived from the next input chunk.
+            let timestamp = Utc::now();
+
             select! {
                 _ = disconnect, if deadline.is_some() => {
                     stream.disconnect()
                 },
                 command = command_receiver.recv() => {
                     match command? {
-                        command @ InputReaderCommand::Seek(_) | command @ InputReaderCommand::Replay{..} => {
+                        command @ InputReaderCommand::Replay{..} => {
                             unreachable!("{command:?} must be at the beginning of the command stream")
                         }
                         InputReaderCommand::Extend => {
@@ -355,11 +388,13 @@ impl UrlInputReader {
                             extending = false;
                         }
                         InputReaderCommand::Queue{..} => {
-                            let mut total = 0;
+                            let mut total = BufferSize::empty();
                             let mut hasher = consumer.hasher();
                             let limit = consumer.max_batch_size();
                             let mut range: Option<Range<u64>> = None;
-                            while let Some((offsets, mut buffer)) = queue.pop_front() {
+                            let mut watermarks = Vec::new();
+
+                            while let Some((offsets, mut buffer, timestamp)) = queue.pop_front() {
                                 range = match range {
                                     Some(range) => Some(range.start..offsets.end),
                                     None => Some(offsets),
@@ -369,7 +404,8 @@ impl UrlInputReader {
                                     buffer.hash(hasher);
                                 }
                                 buffer.flush();
-                                if total >= limit {
+                                watermarks.push(Watermark::new(timestamp, None));
+                                if total.records >= limit {
                                     break;
                                 }
                             }
@@ -379,7 +415,7 @@ impl UrlInputReader {
                                         ofs..ofs
                                     }),
                             }).unwrap();
-                            consumer.extended(total, Some(Resume::new_metadata_only(seek, hasher)));
+                            consumer.extended(total, Some(Resume::new_metadata_only(seek, hasher.map(|h| h.finish()))), watermarks);
                         }
                         InputReaderCommand::Disconnect => return Ok(()),
                     }
@@ -394,13 +430,13 @@ impl UrlInputReader {
                         let Some(chunk) = splitter.next(eof) else {
                             break;
                         };
-                        let (buffer, errors) = parser.parse(chunk);
-                        consumer.buffered(buffer.len(), chunk.len());
+                        let (buffer, errors) = parser.parse(chunk, None);
+                        consumer.buffered(buffer.len());
                         consumer.parse_errors(errors);
 
                         if let Some(buffer) = buffer {
                             let end = splitter.position();
-                            queue.push_back((start..end, buffer));
+                            queue.push_back((start..end, buffer, timestamp));
                         }
                     }
                     if eof {
@@ -414,6 +450,10 @@ impl UrlInputReader {
 }
 
 impl InputReader for UrlInputReader {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         let _ = self.sender.send(command);
     }
@@ -438,26 +478,26 @@ struct Metadata {
 mod test {
     use crate::{
         test::{
-            mock_input_pipeline, wait, MockDeZSet, MockInputConsumer, MockInputParser,
-            DEFAULT_TIMEOUT_MS,
+            DEFAULT_TIMEOUT_MS, MockDeZSet, MockInputConsumer, MockInputParser,
+            mock_input_pipeline, wait,
         },
         transport::InputReader,
     };
     use actix::System;
     use actix_web::{
-        middleware,
+        App, FromRequest, Handler, HttpResponse, HttpServer, Responder, Result, middleware,
         web::{self, Bytes},
-        App, FromRequest, Handler, HttpResponse, HttpServer, Responder, Result,
     };
     use async_stream::stream;
     use feldera_types::deserialize_without_context;
     use feldera_types::program_schema::Relation;
     use futures_timer::Delay;
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
     use std::{
         io::Error as IoError,
         sync::mpsc::channel,
-        thread::{sleep, spawn},
+        thread::{self, sleep},
         time::Duration,
     };
 
@@ -498,41 +538,42 @@ mod test {
         // Start HTTP server listening on an arbitrary local port, and obtain
         // its socket address as `addr`.
         let (sender, receiver) = channel();
-        spawn(move || {
-            System::new().block_on(async {
-                let server = HttpServer::new(move || {
-                    App::new()
-                        // enable logger
-                        .wrap(middleware::Logger::default())
-                        .service(web::resource("/test.csv").to(response))
-                })
-                .workers(1)
-                .bind(("127.0.0.1", 0))
-                .unwrap();
-                sender.send(server.addrs()[0]).unwrap();
-                server.run().await.unwrap();
-            });
-        });
+        thread::Builder::new()
+            .name("url-connector-test".to_string())
+            .spawn(move || {
+                System::new().block_on(async {
+                    let server = HttpServer::new(move || {
+                        App::new()
+                            // enable logger
+                            .wrap(middleware::Logger::default())
+                            .service(web::resource("/test.csv").to(response))
+                    })
+                    .workers(1)
+                    .bind(("127.0.0.1", 0))
+                    .unwrap();
+                    sender.send(server.addrs()[0]).unwrap();
+                    server.run().await.unwrap();
+                });
+            })
+            .expect("failed to spawn test thread");
         let addr = receiver.recv().unwrap();
         // Create a transport endpoint attached to the file.
-        let config_str = format!(
-            r#"
-stream: test_input
-transport:
-    name: url_input
-    config:
-        path: http://{addr}/{path}
-        pause_timeout: {pause_timeout}
-format:
-    name: csv
-"#
-        );
+        let config = serde_json::from_value(json!({
+            "stream": "test_input",
+            "transport": {
+                "name": "url_input",
+                "config": {
+                    "path": format!("http://{addr}/{path}"),
+                    "pause_timeout": pause_timeout,
+                }
+            },
+            "format": {
+                "name": "csv"
+            }
+        }))
+        .unwrap();
 
-        mock_input_pipeline::<TestStruct, TestStruct>(
-            serde_yaml::from_str(&config_str).unwrap(),
-            Relation::empty(),
-        )
-        .unwrap()
+        mock_input_pipeline::<TestStruct, TestStruct>(config, Relation::empty()).unwrap()
     }
 
     /// Test normal successful data retrieval.

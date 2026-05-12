@@ -1,6 +1,7 @@
 //! Functions for manipulating maps
 
-use crate::{ConcatSemigroup, Semigroup, Weight};
+use crate::error::{SqlResult, SqlRuntimeError};
+use crate::{Array, ConcatSemigroup, Semigroup, Weight};
 use dbsp::utils::Tup2;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ where
     K: Clone,
     V: Clone,
 {
-    (*data).clone()
+    Arc::unwrap_or_clone(data)
 }
 
 #[doc(hidden)]
@@ -78,26 +79,68 @@ where
     }
 }
 
+// Convert a map to another map
 #[doc(hidden)]
-pub fn map_map__<K, V0, V1, F>(map: &Map<K, V0>, f: F) -> Map<K, V1>
+pub fn map_map__<K0, K1, V0, V1, F, G>(map: Map<K0, V0>, f: (F, G)) -> Map<K1, V1>
 where
-    K: Ord + Clone,
-    F: Fn(&V0) -> V1,
+    K0: Ord + Clone,
+    K1: Ord + Clone,
+    F: Fn(&K0) -> K1,
+    G: Fn(&V0) -> V1,
 {
-    let result: BTreeMap<K, V1> = (*map)
+    let result: BTreeMap<K1, V1> = (*map)
         .iter()
-        .map(move |(key, value)| (key.clone(), f(value)))
+        .map(move |(key, value)| (f.0(key), f.1(value)))
         .collect();
     result.into()
 }
 
 #[doc(hidden)]
-pub fn map_mapN_<K, V0, V1, F>(map: &Option<Map<K, V0>>, f: F) -> Option<Map<K, V1>>
+pub fn map_mapN_<K0, K1, V0, V1, F, G>(map: Option<Map<K0, V0>>, f: (F, G)) -> Option<Map<K1, V1>>
 where
-    K: Ord + Clone,
-    F: Fn(&V0) -> V1,
+    K0: Ord + Clone,
+    K1: Ord + Clone,
+    F: Fn(&K0) -> K1,
+    G: Fn(&V0) -> V1,
 {
-    map.as_ref().map(|map| map_map__(map, f))
+    map.map(|map| map_map__(map, f))
+}
+
+#[doc(hidden)]
+pub fn map_map_safe__<K0, K1, V0, V1, F, G>(
+    map: Map<K0, V0>,
+    f: (F, G),
+) -> SqlResult<Option<Map<K1, V1>>>
+where
+    K0: Ord + Clone,
+    K1: Ord + Clone,
+    F: Fn(&K0) -> SqlResult<K1>,
+    G: Fn(&V0) -> SqlResult<V1>,
+{
+    (*map)
+        .iter()
+        .map(move |(key, value)| (f.0(key), f.1(value)))
+        .map(move |(a, b)| Ok((a?, b?)))
+        .collect::<SqlResult<BTreeMap<K1, V1>>>()
+        .map(|x| Some(x.into()))
+}
+
+#[doc(hidden)]
+pub fn map_map_safeN_<K0, K1, V0, V1, F, G>(
+    map: Option<Map<K0, V0>>,
+    f: (F, G),
+) -> SqlResult<Option<Map<K1, V1>>>
+where
+    K0: Ord + Clone,
+    K1: Ord + Clone,
+    F: Fn(&K0) -> SqlResult<K1>,
+    G: Fn(&V0) -> SqlResult<V1>,
+{
+    match map {
+        // Treat like an error; the result will be unwrapped to None anyway
+        None => Err(SqlRuntimeError::from_strng("")),
+        Some(map) => map_map_safe__(map.clone(), f),
+    }
 }
 
 #[doc(hidden)]
@@ -230,7 +273,7 @@ pub fn cardinalityMap<I, T>(value: Map<I, T>) -> i32 {
 
 #[doc(hidden)]
 pub fn cardinalityMapN<I, T>(value: Option<Map<I, T>>) -> Option<i32> {
-    value.as_ref().map(|map| cardinalityMap(map.clone()))
+    value.map(|map| cardinalityMap(map))
 }
 
 #[doc(hidden)]
@@ -248,9 +291,7 @@ where
     I: Ord,
     T: Clone,
 {
-    value
-        .as_ref()
-        .map(|map| map_contains_key__(map.clone(), key))
+    value.map(|map| map_contains_key__(map, key))
 }
 
 #[doc(hidden)]
@@ -271,4 +312,38 @@ where
 {
     let key = key?;
     Some(map_contains_key__(value, key))
+}
+
+#[doc(hidden)]
+pub fn map_keys_<I, T>(value: Map<I, T>) -> Array<I>
+where
+    I: Ord + Clone,
+{
+    Arc::new(value.keys().cloned().collect())
+}
+
+#[doc(hidden)]
+pub fn map_keysN<I, T>(value: Option<Map<I, T>>) -> Option<Array<I>>
+where
+    I: Ord + Clone,
+{
+    value.map(|value| map_keys_(value))
+}
+
+#[doc(hidden)]
+pub fn map_values_<I, T>(value: Map<I, T>) -> Array<T>
+where
+    I: Ord + Clone,
+    T: Clone,
+{
+    Arc::new(value.values().cloned().collect())
+}
+
+#[doc(hidden)]
+pub fn map_valuesN<I, T>(value: Option<Map<I, T>>) -> Option<Array<T>>
+where
+    I: Ord + Clone,
+    T: Clone,
+{
+    value.map(|value| map_values_(value))
 }

@@ -24,6 +24,7 @@
 package org.dbsp.sqlCompiler.compiler.sql;
 
 import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlSetOption;
 import org.apache.calcite.sql.parser.SqlParseException;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.StderrErrorReporter;
@@ -84,6 +85,15 @@ public class ParserTests {
         Assert.assertNotNull(node);
         Assert.assertTrue(node instanceof SqlCreateView);
         Assert.assertSame(SqlCreateView.ViewKind.MATERIALIZED, ((SqlCreateView) node).viewKind);
+    }
+
+    @Test
+    public void testSetOption() throws SqlParseException {
+        SqlToRelCompiler compiler = this.getCompiler();
+        List<ParsedStatement> node = compiler.parseStatements("SET FELDERA_VARIABLE = 1;");
+        Assert.assertNotNull(node);
+        Assert.assertEquals(1, node.size());
+        Assert.assertTrue(node.get(0).statement() instanceof SqlSetOption);
     }
 
     @Test
@@ -172,6 +182,19 @@ public class ParserTests {
                 CREATE FUNCTION to_json(data VARCHAR) RETURNS VARBINARY;
                 CREATE FUNCTION from_json(data VARBINARY) RETURNS VARCHAR;
                 CREATE FUNCTION no_args() RETURNS TIMESTAMP AS TIMESTAMP '2024-01-01 00:00:00';
+                """;
+        List<ParsedStatement> list = calcite.parseStatements(ddl);
+        Assert.assertNotNull(list);
+        Assert.assertEquals(3, list.size());
+    }
+
+    @Test
+    public void createAggregateTEst() throws SqlParseException {
+        SqlToRelCompiler calcite = this.getCompiler();
+        String ddl = """
+                CREATE AGGREGATE x(data VARCHAR) RETURNS VARBINARY;
+                CREATE TYPE I128 AS (a BIGINT, b BIGINT);
+                CREATE LINEAR AGGREGATE yx(arg I128) RETURNS I128;
                 """;
         List<ParsedStatement> list = calcite.parseStatements(ddl);
         Assert.assertNotNull(list);

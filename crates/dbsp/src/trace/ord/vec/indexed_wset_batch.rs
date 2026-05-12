@@ -1,4 +1,7 @@
+use crate::storage::file::{FilterStats, SerializerInner, TouchedWindowCount};
+use crate::trace::ord::merge_batcher::MergeBatcher;
 use crate::{
+    DBData, DBWeight, Error, NumEntries,
     algebra::{NegByRef, ZRingValue},
     circuit::checkpointer::Checkpoint,
     dynamic::{
@@ -6,23 +9,24 @@ use crate::{
         WeightTraitTyped, WithFactory,
     },
     trace::{
+        Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, DbspSerializer,
+        Deserializer, Filter, GroupFilter, MergeCursor, VecValBatch, WeightedItem,
+        cursor::Position,
         deserialize_indexed_wset,
         layers::{
             Cursor as _, Layer, LayerCursor, LayerFactories, Leaf, LeafFactories, OrdOffset, Trie,
         },
-        serialize_indexed_wset, Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder,
-        Cursor, Deserializer, Filter, MergeCursor, Serializer, WeightedItem,
+        serialize_indexed_wset,
     },
     utils::Tup2,
-    DBData, DBWeight, Error, NumEntries,
 };
+use crate::{DynZWeight, ZWeight};
 use itertools::{EitherOrBoth, Itertools};
 use rand::Rng;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
+use std::any::TypeId;
 use std::fmt::{self, Debug, Display};
-
-use crate::trace::ord::merge_batcher::MergeBatcher;
 
 pub struct VecIndexedWSetFactories<K, V, R>
 where
@@ -153,7 +157,6 @@ where
 type Layers<K, V, R, O> = Layer<K, Leaf<V, R>, O>;
 
 /// An immutable collection of update tuples.
-#[derive(SizeOf)]
 pub struct VecIndexedWSet<K, V, R, O = usize>
 where
     K: DataTrait + ?Sized,
@@ -164,8 +167,9 @@ where
     /// Where all the data is.
     #[doc(hidden)]
     pub layer: Layers<K, V, R, O>,
-    #[size_of(skip)]
     factories: VecIndexedWSetFactories<K, V, R>,
+    negative_weight_count: u64,
+    touched_window_count: TouchedWindowCount,
 }
 
 impl<K, V, R, O> VecIndexedWSet<K, V, R, O>
@@ -181,6 +185,7 @@ where
         offs: Vec<O>,
         vals: Box<DynVec<V>>,
         diffs: Box<DynVec<R>>,
+        negative_weight_count: u64,
     ) -> Self {
         Self {
             layer: Layer::from_parts(
@@ -190,7 +195,23 @@ where
                 Leaf::from_parts(&factories.layer_factories.child, vals, diffs),
             ),
             factories,
+            negative_weight_count,
+            touched_window_count: TouchedWindowCount::default(),
         }
+    }
+}
+
+impl<K, V, R, O> SizeOf for VecIndexedWSet<K, V, R, O>
+where
+    K: DataTrait + ?Sized,
+    V: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+    O: OrdOffset,
+{
+    fn size_of_children(&self, context: &mut size_of::Context) {
+        // This is only approximate but it is *much* cheaper than measuring all
+        // the elements individually.
+        context.add(self.approximate_byte_size());
     }
 }
 
@@ -239,6 +260,8 @@ where
         Self {
             layer: self.layer.clone(),
             factories: self.factories.clone(),
+            negative_weight_count: self.negative_weight_count,
+            touched_window_count: self.touched_window_count,
         }
     }
 }
@@ -325,6 +348,8 @@ where
         Self {
             layer: self.layer.neg_by_ref(),
             factories: self.factories.clone(),
+            negative_weight_count: self.negative_weight_count,
+            touched_window_count: self.touched_window_count,
         }
     }
 }
@@ -358,7 +383,7 @@ where
         todo!()
     }
 }
-impl<K, V, R, O> Serialize<Serializer> for VecIndexedWSet<K, V, R, O>
+impl<K, V, R, O> Serialize<DbspSerializer<'_>> for VecIndexedWSet<K, V, R, O>
 where
     K: DataTrait + ?Sized,
     V: DataTrait + ?Sized,
@@ -367,8 +392,8 @@ where
 {
     fn serialize(
         &self,
-        _serializer: &mut Serializer,
-    ) -> Result<Self::Resolver, <Serializer as rkyv::Fallible>::Error> {
+        _serializer: &mut DbspSerializer,
+    ) -> Result<Self::Resolver, <DbspSerializer<'_> as rkyv::Fallible>::Error> {
         todo!()
     }
 }
@@ -410,7 +435,7 @@ where
     fn consuming_cursor(
         &mut self,
         key_filter: Option<Filter<Self::Key>>,
-        value_filter: Option<Filter<Self::Val>>,
+        value_filter: Option<GroupFilter<Self::Val>>,
     ) -> Box<dyn crate::trace::MergeCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_>
     {
         if key_filter.is_none() && value_filter.is_none() {
@@ -443,12 +468,15 @@ where
 
     #[inline]
     fn approximate_byte_size(&self) -> usize {
-        self.size_of().total_bytes()
+        self.layer.approximate_byte_size()
+    }
+
+    fn membership_filter_stats(&self) -> FilterStats {
+        FilterStats::default()
     }
 
     fn sample_keys<RG>(&self, rng: &mut RG, sample_size: usize, sample: &mut DynVec<Self::Key>)
     where
-        Self::Time: PartialEq<()>,
         RG: Rng,
     {
         self.layer.sample_keys(rng, sample_size, sample);
@@ -466,8 +494,21 @@ where
     R: WeightTrait + ?Sized,
     O: OrdOffset,
 {
+    type Timed<T: crate::Timestamp> = VecValBatch<K, V, T, R, O>;
     type Batcher = MergeBatcher<Self>;
     type Builder = VecIndexedWSetBuilder<K, V, R, O>;
+
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        Some((self.layer.keys.first()?, self.layer.keys.last()?))
+    }
+
+    fn negative_weight_count(&self) -> Option<u64> {
+        Some(self.negative_weight_count)
+    }
+
+    fn touched_window_count(&self) -> TouchedWindowCount {
+        self.touched_window_count
+    }
 }
 
 /// A cursor for navigating a single layer.
@@ -557,6 +598,10 @@ where
         self.cursor.child.current_diff()
     }
 
+    fn weight_checked(&mut self) -> &R {
+        self.weight()
+    }
+
     fn map_values(&mut self, logic: &mut dyn FnMut(&V, &R)) {
         while self.val_valid() {
             logic(self.val(), self.cursor.child.current_diff());
@@ -584,7 +629,7 @@ where
         self.cursor.seek(key);
     }
 
-    fn seek_key_exact(&mut self, key: &K) -> bool {
+    fn seek_key_exact(&mut self, key: &K, _hash: Option<u64>) -> bool {
         self.seek_key(key);
         self.key_valid() && self.key().eq(key)
     }
@@ -640,6 +685,13 @@ where
     fn fast_forward_vals(&mut self) {
         self.cursor.child.fast_forward();
     }
+
+    fn position(&self) -> Option<Position> {
+        Some(Position {
+            total: self.cursor.keys() as u64,
+            offset: self.cursor.pos() as u64,
+        })
+    }
 }
 
 /// A builder for creating layers from unsorted update tuples.
@@ -657,6 +709,7 @@ where
     offs: Vec<O>,
     vals: Box<DynVec<V>>,
     diffs: Box<DynVec<R>>,
+    negative_weight_count: u64,
 }
 
 impl<K, V, R, O> VecIndexedWSetBuilder<K, V, R, O>
@@ -716,6 +769,15 @@ where
         );
     }
 
+    fn update_total_weight(&mut self, weight: &R) {
+        if TypeId::of::<R>() == TypeId::of::<DynZWeight>() {
+            let weight = unsafe { weight.downcast::<ZWeight>() };
+            if !weight.ge0() {
+                self.negative_weight_count += 1;
+            }
+        }
+    }
+
     /// Copies the contents of this in-progress [Builder] to `dst`.
     ///
     /// This handles all the possible states that this builder can be in (such
@@ -761,24 +823,29 @@ where
     R: WeightTrait + ?Sized,
     O: OrdOffset,
 {
-    fn with_capacity(factories: &VecIndexedWSetFactories<K, V, R>, capacity: usize) -> Self {
+    fn with_capacity(
+        factories: &VecIndexedWSetFactories<K, V, R>,
+        key_capacity: usize,
+        value_capacity: usize,
+    ) -> Self {
         let mut keys = factories.layer_factories.keys.default_box();
-        keys.reserve_exact(capacity);
+        keys.reserve_exact(key_capacity);
 
-        let mut offs = Vec::with_capacity(capacity + 1);
+        let mut offs = Vec::with_capacity(key_capacity + 1);
         offs.push(O::zero());
 
         let mut vals = factories.layer_factories.child.keys.default_box();
-        vals.reserve_exact(capacity);
+        vals.reserve_exact(value_capacity);
 
         let mut diffs = factories.layer_factories.child.diffs.default_box();
-        diffs.reserve_exact(capacity);
+        diffs.reserve_exact(value_capacity);
         Self {
             factories: factories.clone(),
             keys,
             offs,
             vals,
             diffs,
+            negative_weight_count: 0,
         }
     }
 
@@ -811,18 +878,21 @@ where
 
     fn push_time_diff(&mut self, _time: &(), weight: &R) {
         debug_assert!(!weight.is_zero());
+        self.update_total_weight(weight);
         self.diffs.push_ref(weight);
         self.pushed_diff();
     }
 
     fn push_time_diff_mut(&mut self, _time: &mut (), weight: &mut R) {
         debug_assert!(!weight.is_zero());
+        self.update_total_weight(weight);
         self.diffs.push_val(weight);
         self.pushed_diff();
     }
 
     fn push_val_diff(&mut self, val: &V, weight: &R) {
         debug_assert!(!weight.is_zero());
+        self.update_total_weight(weight);
         self.vals.push_ref(val);
         self.diffs.push_ref(weight);
         self.pushed_val();
@@ -830,13 +900,29 @@ where
 
     fn push_val_diff_mut(&mut self, val: &mut V, weight: &mut R) {
         debug_assert!(!weight.is_zero());
+        self.update_total_weight(weight);
         self.vals.push_val(val);
         self.diffs.push_val(weight);
         self.pushed_val();
     }
 
     fn done(self) -> VecIndexedWSet<K, V, R, O> {
-        VecIndexedWSet::from_parts(self.factories, self.keys, self.offs, self.vals, self.diffs)
+        VecIndexedWSet::from_parts(
+            self.factories,
+            self.keys,
+            self.offs,
+            self.vals,
+            self.diffs,
+            self.negative_weight_count,
+        )
+    }
+
+    fn num_keys(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn num_tuples(&self) -> usize {
+        self.diffs.len()
     }
 }
 
@@ -945,7 +1031,7 @@ where
     R: WeightTrait + ?Sized,
 {
     fn checkpoint(&self) -> Result<Vec<u8>, Error> {
-        Ok(serialize_indexed_wset(self))
+        Ok(serialize_indexed_wset(self, &mut SerializerInner::new()).into_vec())
     }
 
     fn restore(&mut self, data: &[u8]) -> Result<(), Error> {

@@ -12,9 +12,9 @@ use futures_util::StreamExt;
 use log::{debug, error, trace, warn};
 use reqwest_websocket::{CloseCode, Message, RequestBuilderExt};
 
+use crate::UPGRADE_NOTICE;
 use crate::cli::OutputFormat;
 use crate::unique_file;
-use crate::UPGRADE_NOTICE;
 
 fn handle_ws_errors_fatal(
     server: String,
@@ -29,7 +29,7 @@ fn handle_ws_errors_fatal(
                 error!("Failed to establish a websocket connection to {server}.");
             }
             reqwest_websocket::Error::Reqwest(e) => {
-                eprintln!("{}: {e}", msg);
+                eprintln!("{}: {e}, source: {}", msg, source_error(&e));
             }
             reqwest_websocket::Error::Tungstenite(e) => {
                 eprintln!("{}: {e}", msg);
@@ -52,7 +52,9 @@ async fn handle_websocket_message_generic(
 ) {
     match msg {
         Ok(Message::Binary(chunk)) => {
-            eprintln!("ERROR: Received unexpected message type `binary` as part of query execution: {chunk:?}");
+            eprintln!(
+                "ERROR: Received unexpected message type `binary` as part of query execution: {chunk:?}"
+            );
             error!("{}", UPGRADE_NOTICE);
             std::process::exit(1);
         }
@@ -148,11 +150,18 @@ pub(crate) async fn handle_adhoc_query(
     let format = match format {
         OutputFormat::Text => AdHocResultFormat::Text,
         OutputFormat::Json => {
-            warn!("The JSON format is deprecated for ad-hoc queries, see https://github.com/feldera/feldera/issues/4219 for the tracking issue.");
+            warn!(
+                "The JSON format is deprecated for ad-hoc queries, see https://github.com/feldera/feldera/issues/4219 for the tracking issue."
+            );
             AdHocResultFormat::Json
         }
         OutputFormat::ArrowIpc => AdHocResultFormat::ArrowIpc,
         OutputFormat::Parquet => AdHocResultFormat::Parquet,
+        OutputFormat::Prometheus => {
+            eprintln!("`query` command does not support Prometheus output format");
+            std::process::exit(1);
+        }
+        OutputFormat::Hash => AdHocResultFormat::Hash,
     };
     let sql = sql.unwrap_or_else(|| {
         if stdin {
@@ -224,5 +233,26 @@ pub(crate) async fn handle_adhoc_query(
             result_file.flush().unwrap();
             println!("Query result saved to '{}'", path.display());
         }
+        AdHocResultFormat::Hash => {
+            while let Some(chunk) = websocket.next().await {
+                let mut text: String = String::new();
+                if let Ok(Message::Text(chunk)) = chunk {
+                    text.push_str(chunk.as_str());
+                    print!("{}", chunk);
+                } else {
+                    handle_websocket_message_generic(&mut websocket, chunk).await;
+                    break;
+                }
+            }
+            println!()
+        }
     }
+}
+
+// helper method to get nested source error
+fn source_error(mut err: &dyn std::error::Error) -> &dyn std::error::Error {
+    while let Some(src) = err.source() {
+        err = src;
+    }
+    err
 }

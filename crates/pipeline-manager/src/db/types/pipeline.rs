@@ -1,9 +1,11 @@
 use crate::db::error::DBError;
 use crate::db::types::program::{ProgramError, ProgramStatus};
+use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
 use crate::db::types::storage::StorageStatus;
 use crate::db::types::version::Version;
 use chrono::{DateTime, Utc};
 use feldera_types::error::ErrorResponse;
+use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Display;
@@ -24,393 +26,85 @@ impl Display for PipelineId {
     }
 }
 
-/// Pipeline status.
-///
-/// This type represents the state of the pipeline tracked by the pipeline
-/// runner and observed by the API client via the `GET /v0/pipelines/{name}` endpoint.
-///
-/// ### The lifecycle of a pipeline
-///
-/// The following automaton captures the lifecycle of the pipeline.
-/// Individual states and transitions of the automaton are described below.
-///
-/// * States labeled with the hourglass symbol (⌛) are **timed** states. The
-///   automaton stays in timed state until the corresponding operation completes
-///   or until it transitions to become failed after the pre-defined timeout
-///   period expires.
-///
-/// * State transitions labeled with API endpoint names (`/start`, `/pause`,
-///   `/stop`) are triggered by invoking corresponding endpoint,
-///   e.g., `POST /v0/pipelines/{name}/start`. Note that these only express
-///   desired state, and are applied asynchronously by the automata.
-///
-/// ```text
-///                 Stopped ◄─────────── Stopping ◄───── All states can transition
-///                    │                    ▲            to Stopping by either:
-///   /start or /pause │                    │            (1) user calling /stop?force=true, or;
-///                    ▼                    │            (2) pipeline encountering a fatal
-///             ⌛Provisioning          Suspending            resource or runtime error,
-///                    │                    ▲                having the system call /stop?force=true
-///                    ▼                    │ /stop          effectively
-///             ⌛Initializing ──────────────┤  ?force=false
-///                    │                    │
-///          ┌─────────┼────────────────────┴─────┐
-///          │         ▼                          │
-///          │       Paused  ◄──────► Unavailable │
-///          │        │   ▲                ▲      │
-///          │ /start │   │  /pause        │      │
-///          │        ▼   │                │      │
-///          │       Running ◄─────────────┘      │
-///          └────────────────────────────────────┘
-/// ```
-///
-/// ### Desired and actual status
-///
-/// We use the desired state model to manage the lifecycle of a pipeline.
-/// In this model, the pipeline has two status attributes associated with
-/// it at runtime: the **desired** status, which represents what the user
-/// would like the pipeline to do, and the **current** status, which
-/// represents the actual state of the pipeline.  The pipeline runner
-/// service continuously monitors both fields and steers the pipeline
-/// towards the desired state specified by the user.
-///
-/// Only four of the states in the pipeline automaton above can be
-/// used as desired statuses: `Paused`, `Running`, `Suspended` and
-/// `Stopped`. These statuses are selected by invoking REST endpoints
-/// shown in the diagram (respectively, `/pause`, `/start`, and `/stop`).
-///
-/// The user can monitor the current state of the pipeline via the
-/// `GET /v0/pipelines/{name}` endpoint. In a typical scenario,
-/// the user first sets the desired state, e.g., by invoking the
-/// `/start` endpoint, and then polls the `GET /v0/pipelines/{name}`
-/// endpoint to monitor the actual status of the pipeline until its
-/// `deployment_status` attribute changes to `Running` indicating
-/// that the pipeline has been successfully initialized and is
-/// processing data, or `Stopped` with `deployment_error` being set.
-#[derive(Deserialize, Serialize, ToSchema, Eq, PartialEq, Debug, Clone, Copy)]
-#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
-pub enum PipelineStatus {
-    /// Pipeline has not (yet) been started or has been stopped either
-    /// manually by the user or automatically by the system because
-    /// a resource or runtime error was encountered.
-    ///
-    /// The pipeline remains in this state until:
-    ///
-    /// 1. The user triggers a start by invoking the `/start` or `/pause` endpoint.
-    ///    It transitions to `Provisioning`.
-    ///
-    /// 2. If applicable, early start fails (e.g., pipeline fails to compile).
-    ///    It transitions to `Stopping`.
-    Stopped,
-
-    /// The compute and (optionally) storage resources needed for the
-    /// running the pipeline are being provisioned.
-    ///
-    /// The provisioning is performed asynchronously, as such the user
-    /// is able to cancel.
-    ///
-    /// The pipeline remains in this state until:
-    ///
-    /// 1. Resources check passes, indicating all resources were provisioned.
-    ///    It transitions to `Initializing`.
-    ///
-    /// 2. Resource provisioning fails or takes too long (timeout exceeded).
-    ///    It transitions to `Stopping` with `deployment_error` set.
-    ///
-    /// 3. The user stops the pipeline by invoking the `/stop` endpoint.
-    ///    It transitions to `Stopping`.
-    Provisioning,
-
-    /// The pipeline is initializing its internal state and connectors.
-    ///
-    /// In this state, the pipeline resources were provisioned, but the pipeline
-    /// is not yet ready to be able to process data (e.g., its query engine and
-    /// input and output connectors are still initializing).
-    ///
-    /// The pipeline remains in this state until:
-    ///
-    /// 1. Initialization check passes, indicating pipeline is ready.
-    ///    It transitions to `Paused` state.
-    ///
-    /// 2. Resource error or runtime error is encountered,
-    ///    or initialization takes too long (timeout exceeded).
-    ///    It transitions to `Stopping` with `deployment_error` set.
-    ///
-    /// 3. The user suspends the pipeline by invoking the `/stop?force=false` endpoint.
-    ///    It transitions to `Suspending`.
-    ///
-    /// 4. The user stops the pipeline by invoking the `/stop?force=true` endpoint.
-    ///    It transitions to `Stopping`.
-    Initializing,
-
-    /// The pipeline was at least once initialized, and in the most recent status check
-    /// reported its data processing is paused.
-    ///
-    /// The pipeline remains in this state until:
-    ///
-    /// 1. The user starts the pipeline by invoking the `/start` endpoint.
-    ///    It asynchronously passes the request to the pipeline, and upon
-    ///    success transitions to `Running`.
-    ///
-    /// 2. Resource error or runtime error is encountered.
-    ///    It transitions to `Stopping` with `deployment_error` set.
-    ///
-    /// 3. The user suspends the pipeline by invoking the `/stop?force=false` endpoint.
-    ///    It transitions to `Suspending`.
-    ///
-    /// 4. The user stops the pipeline by invoking the `/stop?force=true` endpoint.
-    ///    It transitions to `Stopping`.
-    Paused,
-
-    /// The pipeline was at least once initialized, and in the most recent status check
-    /// reported to be processing data.
-    ///
-    /// The pipeline remains in this state until:
-    ///
-    /// 1. The user pauses the pipeline by invoking the `/pause` endpoint.
-    ///    It asynchronously passes the request to the pipeline, and upon
-    ///    transitions to `Paused`.
-    ///
-    /// 2. Resource error or runtime error is encountered.
-    ///    It transitions to `Stopping` with `deployment_error` set.
-    ///
-    /// 3. The user suspends the pipeline by invoking the `/stop?force=false` endpoint.
-    ///    It transitions to `Suspending`.
-    ///
-    /// 4. The user stops the pipeline by invoking the `/stop?force=true` endpoint.
-    ///    It transitions to `Stopping`.
-    Running,
-
-    /// The pipeline was at least once initialized, but in the most recent status check either
-    /// could not be reached or returned it is not yet ready.
-    ///
-    /// The pipeline remains in this state until:
-    ///
-    /// 1. A status check succeeds, in which case it transitions to either
-    ///    `Paused` or `Running` depending on the check outcome.
-    ///
-    /// 2. Resource error or runtime error is encountered.
-    ///    It transitions to `Stopping` with `deployment_error` set.
-    ///
-    /// 3. The user suspends the pipeline by invoking the `/stop?force=false` endpoint.
-    ///    It transitions to `Suspending`.
-    ///
-    /// 4. The user stops the pipeline by invoking the `/stop?force=true` endpoint.
-    ///    It transitions to `Stopping`.
-    ///
-    /// Note that calls to `/start` and `/pause` express desired state and
-    /// are applied asynchronously. While the pipeline is in this state,
-    /// the runner will not try to reach out to start/pause until a status
-    /// check has succeeded.
-    Unavailable,
-
-    /// The pipeline is being requested to suspend the circuit to storage.
-    ///
-    /// The pipeline remains in this state until:
-    ///
-    /// 1. A suspend request succeeds, in which case it transitions to
-    ///    `Stopping` with `suspend_info` set.
-    ///
-    /// 2. Resource error or runtime error is encountered.
-    ///    It transitions to `Stopping` with `deployment_error` set.
-    Suspending,
-
-    /// The compute resources of the pipeline are being scaled down to zero.
-    ///
-    /// The pipeline remains in this state until the compute resources are deallocated,
-    /// after which it transitions to `Stopped`.
-    Stopping,
+/// Converts the `RuntimeStatus` to its string representation.
+/// This is used by the database operations.
+pub fn runtime_status_to_string(runtime_status: RuntimeStatus) -> String {
+    match runtime_status {
+        RuntimeStatus::Unavailable => "unavailable",
+        RuntimeStatus::Coordination => "coordination",
+        RuntimeStatus::Standby => "standby",
+        RuntimeStatus::AwaitingApproval => "awaiting_approval",
+        RuntimeStatus::Initializing => "initializing",
+        RuntimeStatus::Bootstrapping => "bootstrapping",
+        RuntimeStatus::Replaying => "replaying",
+        RuntimeStatus::Paused => "paused",
+        RuntimeStatus::Running => "running",
+        RuntimeStatus::Suspended => "suspended",
+    }
+    .to_string()
 }
 
-impl TryFrom<String> for PipelineStatus {
-    type Error = DBError;
-    fn try_from(value: String) -> Result<Self, DBError> {
-        match value.as_str() {
-            "stopped" => Ok(Self::Stopped),
-            "provisioning" => Ok(Self::Provisioning),
-            "initializing" => Ok(Self::Initializing),
-            "paused" => Ok(Self::Paused),
-            "running" => Ok(Self::Running),
-            "unavailable" => Ok(Self::Unavailable),
-            "suspending" => Ok(Self::Suspending),
-            "stopping" => Ok(Self::Stopping),
-            _ => Err(DBError::invalid_pipeline_status(value)),
-        }
+/// Parses the string as a `RuntimeStatus`.
+/// This is used by the database operations.
+/// Upon failure returns a database error.
+pub fn parse_string_as_runtime_status(s: String) -> Result<RuntimeStatus, DBError> {
+    match s.as_str() {
+        "unavailable" => Ok(RuntimeStatus::Unavailable),
+        "coordination" => Ok(RuntimeStatus::Coordination),
+        "standby" => Ok(RuntimeStatus::Standby),
+        "awaiting_approval" => Ok(RuntimeStatus::AwaitingApproval),
+        "initializing" => Ok(RuntimeStatus::Initializing),
+        "bootstrapping" => Ok(RuntimeStatus::Bootstrapping),
+        "replaying" => Ok(RuntimeStatus::Replaying),
+        "paused" => Ok(RuntimeStatus::Paused),
+        "running" => Ok(RuntimeStatus::Running),
+        "suspended" => Ok(RuntimeStatus::Suspended),
+        _ => Err(DBError::InvalidRuntimeStatus(s)),
     }
 }
 
-impl From<PipelineStatus> for &'static str {
-    fn from(val: PipelineStatus) -> Self {
-        match val {
-            PipelineStatus::Stopped => "stopped",
-            PipelineStatus::Provisioning => "provisioning",
-            PipelineStatus::Initializing => "initializing",
-            PipelineStatus::Paused => "paused",
-            PipelineStatus::Running => "running",
-            PipelineStatus::Unavailable => "unavailable",
-            PipelineStatus::Suspending => "suspending",
-            PipelineStatus::Stopping => "stopping",
-        }
+/// Converts the `RuntimeDesiredStatus` to its string representation.
+/// This is used by the database operations.
+pub fn runtime_desired_status_to_string(runtime_desired_status: RuntimeDesiredStatus) -> String {
+    match runtime_desired_status {
+        RuntimeDesiredStatus::Unavailable => "unavailable",
+        RuntimeDesiredStatus::Coordination => "coordination",
+        RuntimeDesiredStatus::Standby => "standby",
+        RuntimeDesiredStatus::Paused => "paused",
+        RuntimeDesiredStatus::Running => "running",
+        RuntimeDesiredStatus::Suspended => "suspended",
+    }
+    .to_string()
+}
+
+/// Parses the string as a `RuntimeDesiredStatus`.
+/// This is used by the database operations. Upon failure returns a database error.
+pub fn parse_string_as_runtime_desired_status(s: String) -> Result<RuntimeDesiredStatus, DBError> {
+    match s.as_str() {
+        "unavailable" => Ok(RuntimeDesiredStatus::Unavailable),
+        "standby" => Ok(RuntimeDesiredStatus::Standby),
+        "paused" => Ok(RuntimeDesiredStatus::Paused),
+        "running" => Ok(RuntimeDesiredStatus::Running),
+        "suspended" => Ok(RuntimeDesiredStatus::Suspended),
+        _ => Err(DBError::InvalidRuntimeDesiredStatus(s)),
     }
 }
 
-impl Display for PipelineStatus {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let status: &'static str = (*self).into();
-        write!(f, "{status}")
+pub fn bootstrap_policy_to_string(bootstrap: BootstrapPolicy) -> String {
+    match bootstrap {
+        BootstrapPolicy::Allow => "allow",
+        BootstrapPolicy::Reject => "reject",
+        BootstrapPolicy::AwaitApproval => "await_approval",
     }
+    .to_string()
 }
 
-#[derive(Deserialize, Serialize, ToSchema, Eq, PartialEq, Debug, Clone, Copy)]
-#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
-pub enum PipelineDesiredStatus {
-    Stopped,
-    Paused,
-    Running,
-    Suspended,
-}
-
-impl TryFrom<String> for PipelineDesiredStatus {
-    type Error = DBError;
-    fn try_from(value: String) -> Result<Self, DBError> {
-        match value.as_str() {
-            "stopped" => Ok(Self::Stopped),
-            "paused" => Ok(Self::Paused),
-            "running" => Ok(Self::Running),
-            "suspended" => Ok(Self::Suspended),
-            _ => Err(DBError::invalid_desired_pipeline_status(value)),
-        }
-    }
-}
-
-impl From<PipelineDesiredStatus> for &'static str {
-    fn from(val: PipelineDesiredStatus) -> Self {
-        match val {
-            PipelineDesiredStatus::Stopped => "stopped",
-            PipelineDesiredStatus::Paused => "paused",
-            PipelineDesiredStatus::Running => "running",
-            PipelineDesiredStatus::Suspended => "suspended",
-        }
-    }
-}
-
-impl Display for PipelineDesiredStatus {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let status: &'static str = (*self).into();
-        write!(f, "{status}")
-    }
-}
-
-/// Validates the deployment status transition from current status to a new one.
-#[rustfmt::skip]
-pub fn validate_deployment_status_transition(
-    storage_status: StorageStatus,
-    current_status: PipelineStatus,
-    new_status: PipelineStatus,
-) -> Result<(), DBError> {
-    if matches!(
-        (storage_status, current_status, new_status),
-        (StorageStatus::Cleared | StorageStatus::InUse,  PipelineStatus::Stopped, PipelineStatus::Provisioning)
-        | (StorageStatus::Cleared | StorageStatus::InUse, PipelineStatus::Stopped, PipelineStatus::Stopping)
-        | (StorageStatus::InUse,PipelineStatus::Provisioning, PipelineStatus::Initializing)
-        | (StorageStatus::InUse, PipelineStatus::Provisioning, PipelineStatus::Stopping)
-        | (StorageStatus::InUse, PipelineStatus::Initializing, PipelineStatus::Paused)
-        | (StorageStatus::InUse, PipelineStatus::Initializing, PipelineStatus::Suspending)
-        | (StorageStatus::InUse, PipelineStatus::Initializing, PipelineStatus::Stopping)
-        | (StorageStatus::InUse, PipelineStatus::Running, PipelineStatus::Paused)
-        | (StorageStatus::InUse, PipelineStatus::Running, PipelineStatus::Unavailable)
-        | (StorageStatus::InUse, PipelineStatus::Running, PipelineStatus::Suspending)
-        | (StorageStatus::InUse, PipelineStatus::Running, PipelineStatus::Stopping)
-        | (StorageStatus::InUse, PipelineStatus::Paused, PipelineStatus::Running)
-        | (StorageStatus::InUse, PipelineStatus::Paused, PipelineStatus::Unavailable)
-        | (StorageStatus::InUse, PipelineStatus::Paused, PipelineStatus::Suspending)
-        | (StorageStatus::InUse, PipelineStatus::Paused, PipelineStatus::Stopping)
-        | (StorageStatus::InUse, PipelineStatus::Unavailable, PipelineStatus::Running)
-        | (StorageStatus::InUse, PipelineStatus::Unavailable, PipelineStatus::Paused)
-        | (StorageStatus::InUse, PipelineStatus::Unavailable, PipelineStatus::Suspending)
-        | (StorageStatus::InUse, PipelineStatus::Unavailable, PipelineStatus::Stopping)
-        | (StorageStatus::InUse, PipelineStatus::Suspending, PipelineStatus::Stopping)
-        | (StorageStatus::Cleared | StorageStatus::InUse, PipelineStatus::Stopping, PipelineStatus::Stopped)
-    ) {
-        Ok(())
-    } else {
-        Err(DBError::InvalidDeploymentStatusTransition {
-            storage_status,
-            current_status,
-            new_status,
-        })
-    }
-}
-
-/// Validates the deployment desired status transition from current status to a new one.
-pub fn validate_deployment_desired_status_transition(
-    pipeline_status: PipelineStatus,
-    current_desired_status: PipelineDesiredStatus,
-    new_desired_status: PipelineDesiredStatus,
-) -> Result<(), DBError> {
-    match new_desired_status {
-        PipelineDesiredStatus::Stopped => {
-            // It's always possible to stop a pipeline
-            Ok(())
-        }
-        PipelineDesiredStatus::Paused | PipelineDesiredStatus::Running => {
-            if current_desired_status == PipelineDesiredStatus::Stopped
-                && pipeline_status != PipelineStatus::Stopped
-            {
-                // After calling `/stop`, it must first become `Stopped`
-                return Err(DBError::IllegalPipelineAction {
-                    pipeline_status,
-                    current_desired_status,
-                    new_desired_status,
-                    hint: "Cannot restart the pipeline while it is stopping. Wait until it is stopped before starting the pipeline again.".to_string(),
-                });
-            };
-
-            if current_desired_status == PipelineDesiredStatus::Suspended {
-                // After calling `/stop?force=false`, it must first become `Stopped`
-                return Err(DBError::IllegalPipelineAction {
-                    pipeline_status,
-                    current_desired_status,
-                    new_desired_status,
-                    hint: "Cannot resume the pipeline while it is suspending. Wait until is stopped after the suspend before resuming the pipeline.".to_string(),
-                });
-            };
-
-            Ok(())
-        }
-        PipelineDesiredStatus::Suspended => {
-            match current_desired_status {
-                PipelineDesiredStatus::Stopped => Err(DBError::IllegalPipelineAction {
-                    pipeline_status,
-                    current_desired_status,
-                    new_desired_status,
-                    hint: "Cannot suspend a pipeline which is stopping.".to_string(),
-                }),
-                PipelineDesiredStatus::Paused | PipelineDesiredStatus::Running => {
-                    if matches!(
-                        pipeline_status,
-                        PipelineStatus::Initializing
-                            | PipelineStatus::Running
-                            | PipelineStatus::Paused
-                            | PipelineStatus::Unavailable
-                    ) {
-                        // Calling `/stop?force=false` is only possible if the pipeline is Initializing, Running, Paused or Unavailable.
-                        Ok(())
-                    } else {
-                        // In other cases, it is not possible. Sometimes it will become possible eventually
-                        // (e.g., `Provisioning` should eventually generally transition to these states).
-                        Err(DBError::IllegalPipelineAction {
-                            pipeline_status,
-                            current_desired_status,
-                            new_desired_status,
-                            hint: "Cannot suspend a pipeline which is not initializing, running, paused or unavailable."
-                                .to_string(),
-                        })
-                    }
-                }
-                PipelineDesiredStatus::Suspended => Ok(()),
-            }
-        }
+pub fn parse_string_as_bootstrap_policy(s: String) -> Result<BootstrapPolicy, DBError> {
+    match s.as_str() {
+        "allow" => Ok(BootstrapPolicy::Allow),
+        "reject" => Ok(BootstrapPolicy::Reject),
+        "await_approval" => Ok(BootstrapPolicy::AwaitApproval),
+        _ => Err(DBError::InvalidBootstrap(s)),
     }
 }
 
@@ -439,9 +133,28 @@ pub struct PipelineDescr {
     pub program_config: serde_json::Value,
 }
 
+impl PipelineDescr {
+    #[cfg(test)]
+    pub(crate) fn test_descr() -> Self {
+        use serde_json::json;
+        Self {
+            name: "test_pipeline".to_string(),
+            description: "Test pipeline".to_string(),
+            runtime_config: json!({}),
+            program_code: "CREATE TABLE test (col1 INT);".to_string(),
+            udf_rust: "".to_string(),
+            udf_toml: "".to_string(),
+            program_config: json!({
+                "profile": "unoptimized",
+                "cache": false
+            }),
+        }
+    }
+}
+
 /// Pipeline descriptor which besides the basic fields in direct regular control of the user
 /// also has all additional fields generated and maintained by the back-end.
-#[derive(Eq, PartialEq, Debug, Clone)]
+#[derive(Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedPipelineDescr {
     /// Assigned globally unique pipeline identifier.
     pub id: PipelineId,
@@ -501,23 +214,12 @@ pub struct ExtendedPipelineDescr {
     /// Checksum of the binary file itself.
     pub program_binary_integrity_checksum: Option<String>,
 
-    /// URL where to download the program binary from.
-    pub program_binary_url: Option<String>,
-
-    /// Current status of the pipeline.
-    pub deployment_status: PipelineStatus,
-
-    /// Time when the pipeline was assigned its current status
-    /// of the pipeline.
-    pub deployment_status_since: DateTime<Utc>,
-
-    /// Desired pipeline status, i.e., the status requested by the user.
-    pub deployment_desired_status: PipelineDesiredStatus,
+    /// Checksum of the program information.
+    pub program_info_integrity_checksum: Option<String>,
 
     /// Resource or runtime error that caused the pipeline to stop unexpectedly.
     ///
-    /// Can only be set when [`Stopping`](`PipelineStatus::Stopping`)
-    /// or [`Stopped`](`PipelineStatus::Stopped`).
+    /// Can only be set when `Stopping` or `Stopped`.
     pub deployment_error: Option<ErrorResponse>,
 
     // Pipeline deployment configuration.
@@ -534,14 +236,53 @@ pub struct ExtendedPipelineDescr {
     /// all fields).
     pub refresh_version: Version,
 
-    /// Information about the current suspended state.
-    ///
-    /// Can only be set when [`Stopping`](`PipelineStatus::Stopping`)
-    /// or [`Stopped`](`PipelineStatus::Stopped`).
-    pub suspend_info: Option<serde_json::Value>,
-
     /// Storage status.
     pub storage_status: StorageStatus,
+
+    /// Storage status details.
+    pub storage_status_details: Option<serde_json::Value>,
+
+    /// Identifier of the current deployment.
+    pub deployment_id: Option<Uuid>,
+
+    /// Initial runtime desired status of the current deployment.
+    pub deployment_initial: Option<RuntimeDesiredStatus>,
+
+    /// Policy enforced when the pipeline has to bootstrap
+    /// due to detected changes caused by recompilation.
+    pub bootstrap_policy: Option<BootstrapPolicy>,
+
+    /// Resources status of the current deployment.
+    pub deployment_resources_status: ResourcesStatus,
+
+    /// Timestamp when the `deployment_resources_status` last changed.
+    pub deployment_resources_status_since: DateTime<Utc>,
+
+    /// Details about the resources status.
+    /// No assumptions should be made about the structure of this JSON value.
+    pub deployment_resources_status_details: Option<serde_json::Value>,
+
+    /// Resources desired status of the current deployment.
+    pub deployment_resources_desired_status: ResourcesDesiredStatus,
+
+    /// Timestamp when the `deployment_resources_desired_status` last changed.
+    pub deployment_resources_desired_status_since: DateTime<Utc>,
+
+    /// Observed runtime status of the current deployment.
+    pub deployment_runtime_status: Option<RuntimeStatus>,
+
+    /// Details about the runtime status.
+    /// No assumptions should be made about the structure of this JSON value.
+    pub deployment_runtime_status_details: Option<serde_json::Value>,
+
+    /// Timestamp when the `deployment_runtime_status` observation last changed.
+    pub deployment_runtime_status_since: Option<DateTime<Utc>>,
+
+    /// Observed runtime desired status of the current deployment.
+    pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
+
+    /// Timestamp when the `deployment_runtime_desired_status` last changed.
+    pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
 }
 
 /// Pipeline descriptor which includes the fields relevant to system monitoring.
@@ -550,7 +291,7 @@ pub struct ExtendedPipelineDescr {
 /// in `program_info` can become several MiB in size). This is particularly relevant
 /// for monitoring in which the pipeline tuple is retrieved very frequently, which would
 /// result in high CPU usage to retrieve large fields that are not of interest.
-#[derive(Eq, PartialEq, Debug, Clone)]
+#[derive(Eq, PartialEq, Debug, Clone, Serialize)]
 pub struct ExtendedPipelineDescrMonitoring {
     pub id: PipelineId,
     pub name: String,
@@ -558,14 +299,41 @@ pub struct ExtendedPipelineDescrMonitoring {
     pub created_at: DateTime<Utc>,
     pub version: Version,
     pub platform_version: String,
+    pub program_config: serde_json::Value,
     pub program_version: Version,
     pub program_status: ProgramStatus,
     pub program_status_since: DateTime<Utc>,
-    pub deployment_status: PipelineStatus,
-    pub deployment_status_since: DateTime<Utc>,
-    pub deployment_desired_status: PipelineDesiredStatus,
     pub deployment_error: Option<ErrorResponse>,
     pub deployment_location: Option<String>,
     pub refresh_version: Version,
     pub storage_status: StorageStatus,
+    pub storage_status_details: Option<serde_json::Value>,
+    pub deployment_id: Option<Uuid>,
+    pub deployment_initial: Option<RuntimeDesiredStatus>,
+    pub deployment_resources_status: ResourcesStatus,
+    pub deployment_resources_status_since: DateTime<Utc>,
+    pub deployment_resources_desired_status: ResourcesDesiredStatus,
+    pub deployment_resources_desired_status_since: DateTime<Utc>,
+    pub deployment_runtime_status: Option<RuntimeStatus>,
+    pub deployment_runtime_status_details: Option<serde_json::Value>,
+    pub deployment_runtime_status_since: Option<DateTime<Utc>>,
+    pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
+    pub bootstrap_policy: Option<BootstrapPolicy>,
+    pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
+}
+
+/// Pipeline descriptor with all fields needed to create a monitor event.
+#[derive(Eq, PartialEq, Debug, Clone, Serialize)]
+pub struct ExtendedPipelineDescrEventInfo {
+    pub id: PipelineId,
+    pub program_status: ProgramStatus,
+    pub storage_status: StorageStatus,
+    pub storage_status_details: Option<serde_json::Value>,
+    pub deployment_error: Option<ErrorResponse>,
+    pub deployment_resources_status: ResourcesStatus,
+    pub deployment_resources_status_details: Option<serde_json::Value>,
+    pub deployment_resources_desired_status: ResourcesDesiredStatus,
+    pub deployment_runtime_status: Option<RuntimeStatus>,
+    pub deployment_runtime_status_details: Option<serde_json::Value>,
+    pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
 }

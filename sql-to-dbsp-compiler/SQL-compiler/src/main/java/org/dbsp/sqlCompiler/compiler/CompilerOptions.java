@@ -84,15 +84,15 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         @Override
         public String toString() {
             return "Language{" +
-                    "\n\tincrementalize=" + this.incrementalize +
+                    "\n\tgenerateInputForEveryTable=" + this.generateInputForEveryTable +
                     ",\n\tignoreOrderBy=" + this.ignoreOrderBy +
-                    ",\n\toutputsAreSets=" + this.outputsAreSets +
-                    ",\n\toptimizationLevel=" + this.optimizationLevel +
-                    ",\n\tthrowOnError=" + this.throwOnError +
-                    ",\n\tgenerateInputForEveryTable=" + this.generateInputForEveryTable +
-                    ",\n\tunrestrictedIOTypes=" + this.unrestrictedIOTypes +
-                    ",\n\tunaryPlusNoop=" + this.unaryPlusNoop +
+                    ",\n\tincrementalize=" + this.incrementalize +
                     ",\n\tlenient=" + this.lenient +
+                    ",\n\toptimizationLevel=" + this.optimizationLevel +
+                    ",\n\toutputsAreSets=" + this.outputsAreSets +
+                    ",\n\tthrowOnError=" + this.throwOnError +
+                    ",\n\tunaryPlusNoop=" + this.unaryPlusNoop +
+                    ",\n\tunrestrictedIOTypes=" + this.unrestrictedIOTypes +
                     '}';
         }
 
@@ -157,6 +157,8 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
     /** Options related to input and output. */
     @SuppressWarnings("CanBeFinal")
     public static class IO implements IDiff<IO>, IValidate {
+        @Parameter(names = "--anonymize", description = "Produce in the output file an anonymized version of the input program")
+        public boolean anonymize = false;
         @DynamicParameter(names = "-T",
                 description = "Specify logging level for a class (can be repeated)")
         public Map<String, String> loggingLevel = new HashMap<>();
@@ -172,6 +174,8 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         public boolean emitJpeg = false;
         @Parameter(names = {"--png", "-png"}, description = "Emit a png image of the circuit instead of Rust")
         public boolean emitPng = false;
+        @Parameter(names="--jit", description = "Emit a JSON representation suitable for an interpreter")
+        public boolean interpreterJson = false;
         @Nullable @Parameter(names = "--plan", description = "Emit the Calcite plan of the program in the specified JSON file")
         public String emitPlan = null;
         @Nullable @Parameter(names = "--dataflow", description = "Emit the Dataflow graph of the program in the specified JSON file")
@@ -192,29 +196,39 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         @Parameter(names = "--handles",
                 description = "Use handles (true) or Catalog (false) in the emitted Rust code")
         public boolean emitHandles = false;
-        @Parameter(names = "--jdbcSource",
-                description = "Connection string to a database that contains table metadata")
-        public String metadataSource = "";
-        @Parameter(names = "--nowstream",
-                description = "Implement NOW as a stream (true) or as an internal operator (false)")
-        public boolean nowStream = false;
-        @Parameter(names = "--sqlnames", hidden = true,
-                description = "Use the table names as identifiers in the generated code")
-        public boolean sqlNames = false;
         @Parameter(names = "--trimInputs", description = "Do not ingest unused fields of input tables")
         public boolean trimInputs = false;
-        @Parameter(names = "--raw", hidden = true,
-                description = "Do not generate any internal tables (ERROR, NOW, etc).")
-        public boolean raw = false;
         @Parameter(names = "--crates", description = "Followed by a program name. Generates code using multiple crates; " +
                 "`outputFile` is interpreted as a directory.")
         public String crates = "";
+        @Parameter(names = "--runtime", description = "Followed by a path.  Path to the runtime to use.  " +
+                "Used in conjunction with '--crates'.")
+        public String runtimePath = "";
+        @Parameter(names = "--correlatedColumns",
+                description = "Dump information about the columns that are used in join equality comparisons")
+        public boolean correlatedColumns = false;
+
+        // Hidden options used for testing
+        @Parameter(names = "--sqlnames", hidden = true,
+                description = "Use the table names as identifiers in the generated code")
+        public boolean sqlNames = false;
+        @Parameter(names = "--raw", hidden = true,
+                description = "Do not generate any internal tables (ERROR, NOW, etc).")
+        public boolean raw = false;
         @Parameter(hidden = true, names = "--input_circuit",
                 description = "Do not process the circuit, return immediately after creation.  Used for testing")
         public boolean inputCircuit = false;
         @Parameter(hidden = true, names = "--skip_calcite_optimization",
                 description = "Calcite optimizer steps whose names match this regex are not applied.  Used for testing")
         public String skipCalciteOptimizations = "";
+        @Parameter(hidden = true, names = "--testing",
+                description = "Signals that compiler is invoked from a testing path: disables some warnings")
+        public boolean testing = false;
+
+        // Used only for internal testing
+        public boolean nowStream = true;
+        @Parameter(names = "--version", description = "Print compiler version", help = true)
+        public boolean showVersion = false;
 
         /** Only compare fields that matter. */
         public boolean same(IO other) {
@@ -233,29 +247,30 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
                         "Options -png and -jpg cannot be used at the same time");
                 return false;
             }
-            if (this.noRust && !this.outputFile.isEmpty()) {
-                reporter.reportWarning(SourcePositionRange.INVALID, "Invalid options",
-                        "Options --nooutput and -o used at the same time");
-            }
             return true;
         }
 
         @Override
         public String toString() {
             return "IO{" +
-                    "\n\toutputFile=" + Utilities.singleQuote(this.outputFile) +
-                    ",\n\tmetadataSource=" + this.metadataSource +
-                    ",\n\terrorFile=" + Utilities.singleQuote(this.errorFile) +
+                    "\n\tanonymize=" + this.anonymize +
+                    ",\n\tcorrelatedColumns=" + this.correlatedColumns +
+                    ",\n\tcrates=" + this.crates +
                     ",\n\temitHandles=" + this.emitHandles +
                     ",\n\temitJpeg=" + this.emitJpeg +
-                    ",\n\temitPng=" + this.emitPng +
-                    ",\n\temitPlan=" + this.emitPlan +
+                    ",\n\tinterpreterJson=" + this.interpreterJson +
                     ",\n\temitJsonErrors=" + this.emitJsonErrors +
                     ",\n\temitJsonSchema=" + Utilities.singleQuote(this.emitJsonSchema) +
+                    ",\n\temitPlan=" + this.emitPlan +
+                    ",\n\temitPng=" + this.emitPng +
+                    ",\n\terrorFile=" + Utilities.singleQuote(this.errorFile) +
                     ",\n\tinputFile=" + Utilities.singleQuote(this.inputFile) +
+                    ",\n\tnoRust=" + this.noRust +
+                    ",\n\toutputFile=" + Utilities.singleQuote(this.outputFile) +
+                    ",\n\tquiet=" + this.quiet +
+                    ",\n\truntime=" + Utilities.singleQuote(this.runtimePath) +
                     ",\n\ttrimInputs=" + this.trimInputs +
                     ",\n\tverbosity=" + this.verbosity +
-                    ",\n\tnoRust=" + this.noRust +
                     '}';
         }
 
@@ -305,6 +320,11 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
 
     public static CompilerOptions getDefault() {
         return new CompilerOptions();
+    }
+
+    public boolean generateMultiCrateMain() {
+        return this.ioOptions.multiCrates() &&
+                !this.ioOptions.runtimePath.isEmpty();
     }
 
     @Override

@@ -5,11 +5,11 @@ use std::{
     str::FromStr,
 };
 
-use num_traits::{cast, CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Zero};
+use num_traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Zero, cast};
 
 use crate::{
-    checked_pow10, debug_decimal, display_decimal, div_ceil, div_floor, i128_mul_pow10_round_even,
-    parse_decimal, pow10, round_inner, u256::I256, Halfway, OutOfRange, ParseDecimalError,
+    Halfway, OutOfRange, ParseDecimalError, checked_pow10, debug_decimal, display_decimal,
+    div_ceil, div_floor, i128_mul_pow10_round_even, parse_decimal, pow10, round_inner, u256::I256,
 };
 
 /// Decimal real number with fixed precision and scale.
@@ -130,6 +130,15 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
             panic!("all values of Fixed::<S,P>::one() for S >= P have magnitude less than one");
         }
     };
+
+    /// Returns the mantissa of this fixed-point decimal number.
+    ///
+    /// The mantissa is the unscaled integer representation of the decimal value.
+    /// For a decimal number `d` with a given scale `s`, the mantissa `m` satisfies:
+    /// `d = m × 10^(-s)`, or equivalently, `m = d × 10^s`.
+    pub fn mantissa(&self) -> i128 {
+        self.0
+    }
 
     /// Returns `value` in this type.
     ///
@@ -283,6 +292,12 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
             .then_some(Self(value))
     }
 
+    /// Returns the internal representation of this Fixed value
+    /// This is an unstable API, use at your own risk!
+    pub fn internal_representation(self) -> i128 {
+        self.0
+    }
+
     /// Returns `Self(value * 10**exponent)`, rounding to even if `exponent` is
     /// negative, if the computed value is in the correct range for the type.
     fn try_new_with_exponent_round_even(value: i128, exponent: i32) -> Option<Self> {
@@ -350,18 +365,18 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     /// Returns `None` if `other` is zero.
     ///
     /// [General Decimal Arithmetic]: https://speleotrove.com/decimal/decarith.pdf
-    pub const fn checked_rem_integer(self, _other: Self) -> Option<Self> {
-        todo!()
-    }
-
-    /// Integer remainder like [checked_rem_integer](Self::checked_rem_integer),
-    /// but panic on error.
-    ///
-    /// # Panic
-    ///
-    /// Panics if `other` is zero.
-    pub const fn strict_rem_integer(self, other: Self) -> Self {
-        self.checked_rem_integer(other).unwrap()
+    pub fn checked_rem<const P0: usize, const S0: usize, const P1: usize, const S1: usize>(
+        self,
+        other: Fixed<P0, S0>,
+    ) -> Option<Fixed<P1, S1>> {
+        let neg = self.is_negative();
+        let left = self.abs();
+        let right = other.abs();
+        let div: Self = left.checked_div_generic(right)?;
+        let trunc: Self = div.trunc();
+        let mul: Self = right.checked_mul_generic(trunc)?;
+        let rem: Fixed<P1, S1> = left.checked_sub_generic(mul)?;
+        Some(if neg { rem.neg() } else { rem })
     }
 
     /// Returns the absolute value.  This is an exact calculation that cannot
@@ -415,7 +430,8 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// [checked_round]: Self::checked_round
     pub fn round(&self, n: i32) -> Self {
-        self.checked_round(n).unwrap()
+        self.checked_round(n)
+            .unwrap_or_else(|| panic!("Could not round value {} to {} digits", self, n))
     }
 
     /// Returns this value rounded to `n` digits after the decimal point, or
@@ -460,6 +476,15 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         self.checked_floor().unwrap()
     }
 
+    /// Returns this value rounded down to the nearest integer, with type Fixed<P, 0>
+    pub fn int_floor(&self) -> Fixed<P, 0> {
+        if S > 0 {
+            Fixed::<P, 0>::new(div_floor(self.0, Self::scale()), 0i32).unwrap()
+        } else {
+            Fixed::<P, 0>::new(self.0, S as i32).unwrap()
+        }
+    }
+
     /// Returns the integer part of this value, truncating non-integers toward
     /// zero.  This is an exact calculation that cannot overflow.
     ///
@@ -501,6 +526,16 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     /// [checked_ceil]: Self::checked_ceil
     pub fn ceil(&self) -> Self {
         self.checked_ceil().unwrap()
+    }
+
+    /// Returns this value rounded up to the nearest integer, or `None` if
+    /// rounding caused overflow.
+    pub fn int_ceil(&self) -> Fixed<P, 0> {
+        if S > 0 {
+            Fixed::<P, 0>::new(div_ceil(self.0, Self::scale()), 0i32).unwrap()
+        } else {
+            Fixed::<P, 0>::new(self.0, S as i32).unwrap()
+        }
     }
 
     /// Returns -1 if this value is less than zero, 0 if this value is zero, and
@@ -682,31 +717,48 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
         match S0.cmp(&S1) {
             Ordering::Less => {
                 let factor = pow10(S1 - S0);
-                if self.0 <= i128::MAX / factor / 10 {
-                    Fixed::try_new_with_exponent(
-                        other.0.checked_add(self.0 * factor)?,
-                        S2 as i32 - S1 as i32,
-                    )
+                if let Some(shifted) = self.0.checked_mul(factor)
+                    && let Some(sum) = other.0.checked_add(shifted)
+                {
+                    // This is the common case, where we can shift `self` left
+                    // to match `other` and add `other` without intermediate
+                    // overflow.
+                    Fixed::try_new_with_exponent(sum, S2 as i32 - S1 as i32)
                 } else {
+                    // If the result type has more digits to the left of the
+                    // decimal point than `other`, then we still might be able
+                    // to compute a correct answer without ultimate overflow.
                     let result = (I256::from_product(self.0, factor) + I256::from(other.0))
-                        .narrowing_div(pow10(S2.saturating_sub(S1)))?;
-                    Fixed::try_new_with_exponent(result, S1.saturating_sub(S2) as i32)
+                        .narrowing_div(pow10(S1.saturating_sub(S2)))?;
+                    Fixed::try_new_with_exponent(result, (S2.saturating_sub(S1)) as i32)
                 }
             }
             Ordering::Equal => {
-                Fixed::try_new_with_exponent(self.0.checked_add(other.0)?, (S2 - S0) as i32)
-            }
-            Ordering::Greater => {
-                let factor = pow10(S0 - S1);
-                if other.0 <= i128::MAX / factor / 10 {
-                    Fixed::try_new_with_exponent(
-                        self.0.checked_add(other.0 * factor)?,
-                        S2 as i32 - S0 as i32,
+                if let Some(sum) = self.0.checked_add(other.0) {
+                    // This is the common case, where the result fits in `i128`.
+                    Fixed::try_new_with_exponent(sum, S2 as i32 - S0 as i32)
+                } else if S2 < S0 {
+                    // The ultimate result might fit in `i128` but we need
+                    // multiple-precision arithmetic.
+                    Fixed::try_new(
+                        (I256::from(self.0) + I256::from(other.0)).narrowing_div(pow10(S0 - S2))?,
                     )
                 } else {
+                    // Definitely does not fit.
+                    None
+                }
+            }
+            Ordering::Greater => {
+                // Mirror of the `Less` case.
+                let factor = pow10(S0 - S1);
+                if let Some(shifted) = other.0.checked_mul(factor)
+                    && let Some(sum) = self.0.checked_add(shifted)
+                {
+                    Fixed::try_new_with_exponent(sum, S2 as i32 - S0 as i32)
+                } else {
                     let result = (I256::from_product(other.0, factor) + I256::from(self.0))
-                        .narrowing_div(pow10(S2.saturating_sub(S0)))?;
-                    Fixed::try_new_with_exponent(result, S0.saturating_sub(S2) as i32)
+                        .narrowing_div(pow10(S0.saturating_sub(S2)))?;
+                    Fixed::try_new_with_exponent(result, S2.saturating_sub(S0) as i32)
                 }
             }
         }
@@ -776,7 +828,7 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
             } else {
                 Fixed::try_new_with_exponent(
                     I256::from_product(self.0, pow10(shift_left)).narrowing_div(other.0)?,
-                    S0.saturating_sub(S1 + S2) as i32,
+                    -(S0.saturating_sub(S1 + S2) as i32),
                 )
             }
         }
@@ -863,6 +915,18 @@ impl<const P: usize, const S: usize> TryFrom<f64> for Fixed<P, S> {
     /// `value` is out of range.
     fn try_from(value: f64) -> Result<Self, Self::Error> {
         cast(value * Self::scale() as f64)
+            .and_then(Self::try_new)
+            .ok_or(OutOfRange)
+    }
+}
+
+impl<const P: usize, const S: usize> TryFrom<f32> for Fixed<P, S> {
+    type Error = OutOfRange;
+
+    /// Convert `value` to `Fixed`, rounding toward zero, reporting an error if
+    /// `value` is out of range.
+    fn try_from(value: f32) -> Result<Self, Self::Error> {
+        cast(value as f64 * Self::scale() as f64)
             .and_then(Self::try_new)
             .ok_or(OutOfRange)
     }
@@ -981,11 +1045,7 @@ macro_rules! min_max_int {
 impl<const P: usize, const S: usize> Fixed<P, S> {
     /// Returns the maximum `i128` that can be converted to this type.
     pub const fn max_i128() -> i128 {
-        if P > S {
-            pow10(P - S) - 1
-        } else {
-            0
-        }
+        if P > S { pow10(P - S) - 1 } else { 0 }
     }
 
     /// Returns the minimum `i128` that can be converted to this type.
@@ -1464,8 +1524,7 @@ mod test {
 
     #[test]
     fn div_generic() {
-        for a in -999..=999 {
-            let af: Fixed<10, 2> = Fixed(a);
+        fn test<const P: usize, const S: usize>(a: i128, af: Fixed<P, S>) {
             for b in -999..=999 {
                 if b != 0 {
                     let bf: Fixed<10, 3> = Fixed(b);
@@ -1478,6 +1537,13 @@ mod test {
                 }
             }
         }
+
+        for a in -999..=999 {
+            let af: Fixed<10, 2> = Fixed(a);
+            test(a, af);
+            let af2: Fixed<18, 10> = af.convert().unwrap();
+            test(a, af2);
+        }
     }
 
     #[test]
@@ -1487,6 +1553,18 @@ mod test {
         assert_eq!(f(-1.23) + f(2.34), f(1.11));
         assert_eq!(f(1.23) + f(-2.34), f(-1.11));
         assert_eq!(f(-1.23) + f(-2.34), f(-3.57));
+
+        // Cases that require avoiding intermediate overflow.
+        let af: Fixed<38, 35> = Fixed::try_from(999).unwrap();
+        let bf: Fixed<37, 34> = Fixed::try_from(999).unwrap();
+        let cf: Fixed<36, 30> = af.checked_add_generic(bf).unwrap();
+        assert_eq!(cf, 1998);
+        let df: Fixed<36, 30> = bf.checked_add_generic(af).unwrap();
+        assert_eq!(df, 1998);
+        let ef: Fixed<36, 3> = af.checked_add_generic(af).unwrap();
+        assert_eq!(ef, 1998);
+        let ff: Option<Fixed<38, 35>> = af.checked_add_generic(af);
+        assert_eq!(ff, None);
 
         // General case.
         for a in -999..=999 {
@@ -1537,6 +1615,12 @@ mod test {
                     Fixed::<10, 0>((a * 10 + b) / 1000),
                     "{af} + {bf} ?= {ef}"
                 );
+
+                let ff: Fixed<10, 2> = Fixed(b);
+                let gf: Fixed<10, 1> = af.checked_add_generic(ff).unwrap();
+                assert_eq!(gf, Fixed::<10, 1>((a + b) / 10), "{af} + {ff} ?= {gf}");
+                let hf: Fixed<10, 3> = af.checked_add_generic(ff).unwrap();
+                assert_eq!(hf, Fixed::<10, 3>((a + b) * 10), "{af} + {ff} ?= {hf}");
             }
         }
     }
@@ -1820,6 +1904,72 @@ mod test {
         test(-99_999_999.1, -99_999_999.0);
         test(-99_999_999.5, -99_999_999.0);
         test(-99_999_999.6, -99_999_999.0);
+    }
+
+    #[test]
+    fn round() {
+        fn test(x: f64, expected: Option<f64>) {
+            assert_eq!(f(x).checked_round(0), expected.map(f));
+        }
+        type F = Fixed<10, 2>;
+        fn test1((x, s): (i128, i32), d: i32, expected: Option<(i128, i32)>) {
+            assert_eq!(
+                F::new(x, s).unwrap().checked_round(d),
+                expected.map(|x| F::new(x.0, x.1).unwrap())
+            );
+        }
+
+        // round(5.1 , 2) = 5.1
+        test1((51, 1), 2, Some((51, 1)));
+        // round(5.1, 1) = 5.1
+        test1((51, 1), 1, Some((51, 1)));
+        // round(5.1, 0) = 5.0
+        test1((51, 1), 0, Some((50, 1)));
+        // round(5.1, -1) = 10
+        test1((51, 1), -1, Some((10, 0)));
+
+        // round(2.1, 2) = 2.1
+        test1((21, 1), 2, Some((21, 1)));
+        // round(2.1, 1) = 2.1
+        test1((21, 1), 1, Some((21, 1)));
+        // round(2.1, 0) = 2.0
+        test1((21, 1), 0, Some((20, 1)));
+        // round(2.1, -1) = 0
+        test1((21, 1), -1, Some((0, 0)));
+
+        // round(99_999_999.1, 2) = 99_999_999.1
+        test1((999_999_991, 1), 2, Some((999_999_991, 1)));
+        // round(99_999_999.1, 1) = 99_999_999.1
+        test1((999_999_991, 1), 1, Some((999_999_991, 1)));
+        // round(99_999_999.1, 0) = 99_999_999.0
+        test1((999_999_991, 1), 0, Some((999_999_990, 1)));
+        // round(99_999_999.1, -1) = None
+        test1((999_999_991, 1), -1, None);
+
+        test(5.0, Some(5.0));
+        test(5.1, Some(5.0));
+        test(5.5, Some(6.0));
+        test(5.9, Some(6.0));
+        test(-5.0, Some(-5.0));
+        test(-5.1, Some(-5.0));
+        test(-5.5, Some(-6.0));
+        test(-5.6, Some(-6.0));
+        test(4.0, Some(4.0));
+        test(4.1, Some(4.0));
+        test(4.5, Some(5.0));
+        test(4.9, Some(5.0));
+        test(-4.0, Some(-4.0));
+        test(-4.1, Some(-4.0));
+        test(-4.5, Some(-5.0));
+        test(-4.6, Some(-5.0));
+        test(99_999_999.0, Some(99_999_999.0));
+        test(99_999_999.1, Some(99_999_999.0));
+        test(99_999_999.5, None);
+        test(99_999_999.6, None);
+        test(-99_999_999.0, Some(-99_999_999.0));
+        test(-99_999_999.1, Some(-99_999_999.0));
+        test(-99_999_999.5, None);
+        test(-99_999_999.6, None);
     }
 
     #[test]

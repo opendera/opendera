@@ -1,14 +1,14 @@
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
 default_language_version:
-  rust: 1.87.0
+  rust: 1.93.1
 repos:
   - repo: local
     hooks:
       - id: cargo-clippy
         name: Clippy Automatic Fixes
         description: Run the Clippy linter on the package.
-        entry: cargo clippy --fix
+        entry: cargo clippy --fix --allow-dirty
         language: rust
         files: \.rs$
         pass_filenames: false
@@ -32,6 +32,13 @@ repos:
         language: rust
         files: \.rs$
         pass_filenames: false
+      - id: javascript-check
+        name: JavaScript Check
+        description: Run type checking on all JavaScript packages
+        entry: bash -c 'bun ci && bun run check'
+        language: system
+        files: '^js-packages/.*\.(ts|tsx|js|jsx|svelte|css|json|html)$'
+        pass_filenames: false
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
@@ -39,10 +46,25 @@ repos:
         exclude: 'crates/pipeline-manager/migrations/.*|.*\.patch|.*\.svg|.*\.java'
   - repo: local
     hooks:
+      - id: fix-rust-mod-naming
+        name: Rust module naming
+        entry: scripts/fix-rust-module-naming
+        language: rust
+        files: mod\.rs$
+        pass_filenames: false
       - id: update-openapi
         name: Update OpenAPI
         entry: cargo run --bin=pipeline-manager -- --dump-openapi
         language: system
+        files: \.rs$
+        pass_filenames: false
+      # The reason this runs after the openapi update is because the openapi
+      # generation adds documentation to e.g., the rest-api crate.
+      - id: cargo-doc
+        name: Cargo Documentation
+        description: Generate documentation with warnings treated as errors
+        entry: bash -c 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps'
+        language: rust
         files: \.rs$
         pass_filenames: false
   - repo: https://github.com/astral-sh/ruff-pre-commit

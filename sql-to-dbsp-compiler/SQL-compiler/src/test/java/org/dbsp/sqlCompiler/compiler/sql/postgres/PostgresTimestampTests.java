@@ -24,6 +24,7 @@
 package org.dbsp.sqlCompiler.compiler.sql.postgres;
 
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.frontend.TableData;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.sql.tools.CompilerCircuitStream;
 import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
@@ -57,7 +58,7 @@ public class PostgresTimestampTests extends SqlIoTest {
     @Override
     public void prepareInputs(DBSPCompiler compiler) {
         String data =
-                "CREATE TABLE TIMESTAMP_TBL (d1 timestamp(2) without time zone)\n;" +
+                "CREATE TABLE TIMESTAMP_TBL (d1 timestamp without time zone)\n;" +
                 // -- Postgres v6.0 standard output format
                 "INSERT INTO TIMESTAMP_TBL VALUES ('1970-01-01 00:00:00');\n" +          // INSERT INTO TIMESTAMP_TBL VALUES ('epoch');
                 "INSERT INTO TIMESTAMP_TBL VALUES ('1997-02-10 17:32:01');\n" +          // INSERT INTO TIMESTAMP_TBL VALUES ('Mon Feb 10 17:32:01 1997 PST');
@@ -100,7 +101,7 @@ public class PostgresTimestampTests extends SqlIoTest {
                 // -- this fails (even though TZ is a no-op, we still look it up)
                 // INSERT INTO TIMESTAMP_TBL VALUES ('19970710 173201 America/Does_not_exist');
                 // ERROR:  time zone "america/does_not_exist" not recognized
-                // LINE 1: INSERT INTO TIMESTAMP_TBL VALUES ('19970710 173201 America/D...
+                // LINE 1: INSERT INTO TIMESTAMP_TBL VALUES ('19970710 173201 America/D...)
                 // -- Check date conversion and date arithmetic
                 "INSERT INTO TIMESTAMP_TBL VALUES ('1997-06-10 18:32:01');\n" +          // INSERT INTO TIMESTAMP_TBL VALUES ('1997-06-10 18:32:01 PDT');
                 "INSERT INTO TIMESTAMP_TBL VALUES ('1997-02-10 17:32:01');\n" +          // INSERT INTO TIMESTAMP_TBL VALUES ('Feb 10 17:32:01 1997');
@@ -142,7 +143,7 @@ public class PostgresTimestampTests extends SqlIoTest {
         query = "CREATE VIEW V AS " + query;
         DBSPCompiler compiler = this.compileQuery(query, true);
         CompilerCircuitStream ccs = this.getCCS(compiler);
-        DBSPZSetExpression input = compiler.getTableContents().getTableContents(
+        TableData input = compiler.getTableContents().getTableData(
                 compiler.canonicalName("TIMESTAMP_TBL", false));
         InputOutputChange change = new InputOutputChange(new Change(input), expectedOutput);
         ccs.addChange(change);
@@ -156,9 +157,9 @@ public class PostgresTimestampTests extends SqlIoTest {
                              d1
                 -----------------------------
                  Thu Jan 01 00:00:00 1970
+                 Mon Feb 10 17:32:01.999999 1997
+                 Mon Feb 10 17:32:01.000001 1997
                  Mon Feb 10 17:32:01 1997
-                 Mon Feb 10 17:32:01 1997
-                 Mon Feb 10 17:32:02 1997
                  Mon Feb 10 17:32:01.4 1997
                  Mon Feb 10 17:32:01.5 1997
                  Mon Feb 10 17:32:01.6 1997
@@ -245,11 +246,11 @@ public class PostgresTimestampTests extends SqlIoTest {
         this.q("""
                 SELECT d1 FROM TIMESTAMP_TBL
                    WHERE d1 > timestamp '1997-01-02';
-                             d1            \s
+                             d1
                 ----------------------------
                  Mon Feb 10 17:32:01 1997
-                 Mon Feb 10 17:32:01 1997
-                 Mon Feb 10 17:32:02 1997
+                 Mon Feb 10 17:32:01.000001 1997
+                 Mon Feb 10 17:32:01.999999 1997
                  Mon Feb 10 17:32:01.4 1997
                  Mon Feb 10 17:32:01.5 1997
                  Mon Feb 10 17:32:01.6 1997
@@ -303,7 +304,7 @@ public class PostgresTimestampTests extends SqlIoTest {
         this.q("""
                 SELECT d1 FROM TIMESTAMP_TBL
                    WHERE d1 < timestamp '1997-01-02';
-                             d1             \s
+                             d1
                 -----------------------------
                  Thu Jan 01 00:00:00 1970
                  Sat Feb 16 17:32:01 0097
@@ -339,12 +340,12 @@ public class PostgresTimestampTests extends SqlIoTest {
         this.q("""
                 SELECT d1 FROM TIMESTAMP_TBL
                    WHERE d1 != timestamp '1997-01-02';
-                             d1             \s
+                             d1
                 -----------------------------
                 Thu Jan 01 00:00:00 1970
+                Mon Feb 10 17:32:01.000001 1997
                 Mon Feb 10 17:32:01 1997
-                Mon Feb 10 17:32:01 1997
-                Mon Feb 10 17:32:02 1997
+                Mon Feb 10 17:32:01.999999 1997
                 Mon Feb 10 17:32:01.4 1997
                 Mon Feb 10 17:32:01.5 1997
                 Mon Feb 10 17:32:01.6 1997
@@ -411,7 +412,7 @@ public class PostgresTimestampTests extends SqlIoTest {
        this.q("""
                SELECT d1 FROM TIMESTAMP_TBL
                   WHERE d1 <= timestamp '1997-01-02';
-                            d1             \s
+                            d1
                -----------------------------
                 Thu Jan 01 00:00:00 1970
                 Thu Jan 02 00:00:00 1997
@@ -436,11 +437,11 @@ public class PostgresTimestampTests extends SqlIoTest {
        this.q("""
                SELECT d1 FROM TIMESTAMP_TBL
                   WHERE d1 >= timestamp '1997-01-02';
-                            d1            \s
+                            d1
                ----------------------------
                 Mon Feb 10 17:32:01 1997
-                Mon Feb 10 17:32:01 1997
-                Mon Feb 10 17:32:02 1997
+                Mon Feb 10 17:32:01.000001 1997
+                Mon Feb 10 17:32:01.999999 1997
                 Mon Feb 10 17:32:01.4 1997
                 Mon Feb 10 17:32:01.5 1997
                 Mon Feb 10 17:32:01.6 1997
@@ -555,10 +556,11 @@ public class PostgresTimestampTests extends SqlIoTest {
         DBSPExpression[] results = Linq.map(data, d ->
                 new DBSPTupleExpression(d == null ?
                         DBSPLiteral.none(new DBSPTypeInteger(CalciteObject.EMPTY, 32, true,true)) :
-                        new DBSPI32Literal(-(int)(TableParser.shortIntervalToMilliseconds(d) / 60000), true)), DBSPExpression.class);
+                        new DBSPI32Literal(-(int)(TableParser.shortIntervalToMicroseconds(d) / 60_000_000), true)),
+                DBSPExpression.class);
         String query = "SELECT TIMESTAMPDIFF(MINUTE, d1, timestamp '1997-01-02') AS diff\n" +
                 "   FROM TIMESTAMP_TBL WHERE d1 BETWEEN '1902-01-01' AND '2038-01-01'";
-        this.testQuery(query, new Change(new DBSPZSetExpression(results)));
+        this.testQuery(query, new Change("V", new DBSPZSetExpression(results)));
     }
 
     @Test
@@ -605,7 +607,7 @@ public class PostgresTimestampTests extends SqlIoTest {
             "9863 days ago",
             "39 days 17 hours 32 mins 1 sec",
             "39 days 17 hours 32 mins 1 sec",
-            "39 days 17 hours 32 mins 2 secs",
+            "39 days 17 hours 32 mins 1 secs",
             "39 days 17 hours 32 mins 1.4 secs",
             "39 days 17 hours 32 mins 1.5 secs",
             "39 days 17 hours 32 mins 1.6 secs",
@@ -659,9 +661,11 @@ public class PostgresTimestampTests extends SqlIoTest {
             "1460 days 17 hours 32 mins 1 sec"
         };
         DBSPExpression[] results = Linq.map(data, d ->
-                new DBSPTupleExpression(d == null ? DBSPLiteral.none(new DBSPTypeInteger(CalciteObject.EMPTY, 32, true,true)) :
-                        new DBSPI32Literal(-(int)(TableParser.shortIntervalToMilliseconds(d)/1000), true)), DBSPExpression.class);
-        this.testQuery(query, new Change(new DBSPZSetExpression(results)));
+                new DBSPTupleExpression(d == null ?
+                        DBSPLiteral.none(new DBSPTypeInteger(CalciteObject.EMPTY, 32, true,true)) :
+                        new DBSPI32Literal(-(int)(TableParser.shortIntervalToMicroseconds(d)/1_000_000L), true)),
+                DBSPExpression.class);
+        this.testQuery(query, new Change("V", new DBSPZSetExpression(results)));
     }
 
     @Test
@@ -678,15 +682,15 @@ public class PostgresTimestampTests extends SqlIoTest {
                 EXTRACT(day FROM d1) AS 'day', EXTRACT(hour FROM d1) AS 'hour',
                 EXTRACT(minute FROM d1) AS 'minute', EXTRACT(second FROM d1) AS 'second'
                 FROM TIMESTAMP_TBL;
-                          timestamp          |   year    | month | day | hour | minute | second\s
+                          timestamp          |   year    | month | day | hour | minute | second
                 -----------------------------+-----------+-------+-----+------+--------+--------
                  Thu Jan 01 00:00:00 1970    |      1970 |     1 |   1 |    0 |      0 |      0
+                 Mon Feb 10 17:32:01.000001 1997 |  1997 |     2 |  10 |   17 |     32 |      1
                  Mon Feb 10 17:32:01 1997    |      1997 |     2 |  10 |   17 |     32 |      1
-                 Mon Feb 10 17:32:01 1997    |      1997 |     2 |  10 |   17 |     32 |      1
-                 Mon Feb 10 17:32:02 1997    |      1997 |     2 |  10 |   17 |     32 |      2
-                 Mon Feb 10 17:32:01.4 1997  |      1997 |     2 |  10 |   17 |     32 |    1
-                 Mon Feb 10 17:32:01.5 1997  |      1997 |     2 |  10 |   17 |     32 |    1
-                 Mon Feb 10 17:32:01.6 1997  |      1997 |     2 |  10 |   17 |     32 |    1
+                 Mon Feb 10 17:32:01.999999 1997 |  1997 |     2 |  10 |   17 |     32 |      1
+                 Mon Feb 10 17:32:01.4 1997  |      1997 |     2 |  10 |   17 |     32 |      1
+                 Mon Feb 10 17:32:01.5 1997  |      1997 |     2 |  10 |   17 |     32 |      1
+                 Mon Feb 10 17:32:01.6 1997  |      1997 |     2 |  10 |   17 |     32 |      1
                  Thu Jan 02 00:00:00 1997    |      1997 |     1 |   2 |    0 |      0 |      0
                  Thu Jan 02 03:04:05 1997    |      1997 |     1 |   2 |    3 |      4 |      5
                  Mon Feb 10 17:32:01 1997    |      1997 |     2 |  10 |   17 |     32 |      1
@@ -758,9 +762,9 @@ public class PostgresTimestampTests extends SqlIoTest {
                           timestamp          | quarter | msec  |   usec
                 -----------------------------+---------+-------+----------
                  Thu Jan 01 00:00:00 1970    |       1 |     0 |        0
+                 Mon Feb 10 17:32:01.000001 1997 |   1 |  1000 |  1000001
                  Mon Feb 10 17:32:01 1997    |       1 |  1000 |  1000000
-                 Mon Feb 10 17:32:01 1997    |       1 |  1000 |  1000000
-                 Mon Feb 10 17:32:02 1997    |       1 |  2000 |  2000000
+                 Mon Feb 10 17:32:01.999999 1997 |   1 |  1999 |  1999999
                  Mon Feb 10 17:32:01.4 1997  |       1 |  1400 |  1400000
                  Mon Feb 10 17:32:01.5 1997  |       1 |  1500 |  1500000
                  Mon Feb 10 17:32:01.6 1997  |       1 |  1600 |  1600000
@@ -835,12 +839,12 @@ public class PostgresTimestampTests extends SqlIoTest {
                    extract(isodow FROM d1) AS 'isodow', extract(dow FROM d1) AS 'dow',
                    extract(doy FROM d1) AS 'doy'
                    FROM TIMESTAMP_TBL;
-                          timestamp          |  isoyear  | week | isodow | dow | doy\s
+                          timestamp          |  isoyear  | week | isodow | dow | doy
                 -----------------------------+-----------+------+--------+-----+-----
                  Thu Jan 01 00:00:00 1970    |      1970 |    1 |      4 |   5 |   1
+                 Mon Feb 10 17:32:01.000001 1997 |  1997 |    7 |      1 |   2 |  41
                  Mon Feb 10 17:32:01 1997    |      1997 |    7 |      1 |   2 |  41
-                 Mon Feb 10 17:32:01 1997    |      1997 |    7 |      1 |   2 |  41
-                 Mon Feb 10 17:32:02 1997    |      1997 |    7 |      1 |   2 |  41
+                 Mon Feb 10 17:32:01.999999 1997 |  1997 |    7 |      1 |   2 |  41
                  Mon Feb 10 17:32:01.4 1997  |      1997 |    7 |      1 |   2 |  41
                  Mon Feb 10 17:32:01.5 1997  |      1997 |    7 |      1 |   2 |  41
                  Mon Feb 10 17:32:01.6 1997  |      1997 |    7 |      1 |   2 |  41
@@ -913,12 +917,12 @@ public class PostgresTimestampTests extends SqlIoTest {
                         date_part(dow, d1) AS 'dow',
                         date_part(doy, d1) AS 'doy'
                         FROM TIMESTAMP_TBL;
-                          timestamp          |  isoyear  | week | isodow | dow | doy\s
+                          timestamp          |  isoyear  | week | isodow | dow | doy
                 -----------------------------+-----------+------+--------+-----+-----
                  Thu Jan 01 00:00:00 1970    |      1970 |    1 |      4 |   5 |   1
                  Mon Feb 10 17:32:01 1997    |      1997 |    7 |      1 |   2 |  41
-                 Mon Feb 10 17:32:01 1997    |      1997 |    7 |      1 |   2 |  41
-                 Mon Feb 10 17:32:02 1997    |      1997 |    7 |      1 |   2 |  41
+                 Mon Feb 10 17:32:01.000001 1997 |  1997 |    7 |      1 |   2 |  41
+                 Mon Feb 10 17:32:01.999999 1997 |  1997 |    7 |      1 |   2 |  41
                  Mon Feb 10 17:32:01.4 1997  |      1997 |    7 |      1 |   2 |  41
                  Mon Feb 10 17:32:01.5 1997  |      1997 |    7 |      1 |   2 |  41
                  Mon Feb 10 17:32:01.6 1997  |      1997 |    7 |      1 |   2 |  41
@@ -998,15 +1002,15 @@ public class PostgresTimestampTests extends SqlIoTest {
                 --   round(extract(julian FROM d1)) AS 'julian',
                    extract(epoch FROM d1) AS 'epoch'
                    FROM TIMESTAMP_TBL;
-                          timestamp          |  decade   |  century  | millennium |    epoch    \s
+                          timestamp          |  decade   |  century  | millennium |    epoch
                 -----------------------------+-----------+-----------+------------+--------------
                  Thu Jan 01 00:00:00 1970    |       197 |        20 |          2 |            0
                  Mon Feb 10 17:32:01 1997    |       199 |        20 |          2 |    855595921
-                 Mon Feb 10 17:32:01 1997    |       199 |        20 |          2 |    855595921
-                 Mon Feb 10 17:32:02 1997    |       199 |        20 |          2 |    855595922
-                 Mon Feb 10 17:32:01.4 1997  |       199 |        20 |          2 |  855595921 \s
-                 Mon Feb 10 17:32:01.5 1997  |       199 |        20 |          2 |  855595921 \s
-                 Mon Feb 10 17:32:01.6 1997  |       199 |        20 |          2 |  855595921 \s
+                 Mon Feb 10 17:32:01.000001 1997 |   199 |        20 |          2 |    855595921
+                 Mon Feb 10 17:32:01.999999 1997 |   199 |        20 |          2 |    855595921
+                 Mon Feb 10 17:32:01.4 1997  |       199 |        20 |          2 |    855595921
+                 Mon Feb 10 17:32:01.5 1997  |       199 |        20 |          2 |    855595921
+                 Mon Feb 10 17:32:01.6 1997  |       199 |        20 |          2 |    855595921
                  Thu Jan 02 00:00:00 1997    |       199 |        20 |          2 |    852163200
                  Thu Jan 02 03:04:05 1997    |       199 |        20 |          2 |    852174245
                  Mon Feb 10 17:32:01 1997    |       199 |        20 |          2 |    855595921
@@ -1076,15 +1080,15 @@ public class PostgresTimestampTests extends SqlIoTest {
                    -- round(date_part( 'julian', d1)) AS julian,
                    date_part( epoch, d1) AS 'epoch'
                    FROM TIMESTAMP_TBL;
-                          timestamp          |  decade   |  century  | millennium |    epoch    \s
+                          timestamp          |  decade   |  century  | millennium |    epoch
                 -----------------------------+-----------+-----------+------------+--------------
                  Thu Jan 01 00:00:00 1970    |       197 |        20 |          2 |            0
                  Mon Feb 10 17:32:01 1997    |       199 |        20 |          2 |    855595921
-                 Mon Feb 10 17:32:01 1997    |       199 |        20 |          2 |    855595921
-                 Mon Feb 10 17:32:02 1997    |       199 |        20 |          2 |    855595922
-                 Mon Feb 10 17:32:01.4 1997  |       199 |        20 |          2 |  855595921 \s
-                 Mon Feb 10 17:32:01.5 1997  |       199 |        20 |          2 |  855595921 \s
-                 Mon Feb 10 17:32:01.6 1997  |       199 |        20 |          2 |  855595921 \s
+                 Mon Feb 10 17:32:01.000001 1997 |   199 |        20 |          2 |    855595921
+                 Mon Feb 10 17:32:01.999999 1997 |   199 |        20 |          2 |    855595921
+                 Mon Feb 10 17:32:01.4 1997  |       199 |        20 |          2 |    855595921
+                 Mon Feb 10 17:32:01.5 1997  |       199 |        20 |          2 |    855595921
+                 Mon Feb 10 17:32:01.6 1997  |       199 |        20 |          2 |    855595921
                  Thu Jan 02 00:00:00 1997    |       199 |        20 |          2 |    852163200
                  Thu Jan 02 03:04:05 1997    |       199 |        20 |          2 |    852174245
                  Mon Feb 10 17:32:01 1997    |       199 |        20 |          2 |    855595921
@@ -1158,7 +1162,7 @@ public class PostgresTimestampTests extends SqlIoTest {
                  Thu Jan 01 00:00:00 1970    |            0 |        0     |  0        |            0
                  Mon Feb 10 17:32:01 1997    |      1000000 |     1000     |  1        |    855595921
                  Mon Feb 10 17:32:01 1997    |      1000000 |     1000     |  1        |    855595921
-                 Mon Feb 10 17:32:02 1997    |      2000000 |     2000     |  2        |    855595922
+                 Mon Feb 10 17:32:01.999999 1997 |  1999999 |     1999     |  1        |    855595921
                  Mon Feb 10 17:32:01.4 1997  |      1400000 |     1400     |  1        |    855595921
                  Mon Feb 10 17:32:01.5 1997  |      1500000 |     1500     |  1        |    855595921
                  Mon Feb 10 17:32:01.6 1997  |      1600000 |     1600     |  1        |    855595921
@@ -1175,7 +1179,7 @@ public class PostgresTimestampTests extends SqlIoTest {
                  Wed Mar 15 12:14:03 2000    |      3000000 |     3000     |  3        |    953122443
                  Wed Mar 15 03:14:04 2000    |      4000000 |     4000     |  4        |    953090044
                  Wed Mar 15 02:14:05 2000    |      5000000 |     5000     |  5        |    953086445
-                 Mon Feb 10 17:32:01 1997    |      1000000 |     1000     |  1        |    855595921
+                 Mon Feb 10 17:32:01.000001 1997 |  1000001 |     1000     |  1        |    855595921
                  Mon Feb 10 17:32:01 1997    |      1000000 |     1000     |  1        |    855595921
                  Mon Feb 10 17:32:00 1997    |            0 |        0     |  0        |    855595920
                  Mon Feb 10 17:32:01 1997    |      1000000 |     1000     |  1        |    855595921

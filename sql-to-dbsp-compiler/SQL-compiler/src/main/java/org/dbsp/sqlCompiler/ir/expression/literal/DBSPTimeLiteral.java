@@ -53,7 +53,7 @@ public final class DBSPTimeLiteral extends DBSPLiteral {
     }
 
     public DBSPTimeLiteral() {
-        this(CalciteObject.EMPTY, new DBSPTypeTime(CalciteObject.EMPTY, true), null);
+        this(CalciteObject.EMPTY, DBSPTypeTime.NULLABLE_INSTANCE, null);
     }
 
     @Override
@@ -93,7 +93,7 @@ public final class DBSPTimeLiteral extends DBSPLiteral {
                     .append(this.type)
                     .append(")null");
         else
-            return builder.append(this.value.toString());
+            return builder.append(this.wrapSome(this.value.toString()));
     }
 
     @Override

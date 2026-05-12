@@ -1,25 +1,27 @@
 package org.dbsp.simulator.operators;
 
+import org.dbsp.simulator.types.CollectionType;
+import org.dbsp.simulator.values.RuntimeFunction;
 import org.dbsp.simulator.collections.BaseCollection;
+import org.dbsp.simulator.collections.IndexedZSet;
 import org.dbsp.simulator.collections.ZSet;
-import org.dbsp.simulator.types.WeightType;
 import org.dbsp.simulator.values.SqlTuple;
 
-import java.util.function.Function;
+public class IndexOperator<Weight> extends UnaryOperator {
+    public final RuntimeFunction<SqlTuple, SqlTuple> keyFunction;
 
-public class IndexOperator<Weight> extends UnaryOperator<Weight> {
-    public final Function<SqlTuple, SqlTuple> keyFunction;
-
-    public IndexOperator(WeightType<Weight> weightType,
-                         Function<SqlTuple, SqlTuple> keyFunction, BaseOperator<Weight> input) {
-        super(weightType, input);
+    public IndexOperator(CollectionType outputType,
+                         RuntimeFunction<SqlTuple, SqlTuple> keyFunction, Stream input) {
+        super(outputType, input);
         this.keyFunction = keyFunction;
     }
 
+    @SuppressWarnings("unchecked")
     @Override
     public void step() {
-        BaseCollection<Weight> input = this.getInputValue();
-        ZSet<SqlTuple, Weight> zset = (ZSet<SqlTuple, Weight>) input;
-        this.nextOutput = zset.index(this.keyFunction);
+        BaseCollection input = this.input().getCurrentValue();
+        ZSet<SqlTuple> zset = (ZSet<SqlTuple>) input;
+        IndexedZSet<SqlTuple, SqlTuple> result = zset.index(keyFunction);
+        this.output.setValue(result);
     }
 }

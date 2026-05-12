@@ -2,9 +2,11 @@ package org.dbsp.sqlCompiler.compiler.visitors.inner;
 
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.errors.UnsupportedException;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.CustomFunctions;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPBlockExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPPathExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLiteral;
@@ -37,6 +39,11 @@ public class ExpandWriteLog extends InnerRewriteVisitor {
     }
 
     @Override
+    public VisitDecision preorder(DBSPType type) {
+        return VisitDecision.STOP;
+    }
+
+    @Override
     public VisitDecision preorder(DBSPApplyExpression expression) {
         this.push(expression);
         DBSPExpression[] arguments = this.transform(expression.arguments);
@@ -48,7 +55,7 @@ public class ExpandWriteLog extends InnerRewriteVisitor {
         if (function.is(DBSPPathExpression.class)) {
             DBSPPathExpression func = function.to(DBSPPathExpression.class);
             String path = func.path.asString();
-            if (path.equalsIgnoreCase("writelog")) {
+            if (path.equalsIgnoreCase(CustomFunctions.WriteLogFunction.NAME)) {
                 List<DBSPStatement> statements = new ArrayList<>();
                 DBSPExpression format = arguments[0];
                 if (!format.is(DBSPStringLiteral.class))
@@ -63,7 +70,8 @@ public class ExpandWriteLog extends InnerRewriteVisitor {
                     for (String part: parts) {
                         if (castToStr == null) {
                             DBSPTypeString stringType = DBSPTypeString.varchar(type.mayBeNull);
-                            castToStr = arguments[1].cast(arguments[1].getNode(), stringType, false);
+                            castToStr = arguments[1].cast(arguments[1].getNode(), stringType,
+                                    DBSPCastExpression.CastType.SqlUnsafe);
                             // do not print argument first time around the loop
                         } else {
                             String printFunction = type.mayBeNull ? "print_opt" : "print";

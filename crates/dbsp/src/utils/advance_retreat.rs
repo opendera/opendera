@@ -1,7 +1,7 @@
 use crate::utils::bytes_of;
 use std::{
     cmp::min,
-    mem::{size_of, MaybeUninit},
+    mem::{MaybeUninit, size_of},
 };
 
 const DEFAULT_SMALL_LIMIT: usize = 8;
@@ -292,7 +292,7 @@ struct SlicePtr {
 impl SlicePtr {
     #[inline]
     fn new(slice: &[MaybeUninit<u8>], element_size: usize) -> Self {
-        debug_assert!(slice.len() % element_size == 0);
+        debug_assert!(slice.len().is_multiple_of(element_size));
 
         Self {
             ptr: slice.as_ptr().cast(),

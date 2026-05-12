@@ -1,10 +1,12 @@
 use anyhow::Result;
-use chrono::{Datelike, NaiveDate};
+use chrono::Datelike;
 use csv::Reader;
+use dbsp::typed_batch::IndexedZSetReader;
 use dbsp::{
+    OrdIndexedZSet, OutputHandle, RootCircuit, ZSetHandle, ZWeight,
     utils::{Tup2, Tup3},
-    OrdIndexedZSet, OutputHandle, RootCircuit, ZSetHandle,
 };
+use feldera_macros::IsNone;
 use rkyv::{Archive, Serialize};
 use size_of::SizeOf;
 
@@ -22,11 +24,12 @@ use size_of::SizeOf;
     Serialize,
     rkyv::Deserialize,
     serde::Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 struct Record {
     location: String,
-    date: NaiveDate,
+    date: i32,
     daily_vaccinations: Option<u64>,
 }
 
@@ -44,6 +47,7 @@ struct Record {
     Serialize,
     rkyv::Deserialize,
     serde::Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -69,8 +73,9 @@ fn build_circuit(
     });
     let monthly_totals = subset
         .map_index(|r| {
+            let date = chrono::NaiveDate::from_epoch_days(r.date).unwrap();
             (
-                Tup3(r.location.clone(), r.date.year(), r.date.month() as u8),
+                Tup3(r.location.clone(), date.year(), date.month() as u8),
                 r.daily_vaccinations.unwrap_or(0),
             )
         })
@@ -100,10 +105,10 @@ fn main() -> Result<()> {
     let mut input_records = Reader::from_path(path)?
         .deserialize()
         .map(|result| result.map(|record| Tup2(record, 1)))
-        .collect::<Result<Vec<Tup2<Record, i64>>, _>>()?;
+        .collect::<Result<Vec<Tup2<Record, ZWeight>>, _>>()?;
     input_handle.append(&mut input_records);
 
-    circuit.step()?;
+    circuit.transaction()?;
 
     output_handle
         .consolidate()

@@ -2,6 +2,8 @@ import uuid
 
 import pandas as pd
 from decimal import Decimal
+from datetime import datetime
+from typing import Mapping, Any
 
 
 def sql_type_to_pandas_type(sql_type: str):
@@ -60,9 +62,14 @@ def ensure_dataframe_has_columns(df: pd.DataFrame):
         )
 
 
-def dataframe_from_response(buffer: list[list[dict]], schema: dict):
+def dataframe_from_response(
+    buffer: list[list[Mapping[str, Any]]], fields: list[Mapping[str, Any]]
+):
     """
     Converts the response from Feldera to a pandas DataFrame.
+
+    :param buffer: A buffer of a list of JSON formatted output of the view you are listening to.
+    :param fields: The schema (list of fields) of the view you are listening to.
     """
 
     pd_schema = {}
@@ -70,7 +77,7 @@ def dataframe_from_response(buffer: list[list[dict]], schema: dict):
     decimal_col = []
     uuid_col = []
 
-    for column in schema["fields"]:
+    for column in fields:
         column_name = column["name"]
         if not column["case_sensitive"]:
             column_name = column_name.lower()
@@ -115,3 +122,43 @@ def chunk_dataframe(df, chunk_size=1000):
 
     for i in range(0, len(df), chunk_size):
         yield df.iloc[i : i + chunk_size]
+
+
+def parse_datetime(value: str, field: str) -> datetime:
+    """Parse RFC3339-like datetime strings returned by the API."""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"invalid datetime for '{field}': {value!r}") from exc
+
+
+def expect_mapping(d: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    """Return required mapping field or raise ValueError."""
+    value = d.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"missing or invalid required object field '{key}'")
+    return value
+
+
+def expect_str(d: Mapping[str, Any], key: str) -> str:
+    """Return required string field or raise ValueError."""
+    value = d.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f"missing or invalid required string field '{key}'")
+    return value
+
+
+def expect_int(d: Mapping[str, Any], key: str) -> int:
+    """Return required integer field or raise ValueError."""
+    value = d.get(key)
+    if not isinstance(value, int):
+        raise ValueError(f"missing or invalid required integer field '{key}'")
+    return value
+
+
+def expect_bool(d: Mapping[str, Any], key: str) -> bool:
+    """Return required boolean field or raise ValueError."""
+    value = d.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"missing or invalid required boolean field '{key}'")
+    return value

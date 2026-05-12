@@ -1,30 +1,32 @@
 //! byte arrays (binary objects in SQL)
 
 use crate::{
-    some_function1, some_function2, some_function3, some_function4, some_polymorphic_function1,
-    some_polymorphic_function2, SqlString,
+    SqlString, some_function1, some_function2, some_function3, some_function4,
+    some_polymorphic_function1, some_polymorphic_function2,
 };
 use base58::{FromBase58, ToBase58};
 use base64::prelude::*;
 use dbsp::NumEntries;
+use feldera_macros::IsNone;
 use feldera_types::serde_with_context::{
-    serde_config::BinaryFormat, DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
+    DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, serde_config::BinaryFormat,
 };
 use flate2::read::GzDecoder;
 use hex::ToHex;
 use md5::{Digest, Md5};
 use serde::{
-    de::{Error as _, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
+    de::{Error as _, Visitor},
 };
 use size_of::SizeOf;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::{
     borrow::Cow,
-    cmp::{min, Ordering},
+    cmp::{Ordering, min},
     fmt::Debug,
     io::Read,
 };
+use xxhash_rust::xxh64::xxh64;
 
 /// Values smaller than this size are allocated on the stack
 const THRESHOLD: usize = 32; // up to 256 bits
@@ -45,6 +47,7 @@ type CompactVec = SmallVec<[u8; THRESHOLD]>;
     rkyv::Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[serde(transparent)]
@@ -75,6 +78,9 @@ impl SerializeWithContext<SqlSerdeConfig> for ByteArray {
             BinaryFormat::PgHex => {
                 serializer.serialize_str(&format!("\\x{}", hex::encode(&self.data)))
             }
+            BinaryFormat::CHex => {
+                serializer.serialize_str(&format!("0x{}", hex::encode(&self.data)))
+            }
         }
     }
 }
@@ -96,7 +102,7 @@ impl Visitor<'_> for ByteVisitor {
     }
 }
 
-impl<'de> DeserializeWithContext<'de, SqlSerdeConfig> for ByteArray {
+impl<'de, AUX> DeserializeWithContext<'de, SqlSerdeConfig, AUX> for ByteArray {
     fn deserialize_with_context<D>(
         deserializer: D,
         config: &'de SqlSerdeConfig,
@@ -104,6 +110,21 @@ impl<'de> DeserializeWithContext<'de, SqlSerdeConfig> for ByteArray {
     where
         D: Deserializer<'de>,
     {
+        fn parse_hex_string(s: &str, prefix: &str) -> Option<CompactVec> {
+            let s = s.strip_prefix(prefix).unwrap_or(s).as_bytes();
+            if !s.len().is_multiple_of(2) || !s.iter().all(u8::is_ascii_hexdigit) {
+                None
+            } else {
+                let mut result = CompactVec::with_capacity(s.len() / 2);
+                for i in 0..s.len() / 2 {
+                    let a = (s[i * 2] as char).to_digit(16).unwrap() as u8;
+                    let b = (s[i * 2 + 1] as char).to_digit(16).unwrap() as u8;
+                    result.push(a * 16 + b);
+                }
+                Some(result)
+            }
+        }
+
         match config.binary_format {
             BinaryFormat::Array => {
                 let data = CompactVec::deserialize(deserializer)?;
@@ -127,6 +148,15 @@ impl<'de> DeserializeWithContext<'de, SqlSerdeConfig> for ByteArray {
             BinaryFormat::PgHex => Err(D::Error::custom(
                 "binary format Postgres Hexadecimal is not supported for input",
             )),
+            BinaryFormat::CHex => {
+                let str: Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+                match parse_hex_string(&str, "0x") {
+                    None => Err(D::Error::custom(format!(
+                        "Invalid C-style hex string: {str:?}"
+                    ))),
+                    Some(data) => Ok(Self { data }),
+                }
+            }
         }
     }
 }
@@ -144,11 +174,12 @@ mod test_binary_deserializer {
     fn test_base58() {
         let encoded = "4F85ZySpwyY6FuH7mQYyyr5b8nV9zFRBLj92AJa37w6y";
 
-        let decoded = ByteArray::deserialize_with_context(
-            serde_json::Value::String(encoded.to_string()),
-            &SqlSerdeConfig::from(JsonFlavor::Blockchain),
-        )
-        .unwrap();
+        let decoded =
+            <ByteArray as DeserializeWithContext<SqlSerdeConfig, ()>>::deserialize_with_context(
+                serde_json::Value::String(encoded.to_string()),
+                &SqlSerdeConfig::from(JsonFlavor::Blockchain),
+            )
+            .unwrap();
 
         assert_eq!(
             decoded,
@@ -200,7 +231,7 @@ impl ByteArray {
         Self { data: d.into() }
     }
 
-    pub fn with_size(d: &[u8], size: i32) -> Self {
+    pub fn with_size(d: &[u8], size: i32, fixed: bool) -> Self {
         if size < 0 {
             ByteArray::new(d)
         } else {
@@ -209,9 +240,34 @@ impl ByteArray {
                 Ordering::Equal => ByteArray::new(d),
                 Ordering::Greater => ByteArray::new(&d[..size]),
                 Ordering::Less => {
-                    let mut data: CompactVec = smallvec![0; size];
-                    data[..d.len()].copy_from_slice(d);
-                    ByteArray { data }
+                    if fixed {
+                        let mut data: CompactVec = smallvec![0; size];
+                        data[..d.len()].copy_from_slice(d);
+                        ByteArray { data }
+                    } else {
+                        ByteArray::new(d)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn with_size_truncate_left(d: &[u8], size: i32, fixed: bool) -> Self {
+        if size < 0 {
+            ByteArray::new(d)
+        } else {
+            let size = size as usize;
+            match d.len().cmp(&size) {
+                Ordering::Equal => ByteArray::new(d),
+                Ordering::Greater => ByteArray::new(&d[d.len() - size..]),
+                Ordering::Less => {
+                    if fixed {
+                        let mut data: CompactVec = smallvec![0; size];
+                        data[size - d.len()..].copy_from_slice(d);
+                        ByteArray { data }
+                    } else {
+                        ByteArray::new(d)
+                    }
                 }
             }
         }
@@ -448,3 +504,26 @@ pub fn md5_bytes(source: ByteArray) -> SqlString {
 }
 
 some_polymorphic_function1!(md5, bytes, ByteArray, SqlString);
+
+#[doc(hidden)]
+pub fn bin2utf8_(bytes: ByteArray) -> Option<SqlString> {
+    std::str::from_utf8(&bytes.data)
+        .ok()
+        .map(SqlString::from_ref)
+}
+
+#[doc(hidden)]
+pub fn bin2utf8N(source: Option<ByteArray>) -> Option<SqlString> {
+    match source {
+        None => None,
+        Some(bytes) => bin2utf8_(bytes),
+    }
+}
+
+#[doc(hidden)]
+pub fn xxhash_bytes_i64(source: ByteArray, seed: i64) -> i64 {
+    let hash = xxh64(&source.data, seed as u64);
+    hash as i64
+}
+
+some_polymorphic_function2!(xxhash, bytes, ByteArray, i64, i64, i64);

@@ -1,10 +1,10 @@
 use crate::{
-    algebra::{Lattice, PartialOrder},
-    dynamic::{DataTrait, WeightTrait},
-    time::Timestamp,
-    trace::{FallbackKeyBatch, FallbackValBatch},
     Scope,
+    algebra::{Lattice, PartialOrder},
+    time::Timestamp,
+    trace::Batch,
 };
+use feldera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 use std::fmt::{Debug, Display, Formatter};
@@ -23,6 +23,7 @@ use std::fmt::{Debug, Display, Formatter};
     Archive,
     Serialize,
     Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(bound(
@@ -86,11 +87,11 @@ where
     TOuter: Timestamp,
     TInner: Timestamp,
 {
+    const NESTING_DEPTH: usize = TOuter::NESTING_DEPTH + 1;
+
     type Nested = Product<Self, u32>;
 
-    type ValBatch<K: DataTrait + ?Sized, V: DataTrait + ?Sized, R: WeightTrait + ?Sized> =
-        FallbackValBatch<K, V, Self, R>;
-    type KeyBatch<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> = FallbackKeyBatch<K, Self, R>;
+    type TimedBatch<B: Batch<Time = ()>> = B::Timed<Self>;
 
     fn minimum() -> Self {
         Self::new(TOuter::minimum(), TInner::minimum())

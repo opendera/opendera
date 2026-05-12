@@ -1,6 +1,7 @@
 use super::NexmarkStream;
 use crate::model::Event;
 use dbsp::{OrdZSet, RootCircuit, Stream};
+use feldera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use rust_decimal::Decimal;
 use size_of::SizeOf;
@@ -56,6 +57,7 @@ use std::hash::Hash;
     Archive,
     Serialize,
     Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -64,20 +66,27 @@ pub struct Q14Output(u64, u64, Decimal, BidTimeType, u64, String, u64);
 type Q14Stream = Stream<RootCircuit, OrdZSet<Q14Output>>;
 
 #[derive(
-    Eq, Clone, Debug, Hash, PartialEq, PartialOrd, Ord, SizeOf, Archive, Serialize, Deserialize,
+    Eq,
+    Clone,
+    Debug,
+    Hash,
+    PartialEq,
+    PartialOrd,
+    Ord,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
+#[derive(Default)]
 pub enum BidTimeType {
+    #[default]
     Day,
     Night,
     Other,
-}
-
-impl Default for BidTimeType {
-    fn default() -> Self {
-        Self::Day
-    }
 }
 
 // This is used because we can't currently use chrono.Utc, which would simply
@@ -147,7 +156,7 @@ mod tests {
         )]]
         .into_iter();
 
-        let (circuit, input_handle) = RootCircuit::build(move |circuit| {
+        let (mut circuit, input_handle) = dbsp::Runtime::init_circuit(1, move |circuit| {
             let (stream, input_handle) = circuit.add_input_zset::<Event>();
 
             let mut expected_output = vec![expected_zset].into_iter();
@@ -162,7 +171,7 @@ mod tests {
 
         for mut vec in input_vecs {
             input_handle.append(&mut vec);
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 }

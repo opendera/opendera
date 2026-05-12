@@ -2,23 +2,21 @@
 //! Intervals are differences between dates and/or times
 
 use crate::{
+    Date, SqlDecimal, finite_or_null,
     operators::{eq, gt, gte, lt, lte, neq},
-    polymorphic_return_function2, some_existing_operator, some_operator,
+    plus_Date_Date_LongInterval__, sign, some_existing_operator, some_function2, some_operator,
     some_polymorphic_function1, some_polymorphic_function2,
-    timestamp::{extract_epoch_Date, extract_quarter_Date, plus_Date_LongInterval_Date},
-    Date, SqlDecimal,
+    timestamp::{extract_epoch_Date, extract_quarter_Date},
 };
 use dbsp::{algebra::F64, num_entries_scalar};
+use feldera_macros::IsNone;
 use feldera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
 };
-use num::PrimInt;
-use serde::{de::Error as _, ser::Error as _, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as _, ser::Error as _};
 use size_of::SizeOf;
-use std::{
-    fmt::Debug,
-    ops::{Add, Div, Mul, Neg, Sub},
-};
+use std::fmt;
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 #[cfg(doc)]
 use crate::{Time, Timestamp};
@@ -42,27 +40,73 @@ use crate::{Time, Timestamp};
     SizeOf,
     rkyv::Archive,
     rkyv::Serialize,
-    rkyv::Deserialize,
     Serialize,
     Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Clone, Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
 #[serde(transparent)]
 pub struct ShortInterval {
-    milliseconds: i64,
+    microseconds: i64,
+}
+
+#[doc(hidden)]
+pub fn reinterpret_ShortInterval(value: ShortInterval) -> i64 {
+    value.milliseconds()
+}
+
+some_polymorphic_function1!(reinterpret, ShortInterval, ShortInterval, i64);
+
+#[doc(hidden)]
+impl<D> ::rkyv::Deserialize<ShortInterval, D> for ArchivedShortInterval
+where
+    D: ::rkyv::Fallible + ::core::any::Any,
+{
+    fn deserialize(&self, deserializer: &mut D) -> Result<ShortInterval, D::Error> {
+        // The internal representation of ShortInterval changed from version 4 of the storage format
+        const MILLISECOND_VERSION: u32 = 4;
+        let version = (deserializer as &mut dyn ::core::any::Any)
+            .downcast_mut::<::dbsp::storage::file::Deserializer>()
+            .map(|deserializer| deserializer.version())
+            .expect("Deserializer must be of type dbsp::storage::file::Deserializer");
+        let value: i64 = self.microseconds.deserialize(deserializer)?;
+        if version <= MILLISECOND_VERSION {
+            Ok(ShortInterval::from_milliseconds(value))
+        } else {
+            Ok(ShortInterval::from_microseconds(value))
+        }
+    }
 }
 
 impl ShortInterval {
     /// Create a ShortInterval with a length specified in milliseconds.
-    pub const fn new(milliseconds: i64) -> Self {
-        Self { milliseconds }
+    pub const fn from_milliseconds(milliseconds: i64) -> Self {
+        Self {
+            microseconds: milliseconds * 1000,
+        }
+    }
+
+    /// Create a ShortInterval with a length specified in microseconds.
+    pub const fn from_microseconds(microseconds: i64) -> Self {
+        Self { microseconds }
+    }
+
+    /// Create a ShortInterval with a length specified in seconds.
+    pub const fn from_seconds(seconds: i64) -> Self {
+        Self::from_milliseconds(seconds * 1_000)
+    }
+
+    /// Extract the length of the interval in microseconds.  The
+    /// result can be negative.
+    pub fn microseconds(&self) -> i64 {
+        self.microseconds
     }
 
     /// Extract the length of the interval in milliseconds.  The
     /// result can be negative.
     pub fn milliseconds(&self) -> i64 {
-        self.milliseconds
+        self.microseconds / 1000
     }
 
     /// Extract the length of the interval in nanoseconds.  The result
@@ -70,13 +114,13 @@ impl ShortInterval {
     /// actually milliseconds, so this function will always return a
     /// number that is a multiple of 1 million.
     pub fn nanoseconds(&self) -> i64 {
-        self.milliseconds * 1_000_000_i64
+        self.microseconds * 1_000
     }
 }
 
 #[doc(hidden)]
 pub fn abs_ShortInterval(value: ShortInterval) -> ShortInterval {
-    ShortInterval::new(num::abs(value.milliseconds))
+    ShortInterval::from_microseconds(num::abs(value.microseconds))
 }
 
 some_polymorphic_function1!(abs, ShortInterval, ShortInterval, ShortInterval);
@@ -84,9 +128,16 @@ some_polymorphic_function1!(abs, ShortInterval, ShortInterval, ShortInterval);
 #[doc(hidden)]
 /// This function is used in rolling window computations, which require all
 /// values to be expressed using unsigned types.
+pub fn to_bound_ShortInterval_ShortInterval_u128(value: &ShortInterval) -> u128 {
+    value.microseconds as u128
+}
+
+#[doc(hidden)]
+/// This function is used in rolling window computations, which require all
+/// values to be expressed using unsigned types.
 pub fn to_bound_ShortInterval_Date_u128(value: &ShortInterval) -> u128 {
     // express value in days
-    (value.milliseconds / 1000 / 86400) as u128
+    (value.microseconds / 1_000_000_i64 / 86400) as u128
 }
 
 #[doc(hidden)]
@@ -94,7 +145,7 @@ pub fn to_bound_ShortInterval_Date_u128(value: &ShortInterval) -> u128 {
 /// values to be expressed using unsigned types.
 pub fn to_bound_ShortInterval_Date_u64(value: &ShortInterval) -> u64 {
     // express value in days
-    (value.milliseconds / 1000 / 86400) as u64
+    (value.microseconds / 1_000_000_i64 / 86400) as u64
 }
 
 #[doc(hidden)]
@@ -102,7 +153,7 @@ pub fn to_bound_ShortInterval_Date_u64(value: &ShortInterval) -> u64 {
 /// values to be expressed using unsigned types.
 pub fn to_bound_ShortInterval_Timestamp_u128(value: &ShortInterval) -> u128 {
     // express value in milliseconds
-    value.milliseconds as u128
+    value.microseconds as u128
 }
 
 #[doc(hidden)]
@@ -110,7 +161,7 @@ pub fn to_bound_ShortInterval_Timestamp_u128(value: &ShortInterval) -> u128 {
 /// values to be expressed using unsigned types.
 pub fn to_bound_ShortInterval_Timestamp_u64(value: &ShortInterval) -> u64 {
     // express value in milliseconds
-    value.milliseconds as u64
+    value.microseconds as u64
 }
 
 #[doc(hidden)]
@@ -118,7 +169,7 @@ pub fn to_bound_ShortInterval_Timestamp_u64(value: &ShortInterval) -> u64 {
 /// values to be expressed using unsigned types.
 pub fn to_bound_ShortInterval_Time_u128(value: &ShortInterval) -> u128 {
     // express value in nanoseconds
-    (value.milliseconds * 1_000_000) as u128
+    (value.microseconds * 1_000) as u128
 }
 
 #[doc(hidden)]
@@ -126,7 +177,7 @@ pub fn to_bound_ShortInterval_Time_u128(value: &ShortInterval) -> u128 {
 /// values to be expressed using unsigned types.
 pub fn to_bound_ShortInterval_Time_u64(value: &ShortInterval) -> u64 {
     // express value in nanoseconds
-    (value.milliseconds * 1_000_000) as u64
+    (value.microseconds * 1_000) as u64
 }
 
 /// Multiply a `ShortInterval` by a numeric value, producing a `ShortInterval`.
@@ -136,7 +187,7 @@ impl Mul<i64> for ShortInterval {
     /// Multiply a short interval by an long integer
     fn mul(self, rhs: i64) -> Self {
         Self {
-            milliseconds: self.milliseconds * rhs,
+            microseconds: self.microseconds * rhs,
         }
     }
 }
@@ -147,20 +198,29 @@ impl Mul<F64> for ShortInterval {
 
     fn mul(self, rhs: F64) -> Self {
         Self {
-            milliseconds: (F64::from(self.milliseconds as f64) * rhs).into_inner() as i64,
+            microseconds: (F64::from(self.microseconds as f64) * rhs).into_inner() as i64,
         }
     }
 }
 
 /// Multiply a `ShortInterval` by a numeric value, producing a `ShortInterval`.
-impl Mul<SqlDecimal> for ShortInterval {
+impl<const P: usize, const S: usize> Mul<SqlDecimal<P, S>> for ShortInterval {
     type Output = Self;
 
-    fn mul(self, rhs: SqlDecimal) -> Self {
+    fn mul(self, rhs: SqlDecimal<P, S>) -> Self {
+        let us = SqlDecimal::<38, 0>::try_from(self.microseconds).unwrap_or_else(|_| {
+            panic!(
+                "overflow in short interval multiplication while converting {} to DECIMAL",
+                self
+            )
+        });
+        let mul = us
+            .checked_mul_generic::<P, S, 38, 0>(rhs)
+            .unwrap_or_else(|| panic!("overflow in INTERVAL multiplication {} * {}", self, rhs));
         Self {
-            milliseconds: (SqlDecimal::from(self.milliseconds) * rhs)
-                .try_into()
-                .expect("overflow in short interval multiplication"),
+            microseconds: mul.try_into().unwrap_or_else(|_| {
+                panic!("overflow in INTERVAL multiplication {} * {}", self, rhs)
+            }),
         }
     }
 }
@@ -171,7 +231,31 @@ impl Div<i64> for ShortInterval {
 
     fn div(self, rhs: i64) -> Self {
         Self {
-            milliseconds: self.milliseconds / rhs,
+            microseconds: self.microseconds / rhs,
+        }
+    }
+}
+
+impl fmt::Display for ShortInterval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (sign, interval) = self.into_sign_and_magnitude();
+        let days = extract_day_ShortInterval(interval);
+        let hours = extract_hour_ShortInterval(interval);
+        let minutes = extract_minute_ShortInterval(interval);
+        let seconds = extract_second_ShortInterval(interval);
+        let micro = interval.microseconds % 1_000_000;
+        if micro == 0 {
+            write!(
+                f,
+                "{sign}{} {:02}:{:02}:{:02}",
+                days, hours, minutes, seconds
+            )
+        } else {
+            write!(
+                f,
+                "{sign}{} {:02}:{:02}:{:02}.{:06}",
+                days, hours, minutes, seconds, micro
+            )
         }
     }
 }
@@ -179,23 +263,37 @@ impl Div<i64> for ShortInterval {
 /// Divide a `ShortInterval` by a numeric value, producing a `ShortInterval`.
 impl Div<F64> for ShortInterval {
     type Output = Self;
-
     fn div(self, rhs: F64) -> Self {
-        Self {
-            milliseconds: (F64::from(self.milliseconds as f64) / rhs).into_inner() as i64,
+        let result = div_null_ShortInterval_d(self, rhs);
+        match result {
+            None => panic!(
+                "overflow while dividing INTERVAL {} / {}",
+                self,
+                rhs.into_inner()
+            ),
+            Some(interval) => interval,
         }
     }
 }
 
 /// Divide a `ShortInterval` by a numeric value, producing a `ShortInterval`.
-impl Div<SqlDecimal> for ShortInterval {
+impl<const P: usize, const S: usize> Div<SqlDecimal<P, S>> for ShortInterval {
     type Output = Self;
 
-    fn div(self, rhs: SqlDecimal) -> Self {
+    fn div(self, rhs: SqlDecimal<P, S>) -> Self {
+        let us = SqlDecimal::<38, 0>::try_from(self.microseconds).unwrap_or_else(|_| {
+            panic!(
+                "overflow in short interval division while converting {} to DECIMAL",
+                self
+            )
+        });
+        let div = us
+            .checked_div_generic::<P, S, 38, 0>(rhs)
+            .unwrap_or_else(|| panic!("overflow in INTERVAL division {} / {}", self, rhs));
         Self {
-            milliseconds: (SqlDecimal::from(self.milliseconds) / rhs)
+            microseconds: div
                 .try_into()
-                .expect("overflow in short interval division"),
+                .unwrap_or_else(|_| panic!("overflow in INTERVAL division {} / {}", self, rhs)),
         }
     }
 }
@@ -206,10 +304,10 @@ impl Add<ShortInterval> for ShortInterval {
 
     fn add(self, rhs: ShortInterval) -> Self {
         Self {
-            milliseconds: self
-                .milliseconds
-                .checked_add(rhs.milliseconds)
-                .expect("Overflow during ShortInterval addition"),
+            microseconds: self
+                .microseconds
+                .checked_add(rhs.microseconds)
+                .unwrap_or_else(|| panic!("overflow in INTERVAL addition {} + {}", self, rhs)),
         }
     }
 }
@@ -220,10 +318,10 @@ impl Sub<ShortInterval> for ShortInterval {
 
     fn sub(self, rhs: ShortInterval) -> Self {
         Self {
-            milliseconds: self
-                .milliseconds
-                .checked_sub(rhs.milliseconds)
-                .expect("Overflow during ShortInterval subtraction"),
+            microseconds: self
+                .microseconds
+                .checked_sub(rhs.microseconds)
+                .unwrap_or_else(|| panic!("overflow in INTERVAL subtraction {} - {}", self, rhs)),
         }
     }
 }
@@ -234,24 +332,10 @@ impl Neg for ShortInterval {
 
     fn neg(self) -> Self {
         Self {
-            milliseconds: self
-                .milliseconds
+            microseconds: self
+                .microseconds
                 .checked_neg()
-                .expect("Overflow during ShortInterval negation"),
-        }
-    }
-}
-
-/// Create a `ShortInterval` from a numeric value that is interpreted as
-/// a number of milliseconds.
-impl<T> From<T> for ShortInterval
-where
-    i64: From<T>,
-    T: PrimInt,
-{
-    fn from(value: T) -> Self {
-        Self {
-            milliseconds: i64::from(value),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL negation -{}", self)),
         }
     }
 }
@@ -275,7 +359,7 @@ impl SerializeWithContext<SqlSerdeConfig> for ShortInterval {
 
 /// Deserialize a `ShortInterval` with context.  See
 /// [`DeserializeWithContext`].
-impl<'de> DeserializeWithContext<'de, SqlSerdeConfig> for ShortInterval {
+impl<'de> DeserializeWithContext<'de, SqlSerdeConfig, ()> for ShortInterval {
     fn deserialize_with_context<D>(
         _deserializer: D,
         _context: &'de SqlSerdeConfig,
@@ -297,18 +381,60 @@ some_operator!(gte, ShortInterval, ShortInterval, bool);
 some_operator!(lte, ShortInterval, ShortInterval, bool);
 
 #[doc(hidden)]
-pub fn div_ShortInterval_SqlDecimal(left: ShortInterval, right: SqlDecimal) -> ShortInterval {
+pub fn div_ShortInterval_SqlDecimal<const P: usize, const S: usize>(
+    left: ShortInterval,
+    right: SqlDecimal<P, S>,
+) -> ShortInterval {
     left / right
 }
 
 some_polymorphic_function2!(
-    div,
+    div <const P: usize, const S: usize>,
     ShortInterval,
     ShortInterval,
     SqlDecimal,
-    SqlDecimal,
+    SqlDecimal<P, S>,
     ShortInterval
 );
+
+#[doc(hidden)]
+pub fn div_null_ShortInterval_SqlDecimal<const P: usize, const S: usize>(
+    left: ShortInterval,
+    right: SqlDecimal<P, S>,
+) -> Option<ShortInterval> {
+    let us = SqlDecimal::<38, 0>::try_from(left.microseconds()).ok()?;
+    let div = us.checked_div_generic::<P, S, 38, 0>(right)?;
+    let micros: i64 = div.try_into().ok()?;
+    Some(ShortInterval::from_microseconds(micros))
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_SqlDecimal<const P: usize, const S: usize>(
+    left: Option<ShortInterval>,
+    right: SqlDecimal<P, S>,
+) -> Option<ShortInterval> {
+    let left = left?;
+    div_null_ShortInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortInterval_SqlDecimalN<const P: usize, const S: usize>(
+    left: ShortInterval,
+    right: Option<SqlDecimal<P, S>>,
+) -> Option<ShortInterval> {
+    let right = right?;
+    div_null_ShortInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_SqlDecimalN<const P: usize, const S: usize>(
+    left: Option<ShortInterval>,
+    right: Option<SqlDecimal<P, S>>,
+) -> Option<ShortInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_ShortInterval_SqlDecimal(left, right)
+}
 
 #[doc(hidden)]
 pub fn times_ShortInterval_i64(left: ShortInterval, right: i64) -> ShortInterval {
@@ -325,16 +451,19 @@ pub fn times_ShortInterval_d(left: ShortInterval, right: F64) -> ShortInterval {
 some_polymorphic_function2!(times, ShortInterval, ShortInterval, d, F64, ShortInterval);
 
 #[doc(hidden)]
-pub fn times_ShortInterval_SqlDecimal(left: ShortInterval, right: SqlDecimal) -> ShortInterval {
+pub fn times_ShortInterval_SqlDecimal<const P: usize, const S: usize>(
+    left: ShortInterval,
+    right: SqlDecimal<P, S>,
+) -> ShortInterval {
     left * right
 }
 
 some_polymorphic_function2!(
-    times,
+    times <const P: usize, const S: usize>,
     ShortInterval,
     ShortInterval,
     SqlDecimal,
-    SqlDecimal,
+    SqlDecimal<P, S>,
     ShortInterval
 );
 
@@ -346,6 +475,38 @@ pub fn div_ShortInterval_d(left: ShortInterval, right: F64) -> ShortInterval {
 some_polymorphic_function2!(div, ShortInterval, ShortInterval, d, F64, ShortInterval);
 
 #[doc(hidden)]
+pub fn div_null_ShortInterval_d(left: ShortInterval, right: F64) -> Option<ShortInterval> {
+    let div = (left.microseconds() as f64) / right.into_inner();
+    let fin: f64 = finite_or_null(div)?;
+    if fin < i64::MIN as f64 || fin > i64::MAX as f64 {
+        return None;
+    }
+    Some(ShortInterval::from_microseconds(fin as i64))
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_d(left: Option<ShortInterval>, right: F64) -> Option<ShortInterval> {
+    let left = left?;
+    div_null_ShortInterval_d(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortInterval_dN(left: ShortInterval, right: Option<F64>) -> Option<ShortInterval> {
+    let right = right?;
+    div_null_ShortInterval_d(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_dN(
+    left: Option<ShortInterval>,
+    right: Option<F64>,
+) -> Option<ShortInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_ShortInterval_d(left, right)
+}
+
+#[doc(hidden)]
 pub fn div_ShortInterval_i64(left: ShortInterval, right: i64) -> ShortInterval {
     left / right
 }
@@ -353,36 +514,65 @@ pub fn div_ShortInterval_i64(left: ShortInterval, right: i64) -> ShortInterval {
 some_polymorphic_function2!(div, ShortInterval, ShortInterval, i64, i64, ShortInterval);
 
 #[doc(hidden)]
-pub fn plus_ShortInterval_ShortInterval_ShortInterval(
+pub fn div_null_ShortInterval_i64(left: ShortInterval, right: i64) -> Option<ShortInterval> {
+    left.microseconds()
+        .checked_div(right)
+        .map(ShortInterval::from_microseconds)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_i64(
+    left: Option<ShortInterval>,
+    right: i64,
+) -> Option<ShortInterval> {
+    let left = left?;
+    div_null_ShortInterval_i64(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortInterval_i64N(
+    left: ShortInterval,
+    right: Option<i64>,
+) -> Option<ShortInterval> {
+    let right = right?;
+    div_null_ShortInterval_i64(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_ShortIntervalN_i64N(
+    left: Option<ShortInterval>,
+    right: Option<i64>,
+) -> Option<ShortInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_ShortInterval_i64(left, right)
+}
+
+#[doc(hidden)]
+pub fn plus_ShortInterval_ShortInterval_ShortInterval__(
     left: ShortInterval,
     right: ShortInterval,
 ) -> ShortInterval {
     left + right
 }
 
-polymorphic_return_function2!(
-    plus,
-    ShortInterval,
-    ShortInterval,
-    ShortInterval,
+some_function2!(
+    plus_ShortInterval_ShortInterval_ShortInterval,
     ShortInterval,
     ShortInterval,
     ShortInterval
 );
 
 #[doc(hidden)]
-pub fn minus_ShortInterval_ShortInterval_ShortInterval(
+pub fn minus_ShortInterval_ShortInterval_ShortInterval__(
     left: ShortInterval,
     right: ShortInterval,
 ) -> ShortInterval {
     left - right
 }
 
-polymorphic_return_function2!(
-    minus,
-    ShortInterval,
-    ShortInterval,
-    ShortInterval,
+some_function2!(
+    minus_ShortInterval_ShortInterval_ShortInterval,
     ShortInterval,
     ShortInterval,
     ShortInterval
@@ -412,6 +602,7 @@ polymorphic_return_function2!(
     rkyv::Deserialize,
     Serialize,
     Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Clone, Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -422,7 +613,7 @@ pub struct LongInterval {
 
 impl LongInterval {
     /// Create a new LongInterval from a number of months.
-    pub const fn new(months: i32) -> Self {
+    pub const fn from_months(months: i32) -> Self {
         Self { months }
     }
 
@@ -442,9 +633,26 @@ impl LongInterval {
     }
 }
 
+impl fmt::Display for LongInterval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let months = self.months();
+        let sign = sign(months < 0);
+        let years = months.unsigned_abs() / 12;
+        let months = months.unsigned_abs() % 12;
+        write!(f, "{sign}{years}-{months:02}")
+    }
+}
+
+#[doc(hidden)]
+pub fn reinterpret_LongInterval(value: LongInterval) -> i64 {
+    value.months() as i64
+}
+
+some_polymorphic_function1!(reinterpret, LongInterval, LongInterval, i64);
+
 #[doc(hidden)]
 pub fn abs_LongInterval(value: LongInterval) -> LongInterval {
-    LongInterval::new(num::abs(value.months))
+    LongInterval::from_months(num::abs(value.months))
 }
 
 some_polymorphic_function1!(abs, LongInterval, LongInterval, LongInterval);
@@ -472,14 +680,23 @@ impl Mul<F64> for LongInterval {
 }
 
 /// Multiply a `LongInterval` by a numeric value producing a `LongInterval`
-impl Mul<SqlDecimal> for LongInterval {
+impl<const P: usize, const S: usize> Mul<SqlDecimal<P, S>> for LongInterval {
     type Output = Self;
 
-    fn mul(self, rhs: SqlDecimal) -> Self {
+    fn mul(self, rhs: SqlDecimal<P, S>) -> Self {
+        let months = SqlDecimal::<10, 0>::try_from(self.months).unwrap_or_else(|_| {
+            panic!(
+                "overflow in long interval multiplication while converting {} to DECIMAL",
+                self
+            )
+        });
+        let mul = months
+            .checked_mul_generic::<P, S, 10, 0>(rhs)
+            .unwrap_or_else(|| panic!("overflow in INTERVAL multiplication {} * {}", self, rhs));
         Self {
-            months: (SqlDecimal::from(self.months) * rhs)
-                .try_into()
-                .expect("overflow in long interval multiplication"),
+            months: mul.try_into().unwrap_or_else(|_| {
+                panic!("overflow in INTERVAL multiplication {} * {}", self, rhs)
+            }),
         }
     }
 }
@@ -500,35 +717,36 @@ impl Div<F64> for LongInterval {
     type Output = Self;
 
     fn div(self, rhs: F64) -> Self {
-        Self {
-            months: (F64::from(self.months as f64) / rhs).into_inner() as i32,
+        let result = div_null_LongInterval_d(self, rhs);
+        match result {
+            None => panic!(
+                "overflow while dividing INTERVAL {} / {}",
+                self,
+                rhs.into_inner()
+            ),
+            Some(interval) => interval,
         }
     }
 }
 
 /// Divide a `LongInterval` by a numeric value producing a `LongInterval`
-impl Div<SqlDecimal> for LongInterval {
+impl<const P: usize, const S: usize> Div<SqlDecimal<P, S>> for LongInterval {
     type Output = Self;
 
-    fn div(self, rhs: SqlDecimal) -> Self {
+    fn div(self, rhs: SqlDecimal<P, S>) -> Self {
+        let months = SqlDecimal::<10, 0>::try_from(self.months).unwrap_or_else(|_| {
+            panic!(
+                "overflow in short interval division while converting {} to DECIMAL",
+                self
+            )
+        });
+        let div = months
+            .checked_div_generic::<P, S, 10, 0>(rhs)
+            .unwrap_or_else(|| panic!("overflow in INTERVAL division {} / {}", self, rhs));
         Self {
-            months: (SqlDecimal::from(self.months) / rhs)
+            months: div
                 .try_into()
-                .expect("overflow in long interval division"),
-        }
-    }
-}
-
-impl<T> From<T> for LongInterval
-where
-    i32: From<T>,
-    T: PrimInt,
-{
-    /// Convert a integer expressing a number of months into a
-    /// [LongInterval]
-    fn from(value: T) -> Self {
-        Self {
-            months: i32::from(value),
+                .unwrap_or_else(|_| panic!("overflow in INTERVAL division {} / {}", self, rhs)),
         }
     }
 }
@@ -553,7 +771,7 @@ impl SerializeWithContext<SqlSerdeConfig> for LongInterval {
     }
 }
 
-impl<'de> DeserializeWithContext<'de, SqlSerdeConfig> for LongInterval {
+impl<'de, AUX> DeserializeWithContext<'de, SqlSerdeConfig, AUX> for LongInterval {
     fn deserialize_with_context<D>(
         _deserializer: D,
         _context: &'de SqlSerdeConfig,
@@ -576,7 +794,7 @@ impl Add<LongInterval> for LongInterval {
             months: self
                 .months
                 .checked_add(rhs.months)
-                .expect("Overflow during LongInterval addition"),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL addition {} + {}", self, rhs)),
         }
     }
 }
@@ -590,7 +808,7 @@ impl Sub<LongInterval> for LongInterval {
             months: self
                 .months
                 .checked_sub(rhs.months)
-                .expect("Overflow during LongInterval subtraction"),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL subtraction {} - {}", self, rhs)),
         }
     }
 }
@@ -604,19 +822,11 @@ impl Neg for LongInterval {
             months: self
                 .months
                 .checked_neg()
-                .expect("Overflow during LongInterval negation"),
+                .unwrap_or_else(|| panic!("overflow in INTERVAL negation -{}", self)),
         }
     }
 }
 
-/*
-some_operator!(lt, LongInterval, &LongInterval, bool);
-some_operator!(gt, LongInterval, &LongInterval, bool);
-some_operator!(eq, LongInterval, &LongInterval, bool);
-some_operator!(neq, LongInterval, &LongInterval, bool);
-some_operator!(gte, LongInterval, &LongInterval, bool);
-some_operator!(lte, LongInterval, &LongInterval, bool);
-*/
 some_operator!(lt, LongInterval, LongInterval, bool);
 some_operator!(gt, LongInterval, LongInterval, bool);
 some_operator!(eq, LongInterval, LongInterval, bool);
@@ -639,16 +849,19 @@ pub fn times_LongInterval_d(left: LongInterval, right: F64) -> LongInterval {
 some_polymorphic_function2!(times, LongInterval, LongInterval, d, F64, LongInterval);
 
 #[doc(hidden)]
-pub fn times_LongInterval_SqlDecimal(left: LongInterval, right: SqlDecimal) -> LongInterval {
+pub fn times_LongInterval_SqlDecimal<const P: usize, const S: usize>(
+    left: LongInterval,
+    right: SqlDecimal<P, S>,
+) -> LongInterval {
     left * right
 }
 
 some_polymorphic_function2!(
-    times,
+    times <const P: usize, const S: usize>,
     LongInterval,
     LongInterval,
     SqlDecimal,
-    SqlDecimal,
+    SqlDecimal<P, S>,
     LongInterval
 );
 
@@ -660,6 +873,35 @@ pub fn div_LongInterval_i32(left: LongInterval, right: i32) -> LongInterval {
 some_polymorphic_function2!(div, LongInterval, LongInterval, i32, i32, LongInterval);
 
 #[doc(hidden)]
+pub fn div_null_LongInterval_i32(left: LongInterval, right: i32) -> Option<LongInterval> {
+    left.months
+        .checked_div(right)
+        .map(LongInterval::from_months)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_i32(left: Option<LongInterval>, right: i32) -> Option<LongInterval> {
+    let left = left?;
+    div_null_LongInterval_i32(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongInterval_i32N(left: LongInterval, right: Option<i32>) -> Option<LongInterval> {
+    let right = right?;
+    div_null_LongInterval_i32(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_i32N(
+    left: Option<LongInterval>,
+    right: Option<i32>,
+) -> Option<LongInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_LongInterval_i32(left, right)
+}
+
+#[doc(hidden)]
 pub fn div_LongInterval_d(left: LongInterval, right: F64) -> LongInterval {
     left / right
 }
@@ -667,50 +909,118 @@ pub fn div_LongInterval_d(left: LongInterval, right: F64) -> LongInterval {
 some_polymorphic_function2!(div, LongInterval, LongInterval, d, F64, LongInterval);
 
 #[doc(hidden)]
-pub fn div_LongInterval_SqlDecimal(left: LongInterval, right: SqlDecimal) -> LongInterval {
+pub fn div_null_LongInterval_d(left: LongInterval, right: F64) -> Option<LongInterval> {
+    let div: f64 = (left.months() as f64) / right.into_inner();
+    let fin: f64 = finite_or_null(div)?;
+    if fin < i32::MIN as f64 || fin > i32::MAX as f64 {
+        return None;
+    }
+    Some(LongInterval::from_months(fin as i32))
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_d(left: Option<LongInterval>, right: F64) -> Option<LongInterval> {
+    let left = left?;
+    div_null_LongInterval_d(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongInterval_dN(left: LongInterval, right: Option<F64>) -> Option<LongInterval> {
+    let right = right?;
+    div_null_LongInterval_d(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_dN(
+    left: Option<LongInterval>,
+    right: Option<F64>,
+) -> Option<LongInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_LongInterval_d(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_LongInterval_SqlDecimal<const P: usize, const S: usize>(
+    left: LongInterval,
+    right: SqlDecimal<P, S>,
+) -> LongInterval {
     left / right
 }
 
 some_polymorphic_function2!(
-    div,
+    div <const P: usize, const S: usize>,
     LongInterval,
     LongInterval,
     SqlDecimal,
-    SqlDecimal,
+    SqlDecimal<P, S>,
     LongInterval
 );
 
 #[doc(hidden)]
-pub fn plus_LongInterval_LongInterval_LongInterval(
+pub fn div_null_LongInterval_SqlDecimal<const P: usize, const S: usize>(
+    left: LongInterval,
+    right: SqlDecimal<P, S>,
+) -> Option<LongInterval> {
+    let m = SqlDecimal::<38, 0>::try_from(left.months()).ok()?;
+    let div = m.checked_div_generic::<P, S, 38, 0>(right)?;
+    let months: i32 = div.try_into().ok()?;
+    Some(LongInterval::from_months(months))
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_SqlDecimal<const P: usize, const S: usize>(
+    left: Option<LongInterval>,
+    right: SqlDecimal<P, S>,
+) -> Option<LongInterval> {
+    let left = left?;
+    div_null_LongInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongInterval_SqlDecimalN<const P: usize, const S: usize>(
+    left: LongInterval,
+    right: Option<SqlDecimal<P, S>>,
+) -> Option<LongInterval> {
+    let right = right?;
+    div_null_LongInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
+pub fn div_null_LongIntervalN_SqlDecimalN<const P: usize, const S: usize>(
+    left: Option<LongInterval>,
+    right: Option<SqlDecimal<P, S>>,
+) -> Option<LongInterval> {
+    let left = left?;
+    let right = right?;
+    div_null_LongInterval_SqlDecimal(left, right)
+}
+
+#[doc(hidden)]
+pub fn plus_LongInterval_LongInterval_LongInterval__(
     left: LongInterval,
     right: LongInterval,
 ) -> LongInterval {
     left + right
 }
 
-polymorphic_return_function2!(
-    plus,
-    LongInterval,
-    LongInterval,
-    LongInterval,
+some_function2!(
+    plus_LongInterval_LongInterval_LongInterval,
     LongInterval,
     LongInterval,
     LongInterval
 );
 
 #[doc(hidden)]
-pub fn minus_LongInterval_LongInterval_LongInterval(
+pub fn minus_LongInterval_LongInterval_LongInterval__(
     left: LongInterval,
     right: LongInterval,
 ) -> LongInterval {
     left - right
 }
 
-polymorphic_return_function2!(
-    minus,
-    LongInterval,
-    LongInterval,
-    LongInterval,
+some_function2!(
+    minus_LongInterval_LongInterval_LongInterval,
     LongInterval,
     LongInterval,
     LongInterval
@@ -728,8 +1038,8 @@ pub fn extract_month_LongInterval(value: LongInterval) -> i64 {
 
 #[doc(hidden)]
 pub fn extract_quarter_LongInterval(value: LongInterval) -> i64 {
-    let dt = Date::from(0);
-    let dt = plus_Date_LongInterval_Date(dt, value);
+    let dt = Date::from_days(0);
+    let dt = plus_Date_Date_LongInterval__(dt, value);
     extract_quarter_Date(dt)
 }
 
@@ -758,8 +1068,8 @@ pub fn extract_day_LongInterval(_value: LongInterval) -> i64 {
 
 #[doc(hidden)]
 pub fn extract_epoch_LongInterval(value: LongInterval) -> i64 {
-    let dt = Date::from(0);
-    let dt = plus_Date_LongInterval_Date(dt, value);
+    let dt = Date::from_days(0);
+    let dt = plus_Date_Date_LongInterval__(dt, value);
     // I think this is right and Postgres is wrong
     extract_epoch_Date(dt)
 }
@@ -792,38 +1102,48 @@ pub fn extract_hour_LongInterval(_value: LongInterval) -> i64 {
 ///////////
 
 #[doc(hidden)]
+pub fn short_interval_to_integer(value: ShortInterval) -> i64 {
+    value.microseconds
+}
+
+#[doc(hidden)]
+pub fn integer_to_short_interval(value: i64) -> ShortInterval {
+    ShortInterval::from_microseconds(value)
+}
+
+#[doc(hidden)]
 pub fn extract_day_ShortInterval(value: ShortInterval) -> i64 {
-    value.milliseconds() / 86_400_000
+    value.microseconds() / 86_400_000_000_i64
 }
 
 #[doc(hidden)]
 pub fn extract_epoch_ShortInterval(value: ShortInterval) -> i64 {
-    value.milliseconds() / 1000
+    value.microseconds() / 1_000_000
 }
 
 #[doc(hidden)]
 pub fn extract_millisecond_ShortInterval(value: ShortInterval) -> i64 {
-    value.milliseconds() % 60_000
+    (value.microseconds() % 60_000_000_i64) / 1000
 }
 
 #[doc(hidden)]
 pub fn extract_microsecond_ShortInterval(value: ShortInterval) -> i64 {
-    extract_millisecond_ShortInterval(value) * 1000
+    value.microseconds() % 60_000_000_i64
 }
 
 #[doc(hidden)]
 pub fn extract_second_ShortInterval(value: ShortInterval) -> i64 {
-    (value.milliseconds() / 1000) % 60
+    (value.microseconds() / 1_000_000) % 60
 }
 
 #[doc(hidden)]
 pub fn extract_minute_ShortInterval(value: ShortInterval) -> i64 {
-    (value.milliseconds() / 60000) % 60
+    (value.microseconds() / 60_000_000_i64) % 60
 }
 
 #[doc(hidden)]
 pub fn extract_hour_ShortInterval(value: ShortInterval) -> i64 {
-    (value.milliseconds() / (60 * 60 * 1000)) % 24
+    (value.microseconds() / (60 * 60 * 1000 * 1000i64)) % 24
 }
 
 some_polymorphic_function1!(extract_year, LongInterval, LongInterval, i64);

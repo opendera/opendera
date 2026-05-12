@@ -1,6 +1,7 @@
 package org.dbsp.sqlCompiler.compiler.backend.rust;
 
 import org.dbsp.sqlCompiler.ir.IDBSPNode;
+import org.dbsp.sqlCompiler.ir.expression.DBSPLazyExpression;
 import org.dbsp.util.IIndentStream;
 
 import javax.annotation.Nullable;
@@ -12,6 +13,8 @@ import java.util.Objects;
 public abstract class BaseRustCodeGenerator implements ICodeGenerator {
     static int crdId = 0;
     final int id;
+    /** List of nodes containing test code */
+    protected final List<IDBSPNode> testNodes;
     /** List of nodes to generate code for */
     protected final List<IDBSPNode> toWrite;
     /** List of crate names that are dependencies for this one */
@@ -22,15 +25,22 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
     boolean generateUdfInclude = true;
     boolean generateMalloc = true;
     boolean generateTuples = true;
+    boolean declareSourceMap = false;
 
     protected BaseRustCodeGenerator() {
         this.id = crdId++;
         this.toWrite = new ArrayList<>();
+        this.testNodes = new ArrayList<>();
         this.dependencies = new ArrayList<>();
     }
 
     public BaseRustCodeGenerator withGenerateTuples(boolean generate) {
         this.generateTuples = generate;
+        return this;
+    }
+
+    public BaseRustCodeGenerator withDeclareSourceMap(boolean declare) {
+        this.declareSourceMap = declare;
         return this;
     }
 
@@ -45,7 +55,7 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
     }
 
     protected String dbspCircuit(boolean topLevel) {
-        return topLevel ? "RootCircuit" : "ChildCircuit<RootCircuit>";
+        return topLevel ? "RootCircuit" : "NestedCircuit";
     }
 
     @Override
@@ -61,6 +71,9 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
     public void add(IDBSPNode node) {
         this.toWrite.add(node);
     }
+
+    @Override
+    public void addTest(IDBSPNode node) { this.testNodes.add(node); }
 
     @Override
     public void addDependency(String crate) {
@@ -95,9 +108,11 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
                      UnimplementedSemigroup, DefaultSemigroup, HasOne, HasZero, AddByRef, NegByRef,
                      AddAssignByRef,
                 },
-                circuit::{checkpointer::Checkpoint, ChildCircuit, Circuit, CircuitConfig, RootCircuit, Stream},
+                circuit::{checkpointer::Checkpoint, Circuit, CircuitConfig, NestedCircuit, RootCircuit, Stream, StepSize},
                 operator::{
-                    dynamic::aggregate::{Max, Min, MinSome1, Postprocess},
+                    apply_n,
+                    dynamic::aggregate::{ArgMinSome, Max, Min, MinSome1, Postprocess},
+                    ConstantGenerator,
                     Generator,
                     Fold,
                     group::WithCustomOrd,
@@ -106,21 +121,24 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
                     MinSemigroup,
                     CmpFunc,
                 },
+                define_inner_star_join, define_inner_star_join_index, define_inner_star_join_flatmap,
                 OrdIndexedZSet, OrdZSet,
                 TypedBox,
                 utils::*,
                 zset,
                 indexed_zset,
                 DBWeight,
+                ZWeight,
                 DBData,
                 DBSPHandle,
                 Error,
                 Runtime,
                 NumEntries,
-                MapHandle, ZSetHandle, OutputHandle,
+                MapHandle, SetHandle, ZSetHandle, OutputHandle,
                 dynamic::{DynData,DynDataTyped},
+                typed_batch::SpineSnapshot,
             };
-            use dbsp_adapters::Catalog;
+            use dbsp_adapters::{Catalog, CircuitCatalog};
             use feldera_types::{
                 program_schema::SqlIdentifier,
                 deserialize_table_record, serialize_table_record,
@@ -128,15 +146,18 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
             use size_of::*;
             use ::serde::{Deserialize,Serialize};
             use std::{
-                cell::LazyCell,
                 collections::BTreeMap,
                 convert::identity,
                 ops::Neg,
                 fmt::{Debug, Formatter, Result as FmtResult},
                 path::Path,
                 marker::PhantomData,
-                sync::{Arc, LazyLock},
+                sync::Arc,
             };
             use core::cmp::Ordering;
-            use feldera_sqllib::*;""";
+            use feldera_sqllib::*;
+            use std::sync::OnceLock;
+            use arcstr::ArcStr;
+            """ +
+            "use " + DBSPLazyExpression.RUST_CRATE + ";\n";
 }

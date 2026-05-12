@@ -2,6 +2,7 @@ use dyn_clone::clone_box;
 
 use super::{DiffGroupTransformer, Monotonicity, NonIncrementalGroupTransformer};
 use crate::{
+    Circuit, DBData, DBWeight, DynZWeight, RootCircuit, Stream, ZWeight,
     algebra::{
         AddAssignByRef, HasOne, HasZero, IndexedZSet, OrdIndexedZSet, OrdIndexedZSetFactories,
         ZCursor, ZRingValue,
@@ -9,7 +10,6 @@ use crate::{
     dynamic::{DataTrait, DynData, DynUnit, Erase, Factory, WeightTrait},
     operator::dynamic::MonoIndexedZSet,
     trace::{BatchReaderFactories, OrdIndexedWSetFactories},
-    DBData, DBWeight, DynZWeight, RootCircuit, Stream, ZWeight,
 };
 use std::{marker::PhantomData, ops::Neg};
 
@@ -217,36 +217,38 @@ where
     where
         V2: DataTrait + ?Sized,
     {
-        self.dyn_map_index(
-            &factories.inner_factories,
-            Box::new(move |(k, v), kv| {
-                let (out_k, out_v) = kv.split_mut();
-                k.clone_to(out_k);
-                encode(v, out_v);
-            }),
-        )
-        .set_persistent_id(
-            persistent_id
-                .map(|name| format!("{name}-ordered"))
-                .as_deref(),
-        )
-        .dyn_group_transform(
-            persistent_id,
-            &factories.inner_factories,
-            &factories.inner_factories,
-            Box::new(DiffGroupTransformer::new(
-                factories.inner_factories.val_factory(),
-                TopK::asc(factories.inner_factories.val_factory(), k),
-            )),
-        )
-        .dyn_map_index(
-            &factories.input_factories,
-            Box::new(move |(k, v), kv| {
-                let (out_k, out_v) = kv.split_mut();
-                k.clone_to(out_k);
-                decode(v).clone_to(out_v);
-            }),
-        )
+        self.circuit().region(&format!("topk_{k}"), || {
+            self.dyn_map_index(
+                &factories.inner_factories,
+                Box::new(move |(k, v), kv| {
+                    let (out_k, out_v) = kv.split_mut();
+                    k.clone_to(out_k);
+                    encode(v, out_v);
+                }),
+            )
+            .set_persistent_id(
+                persistent_id
+                    .map(|name| format!("{name}-ordered"))
+                    .as_deref(),
+            )
+            .dyn_group_transform(
+                persistent_id,
+                &factories.inner_factories,
+                &factories.inner_factories,
+                Box::new(DiffGroupTransformer::new(
+                    factories.inner_factories.val_factory(),
+                    TopK::asc(factories.inner_factories.val_factory(), k),
+                )),
+            )
+            .dyn_map_index(
+                &factories.input_factories,
+                Box::new(move |(k, v), kv| {
+                    let (out_k, out_v) = kv.split_mut();
+                    k.clone_to(out_k);
+                    decode(v).clone_to(out_v);
+                }),
+            )
+        })
     }
 
     /// See [`Stream::topk_rank_custom_order`].
@@ -263,33 +265,35 @@ where
         V2: DataTrait + ?Sized,
         OV: DataTrait + ?Sized,
     {
-        self.dyn_map_index(
-            &factories.inner_factories,
-            Box::new(move |(k, v), kv| {
-                let (out_k, out_v) = kv.split_mut();
-                k.clone_to(out_k);
-                encode(v, out_v);
-            }),
-        )
-        .set_persistent_id(
-            persistent_id
-                .map(|name| format!("{name}-ordered"))
-                .as_deref(),
-        )
-        .dyn_group_transform(
-            persistent_id,
-            &factories.inner_factories,
-            &factories.output_factories,
-            Box::new(DiffGroupTransformer::new(
-                factories.output_factories.val_factory(),
-                TopKRank::sparse(
+        self.circuit().region(&format!("topk_rank_{k}"), || {
+            self.dyn_map_index(
+                &factories.inner_factories,
+                Box::new(move |(k, v), kv| {
+                    let (out_k, out_v) = kv.split_mut();
+                    k.clone_to(out_k);
+                    encode(v, out_v);
+                }),
+            )
+            .set_persistent_id(
+                persistent_id
+                    .map(|name| format!("{name}-ordered"))
+                    .as_deref(),
+            )
+            .dyn_group_transform(
+                persistent_id,
+                &factories.inner_factories,
+                &factories.output_factories,
+                Box::new(DiffGroupTransformer::new(
                     factories.output_factories.val_factory(),
-                    k,
-                    rank_eq_func,
-                    output_func,
-                ),
-            )),
-        )
+                    TopKRank::sparse(
+                        factories.output_factories.val_factory(),
+                        k,
+                        rank_eq_func,
+                        output_func,
+                    ),
+                )),
+            )
+        })
     }
 
     /// See [`Stream::topk_dense_rank_custom_order`].
@@ -306,33 +310,35 @@ where
         V2: DataTrait + ?Sized,
         OV: DataTrait + ?Sized,
     {
-        self.dyn_map_index(
-            &factories.inner_factories,
-            Box::new(move |(k, v), kv| {
-                let (out_k, out_v) = kv.split_mut();
-                k.clone_to(out_k);
-                encode(v, out_v);
-            }),
-        )
-        .set_persistent_id(
-            persistent_id
-                .map(|name| format!("{name}-ordered"))
-                .as_deref(),
-        )
-        .dyn_group_transform(
-            persistent_id,
-            &factories.inner_factories,
-            &factories.output_factories,
-            Box::new(DiffGroupTransformer::new(
-                factories.output_factories.val_factory(),
-                TopKRank::dense(
+        self.circuit().region(&format!("topk_dense_rank_{k}"), || {
+            self.dyn_map_index(
+                &factories.inner_factories,
+                Box::new(move |(k, v), kv| {
+                    let (out_k, out_v) = kv.split_mut();
+                    k.clone_to(out_k);
+                    encode(v, out_v);
+                }),
+            )
+            .set_persistent_id(
+                persistent_id
+                    .map(|name| format!("{name}-ordered"))
+                    .as_deref(),
+            )
+            .dyn_group_transform(
+                persistent_id,
+                &factories.inner_factories,
+                &factories.output_factories,
+                Box::new(DiffGroupTransformer::new(
                     factories.output_factories.val_factory(),
-                    k,
-                    rank_eq_func,
-                    output_func,
-                ),
-            )),
-        )
+                    TopKRank::dense(
+                        factories.output_factories.val_factory(),
+                        k,
+                        rank_eq_func,
+                        output_func,
+                    ),
+                )),
+            )
+        })
     }
 
     /// See [`Stream::topk_row_number_custom_order`].
@@ -348,28 +354,30 @@ where
         V2: DataTrait + ?Sized,
         OV: DataTrait + ?Sized,
     {
-        self.dyn_map_index(
-            &factories.inner_factories,
-            Box::new(move |(k, v), kv| {
-                let (out_k, out_v) = kv.split_mut();
-                k.clone_to(out_k);
-                encode(v, out_v);
-            }),
-        )
-        .set_persistent_id(
-            persistent_id
-                .map(|name| format!("{name}-ordered"))
-                .as_deref(),
-        )
-        .dyn_group_transform(
-            persistent_id,
-            &factories.inner_factories,
-            &factories.output_factories,
-            Box::new(DiffGroupTransformer::new(
-                factories.output_factories.val_factory(),
-                TopKRowNumber::new(factories.output_factories.val_factory(), k, output_func),
-            )),
-        )
+        self.circuit().region(&format!("topk_row_number_{k}"), || {
+            self.dyn_map_index(
+                &factories.inner_factories,
+                Box::new(move |(k, v), kv| {
+                    let (out_k, out_v) = kv.split_mut();
+                    k.clone_to(out_k);
+                    encode(v, out_v);
+                }),
+            )
+            .set_persistent_id(
+                persistent_id
+                    .map(|name| format!("{name}-ordered"))
+                    .as_deref(),
+            )
+            .dyn_group_transform(
+                persistent_id,
+                &factories.inner_factories,
+                &factories.output_factories,
+                Box::new(DiffGroupTransformer::new(
+                    factories.output_factories.val_factory(),
+                    TopKRowNumber::new(factories.output_factories.val_factory(), k, output_func),
+                )),
+            )
+        })
     }
 }
 
@@ -433,11 +441,10 @@ where
         if ASCENDING {
             while cursor.key_valid() && count < self.k {
                 let mut w = **cursor.weight();
-                if !w.is_zero() {
-                    cursor.key().clone_to(&mut key);
-                    output_cb(&mut key, w.erase_mut());
-                    count += 1;
-                }
+                debug_assert!(w != 0);
+                cursor.key().clone_to(&mut key);
+                output_cb(&mut key, w.erase_mut());
+                count += 1;
                 cursor.step_key();
             }
         } else {
@@ -445,11 +452,11 @@ where
 
             while cursor.key_valid() && count < self.k {
                 let mut w = **cursor.weight();
-                if !w.is_zero() {
-                    cursor.key().clone_to(&mut key);
-                    output_cb(&mut key, w.erase_mut());
-                    count += 1;
-                }
+                debug_assert!(w != 0);
+
+                cursor.key().clone_to(&mut key);
+                output_cb(&mut key, w.erase_mut());
+                count += 1;
                 cursor.step_key_reverse();
             }
         }
@@ -529,22 +536,24 @@ where
         let mut prev_key: Option<Box<I>> = None;
         while cursor.key_valid() {
             let mut w = **cursor.weight();
+            debug_assert!(w != 0);
+
             if w > 0 {
                 count += w;
                 let key = cursor.key();
-                if let Some(prev_key) = &prev_key {
-                    if !(self.rank_eq_func)(key, prev_key.as_ref()) {
-                        // Rank stays the same while iterating over equal-ranked elements,
-                        // and then increases by one when computing dense ranking or skips
-                        // to `count` otherwise.
-                        if self.dense {
-                            rank += 1;
-                        } else {
-                            rank = count;
-                        }
-                        if rank as usize > self.k {
-                            break;
-                        }
+                if let Some(prev_key) = &prev_key
+                    && !(self.rank_eq_func)(key, prev_key.as_ref())
+                {
+                    // Rank stays the same while iterating over equal-ranked elements,
+                    // and then increases by one when computing dense ranking or skips
+                    // to `count` otherwise.
+                    if self.dense {
+                        rank += 1;
+                    } else {
+                        rank = count;
+                    }
+                    if rank as usize > self.k {
+                        break;
                     }
                 };
 
@@ -605,6 +614,8 @@ where
 
         while cursor.key_valid() && count < self.k {
             let mut w = **cursor.weight();
+            debug_assert!(w != 0);
+
             while w.ge0() && !w.is_zero() {
                 count += 1;
                 if count > self.k {

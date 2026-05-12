@@ -46,19 +46,6 @@ public final class DBSPBinaryLiteral extends DBSPLiteral {
     @Nullable
     public final byte[] value;
 
-    @SuppressWarnings("unused")
-    public DBSPBinaryLiteral() {
-        this(null);
-    }
-
-    public DBSPBinaryLiteral(@Nullable byte[] value) {
-        this(CalciteObject.EMPTY, new DBSPTypeBinary(CalciteObject.EMPTY, value == null), value);
-    }
-
-    public DBSPBinaryLiteral(@Nullable byte[] value, boolean mayBeNull) {
-        this(CalciteObject.EMPTY, new DBSPTypeBinary(CalciteObject.EMPTY, mayBeNull), value);
-    }
-
     public DBSPBinaryLiteral(CalciteObject node, DBSPType type, @Nullable byte[] value) {
         super(node, type, value == null);
         Utilities.enforce(type.is(DBSPTypeBinary.class));
@@ -107,7 +94,7 @@ public final class DBSPBinaryLiteral extends DBSPLiteral {
                     .append(this.type)
                     .append(")null");
         else
-            return builder.append(Arrays.toString(Objects.requireNonNull(this.value)));
+            return builder.append(this.wrapSome(Arrays.toString(Objects.requireNonNull(this.value))));
     }
 
     @Override

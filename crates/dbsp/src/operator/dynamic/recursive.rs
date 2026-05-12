@@ -1,9 +1,13 @@
 //! Convenience API for defining recursive computations.
 
 use crate::{
+    Timestamp,
     algebra::IndexedZSet,
-    circuit::{schedule::Error as SchedulerError, ChildCircuit, Circuit, Stream, WithClock},
-    operator::{dynamic::distinct::DistinctFactories, DelayedFeedback},
+    circuit::{
+        ChildCircuit, Circuit, Stream, circuit_builder::IterativeCircuit,
+        schedule::Error as SchedulerError,
+    },
+    operator::{DelayedFeedback, dynamic::distinct::DistinctFactories},
     trace::Spine,
 };
 
@@ -94,7 +98,7 @@ where
 // TODO: `impl RecursiveStreams for Vec<Stream>`.
 
 #[allow(clippy::unused_unit)]
-#[impl_for_tuples(12)]
+#[impl_for_tuples(14)]
 #[tuple_types_custom_trait_bound(Clone + RecursiveStreams<C>)]
 impl<C> RecursiveStreams<C> for Tuple {
     for_tuples!( type Feedback = ( #( Tuple::Feedback ),* ); );
@@ -132,16 +136,17 @@ impl<C> RecursiveStreams<C> for Tuple {
 // https://github.com/rust-lang/rustfmt/issues/5420 is resolved
 // (or we can run this doctest with persistence enabled)
 #[rustfmt::skip]
-impl<P> ChildCircuit<P>
+impl<P, T> ChildCircuit<P, T>
 where
-    P: WithClock,
+    P: 'static,
+    T: Timestamp,
     Self: Circuit,
 {
     /// See [`ChildCircuit::recursive`].
     pub fn dyn_recursive<F, S>(&self, factories: &S::Factories, f: F) -> Result<S::Output, SchedulerError>
     where
-        S: RecursiveStreams<ChildCircuit<Self>>,
-        F: FnOnce(&ChildCircuit<Self>, S) -> Result<S, SchedulerError>,
+        S: RecursiveStreams<IterativeCircuit<Self>>,
+        F: FnOnce(&IterativeCircuit<Self>, S) -> Result<S, SchedulerError>,
     {
         // The actual circuit we build:
         //
@@ -182,8 +187,8 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
-        operator::Generator, typed_batch::OrdZSet, utils::Tup2, zset, Circuit, FallbackZSet,
-        RootCircuit, Runtime, Stream,
+        Circuit, FallbackZSet, Runtime, Stream, operator::Generator, typed_batch::OrdZSet,
+        utils::Tup2, zset,
     };
     use std::{
         thread,
@@ -193,7 +198,7 @@ mod test {
 
     #[test]
     fn reachability() {
-        let root = RootCircuit::build(move |circuit| {
+        let mut root = Runtime::init_circuit(1, move |circuit| {
             // Changes to the edges relation.
             let mut edges = vec![
                 zset! { Tup2(1, 2) => 1 },
@@ -245,7 +250,7 @@ mod test {
         .unwrap().0;
 
         for _ in 0..8 {
-            root.step().unwrap();
+            root.transaction().unwrap();
         }
     }
 
@@ -289,12 +294,12 @@ mod test {
         let handle = thread::spawn(move || {
             for i in 0..100 {
                 edges_handle.append(&mut vec![Tup2(Tup2(i, i + 1), 1)]);
-                circuit.step().unwrap();
+                circuit.transaction().unwrap();
             }
         });
 
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(100) {
+        while start.elapsed() < Duration::from_secs(200) {
             if handle.is_finished() {
                 handle.join().unwrap();
                 return;
@@ -316,7 +321,7 @@ mod test {
             .map(|i| Tup2(Tup2(i, i + 1), -1))
             .collect::<Vec<_>>();
 
-        let (root, (edges_handle, paths_handle)) = RootCircuit::build(move |circuit| {
+        let (mut root, (edges_handle, paths_handle)) = Runtime::init_circuit(1, move |circuit| {
             let (edges, edges_handle) = circuit.add_input_zset::<Tup2<u64, u64>>();
 
             let paths = circuit
@@ -340,10 +345,10 @@ mod test {
 
         for _ in 0..10 {
             edges_handle.append(&mut insert_edges.clone());
-            root.step().unwrap();
+            root.transaction().unwrap();
 
             edges_handle.append(&mut delete_edges.clone());
-            root.step().unwrap();
+            root.transaction().unwrap();
 
             let paths = paths_handle.consolidate();
             assert!(paths.is_empty());
@@ -356,7 +361,7 @@ mod test {
     fn reachability2() {
         type Edges<S> = Stream<S, OrdZSet<Tup2<u64, u64>>>;
 
-        let root = RootCircuit::build(move |circuit| {
+        let mut root = Runtime::init_circuit(1, move |circuit| {
             // Changes to the edges relation.
             let mut edges = vec![
                 zset! { Tup2(1, 2) => 1 },
@@ -420,7 +425,7 @@ mod test {
         .unwrap().0;
 
         for _ in 0..8 {
-            root.step().unwrap();
+            root.transaction().unwrap();
         }
     }
 }

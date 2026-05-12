@@ -39,24 +39,27 @@
 //! [`PipelineError`], which allows [`PipelineError`] to be returned as an error
 //! type by HTTP endpoints.
 
-use crate::{dyn_event, ControllerError, ParseError};
+use crate::{ControllerError, ParseError, dyn_event};
 use actix_web::{
-    body::BoxBody, http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError,
+    HttpResponse, HttpResponseBuilder, ResponseError, body::BoxBody, http::StatusCode,
 };
 use anyhow::Error as AnyError;
+use arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
 use dbsp::DetailedError;
+use feldera_types::runtime_status::RuntimeDesiredStatus;
 use parquet::errors::ParquetError;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use std::{
     borrow::Cow,
     error::Error as StdError,
     fmt::{Display, Error as FmtError, Formatter},
     sync::Arc,
 };
-use tracing::{error, warn, Level};
+use tracing::{Level, error, warn};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 pub const MAX_REPORTED_PARSE_ERRORS: usize = 1_000;
 
@@ -71,7 +74,7 @@ pub struct ErrorResponse {
     pub error_code: Cow<'static, str>,
     /// Detailed error metadata.
     /// The contents of this field is determined by `error_code`.
-    #[schema(value_type=Object)]
+    #[schema(value_type=Value)]
     pub details: JsonValue,
 }
 
@@ -144,6 +147,7 @@ impl ErrorResponse {
 #[serde(untagged)]
 pub enum PipelineError {
     Initializing,
+    AwaitingApproval,
     Terminating,
     InitializationError {
         error: Arc<ControllerError>,
@@ -177,6 +181,14 @@ pub enum PipelineError {
         df: Option<Box<DataFusionError>>,
     },
     Suspended,
+    InvalidActivateStatus(RuntimeDesiredStatus),
+    InvalidTransition(&'static str, RuntimeDesiredStatus),
+    IncarnationUuidMismatch {
+        /// The UUID in the request.
+        requested: Uuid,
+        /// The incarnation UUID of the running pipeline.
+        expected: Uuid,
+    },
 }
 
 impl From<ControllerError> for PipelineError {
@@ -206,6 +218,15 @@ impl From<DataFusionError> for PipelineError {
     }
 }
 
+impl From<ArrowError> for PipelineError {
+    fn from(error: ArrowError) -> Self {
+        Self::AdHocQueryError {
+            error: error.to_string(),
+            df: None,
+        }
+    }
+}
+
 impl From<ParquetError> for PipelineError {
     fn from(error: ParquetError) -> Self {
         Self::AdHocQueryError {
@@ -223,14 +244,17 @@ impl Display for PipelineError {
             Self::Initializing => {
                 f.write_str("Operation failed because the pipeline has not finished initializing.")
             }
+            Self::AwaitingApproval => {
+                f.write_str("Operation failed: the pipeline is waiting for approval to bootstrap modified components.")
+            }
             Self::Terminating => {
                 f.write_str("Operation failed because the pipeline is shutting down.")
             }
             Self::InitializationError{error} => {
-                write!(f, "Operation failed because the pipeline failed to initialize. Error details: '{error}'.")
+                write!(f, "Operation failed because the pipeline failed to initialize. Error details: {error}.")
             }
             Self::PrometheusError{error} => {
-                write!(f, "Error retrieving Prometheus metrics: '{error}'.")
+                write!(f, "Error retrieving Prometheus metrics: {error}.")
             }
             Self::MissingUrlEncodedParam { param } => {
                 write!(f, "Missing URL-encoded parameter '{param}'.")
@@ -268,6 +292,16 @@ impl Display for PipelineError {
             Self::Suspended => {
                 write!(f, "Operation failed because the pipeline has been suspended.")
             }
+            Self::InvalidActivateStatus(status) => {
+                write!(
+                    f,
+                    "Invalid activation status {status:?} (only running and paused are valid)"
+                )
+            }
+            Self::InvalidTransition(transition, status) => {
+                write!(f, "Cannot execute {transition} transition starting from {status:?}")
+            }
+            Self::IncarnationUuidMismatch { requested, expected } => write!(f, "Incarnation UUID mismatch ({requested} in request, expected {expected})")
         }
     }
 }
@@ -276,6 +310,7 @@ impl DetailedError for PipelineError {
     fn error_code(&self) -> Cow<'static, str> {
         match self {
             Self::Initializing => Cow::from("Initializing"),
+            Self::AwaitingApproval => Cow::from("AwaitingApproval"),
             Self::Terminating => Cow::from("Terminating"),
             Self::InitializationError { .. } => Cow::from("InitializationError"),
             Self::PrometheusError { .. } => Cow::from("PrometheusError"),
@@ -287,6 +322,9 @@ impl DetailedError for PipelineError {
             Self::HeapProfilerError { .. } => Cow::from("HeapProfilerError"),
             Self::AdHocQueryError { .. } => Cow::from("AdHocQueryError"),
             Self::Suspended => Cow::from("Suspended"),
+            Self::InvalidActivateStatus(_) => Cow::from("InvalidActivateStatus"),
+            Self::InvalidTransition(_, _) => Cow::from("InvalidTransition"),
+            Self::IncarnationUuidMismatch { .. } => Cow::from("IncarnationUuidMismatch"),
         }
     }
 
@@ -306,6 +344,7 @@ impl ResponseError for PipelineError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::Initializing => StatusCode::SERVICE_UNAVAILABLE,
+            Self::AwaitingApproval => StatusCode::SERVICE_UNAVAILABLE,
             Self::Terminating => StatusCode::GONE,
             Self::InitializationError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::PrometheusError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -317,6 +356,9 @@ impl ResponseError for PipelineError {
             Self::ControllerError { error } => error.status_code(),
             Self::AdHocQueryError { .. } => StatusCode::BAD_REQUEST,
             Self::Suspended => StatusCode::SERVICE_UNAVAILABLE,
+            Self::InvalidActivateStatus(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidTransition(_, _) => StatusCode::BAD_REQUEST,
+            Self::IncarnationUuidMismatch { .. } => StatusCode::BAD_REQUEST,
         }
     }
 

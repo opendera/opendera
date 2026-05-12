@@ -10,13 +10,17 @@ data: {
       "org.apache.calcite.schema.ColumnStrategy"
       "org.apache.calcite.sql.SqlCreate"
       "org.apache.calcite.sql.SqlDrop"
-      "org.apache.calcite.sql.ddl.SqlDdlNodes"
-      "org.apache.calcite.sql.ddl.SqlCreateType"
       "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlExtendedColumnDeclaration"
       "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlViewColumnDeclaration"
       "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateFunctionDeclaration"
+      "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlAttributeDefinition"
+      "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateAggregate"
+      "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateType"
       "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlRemove"
       "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlLateness"
+      "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlPrimaryKey"
+      "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlDropView"
+      "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlDropTable"
       "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateView"
       "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlDeclareView"
       "org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateIndex"
@@ -32,6 +36,8 @@ data: {
       "IF"
       "INTERNED"
       "LATENESS"
+      "AGGREGATE"
+      "LINEAR"
       "MATERIALIZED"
       "WATERMARK"
       "PLANS"
@@ -55,6 +61,7 @@ data: {
       "ADD"
       "ADMIN"
       "AFTER"
+      "AGGREGATE"
       "ALWAYS"
       "APPLY"
       "ARRAY_AGG"
@@ -639,6 +646,7 @@ data: {
       "LIKE"
       "LIKE_REGEX"
 #     "LIMIT"
+      "LINEAR"
       "LN"
       "LOCAL"
       "LOCALTIME"
@@ -928,6 +936,7 @@ data: {
       "SqlCreateIndex"
       "SqlCreateType"
       "SqlCreateFunction"
+      "SqlCreateAggregate"
     ]
 
     truncateStatementParserMethods: [
@@ -970,6 +979,7 @@ data: {
     includeAdditionalDeclarations: false
     includeParsingStringLiteralAsArrayLiteral: true
     includeIntervalWithoutQualifier: false
+    includeStarExclude: true
 
     # Method for parsing "SET [OR RESET]" calls.
     setOptionParserMethod: "SqlSetOption"

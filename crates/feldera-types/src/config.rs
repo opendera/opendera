@@ -5,32 +5,42 @@
 //! endpoint configs.  We represent these configs as opaque JSON values, so
 //! that the entire configuration tree can be deserialized from a JSON file.
 
+use crate::preprocess::PreprocessorConfig;
+use crate::program_schema::ProgramSchema;
+use crate::secret_resolver::default_secrets_directory;
 use crate::transport::adhoc::AdHocInputConfig;
 use crate::transport::clock::ClockConfig;
 use crate::transport::datagen::DatagenInputConfig;
 use crate::transport::delta_table::{DeltaTableReaderConfig, DeltaTableWriterConfig};
 use crate::transport::file::{FileInputConfig, FileOutputConfig};
-use crate::transport::http::HttpInputConfig;
+use crate::transport::http::{HttpInputConfig, HttpOutputConfig};
 use crate::transport::iceberg::IcebergReaderConfig;
 use crate::transport::kafka::{KafkaInputConfig, KafkaOutputConfig};
+use crate::transport::nats::NatsInputConfig;
 use crate::transport::nexmark::NexmarkInputConfig;
-use crate::transport::postgres::{PostgresReaderConfig, PostgresWriterConfig};
+use crate::transport::postgres::{
+    PostgresCdcReaderConfig, PostgresReaderConfig, PostgresWriterConfig,
+};
 use crate::transport::pubsub::PubSubInputConfig;
 use crate::transport::redis::RedisOutputConfig;
 use crate::transport::s3::S3InputConfig;
 use crate::transport::url::UrlInputConfig;
 use core::fmt;
+use feldera_ir::{MirNode, MirNodeId};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
-use serde_yaml::Value as YamlValue;
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 use std::{borrow::Cow, cmp::max, collections::BTreeMap};
-use utoipa::openapi::{ObjectBuilder, OneOfBuilder, Ref, RefOr, Schema, SchemaType};
 use utoipa::ToSchema;
+use utoipa::openapi::{ObjectBuilder, OneOfBuilder, Ref, RefOr, Schema, SchemaType};
+
+pub mod dev_tweaks;
+pub use dev_tweaks::DevTweaks;
 
 const DEFAULT_MAX_PARALLEL_CONNECTOR_INIT: u64 = 10;
 
@@ -39,30 +49,52 @@ pub const fn default_max_queued_records() -> u64 {
     1_000_000
 }
 
-/// Default maximum batch size for connectors, in records.
-///
-/// If you change this then update the comment on
-/// [ConnectorConfig::max_batch_size].
-pub const fn default_max_batch_size() -> u64 {
-    10_000
-}
+pub const DEFAULT_MAX_WORKER_BATCH_SIZE: u64 = 10_000;
 
 pub const DEFAULT_CLOCK_RESOLUTION_USECS: u64 = 1_000_000;
+
+/// Program information included in the pipeline configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ProgramIr {
+    /// The MIR of the program.
+    pub mir: HashMap<MirNodeId, MirNode>,
+    /// Program schema.
+    pub program_schema: ProgramSchema,
+}
 
 /// Pipeline deployment configuration.
 /// It represents configuration entries directly provided by the user
 /// (e.g., runtime configuration) and entries derived from the schema
 /// of the compiled program (e.g., connectors). Storage configuration,
 /// if applicable, is set by the runner.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct PipelineConfig {
     /// Global controller configuration.
     #[serde(flatten)]
     #[schema(inline)]
     pub global: RuntimeConfig,
 
-    /// Pipeline name.
+    /// Configuration for multihost pipelines.
+    ///
+    /// The presence of this field indicates that the pipeline is running in
+    /// multihost mode.  In the pod with ordinal 0, this triggers starting the
+    /// coordinator process.  In all pods, this tells the pipeline process to
+    /// await a connection from the coordinator instead of initializing the
+    /// pipeline immediately.
+    pub multihost: Option<MultihostConfig>,
+
+    /// Unique system-generated name of the pipeline (format: `pipeline-<uuid>`).
+    /// It is unique across all tenants and cannot be changed.
+    ///
+    /// The `<uuid>` is also used in the naming of various resources that back the pipeline,
+    /// and as such this name is useful to find/identify corresponding resources.
     pub name: Option<String>,
+
+    /// Name given by the tenant to the pipeline. It is only unique within the same tenant, and can
+    /// be changed by the tenant when the pipeline is stopped.
+    ///
+    /// Given a specific tenant, it can be used to find/identify a specific pipeline of theirs.
+    pub given_name: Option<String>,
 
     /// Configuration for persistent storage
     ///
@@ -72,12 +104,22 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub storage_config: Option<StorageConfig>,
 
+    /// Directory containing values of secrets.
+    ///
+    /// If this is not set, a default directory is used.
+    pub secrets_dir: Option<String>,
+
     /// Input endpoint configuration.
+    #[serde(default)]
     pub inputs: BTreeMap<Cow<'static, str>, InputEndpointConfig>,
 
     /// Output endpoint configuration.
     #[serde(default)]
     pub outputs: BTreeMap<Cow<'static, str>, OutputEndpointConfig>,
+
+    /// Program information.
+    #[serde(default)]
+    pub program_ir: Option<ProgramIr>,
 }
 
 impl PipelineConfig {
@@ -106,6 +148,71 @@ impl PipelineConfig {
         let storage_options = self.global.storage.as_ref();
         let storage_config = self.storage_config.as_ref();
         storage_config.zip(storage_options)
+    }
+
+    /// Returns `self.secrets_dir`, or the default secrets directory if it isn't
+    /// set.
+    pub fn secrets_dir(&self) -> &Path {
+        match &self.secrets_dir {
+            Some(dir) => Path::new(dir.as_str()),
+            None => default_secrets_directory(),
+        }
+    }
+
+    /// Abbreviated config that can be printed in the log on pipeline startup.
+    pub fn display_summary(&self) -> String {
+        // TODO: we may want to further abbreviate connector config.
+        let summary = serde_json::json!({
+            "name": self.name,
+            "given_name": self.given_name,
+            "global": self.global,
+            "storage_config": self.storage_config,
+            "secrets_dir": self.secrets_dir,
+            "inputs": self.inputs,
+            "outputs": self.outputs
+        });
+
+        serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// A subset of fields in `PipelineConfig` that are generated by the compiler.
+/// These fields are shipped to the pipeline by the compilation server along with
+/// the program binary.
+// Note: An alternative would be to embed these fields in the program binary itself
+// as static strings. This would work well for program IR, but it would require recompiling
+// the program anytime a connector config changes, whereas today connector changes
+// do not require recompilation.
+#[derive(Default, Deserialize, Serialize, Eq, PartialEq, Debug, Clone)]
+pub struct PipelineConfigProgramInfo {
+    /// Input endpoint configuration.
+    pub inputs: BTreeMap<Cow<'static, str>, InputEndpointConfig>,
+
+    /// Output endpoint configuration.
+    #[serde(default)]
+    pub outputs: BTreeMap<Cow<'static, str>, OutputEndpointConfig>,
+
+    /// Program information.
+    #[serde(default)]
+    pub program_ir: Option<ProgramIr>,
+}
+
+/// Configuration for a multihost Feldera pipeline.
+///
+/// This configuration is primarily for the coordinator.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct MultihostConfig {
+    /// Number of hosts to launch.
+    ///
+    /// For the configuration to be truly multihost, this should be at least 2.
+    /// A value of 1 still runs the multihost coordinator but it only
+    /// coordinates a single host.
+    pub hosts: usize,
+}
+
+impl Default for MultihostConfig {
+    fn default() -> Self {
+        Self { hosts: 1 }
     }
 }
 
@@ -181,7 +288,7 @@ pub struct StorageOptions {
     ///
     /// A value of 0 will write even empty batches to storage, and nonzero
     /// values provide a threshold.  `usize::MAX` would effectively disable
-    /// storage for such batches.  The default is 1,048,576 (1 MiB).
+    /// storage for such batches.  The default is 10,048,576 (10 MiB).
     pub min_storage_bytes: Option<usize>,
 
     /// For a batch of data passed through the pipeline during a single step,
@@ -223,7 +330,7 @@ pub enum StorageBackendConfig {
     /// Use the local file system.
     ///
     /// This uses ordinary system file operations.
-    File(FileBackendConfig),
+    File(Box<FileBackendConfig>),
 
     /// Object storage.
     Object(ObjectStorageConfig),
@@ -255,6 +362,86 @@ pub enum StorageCompression {
 
     /// Use [Snappy](https://en.wikipedia.org/wiki/Snappy_(compression)) compression.
     Snappy,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum StartFromCheckpoint {
+    Latest,
+    Uuid(uuid::Uuid),
+}
+
+impl ToSchema<'_> for StartFromCheckpoint {
+    fn schema() -> (
+        &'static str,
+        utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+    ) {
+        (
+            "StartFromCheckpoint",
+            utoipa::openapi::RefOr::T(Schema::OneOf(
+                OneOfBuilder::new()
+                    .item(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::String)
+                            .enum_values(Some(["latest"].into_iter()))
+                            .build(),
+                    )
+                    .item(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::String)
+                            .format(Some(utoipa::openapi::SchemaFormat::KnownFormat(
+                                utoipa::openapi::KnownFormat::Uuid,
+                            )))
+                            .build(),
+                    )
+                    .nullable(true)
+                    .build(),
+            )),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for StartFromCheckpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StartFromCheckpointVisitor;
+
+        impl<'de> Visitor<'de> for StartFromCheckpointVisitor {
+            type Value = StartFromCheckpoint;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a UUID string or the string \"latest\"")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value == "latest" {
+                    Ok(StartFromCheckpoint::Latest)
+                } else {
+                    uuid::Uuid::parse_str(value)
+                        .map(StartFromCheckpoint::Uuid)
+                        .map_err(|_| E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_str(StartFromCheckpointVisitor)
+    }
+}
+
+impl Serialize for StartFromCheckpoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            StartFromCheckpoint::Latest => serializer.serialize_str("latest"),
+            StartFromCheckpoint::Uuid(uuid) => serializer.serialize_str(&uuid.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -299,9 +486,194 @@ pub struct SyncConfig {
     /// this can be left empty to allow automatic authentication via the pod's service account.
     pub secret_key: Option<String>,
 
-    /// If `true`, will try to pull the latest checkpoint from the configured
-    /// object store and resume from that point.
-    pub start_from_checkpoint: bool,
+    /// When set, the pipeline will try fetch the specified checkpoint from the
+    /// object store.
+    ///
+    /// If `fail_if_no_checkpoint` is `true`, the pipeline will fail to initialize.
+    pub start_from_checkpoint: Option<StartFromCheckpoint>,
+
+    /// When true, the pipeline will fail to initialize if fetching the
+    /// specified checkpoint fails (missing, download error).
+    /// When false, the pipeline will start from scratch instead.
+    ///
+    /// False by default.
+    #[schema(default = std::primitive::bool::default)]
+    #[serde(default)]
+    pub fail_if_no_checkpoint: bool,
+
+    /// The number of file transfers to run in parallel.
+    /// Default: 20
+    pub transfers: Option<u8>,
+
+    /// The number of checkers to run in parallel.
+    /// Default: 20
+    pub checkers: Option<u8>,
+
+    /// Set to skip post copy check of checksums, and only check the file sizes.
+    /// This can significantly improve the throughput.
+    /// Defualt: false
+    pub ignore_checksum: Option<bool>,
+
+    /// Number of streams to use for multi-thread downloads.
+    /// Default: 10
+    pub multi_thread_streams: Option<u8>,
+
+    /// Use multi-thread download for files above this size.
+    /// Format: `[size][Suffix]` (Example: 1G, 500M)
+    /// Supported suffixes: k|M|G|T
+    /// Default: 100M
+    pub multi_thread_cutoff: Option<String>,
+
+    /// The number of chunks of the same file that are uploaded for multipart uploads.
+    /// Default: 10
+    pub upload_concurrency: Option<u8>,
+
+    /// When `true`, the pipeline starts in **standby** mode; processing doesn't
+    /// start until activation (`POST /activate`).
+    /// If this pipeline was previously activated and the storage has not been
+    /// cleared, the pipeline will auto activate, no newer checkpoints will be
+    /// fetched.
+    ///
+    /// Standby behavior depends on `start_from_checkpoint`:
+    /// - If `latest`, pipeline continuously fetches the latest available
+    ///   checkpoint until activated.
+    /// - If checkpoint UUID, pipeline fetches this checkpoint once and waits
+    ///   in standby until activated.
+    ///
+    /// Default: `false`
+    #[schema(default = std::primitive::bool::default)]
+    #[serde(default)]
+    pub standby: bool,
+
+    /// The interval (in seconds) between each attempt to fetch the latest
+    /// checkpoint from object store while in standby mode.
+    ///
+    /// Applies only when `start_from_checkpoint` is set to `latest`.
+    ///
+    /// Default: 10 seconds
+    #[schema(default = default_pull_interval)]
+    #[serde(default = "default_pull_interval")]
+    pub pull_interval: u64,
+
+    /// The interval (in seconds) between each push of checkpoints to object store.
+    ///
+    /// Default: disabled (no periodic push).
+    #[serde(default)]
+    pub push_interval: Option<u64>,
+
+    /// Extra flags to pass to `rclone`.
+    ///
+    /// WARNING: Supplying incorrect or conflicting flags can break `rclone`.
+    /// Use with caution.
+    ///
+    /// Refer to the docs to see the supported flags:
+    /// - [Global flags](https://rclone.org/flags/)
+    /// - [S3 specific flags](https://rclone.org/s3/)
+    pub flags: Option<Vec<String>>,
+
+    /// The minimum number of checkpoints to retain in object store.
+    /// No checkpoints will be deleted if the total count is below this threshold.
+    ///
+    /// Default: 10
+    #[schema(default = default_retention_min_count)]
+    #[serde(default = "default_retention_min_count")]
+    pub retention_min_count: u32,
+
+    /// The minimum age (in days) a checkpoint must reach before it becomes
+    /// eligible for deletion. All younger checkpoints will be preserved.
+    ///
+    /// Default: 30
+    #[schema(default = default_retention_min_age)]
+    #[serde(default = "default_retention_min_age")]
+    pub retention_min_age: u32,
+
+    /// A read-only bucket used as a fallback checkpoint source.
+    ///
+    /// When the pipeline has no local checkpoint and `bucket` contains no
+    /// checkpoint either, it will attempt to fetch the checkpoint from this
+    /// location instead.  All connection settings (`endpoint`, `region`,
+    /// `provider`, `access_key`, `secret_key`) are shared with `bucket`.
+    ///
+    /// The pipeline **never writes** to `read_bucket`.
+    ///
+    /// Must point to a different location than `bucket`.
+    #[serde(default)]
+    pub read_bucket: Option<String>,
+}
+
+fn default_pull_interval() -> u64 {
+    10
+}
+
+fn default_retention_min_count() -> u32 {
+    10
+}
+
+fn default_retention_min_age() -> u32 {
+    30
+}
+
+impl SyncConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.standby && self.start_from_checkpoint.is_none() {
+            return Err(r#"invalid sync config: `standby` set to `true` but `start_from_checkpoint` not set.
+Standby mode requires `start_from_checkpoint` to be set.
+Consider setting `start_from_checkpoint` to `"latest"`."#.to_owned());
+        }
+
+        if let Some(ref rb) = self.read_bucket
+            && rb == &self.bucket
+        {
+            return Err(
+                "invalid sync config: `read_bucket` and `bucket` must point to different locations"
+                    .to_owned(),
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Configuration for supplying a custom pipeline StatefulSet template via a Kubernetes ConfigMap.
+///
+/// Operators can provide a custom StatefulSet YAML that the Kubernetes runner will use when
+/// creating pipeline StatefulSets for a pipeline. The custom template must be stored as the
+/// value of a key in a ConfigMap in the same namespace as the pipeline; set `name` to the
+/// ConfigMap name and `key` to the entry that contains the template.
+///
+/// Recommendations and requirements:
+/// - **Start from the default template and modify it as needed.** The default template is present
+///   in ConfigMap named as `<release-name>-pipeline-template`, with key `pipelineTemplate` in the release
+///   namespace and should be used as a reference.
+/// - The template must contain a valid Kubernetes `StatefulSet` manifest in YAML form. The
+///   runner substitutes variables in the template before parsing; therefore the final YAML
+///   must be syntactically valid.
+/// - The runner performs simple string substitution for the following placeholders. Please ensure these
+///   placeholders are placed at appropriate location for their semantics:
+///   - `{id}`: pipeline Kubernetes name (used for object names and labels)
+///   - `{namespace}`: Kubernetes namespace where the pipeline runs
+///   - `{pipeline_executor_image}`: container image used to run the pipeline executor
+///   - `{binary_ref}`: program binary reference passed as an argument
+///   - `{program_info_ref}`: program info reference passed as an argument
+///   - `{pipeline_storage_path}`: mount path for persistent pipeline storage
+///   - `{storage_class_name}`: storage class name to use for PVCs (if applicable)
+///   - `{deployment_id}`: UUID identifying the deployment instance
+///   - `{deployment_initial}`: initial desired runtime status (e.g., `provisioning`)
+///   - `{bootstrap_policy}`: bootstrap policy value when applicable
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PipelineTemplateConfig {
+    /// Name of the ConfigMap containing the pipeline template.
+    pub name: String,
+    /// Key in the ConfigMap containing the pipeline template.
+    ///
+    /// If not set, defaults to `pipelineTemplate`.
+    #[schema(default = default_pipeline_template_key)]
+    #[serde(default = "default_pipeline_template_key")]
+    pub key: String,
+}
+
+fn default_pipeline_template_key() -> String {
+    "pipelineTemplate".to_string()
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -395,7 +767,7 @@ pub struct FileBackendConfig {
 
 /// Global pipeline configuration settings. This is the publicly
 /// exposed type for users to configure pipelines.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct RuntimeConfig {
     /// Number of DBSP worker threads.
@@ -408,6 +780,36 @@ pub struct RuntimeConfig {
     /// Each worker increases overall memory consumption for data structures
     /// used during a step.
     pub workers: u16,
+
+    /// The maximum amount of memory, in Megabytes, that the pipeline is allowed to use
+    /// on each host.
+    ///
+    /// Setting this property activates memory pressure monitoring and backpressure
+    /// mechanisms. The pipeline will track the amount of remaining memory and
+    /// report the memory pressure level via the `memory_pressure` metric.
+    ///
+    /// As the memory pressure increases, the system will apply increasing backpressure
+    /// to push state cached in memory to storage, preventing the pipeline from running
+    /// out of memory at the cost of some performance degradation.
+    ///
+    /// It is strongly recommended to set this property to prevent the pipeline from
+    /// running out of memory. The setting should not exceed the memory limit of the pipeline
+    /// instance.
+    ///
+    /// When `max_rss_mb` is not specified but `resources.memory_mb_max` is set, the
+    /// latter is used as the effective memory cap for the pipeline.
+    ///
+    /// See [documentation on the pipeline's memory usage](https://docs.feldera.com/operations/memory)
+    /// for more details.
+    pub max_rss_mb: Option<u64>,
+
+    /// Number of DBSP hosts.
+    ///
+    /// The worker threads are evenly divided among the hosts.  For single-host
+    /// deployments, this should be 1 (the default).
+    ///
+    /// Multihost pipelines are an enterprise-only preview feature.
+    pub hosts: usize,
 
     /// Storage configuration.
     ///
@@ -459,12 +861,11 @@ pub struct RuntimeConfig {
     ///
     /// This parameter controls the execution of queries that use the `NOW()` function.  The output of such
     /// queries depends on the real-time clock and can change over time without any external
-    /// inputs.  The pipeline will update the clock value and trigger incremental recomputation
-    /// at most each `clock_resolution_usecs` microseconds.
+    /// inputs.  If the query uses `NOW()`, the pipeline will update the clock value and trigger incremental
+    /// recomputation at most each `clock_resolution_usecs` microseconds.  If the query does not use
+    /// `NOW()`, then clock value updates are suppressed and the pipeline ignores this setting.
     ///
     /// It is set to 1 second (1,000,000 microseconds) by default.
-    ///
-    /// Set to `null` to disable periodic clock updates.
     pub clock_resolution_usecs: Option<u64>,
 
     /// Optionally, a list of CPU numbers for CPUs to which the pipeline may pin
@@ -494,7 +895,7 @@ pub struct RuntimeConfig {
     pub max_parallel_connector_init: Option<u64>,
 
     /// Specification of additional (sidecar) containers.
-    pub init_containers: Option<serde_yaml::Value>,
+    pub init_containers: Option<serde_json::Value>,
 
     /// Deprecated: setting this true or false does not have an effect anymore.
     pub checkpoint_during_suspend: bool,
@@ -520,12 +921,17 @@ pub struct RuntimeConfig {
     /// If not specified, the default is set to `workers`.
     pub io_workers: Option<u64>,
 
-    /// Optional settings for tweaking Feldera internals.
+    /// Environment variables for the pipeline process.
     ///
-    /// The available key-value pairs change from one version of Feldera to
-    /// another, so users should not depend on particular settings being
-    /// available, or on their behavior.
-    pub dev_tweaks: BTreeMap<String, serde_json::Value>,
+    /// These are key-value pairs injected into the pipeline process environment.
+    /// Some variable names are reserved by the platform and cannot be overridden
+    /// (for example `RUST_LOG`, and variables in the `FELDERA_`,
+    /// `KUBERNETES_`, and `TOKIO_` namespaces).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
+    /// Optional settings for tweaking Feldera internals.
+    pub dev_tweaks: DevTweaks,
 
     /// Log filtering directives.
     ///
@@ -536,6 +942,15 @@ pub struct RuntimeConfig {
     ///
     /// [tracing-subscriber]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives
     pub logging: Option<String>,
+
+    /// ConfigMap containing a custom pipeline template (Enterprise only).
+    ///
+    /// This feature is only available in Feldera Enterprise. If set, the Kubernetes runner
+    /// will read the template from the specified ConfigMap and use it instead of the default
+    /// StatefulSet template for the configured pipeline.
+    ///
+    /// check [`PipelineTemplateConfig`] documentation for details.
+    pub pipeline_template_configmap: Option<PipelineTemplateConfig>,
 }
 
 /// Accepts "true" and "false" and converts them to the new format.
@@ -649,6 +1064,8 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             workers: 8,
+            max_rss_mb: None,
+            hosts: 1,
             storage: Some(StorageOptions::default()),
             fault_tolerance: FtConfig::default(),
             cpu_profiler: true,
@@ -669,8 +1086,10 @@ impl Default for RuntimeConfig {
             checkpoint_during_suspend: true,
             io_workers: None,
             http_workers: None,
-            dev_tweaks: BTreeMap::default(),
+            env: BTreeMap::default(),
+            dev_tweaks: DevTweaks::default(),
             logging: None,
+            pipeline_template_configmap: None,
         }
     }
 }
@@ -943,6 +1362,15 @@ pub struct InputEndpointConfig {
     pub connector_config: ConnectorConfig,
 }
 
+impl InputEndpointConfig {
+    pub fn new(stream: impl Into<Cow<'static, str>>, connector_config: ConnectorConfig) -> Self {
+        Self {
+            stream: stream.into(),
+            connector_config,
+        }
+    }
+}
+
 /// Deserialize the `start_after` property of a connector configuration.
 /// It requires a non-standard deserialization because we want to accept
 /// either a string or an array of strings.
@@ -977,6 +1405,9 @@ pub struct ConnectorConfig {
     /// Transport endpoint configuration.
     pub transport: TransportConfig,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preprocessor: Option<Vec<PreprocessorConfig>>,
+
     /// Parser configuration.
     pub format: Option<FormatConfig>,
 
@@ -1000,22 +1431,35 @@ pub struct ConnectorConfig {
     #[serde(flatten)]
     pub output_buffer_config: OutputBufferConfig,
 
-    /// Maximum batch size, in records.
+    /// Maximum number of records from this connector to process in a single batch.
     ///
-    /// This is the maximum number of records to process in one batch through
-    /// the circuit.  The time and space cost of processing a batch is
-    /// asymptotically superlinear in the size of the batch, but very small
-    /// batches are less efficient due to constant factors.
+    /// When set, this caps how many records are taken from the connector’s input
+    /// buffer and pushed through the circuit at once.
     ///
-    /// This should usually be less than `max_queued_records`, to give the
-    /// connector a round-trip time to restart and refill the buffer while
-    /// batches are being processed.
+    /// This is typically configured lower than `max_queued_records` to allow the
+    /// connector time to restart and refill its buffer while a batch is being
+    /// processed.
     ///
-    /// Some input adapters might not honor this setting.
+    /// Not all input adapters honor this limit.
     ///
-    /// The default is 10,000.
-    #[serde(default = "default_max_batch_size")]
-    pub max_batch_size: u64,
+    /// If this is not set, the batch size is derived from `max_worker_batch_size`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_batch_size: Option<u64>,
+
+    /// Maximum number of records processed per batch, per worker thread.
+    ///
+    /// When `max_batch_size` is not set, this setting is used to cap
+    /// the number of records that can be taken from the connector’s input
+    /// buffer and pushed through the circuit at once.  The effective batch size is computed as:
+    /// `max_worker_batch_size × workers`.
+    ///
+    /// This provides an alternative to `max_batch_size` that automatically adjusts batch
+    /// size as the number of worker threads changes to maintain constant amount of
+    /// work per worker per batch.
+    ///
+    /// Defaults to 10,000 records per worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_worker_batch_size: Option<u64>,
 
     /// Backpressure threshold.
     ///
@@ -1060,6 +1504,45 @@ pub struct ConnectorConfig {
     #[serde(deserialize_with = "deserialize_start_after")]
     #[serde(default)]
     pub start_after: Option<Vec<String>>,
+}
+
+impl ConnectorConfig {
+    pub fn new(transport: TransportConfig, format: Option<FormatConfig>) -> Self {
+        Self {
+            transport,
+            preprocessor: None,
+            format,
+            index: None,
+            output_buffer_config: Default::default(),
+            max_batch_size: None,
+            max_worker_batch_size: None,
+            max_queued_records: default_max_queued_records(),
+            paused: false,
+            labels: Vec::new(),
+            start_after: None,
+        }
+    }
+
+    pub fn with_max_batch_size(mut self, max_batch_size: Option<u64>) -> Self {
+        self.max_batch_size = max_batch_size;
+        self
+    }
+
+    pub fn with_max_queued_records(mut self, max_queued_records: u64) -> Self {
+        self.max_queued_records = max_queued_records;
+        self
+    }
+
+    /// Compare two configs modulo the `paused` field.
+    ///
+    /// Used to compare checkpointed and current connector configs.
+    pub fn equal_modulo_paused(&self, other: &Self) -> bool {
+        let mut a = self.clone();
+        let mut b = other.clone();
+        a.paused = false;
+        b.paused = false;
+        a == b
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -1153,6 +1636,15 @@ pub struct OutputEndpointConfig {
     pub connector_config: ConnectorConfig,
 }
 
+impl OutputEndpointConfig {
+    pub fn new(stream: impl Into<Cow<'static, str>>, connector_config: ConnectorConfig) -> Self {
+        Self {
+            stream: stream.into(),
+            connector_config,
+        }
+    }
+}
+
 /// Transport-specific endpoint configuration passed to
 /// `crate::OutputTransport::new_endpoint`
 /// and `crate::InputTransport::new_endpoint`.
@@ -1161,6 +1653,7 @@ pub struct OutputEndpointConfig {
 pub enum TransportConfig {
     FileInput(FileInputConfig),
     FileOutput(FileOutputConfig),
+    NatsInput(NatsInputConfig),
     KafkaInput(KafkaInputConfig),
     KafkaOutput(KafkaOutputConfig),
     PubSubInput(PubSubInputConfig),
@@ -1172,13 +1665,14 @@ pub enum TransportConfig {
     // Prevent rust from complaining about large size difference between enum variants.
     IcebergInput(Box<IcebergReaderConfig>),
     PostgresInput(PostgresReaderConfig),
+    PostgresCdcInput(PostgresCdcReaderConfig),
     PostgresOutput(PostgresWriterConfig),
     Datagen(DatagenInputConfig),
     Nexmark(NexmarkInputConfig),
     /// Direct HTTP input: cannot be instantiated through API
     HttpInput(HttpInputConfig),
     /// Direct HTTP output: cannot be instantiated through API
-    HttpOutput,
+    HttpOutput(HttpOutputConfig),
     /// Ad hoc input: cannot be instantiated through API
     AdHocInput(AdHocInputConfig),
     ClockInput(ClockConfig),
@@ -1189,6 +1683,7 @@ impl TransportConfig {
         match self {
             TransportConfig::FileInput(_) => "file_input".to_string(),
             TransportConfig::FileOutput(_) => "file_output".to_string(),
+            TransportConfig::NatsInput(_) => "nats_input".to_string(),
             TransportConfig::KafkaInput(_) => "kafka_input".to_string(),
             TransportConfig::KafkaOutput(_) => "kafka_output".to_string(),
             TransportConfig::PubSubInput(_) => "pub_sub_input".to_string(),
@@ -1198,15 +1693,32 @@ impl TransportConfig {
             TransportConfig::DeltaTableOutput(_) => "delta_table_output".to_string(),
             TransportConfig::IcebergInput(_) => "iceberg_input".to_string(),
             TransportConfig::PostgresInput(_) => "postgres_input".to_string(),
+            TransportConfig::PostgresCdcInput(_) => "postgres_cdc_input".to_string(),
             TransportConfig::PostgresOutput(_) => "postgres_output".to_string(),
             TransportConfig::Datagen(_) => "datagen".to_string(),
             TransportConfig::Nexmark(_) => "nexmark".to_string(),
             TransportConfig::HttpInput(_) => "http_input".to_string(),
-            TransportConfig::HttpOutput => "http_output".to_string(),
+            TransportConfig::HttpOutput(_) => "http_output".to_string(),
             TransportConfig::AdHocInput(_) => "adhoc_input".to_string(),
             TransportConfig::RedisOutput(_) => "redis_output".to_string(),
             TransportConfig::ClockInput(_) => "clock".to_string(),
         }
+    }
+
+    /// Returns true if the connector is transient, i.e., is created and destroyed
+    /// at runtime on demand, rather than being configured as part of the pipeline.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            TransportConfig::AdHocInput(_)
+                | TransportConfig::HttpInput(_)
+                | TransportConfig::HttpOutput(_)
+                | TransportConfig::ClockInput(_)
+        )
+    }
+
+    pub fn is_http_input(&self) -> bool {
+        matches!(self, TransportConfig::HttpInput(_))
     }
 }
 
@@ -1220,19 +1732,21 @@ pub struct FormatConfig {
     /// Format-specific parser or encoder configuration.
     #[serde(default)]
     #[schema(value_type = Object)]
-    pub config: YamlValue,
+    pub config: JsonValue,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct ResourceConfig {
     /// The minimum number of CPU cores to reserve
     /// for an instance of this pipeline
-    pub cpu_cores_min: Option<u64>,
+    #[serde(deserialize_with = "crate::serde_via_value::deserialize")]
+    pub cpu_cores_min: Option<f64>,
 
     /// The maximum number of CPU cores to reserve
     /// for an instance of this pipeline
-    pub cpu_cores_max: Option<u64>,
+    #[serde(deserialize_with = "crate::serde_via_value::deserialize")]
+    pub cpu_cores_max: Option<f64>,
 
     /// The minimum memory in Megabytes to reserve
     /// for an instance of this pipeline
@@ -1249,4 +1763,15 @@ pub struct ResourceConfig {
     /// Storage class to use for an instance of this pipeline.
     /// The class determines storage performance such as IOPS and throughput.
     pub storage_class: Option<String>,
+
+    /// Kubernetes service account name to use for an instance of this pipeline.
+    /// The account determines permissions and access controls.
+    pub service_account_name: Option<String>,
+
+    /// Kubernetes namespace to use for an instance of this pipeline.
+    /// The namespace determines the scope of names for resources created
+    /// for the pipeline.
+    /// If not set, the pipeline will be deployed in the same namespace
+    /// as the control-plane.
+    pub namespace: Option<String>,
 }

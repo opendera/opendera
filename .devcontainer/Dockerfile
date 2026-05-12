@@ -4,8 +4,10 @@ FROM ubuntu:24.04 AS base
 
 ARG USERNAME=user
 
-RUN useradd -m $USERNAME && usermod -aG sudo $USERNAME
-RUN echo "user:pass" | chpasswd
+# Rename the default user (uid 1000) from `ubuntu` to USERNAME
+RUN usermod -l $USERNAME -d /home/$USERNAME -m ubuntu
+ENV HOME /home/$USERNAME
+RUN echo "$USERNAME:pass" | chpasswd
 
 # Set locale to fix postgres embedded startup
 ENV LC_ALL=en_US.UTF-8
@@ -20,6 +22,8 @@ RUN apt-get update --fix-missing && \
    gnupg2 \
    sudo \
    build-essential \
+   # Go is required to build aws-lc-fips-sys when rustls is built with FIPS
+   golang-go \
    openssl \
    cmake \
    pkg-config \
@@ -28,20 +32,22 @@ RUN apt-get update --fix-missing && \
    ca-certificates \
    gnupg \
    protobuf-compiler \
-   git
+   git \
+   jq
 
 ## Setup Java and Python
 
 RUN apt-get install -y \
    gcc clang libclang-dev python3-pip python3-plumbum \
-   hub numactl openjdk-21-jre-headless maven
+   hub numactl openjdk-21-jdk maven
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-## Install nodejs (optional)
+## Install nodejs
 RUN mkdir -p /etc/apt/keyrings
 RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
 ENV NODE_MAJOR=20
 RUN echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list
-RUN apt update --fix-missing && apt install nodejs
+RUN apt update --fix-missing && apt install -y nodejs
 
 ## Install Redpanda rpk to enable preparing demos
 
@@ -55,25 +61,34 @@ RUN ARCH=`dpkg --print-architecture`; \
 
 RUN pip3 install --break-system-packages gdown kafka-python-ng
 
+## Prepare directories for non-root user (for Claude Code)
+RUN mkdir -p /home/$USERNAME/.local/share/claude && chown -R $USERNAME /home/$USERNAME/.local/share/claude
+RUN mkdir -p /home/$USERNAME/.local/state/claude && chown -R $USERNAME /home/$USERNAME/.local/state/claude
+RUN mkdir -p /home/$USERNAME/.local/bin/ && chown -R $USERNAME /home/$USERNAME/.local/bin/
+
 ## Switch to non-root user
 
 USER $USERNAME
-ENV HOME /home/$USERNAME
 
 ## Install rustup and common components
-
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 ENV PATH="$HOME/.cargo/bin:$PATH"
 
 ## Install Bun.js
-RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.2.2"
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.3"
 ENV PATH="$HOME/.bun/bin:$PATH"
 RUN $HOME/.bun/bin/bun install --global @hey-api/openapi-ts
+
+## Install Claude Code
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 RUN \
    rustup install $RUST_VERSION && \
    rustup component add rustfmt && \
    rustup component add clippy && \
    cargo install cargo-make
+
+## Install Samply
+RUN echo "pass" | sudo curl --proto '=https' --tlsv1.2 -LsSf https://github.com/feldera/samply/releases/download/v0.13.2/samply-installer.sh | sh
 
 ENV PATH="$HOME/.local/bin:$PATH"

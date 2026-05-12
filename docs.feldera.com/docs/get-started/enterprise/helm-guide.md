@@ -23,6 +23,34 @@ on a Kubernetes cluster. It requires a valid Feldera Enterprise license
   We will use the chart and multi-arch images by referring to their online repository
   naming `public.ecr.aws/feldera/<image>:<version>`.
 
+## Kubernetes Cluster Configuration
+
+### Node Sizing
+
+| Resource | Recommendation |
+|---|---|
+| **CPU** | 32–48 CPUs per node |
+| **RAM** | At least 32 GiB per node |
+
+By default, the Feldera control plane and pipelines run on the same nodes.
+Use [nodeSelectors](/get-started/enterprise/helm-chart-reference#node-selectors) to run them on different nodes or node types.
+
+RAM requirements vary by workload. See the [memory usage](/operations/memory) documentation for detailed guidance.
+
+### Persistent Volume Sizing
+Persistent volumes should meet the following specifications:
+1. **Volume Size:** At least the size of the input data. Feldera stores state to perform incremental computations, so the volume must be large enough to hold it. Users can [expand pipeline storage](/operations/guide/#expand-existing-pipeline-storage) on demand.
+2. **IOPS:** At least 16,000
+3. **Throughput:** At least 1,000 MB/s
+
+Recommended disk types by cloud provider:
+
+| Cloud Provider | Disk Type |
+|---|---|
+| AWS | **gp3** |
+| Azure | **Ultra Disk** |
+| GCP | **Hyperdisk Balanced** |
+
 ## Installing Feldera Enterprise
 
 1. **Kubernetes access:** check that your `kubectl` is configured
@@ -93,6 +121,13 @@ on a Kubernetes cluster. It requires a valid Feldera Enterprise license
 
 ## Extra
 
+### Retrieving the Feldera values file
+The `values.yaml` file can be retrieved for an existing Feldera release or from the remote Feldera registry.
+
+Remote Feldera registry: Run `helm show values oci://public.ecr.aws/feldera/feldera-chart --version {version} >> values.yaml` where `version` is the Feldera platform version for which you want to retrieve values.
+
+Existing Feldera release: Run `helm get values {feldera-release-name} --all -o yaml >> values.yaml` where `feldera-release-name` is the name of your release. The value is usually `feldera`, unless the value has been configured during the [installation](./helm-guide#installing-feldera-enterprise) process.
+
 ### Configure custom database credentials
 
 Instead of the insecure default DB credentials, you can supply your own custom database credentials.
@@ -146,16 +181,16 @@ You can connect to an external PostgreSQL database with the following steps:
    kubectl apply -n feldera -f feldera-db-secret.yaml
    ```
 
-3. **Optional: Add the TLS Certificate (`.pem` file) in a configmap**: We use the Amazon bundled `.pem` file
-   as an example (in case you want to connect to Amazon RDS):
+3. **Optional: Add the TLS Certificate (`.pem` file) in a configmap**:
 
    ```bash
-   wget https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
-   kubectl create configmap postgres-pem -n feldera --from-file=postgresql-ca.pem=global-bundle.pem
+   wget https://example.com/your-bundle.pem
+   kubectl create configmap postgres-pem -n feldera --from-file=postgresql-ca.pem=your-bundle.pem
    ```
 
    This step is optional, if no certificate is provided feldera will use the system certificates
-   (`ca-certificates` package from debian 12) to validate the TLS connection.
+   (`ca-certificates` package from Ubuntu 24.04 and the Amazon RDS `global-bundle.pem` file)
+   to validate the TLS connection.
 
    _Note:_ If necessary, you can override the file (`postgresql-ca.pem`) and configmap (`postgres-pem`)
    names by adjusting `postgresTlsCertificateFile` and `postgresTlsConfigMapRef` in `values.yaml`.

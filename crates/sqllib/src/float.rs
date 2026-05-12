@@ -1,5 +1,6 @@
 use crate::{
-    some_function1, some_polymorphic_function1, some_polymorphic_function2, SqlDecimal, SqlString,
+    SqlString, finite_or_null, some_function1, some_polymorphic_function1,
+    some_polymorphic_function2,
 };
 use dbsp::algebra::{F32, F64};
 use lexical_core::format::STANDARD;
@@ -164,13 +165,6 @@ pub fn power_d_d(left: F64, right: F64) -> F64 {
 }
 
 some_polymorphic_function2!(power, d, F64, d, F64, F64);
-
-#[doc(hidden)]
-pub fn power_d_SqlDecimal(left: F64, right: SqlDecimal) -> F64 {
-    F64::new(left.into_inner().powf(right.try_into().unwrap()))
-}
-
-some_polymorphic_function2!(power, d, F64, SqlDecimal, SqlDecimal, F64);
 
 #[doc(hidden)]
 pub fn sqrt_d(left: F64) -> F64 {
@@ -534,4 +528,30 @@ pub fn check() {
         Some(SqlString::from("1.23e10")),
         to_string_dN(Some(12300000000f64.into()))
     );
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn finite_or_null_d(value: F64) -> Option<F64> {
+    finite_or_null(value.into_inner()).map(|x| x.into())
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn finite_or_null_dN(value: Option<F64>) -> Option<F64> {
+    let value = value?;
+    finite_or_null_d(value)
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn finite_or_null_f(value: F32) -> Option<F32> {
+    finite_or_null(value.into_inner()).map(|x| x.into())
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn finite_or_null_fN(value: Option<F32>) -> Option<F32> {
+    let value = value?;
+    finite_or_null_f(value)
 }

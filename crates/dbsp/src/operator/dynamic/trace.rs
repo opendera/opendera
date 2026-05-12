@@ -1,31 +1,31 @@
-use crate::circuit::circuit_builder::{register_replay_stream, StreamId};
-use crate::circuit::metadata::NUM_INPUTS;
-use crate::circuit::metrics::Gauge;
-use crate::dynamic::{Weight, WeightTrait};
-use crate::operator::require_persistent_id;
-use crate::trace::{BatchReaderFactories, Builder, MergeCursor};
 use crate::Runtime;
+use crate::circuit::circuit_builder::{StreamId, register_replay_stream};
+use crate::circuit::metadata::{INPUT_RECORDS_COUNT, MEMORY_ALLOCATIONS_COUNT, RETAINMENT_BOUNDS};
+use crate::dynamic::{Factory, Weight, WeightTrait};
+use crate::operator::require_persistent_id;
+use crate::trace::spine_async::WithSnapshot;
+use crate::trace::{BatchReaderFactories, Builder, GroupFilter, MergeCursor};
 use crate::{
+    Error, Timestamp,
     circuit::{
-        metadata::{
-            MetaItem, OperatorMeta, ALLOCATED_BYTES_LABEL, NUM_ENTRIES_LABEL, SHARED_BYTES_LABEL,
-            USED_BYTES_LABEL,
-        },
-        operator_traits::{BinaryOperator, Operator, StrictOperator, StrictUnaryOperator},
         Circuit, ExportId, ExportStream, FeedbackConnector, GlobalNodeId, OwnershipPreference,
         Scope, Stream, WithClock,
+        metadata::{
+            ALLOCATED_MEMORY_BYTES, MetaItem, OperatorMeta, SHARED_MEMORY_BYTES,
+            STATE_RECORDS_COUNT, USED_MEMORY_BYTES,
+        },
+        operator_traits::{BinaryOperator, Operator, StrictOperator, StrictUnaryOperator},
     },
     circuit_cache_key,
     dynamic::DataTrait,
     trace::{Batch, BatchReader, Filter, Spine, SpineSnapshot, Trace},
-    Error, Timestamp,
 };
 use dyn_clone::clone_box;
-use feldera_storage::StoragePath;
-use minitrace::trace;
+use feldera_storage::{FileCommitter, StoragePath};
 use ouroboros::self_referencing;
 use size_of::SizeOf;
 use std::any::TypeId;
+use std::collections::BTreeMap;
 use std::mem::transmute;
 use std::{
     borrow::Cow,
@@ -40,8 +40,9 @@ use std::{
 
 circuit_cache_key!(TraceId<C, D: BatchReader>(StreamId => Stream<C, D>));
 circuit_cache_key!(BoundsId<D: BatchReader>(StreamId => TraceBounds<<D as BatchReader>::Key, <D as BatchReader>::Val>));
+
+// Trace of a collection delayed by one step.
 circuit_cache_key!(DelayedTraceId<C, D>(StreamId => Stream<C, D>));
-circuit_cache_key!(SpillId<C, D>(StreamId => Stream<C, D>));
 
 /// Lower bound on keys or values in a trace.
 ///
@@ -111,7 +112,7 @@ impl<K: DataTrait + ?Sized> TraceBound<K> {
 
 /// Data structure that tracks key and value retainment policies for a
 /// trace.
-pub struct TraceBounds<K: ?Sized + 'static, V: ?Sized + 'static>(
+pub struct TraceBounds<K: ?Sized + 'static, V: DataTrait + ?Sized>(
     Rc<RefCell<TraceBoundsInner<K, V>>>,
 );
 
@@ -130,7 +131,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> TraceBounds<K, V> {
         Self(Rc::new(RefCell::new(TraceBoundsInner {
             key_predicate: Predicate::Bounds(Vec::new()),
             unique_key_name: None,
-            val_predicate: Predicate::Bounds(Vec::new()),
+            val_predicate: GroupPredicate::Bounds(Vec::new()),
             unique_val_name: None,
         })))
     }
@@ -141,7 +142,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> TraceBounds<K, V> {
         Self(Rc::new(RefCell::new(TraceBoundsInner {
             key_predicate: Predicate::Bounds(vec![TraceBound::new()]),
             unique_key_name: None,
-            val_predicate: Predicate::Bounds(vec![TraceBound::new()]),
+            val_predicate: GroupPredicate::Bounds(vec![TraceBound::new()]),
             unique_val_name: None,
         })))
     }
@@ -165,15 +166,15 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> TraceBounds<K, V> {
 
     pub(crate) fn add_val_bound(&self, bound: TraceBound<V>) {
         match &mut self.0.borrow_mut().val_predicate {
-            Predicate::Bounds(bounds) => bounds.push(bound),
-            Predicate::Filter(_) => {}
+            GroupPredicate::Bounds(bounds) => bounds.push(bound),
+            GroupPredicate::Filter(_) => {}
         };
     }
 
     /// Set value retainment condition.  Disables any value bounds
     /// set using [`Self::add_val_bound`].
-    pub(crate) fn set_val_filter(&self, filter: Filter<V>) {
-        self.0.borrow_mut().val_predicate = Predicate::Filter(filter);
+    pub(crate) fn set_val_filter(&self, filter: GroupFilter<V>) {
+        self.0.borrow_mut().val_predicate = GroupPredicate::Filter(filter);
     }
 
     pub(crate) fn set_unique_val_bound_name(&self, unique_name: Option<&str>) {
@@ -209,9 +210,9 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> TraceBounds<K, V> {
     /// minimum bound installed using [`Self::add_val_bound`] or as the
     /// condition installed using [`Self::set_val_filter`] (the latter
     /// takes precedence).
-    pub(crate) fn effective_val_filter(&self) -> Option<Filter<V>> {
+    pub(crate) fn effective_val_filter(&self) -> Option<GroupFilter<V>> {
         match &(*self.0).borrow().val_predicate {
-            Predicate::Bounds(bounds) => bounds
+            GroupPredicate::Bounds(bounds) => bounds
                 .iter()
                 .min()
                 .expect("At least one trace bound must be set")
@@ -221,12 +222,14 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> TraceBounds<K, V> {
                 .map(|bx| Arc::from(clone_box(bx.as_ref())))
                 .map(|bound: Arc<V>| {
                     let metadata = MetaItem::String(format!("{bound:?}"));
-                    Filter::new(Box::new(move |v: &V| {
-                        bound.as_ref().cmp(v) != Ordering::Greater
-                    }))
-                    .with_metadata(metadata)
+                    GroupFilter::Simple(
+                        Filter::new(Box::new(move |v: &V| {
+                            bound.as_ref().cmp(v) != Ordering::Greater
+                        }))
+                        .with_metadata(metadata),
+                    )
                 }),
-            Predicate::Filter(filter) => Some(filter.clone()),
+            GroupPredicate::Filter(filter) => Some(filter.clone()),
         }
     }
 
@@ -258,42 +261,46 @@ impl<V: Debug + ?Sized> Predicate<V> {
     }
 }
 
-struct TraceBoundsInner<K: ?Sized + 'static, V: ?Sized + 'static> {
+enum GroupPredicate<V: DataTrait + ?Sized> {
+    /// Discard values that are less than at least one of the bounds in the vector.
+    Bounds(Vec<TraceBound<V>>),
+    /// Discard values that don't satisfy the filter.
+    Filter(GroupFilter<V>),
+}
+
+impl<V: DataTrait + ?Sized> GroupPredicate<V> {
+    pub fn metadata(&self) -> MetaItem {
+        match self {
+            Self::Bounds(bounds) => MetaItem::Array(
+                bounds
+                    .iter()
+                    .map(|b| MetaItem::String(format!("{b:?}")))
+                    .collect(),
+            ),
+            Self::Filter(filter) => filter.metadata().clone(),
+        }
+    }
+}
+
+struct TraceBoundsInner<K: ?Sized + 'static, V: DataTrait + ?Sized> {
     /// Key bounds _or_ retainment condition.
     key_predicate: Predicate<K>,
     unique_key_name: Option<String>,
     /// Value bounds _or_ retainment condition.
-    val_predicate: Predicate<V>,
+    val_predicate: GroupPredicate<V>,
     unique_val_name: Option<String>,
 }
 
-impl<K: Debug + ?Sized + 'static, V: Debug + ?Sized + 'static> TraceBoundsInner<K, V> {
+impl<K: Debug + ?Sized + 'static, V: DataTrait + ?Sized> TraceBoundsInner<K, V> {
     pub fn metadata(&self) -> MetaItem {
-        MetaItem::Map(
-            metadata! {
-                "key" => self.key_predicate.metadata(),
-                "value" => self.val_predicate.metadata()
-            }
-            .into(),
-        )
+        MetaItem::Map(BTreeMap::from([
+            (Cow::Borrowed("key"), self.key_predicate.metadata()),
+            (Cow::Borrowed("value"), self.val_predicate.metadata()),
+        ]))
     }
 }
 
-/// An on-storage, key-only [`Spine`] of `C`'s default batch type, with key and
-/// weight types taken from `B`.
-pub type KeySpine<B, C> = Spine<
-    <<C as WithClock>::Time as Timestamp>::KeyBatch<<B as BatchReader>::Key, <B as BatchReader>::R>,
->;
-
-/// An on-storage [`Spine`] of `C`'s default batch type, with key, value, and
-/// weight types taken from `B`.
-pub type ValSpine<B, C> = Spine<
-    <<C as WithClock>::Time as Timestamp>::ValBatch<
-        <B as BatchReader>::Key,
-        <B as BatchReader>::Val,
-        <B as BatchReader>::R,
-    >,
->;
+pub type TimedSpine<B, C> = Spine<<<C as WithClock>::Time as Timestamp>::TimedBatch<B>>;
 
 impl<C, B> Stream<C, B>
 where
@@ -303,9 +310,9 @@ where
     /// See [`Stream::trace`].
     pub fn dyn_trace(
         &self,
-        output_factories: &<ValSpine<B, C> as BatchReader>::Factories,
+        output_factories: &<TimedSpine<B, C> as BatchReader>::Factories,
         batch_factories: &B::Factories,
-    ) -> Stream<C, ValSpine<B, C>>
+    ) -> Stream<C, TimedSpine<B, C>>
     where
         B: Batch<Time = ()>,
     {
@@ -320,11 +327,11 @@ where
     /// See [`Stream::trace_with_bound`].
     pub fn dyn_trace_with_bound(
         &self,
-        output_factories: &<ValSpine<B, C> as BatchReader>::Factories,
+        output_factories: &<TimedSpine<B, C> as BatchReader>::Factories,
         batch_factories: &B::Factories,
         lower_key_bound: TraceBound<B::Key>,
         lower_val_bound: TraceBound<B::Val>,
-    ) -> Stream<C, ValSpine<B, C>>
+    ) -> Stream<C, TimedSpine<B, C>>
     where
         B: Batch<Time = ()>,
     {
@@ -353,7 +360,10 @@ where
                     let replay_stream = z1feedback.operator_mut().prepare_replay_stream(self);
 
                     let trace = circuit.add_binary_operator_with_preference(
-                        <TraceAppend<ValSpine<B, C>, B, C>>::new(output_factories, circuit.clone()),
+                        <TraceAppend<TimedSpine<B, C>, B, C>>::new(
+                            output_factories,
+                            circuit.clone(),
+                        ),
                         (&delayed_trace, OwnershipPreference::STRONGLY_PREFER_OWNED),
                         (self, OwnershipPreference::PREFER_OWNED),
                     );
@@ -410,7 +420,48 @@ where
         bounds.set_unique_val_bound_name(bounds_stream.get_persistent_id().as_deref());
 
         bounds_stream.inspect(move |ts| {
-            let filter = retain_val_func(ts.as_ref());
+            let filter = GroupFilter::Simple(retain_val_func(ts.as_ref()));
+            bounds.set_val_filter(filter);
+        });
+    }
+
+    #[track_caller]
+    pub fn dyn_integrate_trace_retain_values_last_n<TS>(
+        &self,
+        bounds_stream: &Stream<C, Box<TS>>,
+        retain_val_func: Box<dyn Fn(&TS) -> Filter<B::Val>>,
+        n: usize,
+    ) where
+        B: Batch<Time = ()>,
+        TS: DataTrait + ?Sized,
+        Box<TS>: Clone,
+    {
+        let bounds = self.trace_bounds();
+        bounds.set_unique_val_bound_name(bounds_stream.get_persistent_id().as_deref());
+
+        bounds_stream.inspect(move |ts| {
+            let filter = GroupFilter::LastN(n, retain_val_func(ts.as_ref()));
+            bounds.set_val_filter(filter);
+        });
+    }
+
+    #[track_caller]
+    pub fn dyn_integrate_trace_retain_values_top_n<TS>(
+        &self,
+        val_factory: &'static dyn Factory<B::Val>,
+        bounds_stream: &Stream<C, Box<TS>>,
+        retain_val_func: Box<dyn Fn(&TS) -> Filter<B::Val>>,
+        n: usize,
+    ) where
+        B: Batch<Time = ()>,
+        TS: DataTrait + ?Sized,
+        Box<TS>: Clone,
+    {
+        let bounds = self.trace_bounds();
+        bounds.set_unique_val_bound_name(bounds_stream.get_persistent_id().as_deref());
+
+        bounds_stream.inspect(move |ts| {
+            let filter = GroupFilter::TopN(n, retain_val_func(ts.as_ref()), val_factory);
             bounds.set_val_filter(filter);
         });
     }
@@ -435,7 +486,6 @@ where
         B: BatchReader,
     {
         // We handle moving from the sharded to unsharded stream directly here.
-        // Moving from spilled to unspilled is handled by `spill()`.
         let stream_id = self.try_unsharded_version().stream_id();
 
         self.circuit()
@@ -694,7 +744,6 @@ where
 {
     // Total number of input tuples processed by the operator.
     num_inputs: usize,
-    num_inputs_metric: Option<Gauge>,
 
     _phantom: PhantomData<T>,
 }
@@ -715,7 +764,6 @@ where
     pub fn new() -> Self {
         Self {
             num_inputs: 0,
-            num_inputs_metric: None,
             _phantom: PhantomData,
         }
     }
@@ -729,26 +777,9 @@ where
         Cow::from("UntimedTraceAppend")
     }
 
-    fn init(&mut self, global_id: &GlobalNodeId) {
-        self.num_inputs_metric = Some(Gauge::new(
-            NUM_INPUTS,
-            None,
-            Some("count"),
-            global_id,
-            vec![],
-        ));
-    }
-
-    fn metrics(&self) {
-        self.num_inputs_metric
-            .as_ref()
-            .unwrap()
-            .set(self.num_inputs as f64);
-    }
-
     fn metadata(&self, meta: &mut OperatorMeta) {
         meta.extend(metadata! {
-            NUM_INPUTS => MetaItem::Count(self.num_inputs),
+            INPUT_RECORDS_COUNT => MetaItem::Count(self.num_inputs),
         });
     }
 
@@ -767,10 +798,9 @@ where
         panic!("UntimedTraceAppend::eval(): cannot accept trace by reference")
     }
 
-    #[trace]
     async fn eval_owned_and_ref(&mut self, mut trace: T, batch: &T::Batch) -> T {
         self.num_inputs += batch.len();
-        trace.insert(batch.clone());
+        trace.insert(batch.clone()).await;
         trace
     }
 
@@ -780,11 +810,10 @@ where
         panic!("UntimedTraceAppend::eval_ref_and_owned(): cannot accept trace by reference")
     }
 
-    #[trace]
     async fn eval_owned(&mut self, mut trace: T, batch: T::Batch) -> T {
         self.num_inputs += batch.len();
 
-        trace.insert(batch);
+        trace.insert(batch).await;
         trace
     }
 
@@ -802,7 +831,6 @@ pub struct TraceAppend<T: Trace, B: BatchReader, C> {
 
     // Total number of input tuples processed by the operator.
     num_inputs: usize,
-    num_inputs_metric: Option<Gauge>,
 
     _phantom: PhantomData<(T, B)>,
 }
@@ -813,7 +841,6 @@ impl<T: Trace, B: BatchReader, C> TraceAppend<T, B, C> {
             clock,
             output_factories: output_factories.clone(),
             num_inputs: 0,
-            num_inputs_metric: None,
             _phantom: PhantomData,
         }
     }
@@ -832,26 +859,9 @@ where
         true
     }
 
-    fn init(&mut self, global_id: &GlobalNodeId) {
-        self.num_inputs_metric = Some(Gauge::new(
-            NUM_INPUTS,
-            None,
-            Some("count"),
-            global_id,
-            vec![],
-        ));
-    }
-
-    fn metrics(&self) {
-        self.num_inputs_metric
-            .as_ref()
-            .unwrap()
-            .set(self.num_inputs as f64);
-    }
-
     fn metadata(&self, meta: &mut OperatorMeta) {
         meta.extend(metadata! {
-            NUM_INPUTS => MetaItem::Count(self.num_inputs),
+            INPUT_RECORDS_COUNT => MetaItem::Count(self.num_inputs),
         });
     }
 }
@@ -862,23 +872,23 @@ where
     Clk: WithClock + 'static,
     T: Trace<Key = B::Key, Val = B::Val, R = B::R, Time = Clk::Time>,
 {
-    #[trace]
     async fn eval(&mut self, _trace: &T, _batch: &B) -> T {
         // Refuse to accept trace by reference.  This should not happen in a correctly
         // constructed circuit.
         unimplemented!()
     }
 
-    #[trace]
     async fn eval_owned_and_ref(&mut self, mut trace: T, batch: &B) -> T {
         // TODO: extend `trace` type to feed untimed batches directly
         // (adding fixed timestamp on the fly).
         self.num_inputs += batch.len();
-        trace.insert(T::Batch::from_batch(
-            batch,
-            &self.clock.time(),
-            &self.output_factories,
-        ));
+        trace
+            .insert(T::Batch::from_batch(
+                batch,
+                &self.clock.time(),
+                &self.output_factories,
+            ))
+            .await;
         trace
     }
 
@@ -888,20 +898,21 @@ where
         unimplemented!()
     }
 
-    #[trace]
     async fn eval_owned(&mut self, mut trace: T, batch: B) -> T {
         self.num_inputs += batch.len();
 
         if TypeId::of::<B>() == TypeId::of::<T::Batch>() {
             let mut batch = Some(batch);
             let batch = unsafe { transmute::<&mut Option<B>, &mut Option<T::Batch>>(&mut batch) };
-            trace.insert(batch.take().unwrap());
+            trace.insert(batch.take().unwrap()).await;
         } else {
-            trace.insert(T::Batch::from_batch(
-                &batch,
-                &self.clock.time(),
-                &self.output_factories,
-            ));
+            trace
+                .insert(T::Batch::from_batch(
+                    &batch,
+                    &self.clock.time(),
+                    &self.output_factories,
+                ))
+                .await;
         }
         trace
     }
@@ -946,14 +957,13 @@ pub struct Z1Trace<C: Circuit, B: Batch, T: Trace> {
     root_scope: Scope,
     reset_on_clock_start: bool,
     bounds: TraceBounds<T::Key, T::Val>,
-    // Handle to update the metric `total_size`.
-    total_size_metric: Option<Gauge>,
 
     // Metrics maintained by the trace.
-    trace_metrics: Option<T::Metrics>,
     batch_factories: B::Factories,
     // Stream whose integral this Z1 operator stores, if any.
     delta_stream: Option<Stream<C, B>>,
+    flush_output: bool,
+    flush_input: bool,
 }
 
 impl<C, B, T> Z1Trace<C, B, T>
@@ -981,9 +991,9 @@ where
             root_scope,
             reset_on_clock_start,
             bounds,
-            total_size_metric: None,
-            trace_metrics: None,
             delta_stream: None,
+            flush_output: false,
+            flush_input: false,
         }
     }
 
@@ -1043,41 +1053,17 @@ where
     }
 
     fn clock_end(&mut self, scope: Scope) {
-        if scope + 1 == self.root_scope && !self.reset_on_clock_start {
-            if let Some(tr) = self.trace.as_mut() {
-                tr.set_frontier(&self.time.epoch_start(scope));
-            }
+        if scope + 1 == self.root_scope
+            && !self.reset_on_clock_start
+            && let Some(tr) = self.trace.as_mut()
+        {
+            tr.set_frontier(&self.time.epoch_start(scope));
         }
         self.time = self.time.advance(scope + 1);
     }
 
     fn init(&mut self, global_id: &GlobalNodeId) {
         self.global_id = global_id.clone();
-        self.total_size_metric = Some(Gauge::new(
-            "total_size",
-            None,
-            Some("count"),
-            global_id,
-            vec![],
-        ));
-
-        self.trace_metrics = Some(T::init_operator_metrics(global_id));
-    }
-
-    fn metrics(&self) {
-        let total_size = self
-            .trace
-            .as_ref()
-            .map(|trace| trace.num_entries_deep())
-            .unwrap_or(0);
-
-        self.total_size_metric
-            .as_ref()
-            .unwrap()
-            .set(total_size as f64);
-        if let Some(trace) = self.trace.as_ref() {
-            trace.metrics(self.trace_metrics.as_ref().unwrap());
-        }
     }
 
     fn metadata(&self, meta: &mut OperatorMeta) {
@@ -1094,12 +1080,12 @@ where
             .unwrap_or_default();
 
         meta.extend(metadata! {
-            NUM_ENTRIES_LABEL => MetaItem::Count(total_size),
-            ALLOCATED_BYTES_LABEL => MetaItem::bytes(bytes.total_bytes()),
-            USED_BYTES_LABEL => MetaItem::bytes(bytes.used_bytes()),
-            "allocations" => MetaItem::Count(bytes.distinct_allocations()),
-            SHARED_BYTES_LABEL => MetaItem::bytes(bytes.shared_bytes()),
-            "bounds" => self.bounds.metadata()
+            STATE_RECORDS_COUNT => MetaItem::Count(total_size),
+            ALLOCATED_MEMORY_BYTES => MetaItem::bytes(bytes.total_bytes()),
+            USED_MEMORY_BYTES => MetaItem::bytes(bytes.used_bytes()),
+            MEMORY_ALLOCATIONS_COUNT => MetaItem::Count(bytes.distinct_allocations()),
+            SHARED_MEMORY_BYTES => MetaItem::bytes(bytes.shared_bytes()),
+            RETAINMENT_BOUNDS => self.bounds.metadata()
         });
 
         if let Some(trace) = self.trace.as_ref() {
@@ -1111,11 +1097,16 @@ where
         !self.dirty[scope as usize] && self.replay_state.is_none()
     }
 
-    fn commit(&mut self, base: &StoragePath, pid: Option<&str>) -> Result<(), Error> {
+    fn checkpoint(
+        &mut self,
+        base: &StoragePath,
+        pid: Option<&str>,
+        files: &mut Vec<Arc<dyn FileCommitter>>,
+    ) -> Result<(), Error> {
         let pid = require_persistent_id(pid, &self.global_id)?;
         self.trace
             .as_mut()
-            .map(|trace| trace.commit(base, pid))
+            .map(|trace| trace.save(base, pid, files))
             .unwrap_or(Ok(()))
     }
 
@@ -1133,9 +1124,6 @@ where
         self.trace = Some(T::new(&self.trace_factories));
         self.replay_state = None;
         self.dirty = vec![false; self.root_scope as usize + 1];
-        if let Some(metric) = self.total_size_metric.as_ref() {
-            metric.set(0.0)
-        }
 
         Ok(())
     }
@@ -1172,6 +1160,14 @@ where
 
         Ok(())
     }
+
+    fn flush(&mut self) {
+        self.flush_output = true;
+    }
+
+    fn is_flush_complete(&self) -> bool {
+        !self.flush_output
+    }
 }
 
 impl<C, B, T> StrictOperator<T> for Z1Trace<C, B, T>
@@ -1185,10 +1181,14 @@ where
         let replay_step_size = Runtime::replay_step_size();
 
         if self.replay_mode {
-            if let Some(replay) = &mut self.replay_state {
+            // One output per transaction.
+            if self.flush_output
+                && let Some(replay) = &mut self.replay_state
+            {
                 //println!("Z1-{}::get_output: replaying", &self.global_id);
                 let mut builder = <B::Builder as Builder<B>>::with_capacity(
                     &self.batch_factories,
+                    replay_step_size,
                     replay_step_size,
                 );
 
@@ -1233,6 +1233,8 @@ where
             }
         }
 
+        self.flush_output = false;
+
         let mut result = self.trace.take().unwrap();
         result.clear_dirty_flag();
         result
@@ -1253,15 +1255,25 @@ where
     B: Batch<Key = T::Key, Val = T::Val, Time = (), R = T::R>,
     T: Trace,
 {
+    fn flush_input(&mut self) {
+        self.flush_input = true;
+    }
+
+    fn is_flush_input_complete(&self) -> bool {
+        !self.flush_input
+    }
+
     async fn eval_strict(&mut self, _i: &T) {
         unimplemented!()
     }
 
-    #[trace]
     async fn eval_strict_owned(&mut self, mut i: T) {
         // println!("Z1-{}::eval_strict_owned", &self.global_id);
 
-        self.time = self.time.advance(0);
+        if self.flush_input {
+            self.time = self.time.advance(0);
+            self.flush_input = false;
+        }
 
         let dirty = i.dirty();
 
@@ -1288,9 +1300,17 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::cmp::max;
+    use std::{
+        cmp::max,
+        collections::{BTreeMap, BTreeSet},
+    };
 
-    use crate::{dynamic::DynData, utils::Tup2, Runtime, Stream, TypedBox, ZWeight};
+    use crate::{
+        OrdIndexedZSet, Runtime, Stream, TypedBox, ZWeight,
+        dynamic::DynData,
+        typed_batch::{self, Spine},
+        utils::Tup2,
+    };
     use proptest::{collection::vec, prelude::*};
     use size_of::SizeOf;
 
@@ -1320,49 +1340,315 @@ mod test {
             .collect::<Vec<_>>()
     }
 
+    /// Test that `integrate_trace_retain_XXX` functions don't discard more than
+    /// they are supposed to.
+    //
+    // TODO: this test used to also check that the memory footprint of the collection
+    // is bounded, but this check was flaky, since GC is lazy.
+    fn test_integrate_trace_retain(
+        batches: Vec<Vec<((i32, i32), ZWeight)>>,
+        key_lateness: i32,
+        val_lateness: i32,
+    ) {
+        let (mut dbsp, input_handle) = Runtime::init_circuit(4, move |circuit| {
+            let (stream, handle) = circuit.add_input_indexed_zset::<i32, i32>();
+            let stream = stream.shard();
+            let watermark: Stream<_, TypedBox<(i32, i32), DynData>> = stream.waterline(
+                || (i32::MIN, i32::MIN),
+                |k, v| (*k, *v),
+                |(ts1_left, ts2_left), (ts1_right, ts2_right)| {
+                    (max(*ts1_left, *ts1_right), max(*ts2_left, *ts2_right))
+                },
+            );
+
+            // Track all records in `stream` (this integral is not GC'd).
+            let trace = stream.integrate_trace();
+
+            // Test integrate_trace_retain_keys.
+            let stream1 = stream.map_index(|(k, v)| (*k, *v)).shard();
+            let trace1 = stream.integrate_trace();
+            stream1.integrate_trace_retain_keys(&watermark, move |key, ts| {
+                *key >= ts.0.saturating_sub(key_lateness)
+            });
+
+            trace1.apply(|trace| {
+                // println!("retain_keys: {}bytes", trace.size_of().total_bytes());
+                assert!(trace.size_of().total_bytes() < 100_000);
+            });
+
+            // Test `integrate_trace_retain_values`.
+            let stream2 = stream.map_index(|(k, v)| (*k, *v)).shard();
+
+            let trace2 = stream2.integrate_trace();
+            stream2.integrate_trace_retain_values(&watermark, move |val, ts| {
+                *val >= ts.1.saturating_sub(val_lateness)
+            });
+
+            trace2.apply(|trace| {
+                // println!("retain_vals: {}bytes", trace.size_of().total_bytes());
+                assert!(trace.size_of().total_bytes() < 100_000);
+            });
+
+            // Test `integrate_trace_retain_values_last_n(1)`.
+            let stream3 = stream.map_index(|(k, v)| (*k, *v)).shard();
+
+            let trace3 = stream3.integrate_trace();
+            stream3.integrate_trace_retain_values_last_n(
+                &watermark,
+                move |val, ts| *val >= ts.1.saturating_sub(val_lateness),
+                1,
+            );
+
+            // Test `integrate_trace_retain_values_last_n(3)`.
+            let stream4 = stream.map_index(|(k, v)| (*k, *v)).shard();
+
+            let trace4 = stream4.integrate_trace();
+            stream4.integrate_trace_retain_values_last_n(
+                &watermark,
+                move |val, ts| *val >= ts.1.saturating_sub(val_lateness),
+                3,
+            );
+
+            // Test `integrate_trace_retain_values_top_n(1)`.
+            let stream5 = stream.map_index(|(k, v)| (*k, *v)).shard();
+
+            let trace5 = stream5.integrate_trace();
+            stream5.integrate_trace_retain_values_top_n(
+                &watermark,
+                move |val, ts| *val >= ts.1.saturating_sub(val_lateness),
+                1,
+            );
+
+            // Test `integrate_trace_retain_values_top_n(3)`.
+            let stream6 = stream.map_index(|(k, v)| (*k, *v)).shard();
+
+            let trace6 = stream6.integrate_trace();
+            stream6.integrate_trace_retain_values_top_n(
+                &watermark,
+                move |val, ts| *val >= ts.1.saturating_sub(val_lateness),
+                1,
+            );
+
+            // Validate outputs.
+            trace.apply3(&trace1, &watermark, move |trace, trace1, ts| {
+                let expected = typed_batch::IndexedZSetReader::iter(trace.as_ref())
+                    .filter(|(k, _v, _w)| *k >= ts.0.saturating_sub(key_lateness))
+                    .collect::<BTreeSet<_>>();
+                let actual =
+                    typed_batch::IndexedZSetReader::iter(trace1.as_ref()).collect::<BTreeSet<_>>();
+
+                let missing = expected.difference(&actual).collect::<Vec<_>>();
+                assert!(
+                    missing.is_empty(),
+                    "missing tuples in trace1: {:?}",
+                    missing
+                );
+            });
+
+            trace.apply3(&trace2, &watermark, move |trace, trace2, ts| {
+                let expected = typed_batch::IndexedZSetReader::iter(trace.as_ref())
+                    .filter(|(_k, v, _w)| *v >= ts.1.saturating_sub(val_lateness))
+                    .collect::<BTreeSet<_>>();
+                let actual =
+                    typed_batch::IndexedZSetReader::iter(trace2.as_ref()).collect::<BTreeSet<_>>();
+
+                let missing = expected.difference(&actual).collect::<Vec<_>>();
+                assert!(
+                    missing.is_empty(),
+                    "missing tuples in trace2: {:?}",
+                    missing
+                );
+            });
+
+            fn test_retain_values_last_n(
+                trace: &Spine<OrdIndexedZSet<i32, i32>>,
+                watermark: &TypedBox<(i32, i32), DynData>,
+                val_lateness: i32,
+                n: usize,
+            ) -> BTreeSet<(i32, i32, ZWeight)> {
+                let mut all_tuples = BTreeMap::new();
+                typed_batch::IndexedZSetReader::iter(trace).for_each(|(k, v, w)| {
+                    all_tuples
+                        .entry(k)
+                        .or_insert_with(|| Vec::new())
+                        .push((v, w))
+                });
+                let mut expected = BTreeSet::new();
+                for (k, mut tuples) in all_tuples.into_iter() {
+                    let index = tuples
+                        .iter()
+                        .position(|(v, _w)| *v >= watermark.1.saturating_sub(val_lateness))
+                        .unwrap_or(tuples.len());
+                    let first_index = index.saturating_sub(n);
+                    tuples.drain(first_index..).for_each(|(v, w)| {
+                        let _ = expected.insert((k, v, w));
+                    });
+                }
+                expected
+            }
+
+            fn test_retain_values_top_n(
+                trace: &Spine<OrdIndexedZSet<i32, i32>>,
+                watermark: &TypedBox<(i32, i32), DynData>,
+                val_lateness: i32,
+                n: usize,
+            ) -> BTreeSet<(i32, i32, ZWeight)> {
+                let mut all_tuples = BTreeMap::new();
+                typed_batch::IndexedZSetReader::iter(trace).for_each(|(k, v, w)| {
+                    all_tuples
+                        .entry(k)
+                        .or_insert_with(|| Vec::new())
+                        .push((v, w))
+                });
+
+                let mut expected = BTreeSet::new();
+                for (k, mut tuples) in all_tuples.into_iter() {
+                    tuples.retain(|(v, _w)| *v >= watermark.1.saturating_sub(val_lateness));
+                    let first_index = tuples.len().saturating_sub(n);
+                    tuples.drain(first_index..).for_each(|(v, w)| {
+                        let _ = expected.insert((k, v, w));
+                    });
+                }
+                expected
+            }
+
+            trace.apply3(&trace3, &watermark, move |trace, trace3, ts| {
+                let mut all_tuples = BTreeMap::new();
+                typed_batch::IndexedZSetReader::iter(trace.as_ref()).for_each(|(k, v, w)| {
+                    all_tuples
+                        .entry(k)
+                        .or_insert_with(|| Vec::new())
+                        .push((v, w))
+                });
+
+                let expected =
+                    test_retain_values_last_n(trace.as_ref(), ts.as_ref(), val_lateness, 1);
+
+                let actual =
+                    typed_batch::IndexedZSetReader::iter(trace3.as_ref()).collect::<BTreeSet<_>>();
+
+                let missing = expected.difference(&actual).collect::<Vec<_>>();
+                assert!(
+                    missing.is_empty(),
+                    "missing tuples in trace3: {:?}",
+                    missing
+                );
+            });
+
+            trace.apply3(&trace4, &watermark, move |trace, trace4, ts| {
+                let mut all_tuples = BTreeMap::new();
+                typed_batch::IndexedZSetReader::iter(trace.as_ref()).for_each(|(k, v, w)| {
+                    all_tuples
+                        .entry(k)
+                        .or_insert_with(|| Vec::new())
+                        .push((v, w))
+                });
+
+                let expected =
+                    test_retain_values_last_n(trace.as_ref(), ts.as_ref(), val_lateness, 3);
+
+                let actual =
+                    typed_batch::IndexedZSetReader::iter(trace4.as_ref()).collect::<BTreeSet<_>>();
+
+                let missing = expected.difference(&actual).collect::<Vec<_>>();
+                assert!(
+                    missing.is_empty(),
+                    "missing tuples in trace4: {:?}",
+                    missing
+                );
+            });
+
+            trace.apply3(&trace5, &watermark, move |trace, trace5, ts| {
+                let mut all_tuples = BTreeMap::new();
+                typed_batch::IndexedZSetReader::iter(trace.as_ref()).for_each(|(k, v, w)| {
+                    all_tuples
+                        .entry(k)
+                        .or_insert_with(|| Vec::new())
+                        .push((v, w))
+                });
+
+                let expected =
+                    test_retain_values_top_n(trace.as_ref(), ts.as_ref(), val_lateness, 1);
+
+                let actual =
+                    typed_batch::IndexedZSetReader::iter(trace5.as_ref()).collect::<BTreeSet<_>>();
+
+                let missing = expected.difference(&actual).collect::<Vec<_>>();
+                assert!(
+                    missing.is_empty(),
+                    "missing tuples in trace5: {:?}",
+                    missing
+                );
+            });
+
+            trace.apply3(&trace6, &watermark, move |trace, trace6, ts| {
+                let mut all_tuples = BTreeMap::new();
+                typed_batch::IndexedZSetReader::iter(trace.as_ref()).for_each(|(k, v, w)| {
+                    all_tuples
+                        .entry(k)
+                        .or_insert_with(|| Vec::new())
+                        .push((v, w))
+                });
+
+                let expected =
+                    test_retain_values_top_n(trace.as_ref(), ts.as_ref(), val_lateness, 3);
+
+                let actual =
+                    typed_batch::IndexedZSetReader::iter(trace6.as_ref()).collect::<BTreeSet<_>>();
+
+                let missing = expected.difference(&actual).collect::<Vec<_>>();
+                assert!(
+                    missing.is_empty(),
+                    "missing tuples in trace6: {:?}",
+                    missing
+                );
+            });
+
+            Ok(handle)
+        })
+        .unwrap();
+
+        for batch in batches {
+            let mut tuples = batch
+                .into_iter()
+                .map(|((k, v), r)| Tup2(k, Tup2(v, r)))
+                .collect::<Vec<_>>();
+            input_handle.append(&mut tuples);
+            dbsp.transaction().unwrap();
+        }
+    }
+
+    /// Deterministic input that inserts and retracts records in order to simulate a situation where
+    /// records present in a batch are not present in the trace because they were deleted in a subsequent batch.
+    /// This triggered a bug in the initial implementation of LastN filters.
+    #[test]
+    fn test_integrate_trace_retain_with_deletions() {
+        let mut batches: Vec<Vec<((i32, i32), ZWeight)>> = vec![];
+        for i in 0..1000 {
+            batches.push(vec![
+                ((i, i), 1), // Keep this value, delete subsequent values
+                ((i, i + 1), 1),
+                ((i, i + 2), 1),
+                ((i, i + 3), 1),
+                ((i, i + 4), 1),
+            ]);
+            batches.push(vec![
+                ((i, i + 1), -1),
+                ((i, i + 2), -1),
+                ((i, i + 3), -1),
+                ((i, i + 4), -1),
+            ]);
+        }
+
+        test_integrate_trace_retain(batches, 10, 10);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(16))]
+
         #[test]
-        #[ignore = "this test can be flaky especially on aarch64"]
-        fn test_integrate_trace_retain(batches in quasi_monotone_batches(100, 20, 1000, 200, 100, 200)) {
-            let (mut dbsp, input_handle) = Runtime::init_circuit(4, move |circuit| {
-                let (stream, handle) = circuit.add_input_indexed_zset::<i32, i32>();
-                let stream = stream.shard();
-                let watermark: Stream<_, TypedBox<(i32, i32), DynData>> = stream
-                    .waterline(
-                        || (i32::MIN, i32::MIN),
-                        |k, v| (*k, *v),
-                        |(ts1_left, ts2_left), (ts1_right, ts2_right)| {
-                            (max(*ts1_left, *ts1_right), max(*ts2_left, *ts2_right))
-                        },
-                    );
-
-                let trace = stream.integrate_trace();
-                stream.integrate_trace_retain_keys(&watermark, |key, ts| *key >= ts.0.saturating_sub(100));
-                trace.apply(|trace| {
-                    // println!("retain_keys: {}bytes", trace.size_of().total_bytes());
-                    assert!(trace.size_of().total_bytes() < 100_000);
-                });
-
-                let stream2 = stream.map_index(|(k, v)| (*k, *v)).shard();
-
-                let trace2 = stream2.integrate_trace();
-                stream2.integrate_trace_retain_values(&watermark, |val, ts| *val >= ts.1.saturating_sub(1000));
-
-                trace2.apply(|trace| {
-                    // println!("retain_vals: {}bytes", trace.size_of().total_bytes());
-                    assert!(trace.size_of().total_bytes() < 100_000);
-                });
-
-                Ok(handle)
-            })
-            .unwrap();
-
-            for batch in batches {
-                let mut tuples = batch.into_iter().map(|((k, v), r)| Tup2(k, Tup2(v, r))).collect::<Vec<_>>();
-                input_handle.append(&mut tuples);
-                dbsp.step().unwrap();
-            }
+        fn test_integrate_trace_retain_proptest(batches in quasi_monotone_batches(100, 20, 1000, 200, 100, 200)) {
+            test_integrate_trace_retain(batches, 100, 1000);
         }
     }
 }

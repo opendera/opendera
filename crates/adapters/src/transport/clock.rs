@@ -14,20 +14,21 @@
 //!
 //! The connector supports exactly-once FT.
 
-use anyhow::{anyhow, Result as AnyResult};
+use anyhow::{Result as AnyResult, anyhow};
+use chrono::Utc;
 use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::{
-    format::Parser,
+    PipelineState,
+    format::{BufferSize, Parser},
     transport::{
         InputConsumer, InputEndpoint, InputReader, InputReaderCommand, Resume,
-        TransportInputEndpoint,
+        TransportInputEndpoint, Watermark,
     },
-    PipelineState,
 };
 use feldera_types::{
     config::{
-        ConnectorConfig, FormatConfig, FtModel, InputEndpointConfig, OutputBufferConfig,
-        PipelineConfig, TransportConfig, DEFAULT_CLOCK_RESOLUTION_USECS,
+        ConnectorConfig, DEFAULT_CLOCK_RESOLUTION_USECS, FormatConfig, FtModel,
+        InputEndpointConfig, PipelineConfig, TransportConfig,
     },
     format::json::{JsonFlavor, JsonLines, JsonParserConfig, JsonUpdateFormat},
     program_schema::Relation,
@@ -41,24 +42,24 @@ use std::{
 };
 use tokio::{
     select,
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    time::{sleep_until, Instant},
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    time::{Instant, sleep_until},
 };
 
 /// The controller uses this configuration to add a clock input connector to each pipeline.
 pub fn now_endpoint_config(config: &PipelineConfig) -> InputEndpointConfig {
-    InputEndpointConfig {
-        stream: Cow::Borrowed("now"),
-        connector_config: ConnectorConfig {
-            transport: TransportConfig::ClockInput(ClockConfig {
+    InputEndpointConfig::new(
+        "now",
+        ConnectorConfig::new(
+            TransportConfig::ClockInput(ClockConfig {
                 clock_resolution_usecs: config
                     .global
                     .clock_resolution_usecs
                     .unwrap_or(DEFAULT_CLOCK_RESOLUTION_USECS),
             }),
-            format: Some(FormatConfig {
+            Some(FormatConfig {
                 name: Cow::Borrowed("json"),
-                config: serde_yaml::to_value(JsonParserConfig {
+                config: serde_json::to_value(JsonParserConfig {
                     update_format: JsonUpdateFormat::Raw,
                     json_flavor: JsonFlavor::ClockInput,
                     array: false,
@@ -66,16 +67,13 @@ pub fn now_endpoint_config(config: &PipelineConfig) -> InputEndpointConfig {
                 })
                 .unwrap(),
             }),
-            index: None,
-            output_buffer_config: OutputBufferConfig::default(),
-            max_batch_size: 1,
+        )
+        .with_max_batch_size(Some(1))
+        .with_max_queued_records(
             // This must be >1; otherwise the controller will pause the connector after every input.
-            max_queued_records: 2,
-            paused: false,
-            labels: vec![],
-            start_after: None,
-        },
-    }
+            2,
+        ),
+    )
 }
 
 pub struct ClockEndpoint {
@@ -102,6 +100,7 @@ impl TransportInputEndpoint for ClockEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         _schema: Relation,
+        _resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(ClockReader::new(
             self.config.clone(),
@@ -167,6 +166,10 @@ impl ClockReader {
         consumer: Box<dyn InputConsumer>,
         mut receiver: UnboundedReceiver<InputReaderCommand>,
     ) {
+        const RECORD_SIZE: BufferSize = BufferSize {
+            records: 1,
+            bytes: std::mem::size_of::<u64>(),
+        };
         let mut next_tick: Option<Instant> = None;
         let mut pipeline_state = PipelineState::Paused;
         loop {
@@ -183,21 +186,19 @@ impl ClockReader {
                         // channel closed
                         break;
                     }
-                    // Nothing to do for Seek: the connector simply starts from the current timestamp.
-                    Some(InputReaderCommand::Seek(..)) => {}
                     Some(InputReaderCommand::Replay { data, .. }) => {
                         // Parse serialized timestamp, push it to the circuit.
                         let Some(ts_millis) = (match data {
                             RmpValue::Integer(int) => int.as_u64(),
                             _ => None,
                         }) else {
-                            consumer.error(true, anyhow!("Invalid timestamp in replay log: {data:?}"));
+                            consumer.error(true, anyhow!("Invalid timestamp in replay log: {data:?}"), Some("clock"));
                             continue;
                         };
-                        consumer.buffered(1, std::mem::size_of::<u64>());
-                        let mut buffer = parser.parse(Self::timestamp_to_record(ts_millis).as_bytes()).0.unwrap();
+                        consumer.buffered(RECORD_SIZE);
+                        let mut buffer = parser.parse(Self::timestamp_to_record(ts_millis).as_bytes(), None).0.unwrap();
                         buffer.flush();
-                        consumer.replayed(1, 0);
+                        consumer.replayed(RECORD_SIZE, 0);
                     }
                     Some(InputReaderCommand::Extend) => {
                         pipeline_state = PipelineState::Running;
@@ -211,15 +212,15 @@ impl ClockReader {
                     }
                     Some(InputReaderCommand::Queue { .. }) => {
                         // Push current time;
-                        consumer.buffered(1, std::mem::size_of::<u64>());
+                        consumer.buffered(RECORD_SIZE);
                         let now = Self::current_time(&config);
-                        let mut buffer = parser.parse(Self::timestamp_to_record(now).as_bytes()).0.unwrap();
+                        let mut buffer = parser.parse(Self::timestamp_to_record(now).as_bytes(), None).0.unwrap();
                         buffer.flush();
-                        consumer.extended(1, Some(Resume::Replay {
+                        consumer.extended(RECORD_SIZE, Some(Resume::Replay {
                              seek: serde_json::Value::Null,
                              replay: RmpValue::from(now),
                              hash: 0
-                        }));
+                        }), vec![Watermark::new(Utc::now(), None)]);
 
                         // Schedule next tick.
                         next_tick = Some(Self::next_tick_time(&config, &now));
@@ -234,6 +235,10 @@ impl ClockReader {
 }
 
 impl InputReader for ClockReader {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         let _ = self.sender.send(command);
     }
@@ -249,22 +254,22 @@ mod test {
         collections::BTreeMap,
         fs::create_dir,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         thread::sleep,
         time::Duration,
     };
 
-    use dbsp::{circuit::CircuitConfig, utils::Tup1, DBSPHandle, Runtime};
+    use dbsp::{DBSPHandle, Runtime, circuit::CircuitConfig, utils::Tup1};
     use feldera_adapterlib::catalog::CircuitCatalog;
-    use feldera_sqllib::Timestamp;
+    use feldera_sqllib::{Timestamp, Variant};
     use feldera_types::{
-        config::PipelineConfig,
         deserialize_table_record,
         program_schema::{ColumnType, Field, Relation, SqlIdentifier},
         serialize_table_record,
     };
+    use serde_json::json;
     use tempfile::TempDir;
 
     use crate::{Catalog, Controller};
@@ -334,8 +339,8 @@ mod test {
                     Self { now: t.0 }
                 }
             }
-            deserialize_table_record!(Clock["now", 1] {
-                (now, "now", false, Timestamp, None)
+            deserialize_table_record!(Clock["now", Variant, 1] {
+                (now, "now", false, Timestamp, |_| None)
             });
             serialize_table_record!(Clock[1]{
                 now["now"]: Timestamp
@@ -365,27 +370,26 @@ mod test {
         create_dir(&storage_dir).unwrap();
 
         // Create controller.
-        let config_str = format!(
-            r#"
-name: test
-workers: 4
-storage_config:
-    path: {storage_dir:?}
-fault_tolerance: {{}}
-inputs:
-"#
-        );
+        let config = serde_json::from_value(json!({
+            "name": "test",
+            "workers": 4,
+            "storage_config": {
+                "path": storage_dir,
+            },
+            "fault_tolerance": {},
+            "inputs": {}
+        }))
+        .unwrap();
 
-        let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
         println!("Pipeline config: {config:?}");
 
         let test_stats = Arc::new(ClockStats::new());
         let test_stats_clone = test_stats.clone();
 
-        let controller = Controller::with_config(
+        let controller = Controller::with_test_config(
             move |workers| Ok(clock_test_circuit(workers, test_stats_clone)),
             &config,
-            Box::new(move |e| panic!("clock_test pipeline 1: error: {e}")),
+            Box::new(move |e, _| panic!("clock_test pipeline 1: error: {e}")),
         )
         .unwrap();
 
@@ -413,6 +417,10 @@ inputs:
 
         sleep(Duration::from_secs(5));
 
+        // Pause the controller first to prevent more ticks from being generated
+        // before we count them and stop the pipeline
+        controller.pause();
+
         let old_ticks = ticks;
         let ticks_after_checkpoint = test_stats.ticks() - old_ticks;
 
@@ -428,10 +436,10 @@ inputs:
 
         let test_stats_clone = test_stats.clone();
 
-        let controller = Controller::with_config(
+        let controller = Controller::with_test_config(
             move |workers| Ok(clock_test_circuit(workers, test_stats_clone)),
             &config,
-            Box::new(move |e| panic!("clock_test pipeline 2: error: {e}")),
+            Box::new(move |e, _| panic!("clock_test pipeline 2: error: {e}")),
         )
         .unwrap();
 
@@ -439,7 +447,8 @@ inputs:
 
         let ticks = test_stats.ticks();
         println!("{ticks} ticks replayed after restart");
-        assert_eq!(ticks, ticks_after_checkpoint);
+        // Allow at most one extra tick after pause.
+        assert!(ticks >= ticks_after_checkpoint && ticks <= ticks_after_checkpoint + 1);
 
         controller.stop().unwrap();
         println!("Clock test is finished");

@@ -2,13 +2,17 @@ package org.dbsp.sqlCompiler.compiler.backend.rust;
 
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.InputColumnMetadata;
+import org.dbsp.sqlCompiler.compiler.backend.rust.multi.ProjectDeclarations;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.ir.IDBSPNode;
+import org.dbsp.sqlCompiler.ir.statement.DBSPStructItem;
 import org.dbsp.util.ProgramAndTester;
 import org.dbsp.util.Utilities;
 
-import java.util.HashSet;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.List;
 
 /** This class helps generate Rust code.
  * It is given a set of circuit and functions and generates a compilable Rust file. */
@@ -17,8 +21,11 @@ public class RustFileWriter extends RustWriter {
     boolean findUsed = true;
     boolean slt = false;
     boolean test = false;
+    final LateMaterializations materializations;
 
-    public RustFileWriter() {}
+    public RustFileWriter(LateMaterializations materializations) {
+        this.materializations = materializations;
+    }
 
     /** Preamble used when generating Rust code. */
     String rustPreamble() {
@@ -61,11 +68,11 @@ public class RustFileWriter extends RustWriter {
 
     void generatePreamble() {
         this.builder().append(COMMON_PREAMBLE);
-        long max = this.used.getMaxTupleSize();
-        if (max > 120) {
+        long limit = this.used.getRecursionLimit();
+        if (limit > 240) {
             // this is just a guess
             this.builder().append("#![recursion_limit = \"")
-                    .append(max * 2)
+                    .append(limit)
                     .append("\"]")
                     .newline();
         }
@@ -84,7 +91,13 @@ public class RustFileWriter extends RustWriter {
     public void add(ProgramAndTester pt) {
         if (pt.program() != null)
             this.add(pt.program());
-        this.add(pt.tester());
+        this.addTest(pt.tester());
+    }
+
+    @Override
+    public void addTest(IDBSPNode node) {
+        // Do NOT add to the testNodes list
+        this.toWrite.add(node);
     }
 
     public RustFileWriter setUsed(StructuresUsed used) {
@@ -100,7 +113,7 @@ public class RustFileWriter extends RustWriter {
         }
         this.generatePreamble();
         if (!this.used.tupleSizesUsed.isEmpty()) {
-            this.builder().append("use dbsp::declare_tuples;").newline();
+            this.builder().append("use feldera_macros::declare_tuple;").newline();
         }
         if (this.generateMalloc)
             this.outputBuilder.append(BaseRustCodeGenerator.ALLOC_PREAMBLE);
@@ -113,17 +126,57 @@ public class RustFileWriter extends RustWriter {
 
         for (String dep : this.dependencies)
             this.builder().append("use ").append(dep).append("::*;");
-        Set<String> declarationsDone = new HashSet<>();
+
+        if (this.declareSourceMap) {
+            SourcePositionResource.generateDeclaration(this.outputBuilder);
+        }
+
+        ToRustInnerVisitor innerVisitor = new ToRustInnerVisitor(compiler, this.builder(), null, false);
+        ProjectDeclarations declarationsDone = new ProjectDeclarations();
         for (IDBSPNode node : this.toWrite) {
-            String str;
             IDBSPInnerNode inner = node.as(IDBSPInnerNode.class);
             if (inner != null) {
-                str = ToRustInnerVisitor.toRustString(compiler, inner, false);
+                var list = this.findStructs(inner, compiler, declarationsDone);
+                for (var e: list)
+                    e.accept(innerVisitor);
+                if (!inner.is(DBSPStructItem.class))
+                    // If it's a struct item, it is part of the list above
+                    inner.accept(innerVisitor);
             } else {
                 DBSPCircuit outer = node.to(DBSPCircuit.class);
-                str = ToRustVisitor.toRustString(compiler, outer, declarationsDone);
+                ToRustVisitor visitor = new ToRustVisitor(
+                        compiler, this.builder(), outer.metadata, declarationsDone, this.materializations);
+                visitor.apply(outer);
             }
-            this.builder().append(str).newline();
+            this.builder().newline();
         }
+    }
+
+    List<DBSPStructItem> findStructs(IDBSPInnerNode node, DBSPCompiler compiler, ProjectDeclarations done) {
+        List<DBSPStructItem> structs = new ArrayList<>();
+        ToRustVisitor.FindNestedStructs fn = new ToRustVisitor.FindNestedStructs(compiler, structs);
+        fn.apply(node);
+        DBSPStructItem it = node.as(DBSPStructItem.class);
+        if (it != null && it.metadata != null) {
+            // Discover structs used in the metadata
+            for (int i = 0; i < it.metadata.getColumnCount(); i++) {
+                InputColumnMetadata meta = it.metadata.getColumnMetadata(i);
+                if (meta.defaultValue != null)
+                    fn.apply(meta.defaultValue);
+                if (meta.lateness != null)
+                    fn.apply(meta.lateness);
+                if (meta.watermark != null)
+                    fn.apply(meta.watermark);
+            }
+        }
+
+        List<DBSPStructItem> result = new ArrayList<>();
+        for (DBSPStructItem item: fn.structs) {
+            if (done.contains(item.getName()))
+                continue;
+            result.add(item);
+            done.declare(item.getName());
+        }
+        return result;
     }
 }

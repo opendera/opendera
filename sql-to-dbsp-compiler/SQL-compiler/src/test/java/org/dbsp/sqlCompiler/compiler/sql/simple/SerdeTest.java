@@ -1,6 +1,7 @@
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.frontend.TableData;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.sql.tools.Change;
 import org.dbsp.sqlCompiler.compiler.sql.tools.CompilerCircuitStream;
@@ -15,6 +16,16 @@ import org.junit.Assert;
 import org.junit.Test;
 
 public class SerdeTest extends SqlIoTest {
+    @Test
+    public void testJsonString() {
+        String sql = """
+                CREATE TYPE T0 AS (n VARCHAR, u VARCHAR);
+                CREATE FUNCTION jsonstring_as_t0(line VARCHAR) RETURNS T0;
+                CREATE TABLE T(x VARCHAR);
+                CREATE VIEW V AS SELECT jsonstring_as_t0(x).n FROM T;""";
+        this.getCCS(sql);
+    }
+
     @Test
     public void jsonStructTest() {
         String ddl = """
@@ -51,7 +62,7 @@ public class SerdeTest extends SqlIoTest {
         );
         DBSPZSetExpression input = new DBSPZSetExpression(address0, address1, invalid, invalidJson);
         DBSPZSetExpression output = new DBSPZSetExpression(person0, person0);
-        ccs.addPair(new Change(input), new Change(output));
+        ccs.addPair(new Change("PERS", input), new Change("V", output));
     }
 
     @Test
@@ -85,7 +96,9 @@ public class SerdeTest extends SqlIoTest {
         ));
         DBSPZSetExpression input0 = new DBSPZSetExpression(addressIn0);
         DBSPZSetExpression output0 = new DBSPZSetExpression(addressOut0);
-        ccs.addPair(new Change(input0), new Change(output0, output0));
+        ccs.addPair(new Change("data", input0), new Change(
+                new TableData("decoded0", output0),
+                new TableData("decoded1", output0)));
 
         DBSPExpression addressIn1 = new DBSPTupleExpression(
                 new DBSPStringLiteral("{ \"city\": \"Boston\", \"street\": \"Main\", \"NUMBER\": 10 }", true)
@@ -93,10 +106,13 @@ public class SerdeTest extends SqlIoTest {
         DBSPZSetExpression input1 = new DBSPZSetExpression(addressIn1);
         DBSPZSetExpression output1 = new DBSPZSetExpression(addressOut0);
         Assert.assertNotNull(addressOut0.fields);
-        ccs.addPair(new Change(input1), new Change(new DBSPZSetExpression(
-                new DBSPTupleExpression(new DBSPTupleExpression(true, 
-                        new DBSPStringLiteral("Boston", true),
-                        new DBSPStringLiteral("Main", true),
-                        new DBSPTypeInteger(CalciteObject.EMPTY, 32, true, true).none()))), output1));
+        ccs.addPair(new Change(new TableData("data", input1)), new Change(
+                new TableData("decoded0",
+                        new DBSPZSetExpression(
+                                new DBSPTupleExpression(new DBSPTupleExpression(true,
+                                        new DBSPStringLiteral("Boston", true),
+                                        new DBSPStringLiteral("Main", true),
+                                        new DBSPTypeInteger(CalciteObject.EMPTY, 32, true, true).none())))),
+                new TableData("decoded1", output1)));
     }
 }

@@ -11,9 +11,13 @@ use uuid::Uuid;
 #[derive(Clone, Error, Debug, Serialize)]
 pub enum StorageError {
     /// I/O error.
-    #[error("{0}")]
+    #[error("{}: {operation} failed: {kind}", path.as_ref().map_or("(unknown file)", |path| path.as_str()))]
     #[serde(serialize_with = "serialize_io_error")]
-    StdIo(ErrorKind),
+    StdIo {
+        kind: ErrorKind,
+        operation: &'static str,
+        path: Option<String>,
+    },
 
     /// A process already locked the provided storage directory.
     ///
@@ -33,9 +37,13 @@ pub enum StorageError {
     /// Cannot perform operation because storage is not enabled.
     #[error("Cannot perform operation because storage is not enabled.")]
     StorageDisabled,
-    /// Error while creating a bloom filter.
-    #[error("Failed to serialize/deserialize bloom filter.")]
+    /// Error while creating a batch key filter.
+    #[error("Failed to serialize/deserialize batch key filter.")]
     BloomFilter,
+
+    /// Error while serializing a roaring bitmap batch key filter.
+    #[error("Failed to serialize roaring bitmap batch key filter.")]
+    RoaringBitmapFilter,
 
     /// Path is not valid in storage.
     ///
@@ -54,7 +62,8 @@ pub enum StorageError {
     ObjectStore { kind: ErrorKind, message: String },
 
     /// The requested storage backend is not available.
-    #[error("The requested storage backend ({0:?}) is not available in the open-source version of feldera"
+    #[error(
+        "The requested storage backend ({0:?}) is not available in the open-source version of feldera"
     )]
     BackendNotSupported(Box<StorageBackendConfig>),
 
@@ -67,12 +76,6 @@ pub enum StorageError {
 
     #[error("Error deserializing JSON: {0}")]
     JsonError(String),
-}
-
-impl From<std::io::Error> for StorageError {
-    fn from(value: std::io::Error) -> Self {
-        Self::StdIo(value.kind())
-    }
 }
 
 impl From<ObjectStoreError> for StorageError {
@@ -102,12 +105,19 @@ impl From<ObjectStoreError> for StorageError {
     }
 }
 
-fn serialize_io_error<S>(kind: &ErrorKind, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_io_error<S>(
+    kind: &ErrorKind,
+    operation: &str,
+    path: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    let mut ser = serializer.serialize_struct("IOError", 1)?;
+    let mut ser = serializer.serialize_struct("IOError", 3)?;
     ser.serialize_field("kind", &kind.to_string())?;
+    ser.serialize_field("operation", operation)?;
+    ser.serialize_field("path", &path)?;
     ser.end()
 }
 
@@ -126,14 +136,22 @@ where
 }
 
 impl StorageError {
+    pub fn stdio(kind: ErrorKind, operation: &'static str, path: impl ToString) -> Self {
+        Self::StdIo {
+            kind,
+            operation,
+            path: Some(path.to_string()),
+        }
+    }
+
     pub fn kind(&self) -> ErrorKind {
         match self {
-            StorageError::StdIo(kind) => *kind,
+            StorageError::StdIo { kind, .. } => *kind,
             StorageError::StorageLocked(..) => ErrorKind::ResourceBusy,
             StorageError::NoPersistentId(_) => ErrorKind::Other,
             StorageError::CheckpointNotFound(_) => ErrorKind::NotFound,
             StorageError::StorageDisabled => ErrorKind::Other,
-            StorageError::BloomFilter => ErrorKind::Other,
+            StorageError::BloomFilter | StorageError::RoaringBitmapFilter => ErrorKind::Other,
             StorageError::InvalidPath(_) => ErrorKind::Other,
             StorageError::InvalidURL(_) => ErrorKind::Other,
             StorageError::ObjectStore { kind, .. } => *kind,

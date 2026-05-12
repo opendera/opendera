@@ -11,11 +11,11 @@
 //! parallel when DBSP can be scaled.
 
 use self::{
-    generator::{config::Config as GeneratorConfig, NexmarkGenerator},
+    generator::{NexmarkGenerator, config::Config as GeneratorConfig},
     model::Event,
 };
 use config::GeneratorOptions;
-use rand::{rngs::ThreadRng, Rng};
+use rand::{Rng, rngs::ThreadRng};
 use std::{
     collections::VecDeque,
     sync::mpsc,
@@ -195,7 +195,7 @@ pub mod tests {
 
     use super::*;
     use core::ops::Range;
-    use dbsp::{utils::Tup2, OrdZSet, RootCircuit, ZWeight};
+    use dbsp::{OrdZSet, ZWeight, utils::Tup2};
     use rand::rngs::mock::StepRng;
     use rstest::rstest;
 
@@ -241,7 +241,7 @@ pub mod tests {
 
     #[test]
     fn test_nexmark_dbsp_source_full_batch() {
-        let (circuit, input_handle) = RootCircuit::build(move |circuit| {
+        let (mut circuit, input_handle) = dbsp::Runtime::init_circuit(1, move |circuit| {
             let (stream, input_handle) = circuit.add_input_zset();
 
             let expected_zset = generate_expected_zset(10);
@@ -256,7 +256,7 @@ pub mod tests {
         let source = make_source_with_wallclock_times(0..10, 10);
         input_handle.append(&mut source.take(10).map(|e| Tup2(e, 1)).collect());
 
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
     }
 
     #[test]

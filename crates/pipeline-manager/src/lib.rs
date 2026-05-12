@@ -1,17 +1,58 @@
-use log::debug;
 use rustls::crypto::CryptoProvider;
+use std::collections::HashSet;
+use std::sync::OnceLock;
+use tracing::{debug, warn};
 
 mod auth;
 
 pub mod api;
+pub mod cluster_monitor;
 pub mod common_error;
 pub mod compiler;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod events_cleaner;
 pub mod license;
 pub mod logging;
+pub mod pipeline_env;
 pub mod runner;
+
+/// Feature gate for new/unstable features that aren't rolled out or will change
+/// substantially in the future.
+static UNSTABLE_FEATURES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+/// Initialization function to set the platform's unstable feature gate.
+pub fn platform_enable_unstable(requested_features: &str) {
+    let all_features: HashSet<&'static str> = HashSet::from_iter(vec![
+        "runtime_version",
+        "testing",
+        "cluster_monitor_resources",
+    ]);
+    let mut enabled = HashSet::new();
+    for requested_feature in requested_features.split(',') {
+        if let Some(supported_feature) = all_features.get(requested_feature) {
+            enabled.insert(*supported_feature);
+        } else {
+            warn!("Requested unstable feature '{requested_feature}' is not supported by the platform.");
+        }
+    }
+    UNSTABLE_FEATURES
+        .set(enabled)
+        .expect("UNSTABLE_FEATURES already initialized");
+}
+
+pub fn unstable_features() -> Option<&'static HashSet<&'static str>> {
+    UNSTABLE_FEATURES.get()
+}
+
+/// To query whether the platform enabled a certain unstable feature.
+pub fn has_unstable_feature(feature: &str) -> bool {
+    UNSTABLE_FEATURES
+        .get()
+        .map(|features| features.contains(feature))
+        .unwrap_or(false)
+}
 
 /// Some dependencies of this crate use the `rustls` library. This library has two features
 /// `ring` and `aws-lc-rs`. When both are enabled, the library requires a process-wide default
@@ -34,4 +75,11 @@ pub fn init_fd_limit() {
             debug!("Failed to raise fd limit: {}", e);
         }
     }
+}
+
+/// Check if a pipeline compiled for the specificed `runtime_version` is compatible with the current `platform_version`.
+// TODO: this is a placeholder implementation for now.
+// TODO: do we need `platform_version` here at all? This can be implicitly the current running platform version.
+pub fn is_supported_runtime(_platform_version: &str, _runtime_version: &str) -> bool {
+    true
 }

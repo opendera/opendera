@@ -1,12 +1,14 @@
 //! Uuid operations
 
+use crate::error::{SqlResult, convert_error};
 use dbsp::NumEntries;
+use feldera_macros::IsNone;
 use feldera_types::serde_with_context::{
-    serde_config::UuidFormat, DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
+    DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, serde_config::UuidFormat,
 };
-use serde::{de, de::Error as _, Deserializer, Serializer};
+use serde::{Deserializer, Serializer, de, de::Error as _};
 use size_of::{Context, SizeOf};
-use std::fmt::{self, Debug};
+use std::fmt::{self, Debug, Display};
 
 /// A type for storing universally unique identifiers.
 #[derive(
@@ -21,6 +23,7 @@ use std::fmt::{self, Debug};
     rkyv::Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -71,7 +74,7 @@ impl NumEntries for &Uuid {
     }
 }
 
-impl<'de> DeserializeWithContext<'de, SqlSerdeConfig> for Uuid {
+impl<'de, AUX> DeserializeWithContext<'de, SqlSerdeConfig, AUX> for Uuid {
     fn deserialize_with_context<D>(
         deserializer: D,
         config: &'de SqlSerdeConfig,
@@ -155,28 +158,16 @@ impl Uuid {
         self.value.as_bytes()
     }
 
-    /// Convert Uuid to string representation
-    #[doc(hidden)]
-    #[allow(clippy::inherent_to_string)]
-    pub fn to_string(self) -> String {
-        self.value.to_string()
-    }
-
     /// Parse a string into a Uuid
     #[doc(hidden)]
-    pub fn from_string(value: &String) -> Self {
-        Self {
-            value: uuid::Uuid::parse_str(value)
-                .unwrap_or_else(|_| panic!("Cannot parse {value} into a UUID")),
-        }
+    pub fn try_from_ref(value: &str) -> SqlResult<Self> {
+        let uuid = convert_error(uuid::Uuid::parse_str(value))?;
+        Ok(Self { value: uuid })
     }
+}
 
-    /// Parse a string into a Uuid
-    #[doc(hidden)]
-    pub fn from_ref(value: &str) -> Self {
-        Self {
-            value: uuid::Uuid::parse_str(value)
-                .unwrap_or_else(|_| panic!("Cannot parse {value} into a UUID")),
-        }
+impl Display for Uuid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.value, f)
     }
 }

@@ -1,25 +1,24 @@
 package org.dbsp.simulator.operators;
 
-import org.dbsp.simulator.collections.BaseCollection;
 import org.dbsp.simulator.collections.ZSet;
-import org.dbsp.simulator.types.WeightType;
-import org.dbsp.simulator.values.SqlTuple;
+import org.dbsp.simulator.types.CollectionType;
+import org.dbsp.simulator.values.BooleanSqlValue;
+import org.dbsp.simulator.values.DynamicSqlValue;
+import org.dbsp.simulator.values.RuntimeFunction;
 
-import java.util.function.Predicate;
+@SuppressWarnings("unchecked")
+public class FilterOperator extends UnaryOperator {
+    final RuntimeFunction<DynamicSqlValue, BooleanSqlValue> keep;
 
-public class FilterOperator<Weight> extends UnaryOperator<Weight> {
-    final Predicate<SqlTuple> keep;
-
-    public FilterOperator(WeightType<Weight> weightType,
-                          Predicate<SqlTuple> keep, BaseOperator<Weight> input) {
-        super(weightType, input);
+    public FilterOperator(CollectionType outputType, Stream input, RuntimeFunction<DynamicSqlValue, BooleanSqlValue> keep) {
+        super(outputType, input);
         this.keep = keep;
     }
 
     @Override
     public void step() {
-        BaseCollection<Weight> input = this.getInputValue();
-        ZSet<SqlTuple, Weight> inputZset = (ZSet<SqlTuple, Weight>) input;
-        this.nextOutput = inputZset.filter(this.keep);
+        ZSet<DynamicSqlValue> input = (ZSet<DynamicSqlValue>) this.input().getCurrentValue();
+        var filtered = input.filter(this.keep);
+        this.getOutput().setValue(filtered);
     }
 }

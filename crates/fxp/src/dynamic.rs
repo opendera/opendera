@@ -1,15 +1,19 @@
 use std::{
     cmp::Ordering,
     fmt::{Debug, Display, Write},
+    ops::{Add, Div, Mul, Neg, Rem, Sub},
     str::FromStr,
 };
 
 use smallstr::SmallString;
 
 use crate::{
-    checked_pow10, debug_decimal, display_decimal, parse_decimal, pow10, u256::I256, Fixed,
-    OutOfRange, ParseDecimalError,
+    Fixed, OutOfRange, ParseDecimalError, checked_pow10, debug_decimal, display_decimal,
+    parse_decimal, pow10, u256::I256,
 };
+
+use rand::Rng;
+use rand::distributions::uniform::{UniformInt, UniformSampler};
 
 /// Decimal real number with 38 digits of precision and dynamic scale.
 ///
@@ -37,11 +41,17 @@ use crate::{
 ///   digits of precision than other forms.)
 ///
 /// * If `significand == 0`, then `scale` must be zero.
+///
+/// # Arithmetic
+///
+/// There are various arithmetic traits implemented for DynamicDecimal,
+/// but they are intended for limited uses; in particular, these
+/// functions will panic for overflows.
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "size_of", derive(size_of::SizeOf))]
 #[cfg_attr(
     feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, rkyv::CheckBytes)
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
 pub struct DynamicDecimal {
     /// Significand.
@@ -108,8 +118,50 @@ impl DynamicDecimal {
     }
 
     /// Returns the canonical [scale](Self#representation).
-    pub const fn scale(&self) -> u8 {
+    pub const fn exponent(&self) -> u8 {
         self.exponent
+    }
+
+    /// Truncates the value to an integer by discarding digits after decimal point
+    pub fn trunc(&self) -> Self {
+        DynamicDecimal::new(self.sig / pow10(self.exponent as usize), 0)
+    }
+
+    /// Returns this value, truncated toward zero at `digits` after the decimal
+    /// point.
+    pub fn trunc_digits(&self, digits: u8) -> Self {
+        if self.exponent() <= digits {
+            *self
+        } else if self.exponent - digits > 38 {
+            Self::ZERO
+        } else {
+            let divisor = pow10((self.exponent - digits) as usize);
+            Self::new(self.significand() / divisor, digits)
+        }
+    }
+
+    /// Floor of the value
+    pub fn floor(&self) -> Self {
+        let trunc = self.trunc();
+        if self.is_negative() {
+            if trunc != *self {
+                trunc - DynamicDecimal::new(1, 0)
+            } else {
+                *self
+            }
+        } else {
+            trunc
+        }
+    }
+
+    /// True if value is negative
+    pub const fn is_negative(self) -> bool {
+        self.sig.is_negative()
+    }
+
+    /// The absolute value
+    pub const fn abs(self) -> Self {
+        Self::new(self.sig.abs(), self.exponent)
     }
 }
 
@@ -118,6 +170,113 @@ impl<const P: usize, const S: usize> From<Fixed<P, S>> for DynamicDecimal {
     /// possibly a different precision and scale.
     fn from(value: Fixed<P, S>) -> Self {
         Self::new(value.0, S as u8)
+    }
+}
+
+impl Neg for DynamicDecimal {
+    type Output = Self;
+
+    fn neg(self) -> Self {
+        DynamicDecimal::new(-self.sig, self.exponent)
+    }
+}
+
+impl Add<DynamicDecimal> for DynamicDecimal {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        match self.exponent.cmp(&other.exponent) {
+            Ordering::Less => {
+                let factor = pow10((other.exponent - self.exponent) as usize);
+                if self.sig <= i128::MAX / factor / 10 {
+                    DynamicDecimal::new(
+                        other.sig.checked_add(self.sig * factor).unwrap(),
+                        other.exponent,
+                    )
+                } else {
+                    let result = (I256::from_product(self.sig, factor) + I256::from(other.sig))
+                        .reduce_to_i128();
+                    DynamicDecimal::new(result.0, result.1 as u8)
+                }
+            }
+            Ordering::Equal => {
+                DynamicDecimal::new(self.sig.checked_add(other.sig).unwrap(), self.exponent)
+            }
+            Ordering::Greater => {
+                let factor = pow10((self.exponent - other.exponent) as usize);
+                if other.sig <= i128::MAX / factor / 10 {
+                    DynamicDecimal::new(
+                        self.sig.checked_add(other.sig * factor).unwrap(),
+                        self.exponent,
+                    )
+                } else {
+                    let result = (I256::from_product(other.sig, factor) + I256::from(self.sig))
+                        .reduce_to_i128();
+                    DynamicDecimal::new(result.0, result.1 as u8)
+                }
+            }
+        }
+    }
+}
+
+impl Sub<DynamicDecimal> for DynamicDecimal {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        self.add(other.neg())
+    }
+}
+
+impl Mul<DynamicDecimal> for DynamicDecimal {
+    type Output = Self;
+
+    fn mul(self, other: Self) -> Self {
+        let result = I256::from_product(self.sig, other.sig).reduce_to_i128();
+        DynamicDecimal::new(result.0, result.1 as u8 + self.exponent + other.exponent)
+    }
+}
+
+impl Div<DynamicDecimal> for DynamicDecimal {
+    type Output = Self;
+
+    fn div(self, other: DynamicDecimal) -> DynamicDecimal {
+        if other.sig == 0i128 {
+            panic!("Division by zero");
+        } else {
+            // We have to choose an arbitrary number of digits after the decimal
+            // point where we stop.
+            const MIN_DIGITS: u8 = 6;
+            let digits = std::cmp::max(std::cmp::max(MIN_DIGITS, self.exponent), other.exponent);
+
+            let shift_left = (other.exponent + digits).saturating_sub(self.exponent);
+            if shift_left > 38 {
+                // A shift this big would exceed the range of I256, so we can't
+                // calculate it, but the ultimate result would also overflow, so
+                // we don't have to.
+                panic!("Division overflow");
+            } else {
+                let scaled = I256::from_product(self.sig, pow10(shift_left as usize));
+                let div = scaled.narrowing_div(other.sig).unwrap();
+                let exp = self.exponent.saturating_sub(other.exponent + digits);
+                let adjust = div * pow10(exp as usize);
+                DynamicDecimal::new(adjust, digits)
+            }
+        }
+    }
+}
+
+impl Rem<DynamicDecimal> for DynamicDecimal {
+    type Output = Self;
+
+    fn rem(self, other: Self) -> Self {
+        let neg = self.is_negative();
+        let left = self.abs();
+        let right = other.abs();
+        let div = left.div(right);
+        let trunc = div.trunc();
+        let mul = right.mul(trunc);
+        let rem = left.sub(mul);
+        if neg { rem.neg() } else { rem }
     }
 }
 
@@ -264,6 +423,18 @@ try_to_unsigned_int!(u16);
 try_to_unsigned_int!(u8);
 try_to_unsigned_int!(usize);
 
+impl From<DynamicDecimal> for f64 {
+    fn from(value: DynamicDecimal) -> Self {
+        value.significand() as f64 / pow10(value.exponent() as usize) as f64
+    }
+}
+
+impl From<DynamicDecimal> for f32 {
+    fn from(value: DynamicDecimal) -> Self {
+        value.significand() as f32 / pow10(value.exponent() as usize) as f32
+    }
+}
+
 impl TryFrom<f64> for DynamicDecimal {
     type Error = OutOfRange;
 
@@ -316,6 +487,35 @@ impl Ord for DynamicDecimal {
                 }
             }
         }
+    }
+}
+
+/// Supports uniform sampling for DynamicDecimals with a specified scale.
+// This is almost like UniformSampler, but we need to pass additional information
+// to the constructor, so we cannot use that trait.
+#[derive(Clone, Debug)]
+pub struct UniformDecimal {
+    significand: UniformInt<i128>,
+    scale: u8,
+}
+
+impl UniformDecimal {
+    /// Create a new UniformDecimal which will sample between
+    /// DynamicDecimal::new(low, scale) and DynamicDecimal::new(high, scale).
+    pub fn new(low: i128, high: i128, scale: u8) -> Self {
+        if low >= high {
+            panic!("Invalid range");
+        }
+        Self {
+            significand: UniformInt::new(&low, &high),
+            scale,
+        }
+    }
+
+    /// Sample uniformly for this range
+    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> DynamicDecimal {
+        let value = self.significand.sample(rng);
+        DynamicDecimal::new(value, self.scale)
     }
 }
 
@@ -441,7 +641,12 @@ mod test {
             (".136", Ok("0.136")),
             ("1e38", Ok("100000000000000000000000000000000000000")),
             ("1e39", Err(ParseDecimalError::OutOfRange)),
-            ("1e-255", Ok("0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001")),
+            (
+                "1e-255",
+                Ok(
+                    "0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
+                ),
+            ),
             ("1e-256", Ok("0")),
         ] {
             println!("{s}: {:?}", s.parse::<DynamicDecimal>());
@@ -488,5 +693,92 @@ mod test {
             i64::try_from(DynamicDecimal::new(i128::MIN, 0)),
             Err(OutOfRange)
         );
+    }
+
+    #[test]
+    fn mul() {
+        fn f(n: f64) -> DynamicDecimal {
+            DynamicDecimal::try_from(n).unwrap().trunc_digits(2)
+        }
+
+        // Same tests as for Fixed
+        // A few specific handwritten cases.
+        assert_eq!((f(1.23) * f(2.34)).trunc_digits(2), f(2.87));
+        assert_eq!((f(-1.23) * f(2.34)).trunc_digits(2), f(-2.87));
+        assert_eq!((f(1.23) * f(-2.34)).trunc_digits(2), f(-2.87));
+        assert_eq!((f(-1.23) * f(-2.34)).trunc_digits(2), f(2.87));
+
+        // General case.
+        for a in -999..=999 {
+            let af: DynamicDecimal = DynamicDecimal::new(a, 2);
+            for b in -999..=999 {
+                let bf = DynamicDecimal::new(b, 2);
+                assert_eq!(af * bf, DynamicDecimal::new(a * b, 4));
+            }
+        }
+    }
+
+    #[test]
+    fn add() {
+        fn f(n: f64) -> DynamicDecimal {
+            DynamicDecimal::try_from(n).unwrap().trunc_digits(2)
+        }
+
+        // A few specific handwritten cases.
+        assert_eq!(f(1.23) + f(2.34), f(3.57));
+        assert_eq!(f(-1.23) + f(2.34), f(1.11));
+        assert_eq!(f(1.23) + f(-2.34), f(-1.11));
+        assert_eq!(f(-1.23) + f(-2.34), f(-3.57));
+
+        for a in -999..=999 {
+            let af = DynamicDecimal::new(a, 2);
+            for b in -999..=999 {
+                let bf = DynamicDecimal::new(b, 2);
+                assert_eq!(af + bf, DynamicDecimal::new(a + b, 2));
+            }
+        }
+    }
+
+    #[test]
+    fn sub() {
+        fn f(n: f64) -> DynamicDecimal {
+            DynamicDecimal::try_from(n).unwrap().trunc_digits(2)
+        }
+
+        assert_eq!(f(1.23) - f(2.34), f(-1.11));
+        assert_eq!(f(-1.23) - f(2.34), f(-3.57));
+        assert_eq!(f(1.23) - f(-2.34), f(3.57));
+        assert_eq!(f(-1.23) - f(-2.34), f(1.11));
+
+        for a in -999..=999 {
+            let af = DynamicDecimal::new(a, 2);
+            for b in -999..=999 {
+                let bf = DynamicDecimal::new(b, 2);
+                assert_eq!(af - bf, DynamicDecimal::new(a - b, 2));
+            }
+        }
+    }
+
+    #[test]
+    fn div() {
+        fn f(n: f64) -> DynamicDecimal {
+            DynamicDecimal::try_from(n).unwrap().trunc_digits(6)
+        }
+
+        assert_eq!(f(1.23) / f(2.34), f(0.525641));
+        assert_eq!(f(-1.23) / f(2.34), f(-0.525641));
+        assert_eq!(f(1.23) / f(-2.34), f(-0.525641));
+        assert_eq!(f(-1.23) / f(-2.34), f(0.525641));
+
+        for a in -999..=999 {
+            let af = DynamicDecimal::new(a, 2);
+            for b in -999..=999 {
+                let bf = DynamicDecimal::new(b, 2);
+                if b != 0 {
+                    let expected = DynamicDecimal::new(a * 1000000 / b, 6);
+                    assert_eq!(af / bf, expected);
+                }
+            }
+        }
     }
 }

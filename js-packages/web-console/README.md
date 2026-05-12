@@ -1,0 +1,166 @@
+# Feldera Web Console
+
+This is the GUI for managing the Feldera deployment.
+
+## Setup
+
+```bash
+# Install Node on Ubuntu (optional)
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+NODE_MAJOR=20
+echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list
+sudo apt-get update
+sudo apt-get install nodejs -y
+# If you don't run Ubuntu: [other binary distributions for node.js](https://github.com/nodesource/distributions)
+
+# Install Bun
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg unzip
+sudo curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.3"
+
+# Install OpenAPI typings generator
+sudo bun install --global @hey-api/openapi-ts
+```
+
+## Development
+
+Install dependencies (needs to be done whenever package.json depencies change):
+
+```bash
+bun install
+```
+
+Start the development server:
+
+```bash
+bun run dev
+```
+
+Build & export static website:
+
+```bash
+bun build
+```
+
+Format the code & linting:
+
+```bash
+bun run format
+bun run lint
+```
+
+Check that there are no type or syntax errors:
+
+```bash
+bun run check
+```
+
+### End-to-end tests (Playwright)
+
+Expects `pipeline-manager` running on `localhost:8080` (override with
+`PLAYWRIGHT_API_ORIGIN` / `PLAYWRIGHT_APP_ORIGIN`).
+
+```bash
+# Run the full e2e suite
+bun run test-e2e
+
+# Run a single spec file
+bun run test-e2e -- tests/pipelineDeleted.e2e.ts
+
+# Run a single test by name (regex, matches against test.describe + test titles)
+bun run test-e2e -- -g "shows Deleted chip"
+
+# Run a single test at a specific line in a file
+bun run test-e2e -- tests/pipelineDeleted.e2e.ts:42
+
+# Headed / debug modes (need a display)
+bun playwright test tests/pipelineDeleted.e2e.ts --headed
+bun playwright test tests/pipelineDeleted.e2e.ts --debug
+```
+
+### Build issues
+
+If you experience unexpected build issues, run `bun run clean` from the repository root and make sure you have the supported Node.js (v20) and Bun.js (1.3.3) versions installed:
+
+```bash
+bun run clean
+node --version && bun --version
+```
+
+## OpenAPI bindings
+
+The bindings for OpenAPI (under $lib/services/manager) are generated using
+[openapi typescript codegen](https://www.npmjs.com/package/@hey-api/openapi-ts).
+
+If you change the API, execute the following steps to update the bindings:
+
+```bash
+bun run build-openapi # If you need to generate a new openapi.json
+bun run generate-openapi
+```
+
+#### Generation errors
+
+If you get an error like this:
+
+```
+error: failed to run custom build command for `feldera-rest-api v0.252.0 (/__w/feldera/feldera/crates/rest-api)`
+
+Caused by:
+  process didn't exit successfully: `/__w/feldera/feldera/target/debug/build/feldera-rest-api-a075935d8e5b212d/build-script-build` (exit status: 101)
+  --- stdout
+  cargo:rerun-if-changed=../../openapi.json
+
+  --- stderr
+
+  thread 'main' (297854) panicked at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/typify-impl-0.1.0/src/convert.rs:1183:32:
+  $ref #/components/schemas/CommitProgressSummary is missing
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+then generate a new `openapi.json` with:
+
+```bash
+bun run build-openapi
+```
+
+If you get an error like this:
+
+```
+🔥 Unexpected error occurred. Token "<SomeNewType>" does not exist.
+```
+
+then:
+
+- If the new type is a `struct` or `enum`, add it to
+  `crates/pipeline-manager/src/api/main.rs`.
+
+- If the new type is a `type` type alias, then you will have to
+  manually annotate each occurrence with what its expansion, like
+  this:
+
+  ```
+  #[schema(value_type = Option<u64>)]
+  pub step: Option<Step>,
+  ```
+
+Afterward, rerun both commands above. If there is more than one new
+type, you may want to add all of them at once, because this will only
+report one each time.
+
+## File Organization
+
+- `src/assets/`: Static assets referenced in UI components, but not served as-is
+- `src/hooks.server.ts`: Point of injection of HTTP request and page load middleware
+- `src/lib/`: Imported modules
+- `src/lib/components/`: Reusable Svelte components
+- `src/lib/compositions/`: Stateful functions that app state management
+- `src/lib/functions/`: Pure functions, or functions that perform side effects through dependency injection
+- `src/lib/functions/common`: Utility functions that are not specific to this project
+- `src/lib/services/`: Functions that describe side effects (persistent storage, networking etc.)
+- `src/lib/types/`: Types used throughout the app
+- `src/routes/`: Web app pages used in file-based routing
+- `static/`: Static assets served as-is

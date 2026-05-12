@@ -1,18 +1,20 @@
 package org.dbsp.sqlCompiler.compiler.sql.streaming;
 
+import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateLinearPostprocessOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateLinearPostprocessRetainKeysOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPChainAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPControlledKeyFilterOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPFlatMapIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainKeysOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainNValuesOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainValuesOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateWithWaterlineOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWaterlineOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
-import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
-import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
+import org.dbsp.sqlCompiler.compiler.frontend.TableData;
 import org.dbsp.sqlCompiler.compiler.sql.OtherTests;
 import org.dbsp.sqlCompiler.compiler.sql.StreamingTestBase;
 import org.dbsp.sqlCompiler.compiler.sql.tools.Change;
@@ -33,19 +35,14 @@ import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDate;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDouble;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeString;
 import org.dbsp.util.Linq;
+import org.dbsp.util.NullPrintStream;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.PrintStream;
+
 /** Tests that exercise streaming features. */
 public class StreamingTests extends StreamingTestBase {
-    @Override
-    public CompilerOptions testOptions() {
-        CompilerOptions options = super.testOptions();
-        // Used by some tests for NOW
-        options.ioOptions.nowStream = true;
-        return options;
-    }
-
     @Test
     public void issue2846() {
         String sql = """
@@ -119,19 +116,69 @@ public class StreamingTests extends StreamingTestBase {
                          20  |   8 | 1""");
         ccs.step("INSERT INTO T VALUES(5, 20);",
                 """
-                         sum | max | weight
+                         max | min | weight
                         --------------------
                          20  |   8 | -1
                          20  |   3 | 1""");
-        int[] chains = new int[1];
         CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
+            int chains = 0;
+
             @Override
             public void postorder(DBSPChainAggregateOperator operator) {
-                chains[0]++;
+                chains++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(1, chains);
             }
         };
         ccs.visit(visitor);
-        Assert.assertEquals(1, chains[0]);
+    }
+
+    @Test
+    public void issue4686() {
+        String sql = """
+                CREATE TABLE T(TS INT, X INT) WITH ('append_only' = 'true');
+                CREATE VIEW V AS
+                SELECT SUM(TS * 2), COUNT(TS - 2), MAX(TS) FROM T;""";
+        var ccs = this.getCCS(sql);
+        ccs.step("INSERT INTO T VALUES(NULL, 0);",
+                """
+                         sum | ct  | max | weight
+                        --------------------
+                             |   0 |     | 1""");
+        ccs.step("INSERT INTO T VALUES(10, -10);",
+                """
+                         sum | ct  | max | weight
+                        --------------------
+                             |   0 |     |-1
+                         20  |   1 | 10  | 1""");
+        ccs.step("INSERT INTO T VALUES(5, 20);",
+                """
+                         sum | ct  | max | weight
+                        --------------------
+                         30  |   2 | 10  | 1
+                         20  |   1 | 10  | -1""");
+        CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
+            int chains = 0;
+
+            @Override
+            public void postorder(DBSPChainAggregateOperator operator) {
+                chains++;
+            }
+
+            @Override
+            public void postorder(DBSPAggregateLinearPostprocessOperator operator) {
+                Assert.fail("Should not be present");
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(1, chains);
+            }
+        };
+        ccs.visit(visitor);
     }
 
     @Test
@@ -230,7 +277,7 @@ public class StreamingTests extends StreamingTestBase {
 
             @Override
             public void endVisit() {
-                Assert.assertEquals(4, this.integrate_trace);
+                Assert.assertEquals(1, this.integrate_trace);
             }
         };
         cc.visit(visitor);
@@ -308,8 +355,7 @@ public class StreamingTests extends StreamingTestBase {
 
             @Override
             public void endVisit() {
-                // 2 for the lag, one for the window
-                Assert.assertEquals(3, this.integrate_trace);
+                Assert.assertEquals(1, this.integrate_trace);
                 Assert.assertEquals(1, this.window);
             }
         };
@@ -334,7 +380,7 @@ public class StreamingTests extends StreamingTestBase {
 
             @Override
             public void endVisit() {
-                Assert.assertEquals(4, this.integrate_trace);
+                Assert.assertEquals(1, this.integrate_trace);
             }
         };
         ccs.visit(visitor);
@@ -627,15 +673,15 @@ public class StreamingTests extends StreamingTestBase {
                     id bigint NOT NULL,
                     unix_time BIGINT LATENESS 100
                 );
-
+                
                 create table FEEDBACK (
                     id bigint,
                     status int,
                     unix_time bigint NOT NULL LATENESS 100
                 );
-
+                
                 CREATE VIEW TRANSACT AS
-                    SELECT transaction.*, feedback.status
+                    SELECT feedback.*, transaction.*
                     FROM
                     feedback LEFT ASOF JOIN transaction
                     MATCH_CONDITION(transaction.unix_time <= feedback.unix_time)
@@ -644,6 +690,7 @@ public class StreamingTests extends StreamingTestBase {
         CompilerCircuitStream ccs = this.getCCS(sql);
         CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
             int integrate_trace = 0;
+            int integrate_trace_last = 0;
 
             @Override
             public void postorder(DBSPIntegrateTraceRetainValuesOperator operator) {
@@ -651,11 +698,65 @@ public class StreamingTests extends StreamingTestBase {
             }
 
             @Override
+            public void postorder(DBSPIntegrateTraceRetainNValuesOperator operator) {
+                this.integrate_trace_last++;
+            }
+
+            @Override
             public void endVisit() {
                 Assert.assertEquals(1, this.integrate_trace);
+                Assert.assertEquals(1, this.integrate_trace_last);
             }
         };
         ccs.visit(visitor);
+
+        // waterline for ASOF is -100
+        ccs.step("""
+                INSERT INTO TRANSACTION VALUES(1, 0), (2, 1);
+                INSERT INTO FEEDBACK VALUES(1, 1, 0), (2, 1, 0);
+                """, """
+                 id | status | time | tid | ttime | weight
+                ---------------------------------------------
+                  1 |      1 |    0 |   1 |     0 | 1
+                  2 |      1 |    0 |     |       | 1""");
+        ccs.step("""
+                INSERT INTO TRANSACTION VALUES(2, 0)""", """
+                 id | status | time | tid | ttime | weight
+                ---------------------------------------------
+                  2 |      1 |    0 |     |       | -1
+                  2 |      1 |    0 |   2 |     0 | 1""");
+        ccs.step("""
+                INSERT INTO TRANSACTION VALUES(2, 200)""", """
+                 id | status | time | tid | ttime | weight
+                ---------------------------------------------""");
+        // waterline moves to 100 = min(200-100, 300-100)
+        ccs.step("""
+                INSERT INTO FEEDBACK VALUES(2, 2, 300)""", """
+                 id | status | time | tid | ttime | weight
+                ---------------------------------------------
+                  2 |      2 |  300 |   2 |   200 | 1""");
+        ccs.step("""
+                INSERT INTO FEEDBACK VALUES(2, 2, 250)""", """
+                 id | status | time | tid | ttime | weight
+                ---------------------------------------------
+                  2 |      2 |  250 |   2 |   200 | 1""");
+        // waterline moves to 200 = min(300-100, 400-100)
+        ccs.step("""
+                INSERT INTO TRANSACTION VALUES(2, 400)""", """
+                 id | status | time | tid | ttime | weight
+                ---------------------------------------------""");
+        // LATE value in FEEDBACK is ignored
+        ccs.step("""
+                INSERT INTO FEEDBACK VALUES(2, 10, 100)""", """
+                 id | status | time | tid | ttime | weight
+                ---------------------------------------------""");
+        // Remove a value from FEEDBACK, retracts the corresponding output
+        ccs.step("""
+                REMOVE FROM FEEDBACK VALUES(2, 2, 250)""", """
+                 id | status | time | tid | ttime | weight
+                ---------------------------------------------
+                  2 |      2 |  250 |   2 |   200 | -1""");
+
     }
 
     @Test
@@ -777,7 +878,10 @@ public class StreamingTests extends StreamingTestBase {
         compiler.options.ioOptions.quiet = false;  // show warnings
         compiler.submitStatementForCompilation(OtherTests.ddl);
         compiler.submitStatementsForCompilation(query);
+        PrintStream save = System.err;
+        System.setErr(NullPrintStream.INSTANCE);
         var ccs = this.getCCS(compiler);
+        System.setErr(save);
         CircuitVisitor visitor = new CircuitVisitor(compiler) {
             boolean found = false;
 
@@ -1011,27 +1115,45 @@ public class StreamingTests extends StreamingTestBase {
                 WHERE ts >= now() - INTERVAL 1 DAY
                 GROUP BY users""";
         CompilerCircuitStream ccs = this.getCCS(sql);
-        CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
-            int window = 0;
-            int waterline = 0;
-
-            @Override
-            public void postorder(DBSPWindowOperator operator) {
-                this.window++;
-            }
-
-            @Override
-            public void postorder(DBSPWaterlineOperator operator) {
-                this.waterline++;
-            }
-
-            @Override
-            public void endVisit() {
-                Assert.assertEquals(1, this.window);
-                Assert.assertEquals(3, this.waterline);
-            }
-        };
+        CircuitVisitor visitor = new Inspector(ccs.compiler, 1, 1, 1);
         ccs.visit(visitor);
+    }
+
+    static class Inspector extends CircuitVisitor {
+        final int expectedWindow;
+        final int expectedChain;
+        final int expectedWaterline;
+
+        public Inspector(DBSPCompiler compiler, int window, int chain, int waterline) {
+            super(compiler);
+            this.expectedChain = chain;
+            this.expectedWaterline = waterline;
+            this.expectedWindow = window;
+        }
+
+        int window = 0;
+        int waterline = 0;
+        int chain = 0;
+
+        @Override
+        public void postorder(DBSPChainAggregateOperator operator) { this.chain++; }
+
+        @Override
+        public void postorder(DBSPWindowOperator operator) {
+            this.window++;
+        }
+
+        @Override
+        public void postorder(DBSPWaterlineOperator operator) {
+            this.waterline++;
+        }
+
+        @Override
+        public void endVisit() {
+            Assert.assertEquals(this.expectedWindow, this.window);
+            Assert.assertEquals(this.expectedWaterline, this.waterline);
+            Assert.assertEquals(this.expectedChain, this.chain);
+        }
     }
 
     @Test
@@ -1047,26 +1169,7 @@ public class StreamingTests extends StreamingTestBase {
                 FROM transactions
                 WHERE ts BETWEEN now() - INTERVAL 1 DAY AND now() + INTERVAL 1 DAY""";
         CompilerCircuitStream ccs = this.getCCS(sql);
-        CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
-            int window = 0;
-            int waterline = 0;
-
-            @Override
-            public void postorder(DBSPWindowOperator operator) {
-                this.window++;
-            }
-
-            @Override
-            public void postorder(DBSPWaterlineOperator operator) {
-                this.waterline++;
-            }
-
-            @Override
-            public void endVisit() {
-                Assert.assertEquals(1, this.window);
-                Assert.assertEquals(2, this.waterline);
-            }
-        };
+        CircuitVisitor visitor = new Inspector(ccs.compiler, 1, 1, 1);
         ccs.visit(visitor);
         ccs.step("""
                  INSERT INTO transactions VALUES (1, '2024-01-01 00:00:10');
@@ -1103,26 +1206,7 @@ public class StreamingTests extends StreamingTestBase {
                 FROM transactions
                 WHERE ts >= year(now()) + 10""";
         CompilerCircuit cc = this.getCC(sql);
-        CircuitVisitor visitor = new CircuitVisitor(cc.compiler) {
-            int window = 0;
-            int waterline = 0;
-
-            @Override
-            public void postorder(DBSPWindowOperator operator) {
-                this.window++;
-            }
-
-            @Override
-            public void postorder(DBSPWaterlineOperator operator) {
-                this.waterline++;
-            }
-
-            @Override
-            public void endVisit() {
-                Assert.assertEquals(1, this.window);
-                Assert.assertEquals(2, this.waterline);
-            }
-        };
+        CircuitVisitor visitor = new Inspector(cc.compiler, 1, 1, 1);
         cc.visit(visitor);
     }
 
@@ -1140,26 +1224,7 @@ public class StreamingTests extends StreamingTestBase {
                 WHERE id + ts/2 - SIN(id) >= year(now()) + 10 AND
                       id + ts/2 - SIN(id) <= EXTRACT(CENTURY FROM now()) * 20;""";
         CompilerCircuit cc = this.getCC(sql);
-        CircuitVisitor visitor = new CircuitVisitor(cc.compiler) {
-            int window = 0;
-            int waterline = 0;
-
-            @Override
-            public void postorder(DBSPWindowOperator operator) {
-                this.window++;
-            }
-
-            @Override
-            public void postorder(DBSPWaterlineOperator operator) {
-                this.waterline++;
-            }
-
-            @Override
-            public void endVisit() {
-                Assert.assertEquals(1, this.window);
-                Assert.assertEquals(2, this.waterline);
-            }
-        };
+        CircuitVisitor visitor = new Inspector(cc.compiler, 1, 1, 1);
         cc.visit(visitor);
     }
 
@@ -1180,26 +1245,7 @@ public class StreamingTests extends StreamingTestBase {
                       id >= EXTRACT(CENTURY FROM now()) * 20 AND
                       id = 4;""";
         CompilerCircuit cc = this.getCC(sql);
-        CircuitVisitor visitor = new CircuitVisitor(cc.compiler) {
-            int window = 0;
-            int waterline = 0;
-
-            @Override
-            public void postorder(DBSPWindowOperator operator) {
-                this.window++;
-            }
-
-            @Override
-            public void postorder(DBSPWaterlineOperator operator) {
-                this.waterline++;
-            }
-
-            @Override
-            public void endVisit() {
-                Assert.assertEquals(2, this.window);
-                Assert.assertEquals(2, this.waterline);
-            }
-        };
+        CircuitVisitor visitor = new Inspector(cc.compiler, 2, 1, 1);
         cc.visit(visitor);
     }
 
@@ -1217,26 +1263,7 @@ public class StreamingTests extends StreamingTestBase {
                 WHERE id >= EXTRACT(CENTURY FROM now()) * 20 AND
                       EXTRACT(CENTURY FROM now()) % 10 = 0;""";
         CompilerCircuit cc = this.getCC(sql);
-        CircuitVisitor visitor = new CircuitVisitor(cc.compiler) {
-            int window = 0;
-            int waterline = 0;
-
-            @Override
-            public void postorder(DBSPWindowOperator operator) {
-                this.window++;
-            }
-
-            @Override
-            public void postorder(DBSPWaterlineOperator operator) {
-                this.waterline++;
-            }
-
-            @Override
-            public void endVisit() {
-                Assert.assertEquals(1, this.window);
-                Assert.assertEquals(2, this.waterline);
-            }
-        };
+        CircuitVisitor visitor = new Inspector(cc.compiler, 1, 1, 1);
         cc.visit(visitor);
     }
 
@@ -1441,6 +1468,111 @@ public class StreamingTests extends StreamingTestBase {
             }
         };
         ccs.visit(visitor);
+    }
+
+    @Test
+    public void rollingInterval() {
+        // Test rolling aggregates with INTERVAL windows
+        String sql = """
+                CREATE TABLE data (
+                  t0 TIMESTAMP NOT NULL LATENESS INTERVAL '2' HOURS,
+                  location INT NOT NULL
+                );
+                
+                CREATE LOCAL VIEW IT AS SELECT (t0 - TIMESTAMP '2020-01-01 00:00:00') HOURS AS t, location FROM data;
+                
+                CREATE VIEW V AS
+                SELECT
+                *,
+                COUNT(*) OVER(
+                   PARTITION BY location
+                   ORDER BY t
+                   RANGE BETWEEN INTERVAL '2' DAYS PRECEDING AND INTERVAL '1' DAYS PRECEDING ) AS c
+                FROM IT;""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
+            int rolling_waterline = 0;
+            int integrate_trace = 0;
+
+            @Override
+            public void postorder(DBSPPartitionedRollingAggregateWithWaterlineOperator operator) {
+                this.rolling_waterline++;
+            }
+
+            @Override
+            public void postorder(DBSPIntegrateTraceRetainKeysOperator operator) {
+                this.integrate_trace++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(1, this.rolling_waterline);
+                Assert.assertEquals(2, this.integrate_trace);
+            }
+        };
+        ccs.visit(visitor);
+        // Validated on Postgres
+        ccs.step("""
+                INSERT INTO data
+                  VALUES(TIMESTAMP '2020-01-01 10:00:00', 10),
+                        (TIMESTAMP '2020-02-01 10:00:00', 10),
+                        (TIMESTAMP '2019-12-30 20:00:00', 10);""", """
+                 t         | location | c | weight
+                -----------------------------------
+                 10 hours  | 10       | 1 | 1
+                 -28 hours | 10       | 0 | 1
+                 754 hours | 10       | 0 | 1""");
+    }
+
+    @Test
+    public void rollingDecimal() {
+        // Test rolling aggregates with DECIMAL windows
+        String sql = """
+                CREATE TABLE data (
+                  t DECIMAL(4, 2) NOT NULL LATENESS 2.0,
+                  location INT NOT NULL
+                );
+
+                CREATE VIEW V AS
+                SELECT
+                *,
+                COUNT(*) OVER(
+                   PARTITION BY location
+                   ORDER BY  t
+                   RANGE BETWEEN 1.5 PRECEDING AND 0.5 PRECEDING) AS c
+                FROM data;""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
+            int rolling_waterline = 0;
+            int integrate_trace = 0;
+
+            @Override
+            public void postorder(DBSPPartitionedRollingAggregateWithWaterlineOperator operator) {
+                this.rolling_waterline++;
+            }
+
+            @Override
+            public void postorder(DBSPIntegrateTraceRetainKeysOperator operator) {
+                this.integrate_trace++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(1, this.rolling_waterline);
+                Assert.assertEquals(2, this.integrate_trace);
+            }
+        };
+        // Validated on Postgres
+        ccs.visit(visitor);
+        ccs.step("INSERT INTO data VALUES(1.0, 1), (2.0, 2), (1.0, 0), (2.0, 3), (3.5, 2), (4.0, 3);", """
+                 t | location | c | weight
+                ---------------------------
+                 1 | 0        | 0 | 1
+                 1 | 1        | 0 | 1
+                 2 | 2        | 0 | 1
+                 3.5 | 2      | 1 | 1
+                 2 | 3        | 0 | 1
+                 4 | 3        | 0 | 1""");
     }
 
     @Test
@@ -1663,14 +1795,20 @@ public class StreamingTests extends StreamingTestBase {
                 CREATE TABLE T2(l INT, m INT, n INT);
                 CREATE VIEW V0 AS
                 select a, l from t1 full outer join t2 on t1.a = t2.l and t1.b < 5 and t2.m > 0;""");
-        int[] fmi = new int[1];
         CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
+            int fmi = 0;
+
+            @Override
             public void postorder(DBSPFlatMapIndexOperator unused) {
-                fmi[0]++;
+                fmi++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(2, fmi);
             }
         };
         ccs.visit(visitor);
-        Assert.assertEquals(3, fmi[0]);
         ccs.step("""
                 INSERT INTO T1 VALUES(0, 1, 2);
                 INSERT INTO T2 VALUES(0, 1, 2);
@@ -1873,9 +2011,7 @@ public class StreamingTests extends StreamingTestBase {
     @Test
     public void errorStreamTest() {
         // Same as before, but using the error stream
-        DBSPType out = new DBSPTypeTuple(
-                new DBSPTypeDouble(CalciteObject.EMPTY, true),
-                new DBSPTypeDate(CalciteObject.EMPTY, false));
+        DBSPType out = new DBSPTypeTuple(DBSPTypeDouble.NULLABLE_INSTANCE, DBSPTypeDate.INSTANCE);
         DBSPType string = DBSPTypeString.varchar(false);
         DBSPType error = new DBSPTypeTuple(string, string,
                 // new DBSPTypeVariant(false)
@@ -1889,49 +2025,32 @@ public class StreamingTests extends StreamingTestBase {
                 SELECT AVG(distance), CAST(pickup AS DATE) FROM series GROUP BY CAST(pickup AS DATE);""";
         CompilerCircuitStream ccs = this.getCCS(sql);
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(10.0, true),
                                         new DBSPTimestampLiteral("2023-12-30 10:00:00", false)))),
                 new Change(
-                        new DBSPZSetExpression(
+                        new TableData("V", new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(10.0, true),
-                                        new DBSPDateLiteral("2023-12-30", false))),
-                        DBSPZSetExpression.emptyWithElementType(error))));
+                                        new DBSPDateLiteral("2023-12-30", false)))),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, DBSPZSetExpression.emptyWithElementType(error)))));
         // Insert tuple before waterline, should be dropped
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(10.0, true),
                                         new DBSPTimestampLiteral("2023-12-29 10:00:00", false)))),
                 new Change(
-                        DBSPZSetExpression.emptyWithElementType(out),
-                        new DBSPZSetExpression(
+                        new TableData("V", DBSPZSetExpression.emptyWithElementType(out)),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPStringLiteral("series"),
                                         new DBSPStringLiteral("Late value"),
-                                        /*
-                                        new DBSPVariantExpression(
-                                                new DBSPMapExpression(map,
-                                                        Linq.list(
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPStringLiteral("distance")
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPDoubleLiteral(10.0)
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPStringLiteral("pickup")
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPTimestampLiteral("2023-12-29 10:00:00", false)
-                                                                )))))
-                                        */
                                         new DBSPStringLiteral("(Some(10.0), 2023-12-29 10:00:00)")
-                        )))));
+                        ))))));
         // Insert tuple after waterline, should change average.
         // Waterline is advanced
         var set = new DBSPZSetExpression(
@@ -1943,44 +2062,28 @@ public class StreamingTests extends StreamingTestBase {
                         new DBSPDoubleLiteral(10.0, true),
                         new DBSPDateLiteral("2023-12-30", false))).negate());
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(20.0, true),
                                         new DBSPTimestampLiteral("2023-12-30 10:10:00", false)))),
-                new Change(set, DBSPZSetExpression.emptyWithElementType(error))));
+                new Change(new TableData("V", set),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, DBSPZSetExpression.emptyWithElementType(error)))));
         // Insert tuple before last waterline, should be dropped
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(10.0, true),
                                         new DBSPTimestampLiteral("2023-12-29 09:10:00", false)))),
                 new Change(
-                        DBSPZSetExpression.emptyWithElementType(out),
-                        new DBSPZSetExpression(
+                        new TableData("V", DBSPZSetExpression.emptyWithElementType(out)),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPStringLiteral("series"),
                                         new DBSPStringLiteral("Late value"),
-                                        /*
-                                        new DBSPVariantExpression(
-                                                new DBSPMapExpression(map,
-                                                        Linq.list(
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPStringLiteral("distance")
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPDoubleLiteral(10.0)
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPStringLiteral("pickup")
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPTimestampLiteral("2023-12-29 09:10:00", false)
-                                                                ))))
-                                         */
                                         new DBSPStringLiteral("(Some(10.0), 2023-12-29 09:10:00)")
-                                )))));
+                                ))))));
         // Insert tuple in the past, but before the last waterline
         var set1 = new DBSPZSetExpression(
                 new DBSPTupleExpression(
@@ -1991,12 +2094,14 @@ public class StreamingTests extends StreamingTestBase {
                     new DBSPDoubleLiteral(15.0, true),
                     new DBSPDateLiteral("2023-12-30", false))).negate());
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(10.0, true),
                                         new DBSPTimestampLiteral("2023-12-30 10:00:00", false)))),
-                new Change(set1, DBSPZSetExpression.emptyWithElementType(error))));
+                new Change(
+                        new TableData("V", set1),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, DBSPZSetExpression.emptyWithElementType(error)))));
     }
 
     @Test
@@ -2010,11 +2115,6 @@ public class StreamingTests extends StreamingTestBase {
                 DBSPTypeString.varchar(false)
         );
         DBSPType e = new DBSPTypeTuple(DBSPTypeString.varchar(false));
-        /*
-        DBSPTypeMap map = new DBSPTypeMap(
-                new DBSPTypeVariant(false),
-                new DBSPTypeVariant(false), false);
-         */
 
         String sql = """
                 CREATE TABLE series (
@@ -2026,102 +2126,67 @@ public class StreamingTests extends StreamingTestBase {
                 CREATE VIEW E AS SELECT MESSAGE FROM ERROR_VIEW WHERE MESSAGE LIKE '%a%';""";
         CompilerCircuitStream ccs = this.getCCS(sql, Linq.list("series"), Linq.list("e", "error_view"));
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(10.0, true),
                                         new DBSPTimestampLiteral("2023-12-30 10:00:00", false)))),
                 new Change(
-                        DBSPZSetExpression.emptyWithElementType(e),
-                        DBSPZSetExpression.emptyWithElementType(error))));
+                        new TableData("E", DBSPZSetExpression.emptyWithElementType(e)),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, DBSPZSetExpression.emptyWithElementType(error)))));
         // Insert tuple before waterline, should be dropped
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(10.0, true),
                                         new DBSPTimestampLiteral("2023-12-29 10:00:00", false)))),
                 new Change(
-                        new DBSPZSetExpression(
-                                new DBSPTupleExpression(new DBSPStringLiteral("Late value"))),
-                        new DBSPZSetExpression(
+                        new TableData("E", new DBSPZSetExpression(
+                                new DBSPTupleExpression(new DBSPStringLiteral("Late value")))),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPStringLiteral("series"),
                                         new DBSPStringLiteral("Late value"),
-                                        /*
-                                        new DBSPVariantExpression(
-                                                new DBSPMapExpression(map,
-                                                        Linq.list(
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPStringLiteral("distance")
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPDoubleLiteral(10.0)
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPStringLiteral("pickup")
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPTimestampLiteral("2023-12-29 10:00:00", false)
-                                                                ))))
-
-                                         */
                                         new DBSPStringLiteral("(Some(10.0), 2023-12-29 10:00:00)")
-                                )))));
+                                ))))));
         // Insert tuple after waterline, should change average.
         // Waterline is advanced
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(20.0, true),
                                         new DBSPTimestampLiteral("2023-12-30 10:10:00", false)))),
                 new Change(
-                        DBSPZSetExpression.emptyWithElementType(e),
-                        DBSPZSetExpression.emptyWithElementType(error))));
+                        new TableData("E", DBSPZSetExpression.emptyWithElementType(e)),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, DBSPZSetExpression.emptyWithElementType(error)))));
         // Insert tuple before last waterline, should be dropped
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(10.0, true),
                                         new DBSPTimestampLiteral("2023-12-29 09:10:00", false)))),
                 new Change(
-                        new DBSPZSetExpression(
-                                new DBSPTupleExpression(new DBSPStringLiteral("Late value"))),
-                        new DBSPZSetExpression(
+                        new TableData("E", new DBSPZSetExpression(
+                                new DBSPTupleExpression(new DBSPStringLiteral("Late value")))),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPStringLiteral("series"),
                                         new DBSPStringLiteral("Late value"),
-                                        /*
-                                        new DBSPVariantExpression(
-                                                new DBSPMapExpression(map,
-                                                        Linq.list(
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPStringLiteral("distance")
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPDoubleLiteral(10.0)
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPStringLiteral("pickup")
-                                                                ),
-                                                                new DBSPVariantExpression(
-                                                                        new DBSPTimestampLiteral("2023-12-29 09:10:00", false)
-                                                                ))))
-                                         */
                                         new DBSPStringLiteral("(Some(10.0), 2023-12-29 09:10:00)")
-                                )))));
+                                ))))));
         // Insert tuple in the past, but before the last waterline
         ccs.addChange(new InputOutputChange(
-                new Change(
+                new Change("series",
                         new DBSPZSetExpression(
                                 new DBSPTupleExpression(
                                         new DBSPDoubleLiteral(10.0, true),
                                         new DBSPTimestampLiteral("2023-12-30 10:00:00", false)))),
                 new Change(
-                        DBSPZSetExpression.emptyWithElementType(e),
-                        DBSPZSetExpression.emptyWithElementType(error))));
+                        new TableData("E", DBSPZSetExpression.emptyWithElementType(e)),
+                        new TableData(DBSPCompiler.ERROR_TABLE_NAME, DBSPZSetExpression.emptyWithElementType(error)))));
     }
 
     @Test
@@ -2415,5 +2480,261 @@ public class StreamingTests extends StreamingTestBase {
                 SELECT DATE_TRUNC(ts, MONTH), MIN(price), item
                 FROM data
                 GROUP BY DATE_TRUNC(ts, MONTH), item;""");
+    }
+
+    @Test
+    public void issue4904() {
+        String sql = """
+                create table T (
+                  x TIMESTAMP,
+                  y TIMESTAMP,
+                  site_id varchar
+                );
+                
+                create view V
+                as select site_id from T
+                where ( x >= NOW() + INTERVAL 30 DAYS
+                    OR
+                    y  >=  NOW() - INTERVAL 30 DAYS);""";
+        var ccs = this.getCCS(sql);
+        ccs.step("""
+                INSERT INTO NOW VALUES('2019-01-01 00:00:00');
+                INSERT INTO T VALUES('2020-01-11 00:00:00', '2020-01-11 00:00:00', 'z');""", """
+                 site_id | weight
+                ------------------
+                 z|1""");
+        ccs.step("INSERT INTO NOW VALUES('2020-01-01 00:00:00')", """
+                 site_id | weight
+                ------------------""");
+        ccs.step("INSERT INTO NOW VALUES('2020-03-01 00:00:00')", """
+                 site_id | weight
+                ------------------
+                 z| -1""");
+    }
+
+    static final String issue4909data = """
+            INSERT INTO T VALUES ('alpha', TRUE, '2025-10-20 14:23:00', '2025-10-19 09:15:00', '2025-10-18 17:45:00', 'lp1', '2025-10-20 20:00:00');
+                INSERT INTO T VALUES ('bravo', FALSE, '2025-10-15 11:00:00', '2025-10-14 08:30:00', '2025-10-13 19:10:00', 'lp2', '2025-10-15 22:00:00');
+                INSERT INTO T VALUES ('charlie', TRUE, '2025-10-10 16:45:00', '2025-10-09 10:00:00', '2025-10-08 18:30:00', 'lp3', '2025-10-10 21:00:00');
+                INSERT INTO T VALUES ('delta', FALSE, '2025-10-05 13:20:00', '2025-10-04 07:45:00', '2025-10-03 20:15:00', 'lp4', '2025-10-05 23:00:00');
+                INSERT INTO T VALUES ('echo', TRUE, '2025-09-30 12:00:00', '2025-09-29 09:00:00', '2025-09-28 16:00:00', 'lp5', '2025-09-30 19:00:00');
+                INSERT INTO T VALUES ('foxtrot', FALSE, '2025-09-25 15:30:00', '2025-09-24 10:30:00', '2025-09-23 18:00:00', 'lp6', '2025-09-25 21:30:00');
+                INSERT INTO T VALUES ('golf', TRUE, '2025-09-20 14:00:00', '2025-09-19 08:00:00', '2025-09-18 17:00:00', 'lp7', '2025-09-20 22:00:00');
+                INSERT INTO T VALUES ('hotel', FALSE, '2025-09-15 11:45:00', '2025-09-14 07:30:00', '2025-09-13 19:30:00', 'lp8', '2025-09-15 20:45:00');
+                INSERT INTO T VALUES ('india', TRUE, '2025-09-10 13:15:00', '2025-09-09 09:45:00', '2025-09-08 18:15:00', 'lp9', '2025-09-10 23:15:00');
+                INSERT INTO T VALUES ('juliet', FALSE, '2025-09-05 12:30:00', '2025-09-04 08:15:00', '2025-09-03 20:00:00', 'lp10', '2025-09-05 22:30:00');
+                INSERT INTO T VALUES ('kilo', TRUE, '2025-08-31 14:45:00', '2025-08-30 10:00:00', '2025-08-29 17:30:00', 'lp11', '2025-08-31 21:45:00');
+                INSERT INTO T VALUES ('lima', FALSE, '2025-08-26 13:00:00', '2025-08-25 09:30:00', '2025-08-24 18:45:00', 'lp12', '2025-08-26 20:00:00');
+                INSERT INTO T VALUES ('mike', TRUE, '2025-08-21 15:15:00', '2025-08-20 07:45:00', '2025-08-19 19:00:00', 'lp13', '2025-08-21 22:15:00');
+                INSERT INTO T VALUES ('november', FALSE, '2025-08-16 12:20:00', '2025-08-15 08:00:00', '2025-08-14 16:30:00', 'lp14', '2025-08-16 23:00:00');
+                INSERT INTO T VALUES ('oscar', TRUE, '2025-08-11 14:10:00', '2025-08-10 09:15:00', '2025-08-09 18:00:00', 'lp15', '2025-08-11 20:10:00');
+                INSERT INTO T VALUES ('papa', FALSE, '2025-08-06 13:40:00', '2025-08-05 10:30:00', '2025-08-04 17:45:00', 'lp16', '2025-08-06 21:40:00');
+                INSERT INTO T VALUES ('quebec', TRUE, '2025-08-01 11:50:00', '2025-07-31 08:45:00', '2025-07-30 19:15:00', 'lp17', '2025-08-01 22:50:00');
+                INSERT INTO T VALUES ('romeo', FALSE, '2025-07-27 12:10:00', '2025-07-26 09:00:00', '2025-07-25 18:30:00', 'lp18', '2025-07-27 20:10:00');
+                INSERT INTO T VALUES ('sierra', TRUE, '2025-07-22 14:35:00', '2025-07-21 07:30:00', '2025-07-20 17:00:00', 'lp19', '2025-07-22 23:35:00');
+                INSERT INTO T VALUES ('tango', FALSE, '2025-07-17 13:25:00', '2025-07-16 10:15:00', '2025-07-15 16:45:00', 'lp20', '2025-07-17 21:25:00');
+                INSERT INTO NOW VALUES('2025-10-21 00:00:00');""";
+
+    @Test
+    public void issue4909() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(
+                   s VARCHAR,
+                   d BOOL,
+                   last TIMESTAMP,
+                   clk TIMESTAMP,
+                   op TIMESTAMP,
+                   lp VARCHAR,
+                   lsd TIMESTAMP
+                );
+                
+                create view V
+                as SELECT
+                    s
+                FROM
+                    T
+                WHERE
+                    s LIKE '%i%'
+                    AND d = true
+                    AND (
+                        last >= NOW() - INTERVAL 30 DAYS
+                        OR clk >= NOW() - INTERVAL 60 DAYS
+                        OR op >= NOW() - INTERVAL 90 DAYS
+                    )
+                    AND lp IS NOT NULL
+                    AND (
+                        lsd >= NOW() - INTERVAL 30 DAYS
+                        OR op IS NOT NULL
+                    );
+                """);
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            @Override
+            public void postorder(DBSPJoinBaseOperator join) {
+                Assert.fail("Should contain no joins");
+            }
+        });
+        // Validated using Postgres on the right date
+        ccs.step(issue4909data, """
+                 s | weight
+                ----------------
+                 charlie| 1
+                 india| 1
+                 kilo| 1
+                 mike| 1""");
+    }
+
+    @Test
+    public void issue4909a() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(
+                   s VARCHAR,
+                   d BOOL,
+                   last TIMESTAMP,
+                   clk TIMESTAMP,
+                   op TIMESTAMP,
+                   lp VARCHAR,
+                   lsd TIMESTAMP
+                );
+                
+                create view V
+                as SELECT
+                    s
+                FROM
+                    T
+                WHERE
+                    s LIKE '%i%'
+                    AND d = true
+                    OR (
+                        last >= NOW() - INTERVAL 30 DAYS
+                        AND clk >= NOW() - INTERVAL 60 DAYS
+                        AND op >= NOW() - INTERVAL 90 DAYS
+                    )
+                    AND lp IS NOT NULL
+                    AND (
+                        lsd >= NOW() - INTERVAL 30 DAYS
+                        OR op IS NOT NULL
+                    );
+                """);
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            @Override
+            public void postorder(DBSPJoinBaseOperator join) {
+                Assert.fail("Should contain no joins");
+            }
+        });
+        // Validated using Postgres on the right date
+        ccs.step(issue4909data, """
+                 s | weight
+                ----------------
+                 alpha| 1
+                 bravo| 1
+                 charlie| 1
+                 delta| 1
+                 echo| 1
+                 foxtrot| 1
+                 india| 1
+                 kilo| 1
+                 mike| 1
+                 sierra| 1""");
+    }
+
+    @Test
+    public void issue4909b() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(
+                   s VARCHAR,
+                   d BOOL,
+                   last TIMESTAMP,
+                   clk TIMESTAMP,
+                   op TIMESTAMP,
+                   lp VARCHAR,
+                   lsd TIMESTAMP
+                );
+                
+                create view V
+                as SELECT
+                    s
+                FROM
+                    T
+                WHERE
+                    s LIKE '%i%'
+                    AND d = true
+                    OR (
+                        (last >= NOW() - INTERVAL 30 DAYS
+                         AND clk >= NOW() - INTERVAL 60 DAYS)
+                        OR op >= NOW() - INTERVAL 90 DAYS
+                    )
+                    AND lp IS NOT NULL
+                    OR (
+                        lsd >= NOW() - INTERVAL 30 DAYS
+                        AND op IS NOT NULL
+                    );
+                """);
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            @Override
+            public void postorder(DBSPJoinBaseOperator join) {
+                Assert.fail("Should contain no joins");
+            }
+        });
+        // Validated using Postgres on the right date
+        ccs.step(issue4909data, """
+                 s | weight
+                ----------------
+                 alpha| 1
+                 bravo| 1
+                 charlie| 1
+                 delta| 1
+                 echo| 1
+                 foxtrot| 1
+                 golf| 1
+                 hotel| 1
+                 india| 1
+                 juliet| 1
+                 kilo| 1
+                 lima| 1
+                 mike| 1
+                 november| 1
+                 oscar| 1
+                 papa| 1
+                 quebec| 1
+                 romeo| 1
+                 sierra| 1""");
+    }
+
+    @Test
+    public void issue4904_alternate() {
+        String sql = """
+                create table T (
+                  properties variant,
+                  site_id varchar
+                );
+                
+                create view V
+                as (select site_id from T
+                    where CAST(properties['x'] AS TIMESTAMP) >= NOW() + INTERVAL 30 DAYS)
+                UNION ALL
+                (select site_id from T
+                 where CAST(properties['y'] AS TIMESTAMP)  >=  NOW() - INTERVAL 30 DAYS);""";
+        this.getCCS(sql);
+    }
+
+    @Test
+    public void leftLateness() {
+        // The fact that emit_final is compiled proves that the output of the left_join has a waterline
+        String sql = """
+            CREATE TABLE t1(
+                x INT,
+                ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR
+            );
+            
+            CREATE TABLE t2(
+                y INT,
+                ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR
+            );
+            
+            CREATE VIEW v
+            WITH ('emit_final' = 'ts')
+            AS SELECT t1.ts
+            FROM t1 LEFT JOIN t2 on t1.ts = t2.ts;""";
+        this.getCCS(sql);
     }
 }

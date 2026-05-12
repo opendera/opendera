@@ -16,11 +16,13 @@ use crate::db::types::program::{
 use crate::db::types::tenant::TenantId;
 use crate::db::types::utils::validate_program_config;
 use crate::db::types::version::Version;
+use crate::error::source_error;
+use crate::has_unstable_feature;
+use feldera_ir::Dataflow;
+use feldera_observability::ReqwestTracingExt;
 use feldera_types::program_schema::ProgramSchema;
 use futures_util::StreamExt;
 use indoc::formatdoc;
-use log::warn;
-use log::{debug, error, info, trace};
 use std::fs::Metadata;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -33,6 +35,7 @@ use tokio::{
     sync::Mutex,
     time::{sleep, Duration},
 };
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 /// The frequency at which the compiler polls the database for new SQL compilation requests.
@@ -59,9 +62,10 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// SQL compilation task that wakes up periodically.
 /// Sleeps inbetween ticks which affects the response time of SQL compilation.
-/// Note that the logic in this task assumes only one is run at a time.
 /// This task cannot fail, and any internal errors are caught and written to log if need-be.
 pub async fn sql_compiler_task(
+    worker_id: usize,
+    total_workers: usize,
     common_config: CommonConfig,
     config: CompilerConfig,
     db: Arc<Mutex<StoragePostgres>>,
@@ -76,10 +80,10 @@ pub async fn sql_compiler_task(
             if let Err(e) = cleanup_sql_compilation(&config, db.clone()).await {
                 match e {
                     SqlCompilationCleanupError::Database(e) => {
-                        error!("SQL compilation cleanup failed: database error occurred: {e}");
+                        error!("SQL worker {worker_id}: compilation cleanup failed: database error occurred: {e}");
                     }
                     SqlCompilationCleanupError::Utility(e) => {
-                        error!("SQL compilation cleanup failed: filesystem operation error occurred: {e}");
+                        error!("SQL worker {worker_id}: compilation cleanup failed: filesystem operation error occurred: {e}");
                     }
                 }
                 unexpected_error = true;
@@ -88,21 +92,32 @@ pub async fn sql_compiler_task(
         }
 
         // Compile
-        let result = attempt_end_to_end_sql_compilation(&common_config, &config, db.clone()).await;
+        let result = attempt_end_to_end_sql_compilation(
+            worker_id,
+            total_workers,
+            &common_config,
+            &config,
+            db.clone(),
+        )
+        .await;
         if let Err(e) = &result {
             match e {
                 DBError::UnknownPipeline { pipeline_id } => {
-                    debug!("SQL compilation canceled: pipeline {pipeline_id} no longer exists");
+                    debug!(
+                        pipeline_id = %pipeline_id,
+                        pipeline = "N/A",
+                        "SQL worker {worker_id}: compilation canceled: pipeline no longer exists"
+                    );
                 }
                 DBError::OutdatedProgramVersion {
                     outdated_version,
                     latest_version,
                 } => {
-                    debug!("SQL compilation canceled: pipeline program version ({outdated_version}) is outdated by latest ({latest_version})");
+                    debug!("SQL worker {worker_id}: compilation canceled: pipeline program version ({outdated_version}) is outdated by latest ({latest_version})");
                 }
                 e => {
                     unexpected_error = true;
-                    error!("SQL compilation canceled: unexpected database error occurred: {e}");
+                    error!("SQL worker {worker_id}: compilation canceled: unexpected database error occurred: {e}");
                 }
             }
         }
@@ -147,23 +162,29 @@ pub async fn sql_compiler_task(
 /// - The pipeline program is detected to be updated (it became outdated)
 /// - The database cannot be reached
 pub(crate) async fn attempt_end_to_end_sql_compilation(
+    worker_id: usize,
+    total_workers: usize,
     common_config: &CommonConfig,
     config: &CompilerConfig,
     db: Arc<Mutex<StoragePostgres>>,
 ) -> Result<bool, DBError> {
-    trace!("Performing SQL compilation...");
+    trace!("SQL worker {worker_id}: Performing SQL compilation...");
 
     // (1) Reset any pipeline which is `CompilingSql` back to `Pending`
     db.lock()
         .await
-        .clear_ongoing_sql_compilation(&common_config.platform_version)
+        .clear_ongoing_sql_compilation_for_worker(
+            &common_config.platform_version,
+            worker_id,
+            total_workers,
+        )
         .await?;
 
     // (2) Find pipeline which needs SQL compilation
     let Some((tenant_id, pipeline)) = db
         .lock()
         .await
-        .get_next_sql_compilation(&common_config.platform_version)
+        .get_next_sql_compilation(&common_config.platform_version, worker_id, total_workers)
         .await?
     else {
         trace!("No pipeline found which needs SQL compilation");
@@ -183,6 +204,7 @@ pub(crate) async fn attempt_end_to_end_sql_compilation(
         Some(db.clone()),
         tenant_id,
         pipeline.id,
+        Some(pipeline.name.clone()),
         &pipeline.platform_version,
         pipeline.program_version,
         &pipeline.program_config,
@@ -194,8 +216,9 @@ pub(crate) async fn attempt_end_to_end_sql_compilation(
     match compilation_result {
         Ok((program_info, duration, compilation_info)) => {
             info!(
-                "SQL compilation success: pipeline {} (program version: {}) (took {:.2}s)",
-                pipeline.id,
+                pipeline_id = %pipeline.id,
+                pipeline = %pipeline.name,
+                "SQL compilation success (program version: {}) (took {:.2}s)",
                 pipeline.program_version,
                 duration.as_secs_f64()
             );
@@ -213,20 +236,25 @@ pub(crate) async fn attempt_end_to_end_sql_compilation(
         Err(e) => match e {
             SqlCompilationError::NoLongerExists => {
                 debug!(
-                    "SQL compilation canceled: pipeline {} no longer exists",
-                    pipeline.id,
+                    pipeline_id = %pipeline.id,
+                    pipeline = %pipeline.name,
+                    "SQL compilation canceled: pipeline no longer exists"
                 );
             }
             SqlCompilationError::Outdated => {
                 debug!(
-                    "SQL compilation canceled: pipeline {} (program version: {}) is outdated",
-                    pipeline.id, pipeline.program_version,
+                    pipeline_id = %pipeline.id,
+                    pipeline = %pipeline.name,
+                    "SQL compilation canceled: program version {} is outdated",
+                    pipeline.program_version
                 );
             }
             SqlCompilationError::TerminatedBySignal => {
                 error!(
-                    "SQL compilation interrupted: pipeline {} (program version: {}) compilation process was terminated by a signal",
-                    pipeline.id, pipeline.program_version,
+                    pipeline_id = %pipeline.id,
+                    pipeline = %pipeline.name,
+                    "SQL compilation interrupted: compilation process was terminated by a signal (program version: {})",
+                    pipeline.program_version
                 );
             }
             SqlCompilationError::SqlError(compilation_info) => {
@@ -240,8 +268,10 @@ pub(crate) async fn attempt_end_to_end_sql_compilation(
                     )
                     .await?;
                 info!(
-                    "SQL compilation failed: pipeline {} (program version: {}) due to SQL errors",
-                    pipeline.id, pipeline.program_version
+                    pipeline_id = %pipeline.id,
+                    pipeline = %pipeline.name,
+                    "SQL compilation failed due to SQL errors (program version: {})",
+                    pipeline.program_version
                 );
             }
             SqlCompilationError::SystemError(internal_system_error) => {
@@ -254,7 +284,12 @@ pub(crate) async fn attempt_end_to_end_sql_compilation(
                         &internal_system_error,
                     )
                     .await?;
-                error!("SQL compilation failed: pipeline {} (program version: {}) due to system error:\n{}", pipeline.id, pipeline.program_version, internal_system_error);
+                error!(
+                    pipeline_id = %pipeline.id,
+                    pipeline = %pipeline.name,
+                    "SQL compilation failed due to system error (program version: {}): {internal_system_error}",
+                    pipeline.program_version
+                );
             }
         },
     }
@@ -321,6 +356,11 @@ async fn fetch_sql_compiler(
     config: &CompilerConfig,
     runtime_selector: &RuntimeSelector,
 ) -> Result<(), SqlCompilationError> {
+    assert!(
+        has_unstable_feature("runtime_version"),
+        "This code-path is only enabled in unstable mode"
+    );
+
     let jar_cache_dir = config
         .working_dir()
         .join("sql-compilation")
@@ -346,21 +386,27 @@ async fn fetch_sql_compiler(
         base_url = config.sql_compiler_cache_url
     );
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| {
             SqlCompilationError::SystemError(format!(
-                "Unable to initiate download of SQL-to-DBSP compiler: {} for selected runtime version '{}'. If possible, fall-back to platform version or change `runtime_version` in the program config.",
+                "Unable to initiate download of SQL-to-DBSP compiler: {}, source error: {}, for selected runtime version '{}'. If possible, fall-back to platform version or change `runtime_version` in the program config.",
                 e,
+                source_error(&e),
                 runtime_selector
             ))
         })?;
 
-    let response = client.get(&jar_cache_url).send().await.map_err(|e| {
+    let response = client
+        .get(&jar_cache_url)
+        .with_sentry_tracing()
+        .send()
+        .await
+        .map_err(|e| {
         SqlCompilationError::SystemError(format!(
-            "Unable to fetch SQL-to-DBSP compiler at '{}': {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
+            "Unable to fetch SQL-to-DBSP compiler at '{}': {}, source error: {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
             &jar_cache_url,
-            e
+            e,
+            source_error(&e)
         ))
     })?;
 
@@ -377,26 +423,43 @@ async fn fetch_sql_compiler(
 
     let response = response.error_for_status().map_err(|e| {
         SqlCompilationError::SystemError(format!(
-            "Unable to download SQL-to-DBSP compiler from: {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
-            e
+            "Unable to download SQL-to-DBSP compiler from: {}, source error: {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
+            e,
+            source_error(&e)
         ))
     })?;
 
     let mut response_stream = response.bytes_stream();
-    while let Some(chunk) = response_stream.next().await {
-        let bytes = chunk.map_err(|e| SqlCompilationError::SystemError(format!(
-            "Unable to read JAR from HTTP stream '{}': {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
-            &jar_cache_url,
-            e
-        )))?;
-        async_tmp_jar_file.write_all(&bytes).await.map_err(|e| {
+
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), response_stream.next()).await.map_err(|_e| {
             SqlCompilationError::SystemError(format!(
-                "Unable to persist SQL-to-DBSP compiler at '{}': {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
-                path.display(),
-                e
+                "Timed out while waiting for the next HTTP response chunk when downloading the SQL-to-DBSP compiler from '{}'.
+                This might be due to slow network, please retry compilation; alternatively, fall back to the platform compiler by removing or changing `runtime_version` in the program config.",
+                &jar_cache_url,
             ))
         })?;
+
+        match chunk {
+            Some(chunk) => {
+                let bytes = chunk.map_err(|e| SqlCompilationError::SystemError(format!(
+                    "Unable to read JAR from HTTP stream '{}': {}, source error: {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
+                    &jar_cache_url,
+                    e,
+                    source_error(&e)
+                )))?;
+                async_tmp_jar_file.write_all(&bytes).await.map_err(|e| {
+                    SqlCompilationError::SystemError(format!(
+                        "Unable to persist SQL-to-DBSP compiler at '{}': {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
+                        path.display(),
+                        e
+                    ))
+                })?;
+            }
+            None => break,
+        }
     }
+
     let tmp_jar_file = NamedTempFile::from_parts(async_tmp_jar_file.into_std(), path);
 
     // Rename to the JAR file that we'll use for compilation
@@ -421,6 +484,7 @@ pub(crate) async fn perform_sql_compilation(
     db: Option<Arc<Mutex<StoragePostgres>>>,
     tenant_id: TenantId,
     pipeline_id: PipelineId,
+    pipeline_name: Option<String>,
     platform_version: &str,
     program_version: Version,
     program_config: &serde_json::Value,
@@ -451,10 +515,13 @@ pub(crate) async fn perform_sql_compilation(
             "})
     })?;
 
-    let runtime_selector = program_config.runtime_version.unwrap_or_default();
+    let runtime_selector = program_config.runtime_version();
+    assert!(has_unstable_feature("runtime_version") || runtime_selector.is_platform());
+    let pipeline_name = pipeline_name.as_deref().unwrap_or("N/A");
     info!(
-        "SQL compilation started: pipeline {} (program version: {}{})",
-        pipeline_id,
+        pipeline_id = %pipeline_id,
+        pipeline = pipeline_name,
+        "SQL compilation started (program version: {}{})",
         program_version,
         if !runtime_selector.is_platform() {
             format!(", runtime version: {runtime_selector}")
@@ -488,23 +555,25 @@ pub(crate) async fn perform_sql_compilation(
     let output_json_schema_file_path = working_dir.join("schema.json");
     let output_dataflow_file_path = working_dir.join("dataflow.json");
     let output_rust_directory_path = working_dir.join("rust");
-    recreate_dir(&output_rust_directory_path)
+    recreate_dir(&output_rust_directory_path.join("crates"))
         .await
         .map_err(|e| SqlCompilationError::SystemError(e.to_string()))?;
     let output_rust_udf_stubs_file_path = working_dir
         .join("rust")
+        .join("crates")
         .join(crate_name_pipeline_globals(pipeline_id))
         .join("src")
         .join("stubs.rs");
 
     // SQL compiler executable
     let sql_compiler_executable_file_path = determine_sql_compiler_path(config, &runtime_selector);
-    if !sql_compiler_executable_file_path.exists() {
+    if has_unstable_feature("runtime_version") && !sql_compiler_executable_file_path.exists() {
         fetch_sql_compiler(config, &runtime_selector).await?;
+        // Either executable exists now or we error'd out
+        assert!(sql_compiler_executable_file_path.exists());
     }
-    // Either executable exists now or we error'd out
-    assert!(sql_compiler_executable_file_path.exists());
 
+    let runtime_crates_path = runtime_selector.runtime_sources(config);
     // Call executable with arguments
     //
     // In the future, it might be that flags can be passed to the SQL compiler through
@@ -524,7 +593,8 @@ pub(crate) async fn perform_sql_compilation(
         .arg("-je")
         .arg("--alltables")
         .arg("--ignoreOrder")
-        .arg("--nowstream")
+        .arg("--runtime")
+        .arg(runtime_crates_path)
         .arg("--crates") // Generate multiple crates instead of a single main.rs
         .arg(crate_name_pipeline_base(pipeline_id));
     #[cfg(feature = "feldera-enterprise")]
@@ -582,7 +652,11 @@ pub(crate) async fn perform_sql_compilation(
                                 return Err(SqlCompilationError::NoLongerExists);
                             }
                             Err(e) => {
-                                error!("SQL compilation outdated check failed due to database error: {e}")
+                                error!(
+                                    pipeline_id = %pipeline_id,
+                                    pipeline = pipeline_name,
+                                    "SQL compilation outdated check failed due to database error: {e}"
+                                )
                                 // As preemption check failing is not fatal, compilation will continue
                             }
                         }
@@ -639,6 +713,8 @@ pub(crate) async fn perform_sql_compilation(
                     ));
                 } else {
                     error!(
+                        pipeline_id = %pipeline_id,
+                        pipeline = pipeline_name,
                         "Unable to parse SQL compiler response after successful compilation, warnings were not passed to client: {}",
                         stderr_str
                     );
@@ -668,10 +744,10 @@ pub(crate) async fn perform_sql_compilation(
 
         // Read dataflow.json
         let dataflow_str = read_file_content(&output_dataflow_file_path).await?;
-        let dataflow: serde_json::Value = serde_json::from_str(&dataflow_str).map_err(|e| {
+        let dataflow: Dataflow = serde_json::from_str(&dataflow_str).map_err(|e| {
             SqlCompilationError::SystemError(
                 CommonError::json_deserialization_error(
-                    "dataflow.json from SQL compiler into JSON".to_string(),
+                    "dataflow.json from SQL compiler into struct Dataflow".to_string(),
                     e,
                 )
                 .to_string(),
@@ -685,7 +761,7 @@ pub(crate) async fn perform_sql_compilation(
         let stubs = read_file_content(&output_rust_udf_stubs_file_path).await?;
 
         // Generate the program information
-        match generate_program_info(schema, main_rust, stubs, dataflow) {
+        match generate_program_info(schema, main_rust, stubs, Some(dataflow)) {
             Ok(program_info) => {
                 let program_info = match serde_json::to_value(program_info) {
                     Ok(value) => value,
@@ -801,18 +877,19 @@ pub(crate) async fn cleanup_sql_compilation(
                             if let Ok(elapsed) = atime.elapsed() {
                                 if elapsed < MAX_AGE {
                                     trace!("Keeping {_jar_name} because it was accessed within the last 7 days ({elapsed:?} ago)");
-                                    return CleanupDecision::Keep {
+                                    CleanupDecision::Keep {
                                         motivation: "Accessed within the last week".to_string(),
-                                    };
+                                    }
+                                } else {
+                                    CleanupDecision::Remove
                                 }
                             } else {
                                 warn!("Unable to determine access time for JAR file, your system clock may be set incorrectly.");
+                                CleanupDecision::Ignore
                             }
-                            CleanupDecision::Ignore
-
                         }
-                        Err(_e) => {
-                            debug!("Failed to get access time for JAR file");
+                        Err(e) => {
+                            debug!("Failed to get access time for JAR file: {:?}", e);
                             CleanupDecision::Ignore
                         }
                     }
@@ -1263,7 +1340,7 @@ mod test {
             CREATE TABLE t1 (
                 val INT
             ) WITH (
-                'connectors' = 'These are not valid connectors.'
+                'connectors' = '["These are not valid connectors."]'
             )
         "#};
         let pipeline_id = test
@@ -1272,11 +1349,13 @@ mod test {
         test.sql_compiler_tick().await;
         let pipeline_descr = test.get_pipeline(tenant_id, pipeline_id).await;
         assert_eq!(pipeline_descr.program_status, ProgramStatus::SqlError);
+        // First message is a warning about the connector missing a name
+        // Second message is an error
         assert!(pipeline_descr
             .program_error
             .sql_compilation
-            .is_some_and(|info| info.messages.len() == 1
-                && info.messages[0].to_owned().error_type == "ConnectorGenerationError"));
+            .is_some_and(|info| info.messages.len() == 2
+                && info.messages[1].to_owned().error_type == "ConnectorGenerationError"));
     }
 
     /// Tests that the cleanup ignores files and directories that do not follow the pattern.

@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Display};
 use utoipa::ToSchema;
 
 /// Supported Avro data change event formats.
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, ToSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, ToSchema, Default)]
 pub enum AvroUpdateFormat {
     /// Raw encoding.
     ///
@@ -21,6 +21,7 @@ pub enum AvroUpdateFormat {
     ///   `insert`, `update`, or `delete`.
     /// - The message key can optionally store the primary key (see the `key_mode` property).
     #[serde(rename = "raw")]
+    #[default]
     Raw,
 
     /// Debezium data change event format.
@@ -30,12 +31,6 @@ pub enum AvroUpdateFormat {
     /// Confluent JDBC connector change event format.
     #[serde(rename = "confluent_jdbc")]
     ConfluentJdbc,
-}
-
-impl Default for AvroUpdateFormat {
-    fn default() -> Self {
-        Self::Raw
-    }
 }
 
 impl Display for AvroUpdateFormat {
@@ -187,7 +182,7 @@ pub enum AvroEncoderKeyMode {
 }
 
 /// Avro output format configuration.
-#[derive(Clone, Serialize, Deserialize, Debug, Default, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AvroEncoderConfig {
     /// Format used to encode data change events in this stream.
@@ -254,4 +249,32 @@ pub struct AvroEncoderConfig {
     /// assigned by the registry in the
     #[serde(flatten)]
     pub registry_config: AvroSchemaRegistryConfig,
+
+    /// The number of threads to use during encoding.
+    ///
+    /// Avro encoder supports encoding multiple records in parallel. This configuration specifies
+    /// the number of threads to run in parallel.
+    /// Default: 4
+    #[serde(default = "default_encoder_threads")]
+    pub threads: usize,
+}
+
+impl Default for AvroEncoderConfig {
+    fn default() -> Self {
+        Self {
+            update_format: Default::default(),
+            key_mode: Default::default(),
+            schema: Default::default(),
+            cdc_field: Default::default(),
+            namespace: Default::default(),
+            subject_name_strategy: Default::default(),
+            skip_schema_id: Default::default(),
+            registry_config: Default::default(),
+            threads: default_encoder_threads(),
+        }
+    }
+}
+
+fn default_encoder_threads() -> usize {
+    4
 }

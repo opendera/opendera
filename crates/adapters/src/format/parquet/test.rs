@@ -7,30 +7,33 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use dbsp::utils::Tup2;
 use dbsp::OrdZSet;
+use dbsp::utils::Tup2;
+use feldera_sqllib::Variant;
 use feldera_types::format::json::JsonFlavor;
 use feldera_types::format::parquet::ParquetEncoderConfig;
 use feldera_types::program_schema::Relation;
 use feldera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use parquet::file::serialized_reader::SerializedFileReader;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use tempfile::NamedTempFile;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 use crate::{
     catalog::SerBatchReader,
-    format::{parquet::ParquetEncoder, Encoder},
+    format::{Encoder, parquet::ParquetEncoder},
     static_compile::seroutput::SerBatchImpl,
-    test::{mock_input_pipeline, wait, MockOutputConsumer, TestStruct2, DEFAULT_TIMEOUT_MS},
+    test::{DEFAULT_TIMEOUT_MS, MockOutputConsumer, TestStruct2, mock_input_pipeline, wait},
 };
 
 /// Parse Parquet file into an array of `T`.
-pub fn load_parquet_file<T: for<'de> DeserializeWithContext<'de, SqlSerdeConfig>>(
+pub fn load_parquet_file<T: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>>(
     path: &Path,
 ) -> Vec<T> {
     let file = File::open(path).unwrap();
@@ -56,31 +59,33 @@ fn rel_to_schema() {
     relation_to_parquet_schema(&TestStruct2::schema(), false).expect("Can convert");
 }
 
-#[test]
-fn parquet_input() {
+fn parquet_input_test(compression: Compression) {
     // Prepare input data & pipeline
     let test_data = TestStruct2::data();
     let temp_file = NamedTempFile::new().unwrap();
-    let config_str = format!(
-        r#"
-stream: test_input
-transport:
-    name: file_input
-    config:
-        path: {:?}
-        buffer_size_bytes: 5
-format:
-    name: parquet
-"#,
-        temp_file.path().to_str().unwrap()
-    );
+    let config = serde_json::from_value(json!({
+        "stream": "test_input",
+        "transport": {
+            "name": "file_input",
+            "config": {
+                "path": temp_file.path(),
+                "buffer_size_bytes": 5
+            }
+        },
+        "format": {
+            "name": "parquet"
+        }
+    }))
+    .unwrap();
 
     let batch = RecordBatch::try_new(
         TestStruct2::arrow_schema(),
         TestStruct2::make_arrow_array(&test_data),
     )
     .expect("RecordBatch creation should succeed");
-    let props = WriterProperties::builder().build();
+    let props = WriterProperties::builder()
+        .set_compression(compression)
+        .build();
     let mut writer = ArrowWriter::try_new(&temp_file, TestStruct2::arrow_schema(), Some(props))
         .expect("Writer creation should succeed");
     writer
@@ -90,7 +95,7 @@ format:
 
     // Send the data through the mock pipeline
     let (endpoint, consumer, parser, zset) = mock_input_pipeline::<TestStruct2, TestStruct2>(
-        serde_yaml::from_str(&config_str).unwrap(),
+        config,
         Relation::new("test".into(), TestStruct2::schema(), false, BTreeMap::new()),
     )
     .unwrap();
@@ -111,6 +116,16 @@ format:
     for (i, upd) in zset.state().flushed.iter().enumerate() {
         assert_eq!(upd.unwrap_insert(), &test_data[i]);
     }
+}
+
+#[test]
+fn parquet_input_uncompressed() {
+    parquet_input_test(Compression::UNCOMPRESSED);
+}
+
+#[test]
+fn parquet_input_snappy() {
+    parquet_input_test(Compression::SNAPPY);
 }
 
 #[test]
@@ -140,7 +155,7 @@ fn parquet_output() {
         vec![Tup2(test_data[0].clone(), 2), Tup2(test_data[1].clone(), 1)],
     );
 
-    let zset = &SerBatchImpl::<_, TestStruct2, ()>::new(zset) as &dyn SerBatchReader;
+    let zset = Arc::new(SerBatchImpl::<_, TestStruct2, ()>::new(zset)) as Arc<dyn SerBatchReader>;
     encoder.consumer().batch_start(0);
     encoder.encode(zset).unwrap();
     encoder.consumer().batch_end();

@@ -1,9 +1,14 @@
+use super::utils::{copy_to_builder, pick_merge_destination};
+use crate::storage::file::{FilterKind, FilterStats, TouchedWindowCount};
 use crate::{
+    DBWeight, NumEntries,
     algebra::{AddAssignByRef, AddByRef, NegByRef, ZRingValue},
     circuit::checkpointer::Checkpoint,
     dynamic::{DataTrait, DynUnit, DynVec, Erase, WeightTrait, WeightTraitTyped},
     storage::{buffer_cache::CacheStats, file::reader::Error as ReaderError},
     trace::{
+        Batch, BatchLocation, BatchReader, Builder, FallbackKeyBatch, FileWSet, FileWSetFactories,
+        Filter, GroupFilter, MergeCursor,
         cursor::{CursorFactory, DelegatingCursor, PushCursor},
         deserialize_wset, merge_batches_by_reference,
         ord::{
@@ -12,19 +17,18 @@ use crate::{
             merge_batcher::MergeBatcher,
             vec::wset_batch::{VecWSet, VecWSetBuilder},
         },
-        serialize_wset, Batch, BatchLocation, BatchReader, Builder, FileWSet, FileWSetFactories,
-        Filter, MergeCursor,
+        serialize_wset,
     },
-    DBWeight, NumEntries,
 };
-use feldera_storage::StoragePath;
+use feldera_storage::{FileReader, StoragePath};
 use rand::Rng;
-use rkyv::{ser::Serializer, Archive, Archived, Deserialize, Fallible, Serialize};
+use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, ser::Serializer};
 use size_of::SizeOf;
-use std::fmt::{self, Debug};
 use std::ops::Neg;
-
-use super::utils::{copy_to_builder, pick_merge_destination};
+use std::{
+    fmt::{self, Debug},
+    sync::Arc,
+};
 
 pub type FallbackWSetFactories<K, R> = FileWSetFactories<K, R>;
 
@@ -226,7 +230,7 @@ where
     fn merge_cursor(
         &self,
         key_filter: Option<Filter<Self::Key>>,
-        value_filter: Option<Filter<Self::Val>>,
+        value_filter: Option<GroupFilter<Self::Val>>,
     ) -> Box<dyn MergeCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
         match &self.inner {
             Inner::Vec(vec) => vec.merge_cursor(key_filter, value_filter),
@@ -237,7 +241,7 @@ where
     fn consuming_cursor(
         &mut self,
         key_filter: Option<Filter<Self::Key>>,
-        value_filter: Option<Filter<Self::Val>>,
+        value_filter: Option<GroupFilter<Self::Val>>,
     ) -> Box<dyn MergeCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
         match &mut self.inner {
             Inner::Vec(vec) => vec.consuming_cursor(key_filter, value_filter),
@@ -270,6 +274,28 @@ where
     }
 
     #[inline]
+    fn membership_filter_stats(&self) -> FilterStats {
+        match &self.inner {
+            Inner::File(file) => file.membership_filter_stats(),
+            Inner::Vec(vec) => vec.membership_filter_stats(),
+        }
+    }
+
+    fn membership_filter_kind(&self) -> FilterKind {
+        match &self.inner {
+            Inner::File(file) => file.membership_filter_kind(),
+            Inner::Vec(vec) => vec.membership_filter_kind(),
+        }
+    }
+
+    fn range_filter_stats(&self) -> FilterStats {
+        match &self.inner {
+            Inner::File(file) => file.range_filter_stats(),
+            Inner::Vec(vec) => vec.range_filter_stats(),
+        }
+    }
+
+    #[inline]
     fn location(&self) -> BatchLocation {
         match &self.inner {
             Inner::Vec(vec) => vec.location(),
@@ -291,13 +317,6 @@ where
         match &self.inner {
             Inner::File(file) => file.sample_keys(rng, sample_size, sample),
             Inner::Vec(vec) => vec.sample_keys(rng, sample_size, sample),
-        }
-    }
-
-    fn maybe_contains_key(&self, key: &Self::Key) -> bool {
-        match &self.inner {
-            Inner::Vec(vec) => vec.maybe_contains_key(key),
-            Inner::File(file) => file.maybe_contains_key(key),
         }
     }
 
@@ -327,13 +346,15 @@ where
     K: DataTrait + ?Sized,
     R: WeightTrait + ?Sized,
 {
+    type Timed<T: crate::Timestamp> = FallbackKeyBatch<K, T, R>;
     type Batcher = MergeBatcher<Self>;
     type Builder = FallbackWSetBuilder<K, R>;
 
     fn persisted(&self) -> Option<Self> {
         match &self.inner {
             Inner::Vec(vec) => {
-                let mut file = FileWSetBuilder::with_capacity(&self.factories, 0);
+                let mut file =
+                    FileWSetBuilder::with_capacity(&self.factories, self.key_count(), self.len());
                 copy_to_builder(&mut file, vec.cursor());
                 Some(Self {
                     inner: Inner::File(file.done()),
@@ -344,10 +365,10 @@ where
         }
     }
 
-    fn checkpoint_path(&self) -> Option<StoragePath> {
+    fn file_reader(&self) -> Option<Arc<dyn FileReader>> {
         match &self.inner {
-            Inner::Vec(vec) => vec.checkpoint_path(),
-            Inner::File(file) => file.checkpoint_path(),
+            Inner::Vec(vec) => vec.file_reader(),
+            Inner::File(file) => file.file_reader(),
         }
     }
 
@@ -356,6 +377,27 @@ where
             factories: factories.clone(),
             inner: Inner::File(FileWSet::<K, R>::from_path(factories, path)?),
         })
+    }
+
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        match &self.inner {
+            Inner::File(file) => file.key_bounds(),
+            Inner::Vec(vec) => vec.key_bounds(),
+        }
+    }
+
+    fn negative_weight_count(&self) -> Option<u64> {
+        match &self.inner {
+            Inner::File(file) => file.negative_weight_count(),
+            Inner::Vec(vec) => vec.negative_weight_count(),
+        }
+    }
+
+    fn touched_window_count(&self) -> TouchedWindowCount {
+        match &self.inner {
+            Inner::File(file) => file.touched_window_count(),
+            Inner::Vec(vec) => vec.touched_window_count(),
+        }
     }
 }
 
@@ -383,7 +425,7 @@ where
         factories: &FallbackWSetFactories<K, R>,
         vec: &VecWSetBuilder<K, R>,
     ) -> BuilderInner<K, R> {
-        let mut file = FileWSetBuilder::with_capacity(factories, 0);
+        let mut file = FileWSetBuilder::with_capacity(factories, vec.num_keys(), vec.num_tuples());
         vec.copy_to_builder(&mut file);
         BuilderInner::File(file)
     }
@@ -419,20 +461,31 @@ where
     K: DataTrait + ?Sized,
     R: WeightTrait + ?Sized,
 {
-    fn new(factories: &FallbackWSetFactories<K, R>, capacity: usize, build_to: BuildTo) -> Self {
+    fn new(
+        factories: &FallbackWSetFactories<K, R>,
+        key_capacity: usize,
+        build_to: BuildTo,
+    ) -> Self {
         match build_to {
-            BuildTo::Memory => Self::Vec(Self::new_vec(factories, capacity)),
-            BuildTo::Storage => Self::File(FileWSetBuilder::with_capacity(factories, capacity)),
+            BuildTo::Memory => Self::Vec(Self::new_vec(factories, key_capacity)),
+            BuildTo::Storage => Self::File(FileWSetBuilder::with_capacity(
+                factories,
+                key_capacity,
+                key_capacity,
+            )),
             BuildTo::Threshold(bytes) => Self::Threshold {
-                vec: Self::new_vec(factories, capacity),
+                vec: Self::new_vec(factories, key_capacity),
                 size: 0,
                 threshold: bytes,
             },
         }
     }
 
-    fn new_vec(factories: &FallbackWSetFactories<K, R>, capacity: usize) -> VecWSetBuilder<K, R> {
-        VecWSetBuilder::with_capacity(&factories.vec_wset_factory, capacity)
+    fn new_vec(
+        factories: &FallbackWSetFactories<K, R>,
+        key_capacity: usize,
+    ) -> VecWSetBuilder<K, R> {
+        VecWSetBuilder::with_capacity(&factories.vec_wset_factory, key_capacity, key_capacity)
     }
 }
 
@@ -442,10 +495,18 @@ where
     K: DataTrait + ?Sized,
     R: WeightTrait + ?Sized,
 {
-    fn with_capacity(factories: &FallbackWSetFactories<K, R>, capacity: usize) -> Self {
+    fn with_capacity(
+        factories: &FallbackWSetFactories<K, R>,
+        key_capacity: usize,
+        _value_capacity: usize,
+    ) -> Self {
         Self {
             factories: factories.clone(),
-            inner: BuilderInner::new(factories, capacity, BuildTo::for_capacity(capacity)),
+            inner: BuilderInner::new(
+                factories,
+                key_capacity,
+                BuildTo::for_capacity(key_capacity, 0),
+            ),
         }
     }
 
@@ -455,16 +516,22 @@ where
         location: Option<BatchLocation>,
     ) -> Self
     where
-        B: BatchReader,
+        B: Batch<Key = K, Val = DynUnit, Time = (), R = R>,
         I: IntoIterator<Item = &'a B> + Clone,
     {
+        let key_capacity = batches.clone().into_iter().map(|b| b.key_count()).sum();
         Self {
             factories: factories.clone(),
-            inner: BuilderInner::new(
-                factories,
-                batches.clone().into_iter().map(|b| b.len()).sum(),
-                pick_merge_destination(batches, location).into(),
-            ),
+            inner: match pick_merge_destination(batches.clone(), location) {
+                BatchLocation::Memory => BuilderInner::Vec(VecWSetBuilder::with_capacity(
+                    &factories.vec_wset_factory,
+                    key_capacity,
+                    key_capacity,
+                )),
+                BatchLocation::Storage => {
+                    BuilderInner::File(FileWSetBuilder::for_merge(factories, batches, location))
+                }
+            },
         }
     }
 
@@ -598,6 +665,22 @@ where
                     Inner::Vec(vec.done())
                 }
             },
+        }
+    }
+
+    fn num_keys(&self) -> usize {
+        match &self.inner {
+            BuilderInner::Vec(vec) => vec.num_keys(),
+            BuilderInner::File(file) => file.num_keys(),
+            BuilderInner::Threshold { vec, .. } => vec.num_keys(),
+        }
+    }
+
+    fn num_tuples(&self) -> usize {
+        match &self.inner {
+            BuilderInner::Vec(vec) => vec.num_tuples(),
+            BuilderInner::File(file) => file.num_tuples(),
+            BuilderInner::Threshold { vec, .. } => vec.num_tuples(),
         }
     }
 }

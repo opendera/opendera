@@ -40,6 +40,7 @@ import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeArray;
 import org.dbsp.util.IIndentStream;
 import org.dbsp.util.Linq;
+import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
 import java.util.ArrayList;
@@ -51,21 +52,23 @@ public final class DBSPArrayExpression extends DBSPExpression
         implements IDBSPContainer, ISameValue, IConstructor {
     @Nullable
     public final List<DBSPExpression> data;
-    public final DBSPTypeArray vecType;
+    public final DBSPTypeArray arrayType;
 
     public static DBSPArrayExpression emptyWithElementType(DBSPType elementType, boolean mayBeNull) {
         return new DBSPArrayExpression(CalciteObject.EMPTY, new DBSPTypeArray(elementType, mayBeNull), Linq.list());
     }
 
-    public DBSPArrayExpression(DBSPType vectorType, boolean isNull) {
-        super(CalciteObject.EMPTY, vectorType);
+    public DBSPArrayExpression(DBSPTypeArray arrayType, boolean isNull) {
+        super(CalciteObject.EMPTY, arrayType);
         this.data = isNull ? null : new ArrayList<>();
-        this.vecType = this.getType().to(DBSPTypeArray.class);
+        if (this.data == null)
+            Utilities.enforce(arrayType.mayBeNull);
+        this.arrayType = arrayType;
     }
 
     public DBSPArrayExpression(CalciteObject node, DBSPType type, @Nullable List<DBSPExpression> data) {
         super(node, type);
-        this.vecType = this.getType().to(DBSPTypeArray.class);
+        this.arrayType = this.getType().to(DBSPTypeArray.class);
         if (data != null) {
             this.data = new ArrayList<>();
             for (DBSPExpression e : data) {
@@ -81,7 +84,7 @@ public final class DBSPArrayExpression extends DBSPExpression
 
     public DBSPArrayExpression(boolean mayBeNull, DBSPExpression... data) {
         super(CalciteObject.EMPTY, new DBSPTypeArray(data[0].getType(), mayBeNull));
-        this.vecType = this.getType().to(DBSPTypeArray.class);
+        this.arrayType = this.getType().to(DBSPTypeArray.class);
         this.data = new ArrayList<>();
         for (DBSPExpression e: data) {
             if (!e.getType().sameType(data[0].getType()))
@@ -96,7 +99,7 @@ public final class DBSPArrayExpression extends DBSPExpression
     }
 
     public DBSPType getElementType() {
-        return this.vecType.getTypeArg(0);
+        return this.arrayType.getTypeArg(0);
     }
 
     public void append(DBSPExpression expression) {
@@ -162,7 +165,7 @@ public final class DBSPArrayExpression extends DBSPExpression
         if (o == null || getClass() != o.getClass()) return false;
         DBSPArrayExpression that = (DBSPArrayExpression) o;
         if (!Objects.equals(data, that.data)) return false;
-        return vecType.equals(that.vecType);
+        return arrayType.equals(that.arrayType);
     }
 
     @Override
@@ -199,6 +202,10 @@ public final class DBSPArrayExpression extends DBSPExpression
         if (otherExpression == null)
             return false;
         return context.equivalent(this.data, otherExpression.data);
+    }
+
+    public boolean isNull() {
+        return this.data == null;
     }
 
     public String toSqlString() {

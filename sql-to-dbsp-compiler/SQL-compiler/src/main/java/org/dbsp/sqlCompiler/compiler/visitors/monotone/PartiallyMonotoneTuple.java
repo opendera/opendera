@@ -23,7 +23,7 @@ public class PartiallyMonotoneTuple
     public final boolean raw;
     final DBSPTypeTupleBase type;
     final boolean anyMonotone;
-    final boolean mayBeNull;
+    public final boolean mayBeNull;
 
     public PartiallyMonotoneTuple(List<IMaybeMonotoneType> fields, boolean raw, boolean mayBeNull) {
         this.fields = fields;
@@ -31,7 +31,9 @@ public class PartiallyMonotoneTuple
         this.mayBeNull = mayBeNull;
         List<DBSPType> fieldTypes = Linq.map(fields, IMaybeMonotoneType::getType);
         // An empty tuple is always monotone
-        this.anyMonotone = Linq.any(fields, IMaybeMonotoneType::mayBeMonotone) || fields.isEmpty();
+        this.anyMonotone = Linq.any(fields, IMaybeMonotoneType::mayBeMonotone) ||
+                // Tup0<> is monotone, but Option<Tup0> is not.
+                (fields.isEmpty() && !mayBeNull);
         if (raw) {
             Utilities.enforce(!mayBeNull);
             this.type = new DBSPTypeRawTuple(CalciteObject.EMPTY, fieldTypes);
@@ -65,9 +67,9 @@ public class PartiallyMonotoneTuple
         List<IMaybeMonotoneType> monotone = Linq.where(this.fields, IMaybeMonotoneType::mayBeMonotone);
         List<DBSPType> fields = Linq.map(monotone, IMaybeMonotoneType::getProjectedType);
         if (this.raw)
-            return new DBSPTypeRawTuple(CalciteObject.EMPTY, fields);
+            return new DBSPTypeRawTuple(CalciteObject.EMPTY, this.mayBeNull, fields);
         else
-            return new DBSPTypeTuple(CalciteObject.EMPTY, fields);
+            return new DBSPTypeTuple(CalciteObject.EMPTY, this.mayBeNull, fields);
     }
 
     @Override
@@ -111,7 +113,11 @@ public class PartiallyMonotoneTuple
     }
 
     public IMaybeMonotoneType getField(int index) {
-        return this.fields.get(index);
+        IMaybeMonotoneType result = this.fields.get(index);
+        if (this.mayBeNull)
+            // Have to adjust nullability if tuple is nullable
+            result = result.withMaybeNull(this.mayBeNull);
+        return result;
     }
 
     /** Given an index in the original type, return an index into a type
@@ -131,6 +137,9 @@ public class PartiallyMonotoneTuple
         StringBuilder result = new StringBuilder();
         if (!this.raw) {
             result.append("Tup").append(this.size());
+        }
+        if (this.mayBeNull) {
+            result.append("?");
         }
         result.append("(");
         for (IMaybeMonotoneType field: this.fields) {

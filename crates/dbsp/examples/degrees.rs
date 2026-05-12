@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use dbsp::{utils::Tup2, OrdIndexedZSet, OutputHandle, Runtime};
+use dbsp::{OrdIndexedZSet, OutputHandle, Runtime, typed_batch::IndexedZSetReader, utils::Tup2};
 
 type Node = u64;
 
@@ -72,7 +72,7 @@ fn main() -> Result<()> {
     for i in 0..edges {
         hedges.push(Tup2(i % sources, i % 7), 1);
     }
-    dbsp.step().unwrap();
+    dbsp.transaction().unwrap();
     println!("Initialization:");
     print_changes(&degrees, &distribution);
 
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
     for i in 0..extra {
         hedges.push(Tup2(i % sources, i % 9), 1);
     }
-    dbsp.step().unwrap();
+    dbsp.transaction().unwrap();
     println!("Changes:");
     print_changes(&degrees, &distribution);
 

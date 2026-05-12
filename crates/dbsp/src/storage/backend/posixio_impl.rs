@@ -1,38 +1,44 @@
 //! [StorageBackend] implementation using POSIX I/O.
 
 use super::{
-    BlockLocation, FileId, FileReader, FileWriter, HasFileId, StorageCacheFlags, StorageError,
-    MUTABLE_EXTENSION,
+    BlockLocation, FileId, FileReader, FileRw, FileWriter, MUTABLE_EXTENSION, StorageCacheFlags,
+    StorageError,
 };
+use crate::Runtime;
 use crate::circuit::metrics::{FILES_CREATED, FILES_DELETED};
 use crate::storage::{buffer_cache::FBuf, init};
+use feldera_storage::metrics::{
+    READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS, SYNC_LATENCY_MICROSECONDS, WRITE_BLOCKS_BYTES,
+    WRITE_LATENCY_MICROSECONDS,
+};
 use feldera_storage::tokio::TOKIO;
 use feldera_storage::{
-    append_to_path, default_read_async, StorageBackend, StorageBackendFactory, StorageFileType,
-    StoragePath, StoragePathPart,
+    FileCommitter, StorageBackend, StorageBackendFactory, StorageFileType, StoragePath,
+    StoragePathPart, append_to_path, default_read_async,
 };
 use feldera_types::config::{
     FileBackendConfig, StorageBackendConfig, StorageCacheConfig, StorageConfig,
 };
-use metrics::counter;
 use std::ffi::OsString;
-use std::fs::{create_dir_all, DirEntry};
+use std::fmt::Debug;
+use std::fs::{DirEntry, create_dir_all};
 use std::io::{ErrorKind, IoSlice, Write};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     fs::{self, File, OpenOptions},
     io::Error as IoError,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
 };
 use tracing::warn;
 
 pub(super) struct PosixReader {
+    path: StoragePath,
     file: Arc<File>,
     file_id: FileId,
     drop: DeleteOnDrop,
@@ -44,8 +50,15 @@ pub(super) struct PosixReader {
     ioop_delay: Duration,
 }
 
+impl Debug for PosixReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PosixReader({})", self.path)
+    }
+}
+
 impl PosixReader {
     fn new(
+        path: StoragePath,
         file: Arc<File>,
         file_id: FileId,
         drop: DeleteOnDrop,
@@ -53,6 +66,7 @@ impl PosixReader {
         ioop_delay: Duration,
     ) -> Self {
         Self {
+            path,
             file,
             file_id,
             drop,
@@ -61,7 +75,8 @@ impl PosixReader {
         }
     }
     fn open(
-        path: PathBuf,
+        path: StoragePath,
+        file_name: PathBuf,
         cache: StorageCacheConfig,
         usage: Arc<AtomicI64>,
         async_threads: bool,
@@ -70,22 +85,38 @@ impl PosixReader {
         let file = OpenOptions::new()
             .read(true)
             .cache_flags(&cache)
-            .open(&path)?;
-        let size = file.metadata()?.size();
+            .open(&file_name)
+            .map_err(|e| StorageError::stdio(e.kind(), "open", file_name.display()))?;
+        let size = file
+            .metadata()
+            .map_err(|e| StorageError::stdio(e.kind(), "fstat", file_name.display()))?
+            .size();
 
         Ok(Arc::new(Self::new(
+            path,
             Arc::new(file),
             FileId::new(),
-            DeleteOnDrop::new(path, true, size, usage),
+            DeleteOnDrop::new(file_name, true, size, usage),
             async_threads,
             ioop_delay,
         )))
     }
 }
 
-impl HasFileId for PosixReader {
+impl FileRw for PosixReader {
     fn file_id(&self) -> FileId {
         self.file_id
+    }
+    fn path(&self) -> &StoragePath {
+        &self.path
+    }
+}
+
+impl FileCommitter for PosixReader {
+    fn commit(&self) -> Result<(), StorageError> {
+        self.file
+            .sync_all()
+            .map_err(|e| StorageError::stdio(e.kind(), "fsync", self.drop.path.display()))
     }
 }
 
@@ -95,13 +126,20 @@ impl FileReader for PosixReader {
     }
 
     fn read_block(&self, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
-        sleep(self.ioop_delay);
-        let mut buffer = FBuf::with_capacity(location.size);
+        READ_BLOCKS_BYTES.record(location.size);
+        READ_LATENCY_MICROSECONDS.record_callback(|| {
+            sleep(self.ioop_delay);
+            let mut buffer = FBuf::with_capacity(location.size);
 
-        match buffer.read_exact_at(&self.file, location.offset, location.size) {
-            Ok(()) => Ok(Arc::new(buffer)),
-            Err(e) => Err(e.into()),
-        }
+            match buffer.read_exact_at(&self.file, location.offset, location.size) {
+                Ok(()) => Ok(Arc::new(buffer)),
+                Err(e) => Err(StorageError::stdio(
+                    e.kind(),
+                    "read",
+                    self.drop.path.display(),
+                )),
+            }
+        })
     }
 
     fn read_async(
@@ -112,23 +150,31 @@ impl FileReader for PosixReader {
         if self.async_threads {
             let file = self.file.clone();
             let ioop_delay = self.ioop_delay;
+            let start = Instant::now();
             TOKIO.spawn_blocking(move || {
                 // For background reads, we only sleep once, not once per block.
                 sleep(ioop_delay);
-                callback(
-                    blocks
-                        .into_iter()
-                        .map(|location| {
-                            let mut buffer = FBuf::with_capacity(location.size);
-                            match buffer.read_exact_at(&file, location.offset, location.size) {
-                                Ok(()) => Ok(Arc::new(buffer)),
-                                Err(e) => Err(e.into()),
-                            }
-                        })
-                        .collect(),
-                );
+                let blocks = blocks
+                    .into_iter()
+                    .map(|location| {
+                        READ_BLOCKS_BYTES.record(location.size);
+                        let mut buffer = FBuf::with_capacity(location.size);
+                        match buffer.read_exact_at(&file, location.offset, location.size) {
+                            Ok(()) => Ok(Arc::new(buffer)),
+                            Err(e) => Err(StorageError::StdIo {
+                                kind: e.kind(),
+                                operation: "async read",
+                                path: None,
+                            }),
+                        }
+                    })
+                    .collect();
+                READ_LATENCY_MICROSECONDS.record_elapsed(start);
+                callback(blocks);
             });
         } else {
+            // This will call back into [Self::read_block], so don't measure the
+            // latency directly (that would double-count).
             default_read_async(self, blocks, callback);
         }
     }
@@ -150,10 +196,13 @@ impl Drop for DeleteOnDrop {
     fn drop(&mut self) {
         if !self.keep.load(Ordering::Relaxed) {
             if let Err(e) = fs::remove_file(&self.path) {
-                warn!("Unable to delete file {:?}: {:?}", self.path, e);
+                warn!(
+                    "{}: unable to delete dropped file: {e}",
+                    self.path.display(),
+                );
             } else {
                 self.usage.fetch_sub(self.size as i64, Ordering::Relaxed);
-                counter!(FILES_DELETED).increment(1);
+                FILES_DELETED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -193,9 +242,13 @@ struct PosixWriter {
     ioop_delay: Duration,
 }
 
-impl HasFileId for PosixWriter {
+impl FileRw for PosixWriter {
     fn file_id(&self) -> FileId {
         self.file_id
+    }
+
+    fn path(&self) -> &StoragePath {
+        &self.name
     }
 }
 
@@ -206,26 +259,36 @@ impl FileWriter for PosixWriter {
         Ok(block)
     }
 
-    fn complete(mut self: Box<Self>) -> Result<(Arc<dyn FileReader>, StoragePath), StorageError> {
+    fn complete(mut self: Box<Self>) -> Result<Arc<dyn FileReader>, StorageError> {
         if !self.buffers.is_empty() {
             self.flush()?;
         }
-        self.file.sync_all()?;
 
-        // Remove the .mut extension from the file.
-        let finalized_path = self.drop.path.with_extension("");
-        fs::rename(&self.drop.path, &finalized_path)?;
+        SYNC_LATENCY_MICROSECONDS.record_callback(|| {
+            self.file
+                .sync_all()
+                .map_err(|e| StorageError::stdio(e.kind(), "fsync", self.drop.path.display()))?;
 
-        Ok((
-            Arc::new(PosixReader::new(
+            // Remove the .mut extension from the file.
+            let finalized_path = self.drop.path.with_extension("");
+            self.drop.usage.fetch_sub(
+                finalized_path
+                    .metadata()
+                    .map_or(0, |metadata| metadata.size() as i64),
+                Ordering::Relaxed,
+            );
+            fs::rename(&self.drop.path, &finalized_path)
+                .map_err(|e| StorageError::stdio(e.kind(), "rename", self.drop.path.display()))?;
+
+            Ok(Arc::new(PosixReader::new(
+                self.name,
                 Arc::new(self.file),
                 self.file_id,
                 self.drop.with_path(finalized_path),
                 self.async_threads,
                 self.ioop_delay,
-            )),
-            self.name,
-        ))
+            )) as Arc<dyn FileReader>)
+        })
     }
 }
 
@@ -250,21 +313,39 @@ impl PosixWriter {
         }
     }
 
-    fn flush(&mut self) -> Result<(), IoError> {
-        let mut bufs = self
-            .buffers
-            .iter()
-            .map(|buf| IoSlice::new(buf.as_slice()))
-            .collect::<Vec<_>>();
-        let mut cursor = bufs.as_mut_slice();
-        while !cursor.is_empty() {
-            let n = self.file.write_vectored(cursor)?;
-            self.drop.size += n as u64;
-            self.drop.usage.fetch_add(n as i64, Ordering::Relaxed);
-            IoSlice::advance_slices(&mut cursor, n);
-        }
-        self.buffers.clear();
-        Ok(())
+    fn flush(&mut self) -> Result<(), StorageError> {
+        WRITE_LATENCY_MICROSECONDS.record_callback(|| {
+            if let Some(storage_mb_max) = Runtime::with_dev_tweaks(|tweaks| tweaks.storage_mb_max) {
+                let usage_mb = (self.drop.usage.load(Ordering::Relaxed) / 1024 / 1024)
+                    .max(0)
+                    .cast_unsigned();
+                if usage_mb > storage_mb_max {
+                    return Err(StorageError::stdio(
+                        ErrorKind::StorageFull,
+                        "write",
+                        self.drop.path.display(),
+                    ));
+                }
+            }
+
+            let mut bufs = self
+                .buffers
+                .iter()
+                .map(|buf| IoSlice::new(buf.as_slice()))
+                .collect::<Vec<_>>();
+            let mut cursor = bufs.as_mut_slice();
+            while !cursor.is_empty() {
+                let n = self.file.write_vectored(cursor).map_err(|e| {
+                    StorageError::stdio(e.kind(), "write", self.drop.path.display())
+                })?;
+                WRITE_BLOCKS_BYTES.record(n);
+                self.drop.size += n as u64;
+                self.drop.usage.fetch_add(n as i64, Ordering::Relaxed);
+                IoSlice::advance_slices(&mut cursor, n);
+            }
+            self.buffers.clear();
+            Ok(())
+        })
     }
 
     fn write(&mut self, buffer: &Arc<FBuf>) -> Result<(), StorageError> {
@@ -322,8 +403,8 @@ impl PosixBackend {
     }
 
     /// Returns the filesystem path to `name` in this storage.
-    fn fs_path(&self, name: &StoragePath) -> Result<PathBuf, StorageError> {
-        Ok(self.base.join(name.as_ref()))
+    fn fs_path(&self, name: &StoragePath) -> PathBuf {
+        self.base.join(name.as_ref())
     }
 
     fn remove_dir_all(&self, path: &Path) -> Result<(), IoError> {
@@ -376,17 +457,20 @@ impl StorageBackend for PosixBackend {
                 .open(path)
         }
 
-        let path = append_to_path(self.fs_path(name)?, MUTABLE_EXTENSION);
+        let path = append_to_path(self.fs_path(name), MUTABLE_EXTENSION);
         let file = match try_create_named(self, &path) {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
-                    create_dir_all(parent)?;
+                    create_dir_all(parent).map_err(|e| {
+                        StorageError::stdio(e.kind(), "recursive mkdir", path.display())
+                    })?;
                 }
                 try_create_named(self, &path)
             }
             other => other,
-        }?;
-        counter!(FILES_CREATED).increment(1);
+        }
+        .map_err(|e| StorageError::stdio(e.kind(), "create", path.display()))?;
+        FILES_CREATED.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(PosixWriter::new(
             file,
             name.clone(),
@@ -399,7 +483,8 @@ impl StorageBackend for PosixBackend {
 
     fn open(&self, name: &StoragePath) -> Result<Arc<dyn FileReader>, StorageError> {
         PosixReader::open(
-            self.fs_path(name)?,
+            name.clone(),
+            self.fs_path(name),
             self.cache,
             self.usage.clone(),
             self.async_threads,
@@ -412,11 +497,18 @@ impl StorageBackend for PosixBackend {
         parent: &StoragePath,
         cb: &mut dyn FnMut(&StoragePath, StorageFileType),
     ) -> Result<(), StorageError> {
-        fn parse_entry(entry: DirEntry) -> Result<(OsString, StorageFileType), IoError> {
-            let file_type = entry.file_type()?;
+        fn parse_entry(entry: &DirEntry) -> Result<(OsString, StorageFileType), StorageError> {
+            let file_type = entry.file_type().map_err(|e| {
+                StorageError::stdio(e.kind(), "readdir type", entry.path().display())
+            })?;
             let file_type = if file_type.is_file() {
                 StorageFileType::File {
-                    size: entry.metadata()?.size(),
+                    size: entry
+                        .metadata()
+                        .map_err(|e| {
+                            StorageError::stdio(e.kind(), "readdir fstat", entry.path().display())
+                        })?
+                        .size(),
                 }
             } else if file_type.is_dir() {
                 StorageFileType::Directory
@@ -427,10 +519,24 @@ impl StorageBackend for PosixBackend {
         }
 
         let mut result = Ok(());
-        for entry in self.fs_path(parent)?.read_dir()? {
-            match entry.and_then(parse_entry) {
+        let path = self.fs_path(parent);
+        for entry in path
+            .read_dir()
+            .map_err(|e| StorageError::stdio(e.kind(), "readdir", self.fs_path(parent).display()))?
+        {
+            match entry
+                .map_err(|e| StorageError::stdio(e.kind(), "readdir entry", path.display()))
+                .and_then(|entry| parse_entry(&entry))
+            {
                 Err(e) => {
-                    result = Err(e.into());
+                    if e.kind() != ErrorKind::NotFound {
+                        result = Err(e)
+                    } else {
+                        // Ignore NotFound error.  The file was probably
+                        // `status.json.mut`, renamed by the adapters server to
+                        // `status.json` between the call to readdir and the
+                        // call to stat.  Don't succumb to a race for it.
+                    }
                 }
                 Ok((name, file_type)) => cb(
                     &parent.child(StoragePathPart::from(name.as_encoded_bytes())),
@@ -442,9 +548,11 @@ impl StorageBackend for PosixBackend {
     }
 
     fn delete(&self, name: &StoragePath) -> Result<(), StorageError> {
-        let path = self.fs_path(name)?;
-        let metadata = fs::metadata(&path)?;
-        fs::remove_file(&path)?;
+        let path = self.fs_path(name);
+        let metadata = fs::metadata(&path)
+            .map_err(|e| StorageError::stdio(e.kind(), "stat", path.display()))?;
+        fs::remove_file(&path)
+            .map_err(|e| StorageError::stdio(e.kind(), "unlink", path.display()))?;
         if metadata.file_type().is_file() {
             self.usage
                 .fetch_sub(metadata.size() as i64, Ordering::Relaxed);
@@ -453,11 +561,17 @@ impl StorageBackend for PosixBackend {
     }
 
     fn delete_recursive(&self, name: &StoragePath) -> Result<(), StorageError> {
-        let path = self.fs_path(name)?;
+        let path = self.fs_path(name);
         match self.remove_dir_all(&path) {
             Err(error) if error.kind() == ErrorKind::NotFound => (),
             Err(error) if error.kind() == ErrorKind::NotADirectory => self.delete(name)?,
-            Err(error) => return Err(error)?,
+            Err(error) => {
+                return Err(StorageError::stdio(
+                    error.kind(),
+                    "recursive delete",
+                    path.display(),
+                ))?;
+            }
             Ok(()) => (),
         }
         Ok(())

@@ -26,6 +26,7 @@ package org.dbsp.sqlCompiler.compiler.frontend.statements;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelRecordType;
 import org.apache.calcite.schema.impl.AbstractTable;
+import org.apache.calcite.sql.parser.SqlParserPos;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ParsedStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.RelColumnMetadata;
@@ -34,6 +35,7 @@ import org.dbsp.util.Linq;
 import org.dbsp.util.Properties;
 
 import javax.annotation.Nullable;
+import java.util.ArrayList;
 import java.util.List;
 
 /** Base class for CreateTableStatement and CreateViewStatement. */
@@ -43,6 +45,7 @@ public abstract class CreateRelationStatement
     public final ProgramIdentifier relationName;
     public final List<RelColumnMetadata> columns;
     @Nullable final Properties properties;
+    public final SqlParserPos position;
 
     protected CreateRelationStatement(ParsedStatement node, ProgramIdentifier relationName,
                                       List<RelColumnMetadata> columns, @Nullable Properties properties) {
@@ -50,6 +53,7 @@ public abstract class CreateRelationStatement
         this.relationName = relationName;
         this.columns = columns;
         this.properties = properties;
+        this.position = node.statement().getParserPosition();
     }
 
     public AbstractTable getEmulatedTable() {
@@ -58,6 +62,16 @@ public abstract class CreateRelationStatement
 
     public ProgramIdentifier getName() {
         return this.relationName;
+    }
+
+    public List<Integer> getPrimaryKeyColumns() {
+        List<Integer> keys = new ArrayList<>();
+        for (int i = 0; i < this.columns.size(); i++) {
+            RelColumnMetadata meta = this.columns.get(i);
+            if (meta.isPrimaryKey)
+                keys.add(i);
+        }
+        return keys;
     }
 
     public List<RelColumnMetadata> getColumns() {

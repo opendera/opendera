@@ -1,129 +1,145 @@
 # Feldera Python SDK
 
-Feldera Python is the Feldera SDK for Python developers.
+The `feldera` Python package is the Python client for the Feldera HTTP API.
 
-## Installation
+The Python SDK documentation is available at: https://docs.feldera.com/python
 
-```bash
-pip install feldera
-```
+## Getting started
 
-### Installing from Github
+### Installation
 
 ```bash
-pip install git+https://github.com/feldera/feldera#subdirectory=python
+uv pip install feldera
 ```
 
-Similarly, to install from a specific branch:
+### Example usage
+
+The Python client interacts with the API server of the Feldera instance.
+
+```python
+# File: example.py
+from feldera import FelderaClient, PipelineBuilder, Pipeline
+
+# Instantiate client
+client = FelderaClient()  # Default: http://localhost:8080 without authentication
+# client = FelderaClient(url="https://localhost:8080", api_key="apikey:...", requests_verify="/path/to/tls.crt")
+
+# (Re)create pipeline
+name = "example"
+sql = """
+CREATE TABLE t1 (i1 INT) WITH ('materialized' = 'true');
+CREATE MATERIALIZED VIEW v1 AS SELECT * FROM t1;
+"""
+print("(Re)creating pipeline...")
+pipeline = PipelineBuilder(client, name, sql).create_or_replace()
+pipeline.start()
+print(f"Pipeline status: {pipeline.status()}")
+pipeline.pause()
+print(f"Pipeline status: {pipeline.status()}")
+pipeline.stop(force=True)
+
+# Find existing pipeline
+pipeline = Pipeline.get(name, client)
+pipeline.start()
+print(f"Pipeline status: {pipeline.status()}")
+pipeline.stop(force=True)
+pipeline.clear_storage()
+```
+
+Run using:
+```bash
+uv run python example.py
+```
+
+### Environment variables
+
+Some default parameter values in the Python SDK can be overridden via environment variables.
+
+**Environment variables for `FelderaClient(...)`**
 
 ```bash
-$ pip install git+https://github.com/feldera/feldera@{BRANCH_NAME}#subdirectory=python
+export FELDERA_HOST="https://localhost:8080"  # Overrides default for `url`
+export FELDERA_API_KEY="apikey:..."  # Overrides default for `api_key`
+
+# The following together override default for `requests_verify`
+# export FELDERA_TLS_INSECURE="false"  # If set to "1", "true" or "yes" (all case-insensitive), disables TLS certificate verification
+# export FELDERA_HTTPS_TLS_CERT="/path/to/tls.crt"  # Custom TLS certificate
 ```
 
-Replace `{BRANCH_NAME}` with the name of the branch you want to install from.
-
-### Installing from Local Directory
-
-If you have cloned the Feldera repo, you can install the python SDK as follows:
+**Environment variables for `PipelineBuilder(...)`**
 
 ```bash
-# the Feldera Python SDK is present inside the python/ directory
-pip install python/
+export FELDERA_RUNTIME_VERSION="..."  # Overrides default for `runtime_version`
 ```
 
-## Documentation
+## Development
 
-The Python SDK documentation is available at
-[Feldera Python SDK Docs](https://docs.feldera.com/python).
+Development assumes you have cloned the Feldera code repository.
 
-To build the html documentation run:
-
-Ensure that you have sphinx installed. If not, install it using `pip install sphinx`.
-
-Then run the following commands:
-
-```bash
-cd docs
-sphinx-apidoc -o . ../feldera
-make html
-```
-
-To clean the build, run `make clean`.
-
-## Testing
-
-To run unit tests:
-
-```bash
-cd python && python3 -m pytest tests/
-```
-
-- This will detect and run all test files that match the pattern `test_*.py` or
-  `*_test.py`.
-- By default, the tests expect a running Feldera instance at `http://localhost:8080`.
-  To override the default endpoint, set the `FELDERA_BASE_URL` environment variable.
-
-To run tests from a specific file:
-
-```bash
-(cd python && python3 -m pytest ./tests/path-to-file.py)
-```
-
-#### Running Aggregate Tests
-
-The aggregate tests validate end-to-end correctness of SQL functionality.
-To run the aggregate tests use:
+### Installation
 
 ```bash
 cd python
-PYTHONPATH=`pwd` python3 ./tests/aggregate_tests/main.py
+# Optional: create and activate virtual environment if you don't have one
+uv venv
+source .venv/bin/activate
+# Install in editable mode
+uv pip install -e .
 ```
 
-### Reducing Compilation Cycles
+### Formatting
 
-To reduce redundant compilation cycles during testing:
-
-* **Inherit from `SharedTestPipeline`** instead of `unittest.TestCase`.
-* **Define DDLs** (e.g., `CREATE TABLE`, `CREATE VIEW`) in the **docstring** of each test method.
-  * All DDLs from all test functions in the class are combined and compiled into a single pipeline.
-  * If a table or view is already defined in one test, it can be used directly in others without redefinition.
-  * Ensure that all table and view names are unique within the class.
-* Use `@enterprise_only` on tests that require Enterprise features. Their DDLs will be skipped on OSS builds.
-* Use `self.set_runtime_config(...)` to override the default pipeline config.
-  * Reset it at the end using `self.reset_runtime_config()`.
-* Access the shared pipeline via `self.pipeline`.
-
-#### Example
-
-```python
-from tests.shared_test_pipeline import SharedTestPipeline
-
-class TestAverage(SharedTestPipeline):
-    def test_average(self):
-        """
-        CREATE TABLE students(id INT, name STRING);
-        CREATE MATERIALIZED VIEW v AS SELECT * FROM students;
-        """
-        ...
-        self.pipeline.start()
-        self.pipeline.input_pandas("students", df)
-        self.pipeline.wait_for_completion(True)
-        ...
-```
-
-## Linting and formatting
-
-Use [Ruff] to run the lint checks that will be executed by the
-precommit hook when a PR is submitted:
+Formatting requires the `ruff` package: `uv pip install ruff`
 
 ```bash
-ruff check python/
-```
-
-To reformat the code in the same way as the precommit hook:
-
-```bash
+cd python
+ruff check
 ruff format
 ```
 
-[Ruff]: https://github.com/astral-sh/ruff
+### Tests
+
+Running the test requires the `pytest` package: `uv pip install pytest`
+
+```bash
+# All tests
+cd python
+uv run python -m pytest tests/
+
+# Specific tests directory
+uv run python -m pytest tests/platform/
+
+# Specific test file
+uv run python -m pytest tests/platform/test_pipeline_crud.py
+
+# Specific test
+uv run python -m pytest tests/platform/test_pipeline_crud.py::test_pipeline_post
+
+# Tip: add argument -x at the end for it to fail fast
+# Tip: add argument -s at the end to show stdout/stderr
+```
+
+For further information about the tests, please see `tests/README.md`.
+
+### Documentation
+
+Building documentation requires the `sphinx` package: `uv pip install sphinx`
+
+```bash
+cd python/docs
+sphinx-apidoc -o . ../feldera
+make html
+make clean  # Cleanup afterwards
+```
+
+### Installation from GitHub
+
+Latest `main` branch:
+```bash
+uv pip install git+https://github.com/feldera/feldera#subdirectory=python
+```
+
+Different branch (replace `BRANCH_NAME`):
+```bash
+uv pip install git+https://github.com/feldera/feldera@BRANCH_NAME#subdirectory=python
+```

@@ -19,6 +19,12 @@ public enum DBSPOpcode {
     IS_NOT_TRUE("is_not_true", false),
     IS_NOT_FALSE("is_not_false", false),
     TYPEDBOX("TypedBox::new", false),
+    // Lossless conversion between decimal and integer, used for range aggregates
+    DECIMAL_TO_INTEGER("decimal_to_integer", false),
+    INTEGER_TO_DECIMAL("integer_to_decimal", false),
+    // Lossless, order-preserving conversion between short interval and INTEGER, used for range aggregates
+    SHORT_INTERVAL_TO_INTEGER("short_interval_to_integer", false),
+    INTEGER_TO_SHORT_INTERVAL("integer_to_short_interval", false),
 
     // Binary operations
     ADD("+", false),
@@ -27,6 +33,7 @@ public enum DBSPOpcode {
     DIV("/", false),
     // DIV_NULL is like DIV, but returns NULL for a 0 denominator
     DIV_NULL("div_null", false),
+    DIV_INTERVAL_NULL("div_interval_null", false),
     MOD("%", false),
     EQ("==", false),
     NEQ("!=", false),
@@ -42,23 +49,20 @@ public enum DBSPOpcode {
     XOR("^", false),
     MAX("max", false),
     MIN("min", false),
+    MAX_IGNORE_NULLS("max_ignore_nulls", false),
+    MIN_IGNORE_NULLS("min_ignore_nulls", false),
+    MAX_NULL_WINS("max_null_wins", false),
     CONCAT("||", false),
     IS_DISTINCT("is_distinct", false),
-    SQL_INDEX("[]", false),
-    MAP_INDEX("[]", false),
+    SQL_INDEX("index", false),
+    SAFE_RUST_INDEX("safe_index", false),
+    MAP_INDEX("map_index", false),
     // map index in a variant value
-    VARIANT_INDEX("[]", false),
+    VARIANT_INDEX("indexV", false),
     RUST_INDEX("[]", false),
-    // Shift left a decimal number by a number of decimal digits.
-    // Shift amount may be negative
-    SHIFT_LEFT("shift_left", false),
-
-    // Timestamp-based operations
-    TS_ADD("+", false),
-    TS_SUB("-", false),
     // Interval-based operations
-    INTERVAL_MUL("*", false),
-    INTERVAL_DIV("/", false),
+    MUL_INTERVAL("*", false),
+    DIV_INTERVAL("/", false),
 
     // Aggregate operations.  These operations
     // handle NULL values differently from standard
@@ -69,6 +73,9 @@ public enum DBSPOpcode {
     AGG_XOR("agg_xor", true),
     AGG_MAX("agg_max", true),
     AGG_MIN("agg_min", true),
+    // Similar to agg_max, but takes a raw tuple with 2 arguments and only ignores NULLs in the first field.
+    AGG_MAX1("agg_max1", true),
+    AGG_MIN1("agg_min1", true),
     // Operation which combines an accumulator and a *weighted* value
     AGG_ADD("agg_plus", true),
     // Operation which combines an accumulator and a *weighted* value; accumulator and result are never nullable
@@ -83,10 +90,20 @@ public enum DBSPOpcode {
     // Otherwise, this returns left >= right.
     CONTROLLED_FILTER_GTE("cf_compare_gte", true),
     // Higher order operation: apply a function to every element of an array
+    // Only used to implement casts on arrays, which recursively cast elements
     ARRAY_CONVERT("array_map", false),
+    // Same as ARRAY_CONVERT, except the function applied returns SqlResult, and
+    // the map function returns None in case any partial result is Error.
+    ARRAY_CONVERT_SAFE("array_map_safe", false),
     // Apply a function to every key-value element of a map
+    // Only used to implement casts on maps, which recursively cast keys and values
     MAP_CONVERT("map_map", false),
-    ;
+    // Same as MAP_CONVERT, except the function applied returns SqlResult, and
+    // the map function returns None in case any partial result is Error.
+    MAP_CONVERT_SAFE("map_map_safe", false),
+    // Used to implement Calcite's REINTERPRET casts;
+    // input is always an interval, output is always i64
+    REINTERPRET("reinterpret", false);
 
     private final String text;
     public final boolean isAggregate;
@@ -114,8 +131,10 @@ public enum DBSPOpcode {
         return switch (this) {
             case WRAP_BOOL, MAP_CONVERT, ARRAY_CONVERT, CONTROLLED_FILTER_GTE, AGG_LTE, AGG_GTE, AGG_ADD, AGG_MIN,
                  AGG_MAX, AGG_XOR, AGG_OR, AGG_AND, IS_DISTINCT, CONCAT, MIN, MAX, OR, AND, IS_NOT_FALSE, IS_NOT_TRUE,
-                 INDICATOR -> false;
-            case NEG, INTERVAL_DIV, INTERVAL_MUL, TS_SUB, TS_ADD, SHIFT_LEFT, RUST_INDEX, VARIANT_INDEX, MAP_INDEX,
+                 AGG_MAX1, AGG_MIN1, INDICATOR -> false;
+            case NEG, DIV_INTERVAL, DIV_INTERVAL_NULL, MUL_INTERVAL, DECIMAL_TO_INTEGER, INTEGER_TO_DECIMAL,
+                 SHORT_INTERVAL_TO_INTEGER, INTEGER_TO_SHORT_INTERVAL,
+                 RUST_INDEX, VARIANT_INDEX, MAP_INDEX,
                  SQL_INDEX, XOR, BW_OR, MUL_WEIGHT, BW_AND, GTE, LTE, GT, LT, NEQ, EQ, MOD, DIV_NULL, DIV, MUL, SUB,
                  ADD, TYPEDBOX, IS_TRUE, IS_FALSE, NOT, UNARY_PLUS -> true;
             default -> throw new UnimplementedException();

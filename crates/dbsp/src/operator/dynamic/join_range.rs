@@ -15,16 +15,15 @@
 //!   batch with weight `w1 * w2`.
 
 use crate::{
+    DBData, ZWeight,
     algebra::{IndexedZSet, IndexedZSetReader, MulByRef, OrdIndexedZSet, OrdZSet},
     circuit::{
-        operator_traits::{BinaryOperator, Operator},
         Circuit, Scope, Stream,
+        operator_traits::{BinaryOperator, Operator},
     },
     dynamic::{DataTrait, DynUnit, Erase},
     trace::{BatchFactories, BatchReaderFactories, Cursor},
-    DBData, ZWeight,
 };
-use minitrace::trace;
 use std::{borrow::Cow, marker::PhantomData};
 
 pub struct StreamJoinRangeFactories<I, O>
@@ -197,7 +196,6 @@ where
     I2: IndexedZSetReader + Clone,
     O: IndexedZSet,
 {
-    #[trace]
     async fn eval(&mut self, i1: &I1, i2: &I2) -> O {
         let mut tuples = self
             .factories
@@ -263,7 +261,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::{operator::Generator, utils::Tup2, zset, Circuit, RootCircuit};
+    use crate::{Circuit, RootCircuit, operator::Generator, utils::Tup2, zset};
 
     #[test]
     fn stream_join_range_test() {
@@ -360,7 +358,7 @@ mod test {
         .0;
 
         for _ in 0..5 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 }

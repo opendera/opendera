@@ -1,13 +1,15 @@
 //! Common Types and Trait Definition for Storage in Feldera.
 
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::io::{Cursor, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 
 use feldera_types::checkpoint::{CheckpointMetadata, PSpineBatches};
 use feldera_types::config::{StorageBackendConfig, StorageConfig, StorageOptions};
+use feldera_types::constants::CREATE_FILE_EXTENSION;
 use serde::de::DeserializeOwned;
 use tracing::warn;
 use uuid::Uuid;
@@ -15,7 +17,7 @@ use uuid::Uuid;
 use crate::block::BlockLocation;
 use crate::error::StorageError;
 use crate::fbuf::FBuf;
-use crate::file::HasFileId;
+use crate::file::FileId;
 
 pub use object_store::path::{Path as StoragePath, PathPart as StoragePathPart};
 
@@ -24,10 +26,9 @@ pub mod checkpoint_synchronizer;
 pub mod error;
 pub mod fbuf;
 pub mod file;
+pub mod histogram;
+pub mod metrics;
 pub mod tokio;
-
-/// Extension for batch files used by the engine.
-const CREATE_FILE_EXTENSION: &str = ".feldera";
 
 /// Helper function that appends to a [`PathBuf`].
 pub fn append_to_path(p: PathBuf, s: &str) -> PathBuf {
@@ -117,12 +118,19 @@ pub trait StorageBackend: Send + Sync {
 
     /// Writes `content` to `name`, automatically creating any parent
     /// directories within `name` that don't already exist.
-    fn write(&self, name: &StoragePath, content: FBuf) -> Result<(), StorageError> {
+    ///
+    /// The caller must call `commit` on the returned file if it wants to make
+    /// sure that the file is committed to stable storage.
+    fn write(
+        &self,
+        name: &StoragePath,
+        content: FBuf,
+    ) -> Result<Arc<dyn FileCommitter>, StorageError> {
         let mut writer = self.create_named(name)?;
         writer.write_block(content)?;
-        let (reader, _path) = writer.complete()?;
+        let reader = writer.complete()?;
         reader.mark_for_checkpoint();
-        Ok(())
+        Ok(reader)
     }
 
     /// Returns a value that represents the number of bytes of storage in use.
@@ -185,14 +193,14 @@ impl dyn StorageBackend {
         }
     }
 
-    pub fn gather_batches_for_checkpoint(
+    pub fn gather_batches_for_checkpoint_uuid(
         &self,
-        cpm: &CheckpointMetadata,
+        cpm: uuid::Uuid,
     ) -> Result<HashSet<StoragePath>, StorageError> {
-        assert!(!cpm.uuid.is_nil());
+        assert!(!cpm.is_nil());
 
         let mut spines = Vec::new();
-        self.list(&cpm.uuid.to_string().into(), &mut |path, _file_type| {
+        self.list(&cpm.to_string().into(), &mut |path, _file_type| {
             if path
                 .filename()
                 .is_some_and(|filename| filename.starts_with("pspine-batches"))
@@ -212,9 +220,27 @@ impl dyn StorageBackend {
         Ok(batch_files_in_commit)
     }
 
+    pub fn gather_batches_for_checkpoint(
+        &self,
+        cpm: &CheckpointMetadata,
+    ) -> Result<HashSet<StoragePath>, StorageError> {
+        self.gather_batches_for_checkpoint_uuid(cpm.uuid)
+    }
+}
+
+// For an explanation of the `+ '_` here, see:
+// https://stackoverflow.com/questions/73495603/trait-problem-borrowed-data-escapes-outside-of-associated-function
+impl dyn StorageBackend + '_ {
     /// Writes `content` to `name` as JSON, automatically creating any parent
     /// directories within `name` that don't already exist.
-    pub fn write_json<V>(&self, name: &StoragePath, value: &V) -> Result<(), StorageError>
+    ///
+    /// The caller must call `commit` on the returned file if it wants to make
+    /// sure that the file is committed to stable storage.
+    pub fn write_json<V>(
+        &self,
+        name: &StoragePath,
+        value: &V,
+    ) -> Result<Arc<dyn FileCommitter>, StorageError>
     where
         V: serde::Serialize,
     {
@@ -222,11 +248,7 @@ impl dyn StorageBackend {
         serde_json::to_writer(&mut content, value).unwrap();
         self.write(name, content)
     }
-}
 
-// For an explanation of the `+ '_` here, see:
-// https://stackoverflow.com/questions/73495603/trait-problem-borrowed-data-escapes-outside-of-associated-function
-impl dyn StorageBackend + '_ {
     /// Reads `name` as JSON.
     pub fn read_json<V>(&self, name: &StoragePath) -> Result<V, StorageError>
     where
@@ -238,25 +260,50 @@ impl dyn StorageBackend + '_ {
     }
 }
 
+/// A file being read or written.
+pub trait FileRw {
+    /// Returns the file's unique ID.
+    fn file_id(&self) -> FileId;
+
+    /// Returns the file's path.
+    fn path(&self) -> &StoragePath;
+}
+
 /// A file being written.
 ///
 /// The file can't be read until it is completed with
 /// [FileWriter::complete]. Until then, the file is temporary and will be
 /// deleted if it is dropped.
-pub trait FileWriter: Send + Sync + HasFileId {
+pub trait FileWriter: Send + Sync + FileRw {
     /// Writes `data` at the end of the file. len()` must be a multiple of 512.
     /// Returns the data that was written encapsulated in an `Arc`.
     fn write_block(&mut self, data: FBuf) -> Result<Arc<FBuf>, StorageError>;
 
-    /// Completes writing of a file and returns a reader for the file and the
-    /// file's path. The file is treated as temporary and will be deleted if the
-    /// reader is dropped without first calling
+    /// Completes writing of a file and returns a reader for the file.
+    ///
+    /// The file will be deleted if the reader is dropped without calling
     /// [FileReader::mark_for_checkpoint].
-    fn complete(self: Box<Self>) -> Result<(Arc<dyn FileReader>, StoragePath), StorageError>;
+    ///
+    /// The file is not necessarily committed to stable storage before calling
+    /// `commit` on the returned file.
+    fn complete(self: Box<Self>) -> Result<Arc<dyn FileReader>, StorageError>;
+}
+
+/// Allows a file to be committed to stable storage.
+///
+/// This is a supertrait of [FileReader] that only allows the commit operation.
+/// It's somewhat surprising that a file that can't be written can be committed,
+/// but it makes sense in the context of [FileWriter::complete] returning a
+/// [FileReader] that isn't necessarily committed yet.  Making this a separate
+/// trait allows code to split off a `FileCommitter` to hand to a piece of code
+/// that only needs to be able to commit it.
+pub trait FileCommitter: Send + Sync + Debug + FileRw {
+    /// Commits the file to stable storage.
+    fn commit(&self) -> Result<(), StorageError>;
 }
 
 /// A readable file.
-pub trait FileReader: Send + Sync + HasFileId {
+pub trait FileReader: Send + Sync + Debug + FileRw + FileCommitter {
     /// Marks a file to be part of a checkpoint.
     ///
     /// This is used to prevent the file from being deleted when it is dropped.

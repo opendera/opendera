@@ -1,8 +1,10 @@
 use anyhow::Result;
+use dbsp::typed_batch::IndexedZSetReader;
 use dbsp::{
+    Circuit, OrdZSet, Runtime, Stream,
     operator::Generator,
     utils::{Tup3, Tup4},
-    zset, zset_set, Circuit, OrdZSet, Runtime, Stream,
+    zset, zset_set,
 };
 
 fn main() -> Result<()> {
@@ -103,7 +105,7 @@ fn main() -> Result<()> {
     for i in 0..STEPS {
         let iteration = i + 1;
         println!("Iteration {} starts...", iteration);
-        circuit_handle.step()?;
+        circuit_handle.transaction()?;
         let output = output_handle.consolidate();
         assert_eq!(output, expected_outputs.next().unwrap());
         output

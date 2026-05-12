@@ -10,12 +10,15 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPLagOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNoopOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPRankOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPRowNumberOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateWithWaterlineOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMultisetOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPStarJoinBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
@@ -48,6 +51,8 @@ public class SeparateIntegrators extends CircuitCloneWithGraphsVisitor {
                 operator.is(DBSPIntegrateOperator.class) ||
                 operator.is(DBSPLagOperator.class) ||
                 operator.is(DBSPIndexedTopKOperator.class) ||
+                operator.is(DBSPRankOperator.class) ||
+                operator.is(DBSPRowNumberOperator.class) ||
                 (operator.is(DBSPSourceMultisetOperator.class) &&
                         operator.to(DBSPSourceMultisetOperator.class).metadata.materialized) ||
                 (operator.is(DBSPSourceMapOperator.class) &&
@@ -58,6 +63,7 @@ public class SeparateIntegrators extends CircuitCloneWithGraphsVisitor {
         DBSPOperator operator = port.node();
         int input = port.port();
         return operator.is(DBSPJoinBaseOperator.class) ||
+                operator.is(DBSPStarJoinBaseOperator.class) ||
                 (operator.is(DBSPWindowOperator.class) && input == 0) ||
                 operator.is(DBSPPartitionedRollingAggregateOperator.class) ||
                 operator.is(DBSPDistinctOperator.class) ||
@@ -108,8 +114,9 @@ public class SeparateIntegrators extends CircuitCloneWithGraphsVisitor {
             }
         }
 
-        DBSPSimpleOperator result = operator.withInputs(sources, this.force);
-        result.setDerivedFrom(operator.derivedFrom);
+        DBSPSimpleOperator result = operator.withInputs(sources, this.force)
+                .to(DBSPSimpleOperator.class);
+        result.setDerivedFrom(operator);
         this.map(operator, result);
     }
 }

@@ -50,7 +50,7 @@ pub struct KafkaInputConfig {
     pub poller_threads: Option<usize>,
 
     /// Where to begin reading the topic.
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_via_value")]
     pub start_from: KafkaStartFromConfig,
 
     /// The AWS region to use while connecting to AWS Managed Streaming for Kafka (MSK).
@@ -67,14 +67,140 @@ pub struct KafkaInputConfig {
     ///
     /// If offsets are provided for all partitions, this field can be omitted.
     pub partitions: Option<Vec<i32>>,
+
+    /// By default, if the input connector resumes from a checkpoint and the
+    /// data where it needs to resume has expired from the Kafka topic, the
+    /// input connector fails initialization and the pipeline will fail to start.
+    ///
+    /// Set this to true to change the behavior so that, if data is not
+    /// available on resume, the input connector starts from the earliest
+    /// offsets that are now available.
+    pub resume_earliest_if_data_expires: bool,
+
+    /// Whether to include Kafka headers in the record metadata.
+    ///
+    /// When `true`, Kafka message headers are available via the `CONNECTOR_METADATA()` function.
+    /// See <https://docs.feldera.com/connectors/sources/kafka#metadata> for details.
+    #[serde(default)]
+    pub include_headers: Option<bool>,
+
+    /// Whether to include Kafka message timestamp in the record metadata.
+    ///
+    /// When `true`, Kafka message timestamp is available via the `CONNECTOR_METADATA()` function.
+    /// See <https://docs.feldera.com/connectors/sources/kafka#metadata> for details.
+    #[serde(default)]
+    pub include_timestamp: Option<bool>,
+
+    /// Whether to include Kafka partition in the record metadata.
+    ///
+    /// When `true`, Kafka partition from which the message was read is available via the `CONNECTOR_METADATA()` function.
+    /// See <https://docs.feldera.com/connectors/sources/kafka#metadata> for details.
+    #[serde(default)]
+    pub include_partition: Option<bool>,
+
+    /// Whether to include Kafka message offset in the record metadata.
+    ///
+    /// When `true`, Kafka message offset is available via the `CONNECTOR_METADATA()` function.
+    /// See <https://docs.feldera.com/connectors/sources/kafka#metadata> for details.
+    #[serde(default)]
+    pub include_offset: Option<bool>,
+
+    /// Whether to include Kafka topic in the record metadata.
+    ///
+    /// When `true`, Kafka topic from which the message was read is available via the `CONNECTOR_METADATA()` function.
+    /// See <https://docs.feldera.com/connectors/sources/kafka#metadata> for details.
+    #[serde(default)]
+    pub include_topic: Option<bool>,
+
+    /// When lateness is enabled on a Feldera table, Feldera only produces
+    /// correct output if input arrives approximately in order within the bounds
+    /// of the lateness.  The Feldera Kafka input connector can reorder input
+    /// when there are multiple partitions:
+    ///
+    /// - If partitions start at different times, then reading all the
+    ///   partitions in parallel will naturally consume data out of order.
+    ///
+    /// - Even if they start at the same time, partitions might contain events
+    ///   at different rates.
+    ///
+    /// - Even if the partitions start at the same time and have the same number
+    ///   of events per unit time, if partitions are spread across brokers,
+    ///   different brokers may fetch data at different rates.
+    ///
+    /// - Even if all of the partitions are on a single broker, one cannot
+    ///   expect all of the partitions to naturally remain exactly in sync
+    ///   forever.
+    ///
+    /// Setting this option to `true` addresses the issue by synchronizing
+    /// ingestion across partitions, ingesting records in order of their Kafka
+    /// event timestamps.
+    ///
+    /// Pitfalls of this solution include:
+    ///
+    /// - Kafka event timestamps are not necessarily monotonically increasing
+    ///   even within a single partition.  If timestamps jump backward beyond
+    ///   the lateness, then this can also cause correctness problems.
+    ///
+    ///   (This can be avoided by keeping clocks on Kafka producers and brokers
+    ///   synchronized.)
+    ///
+    /// - If an event with a timestamp far in the future is added to a
+    ///   partition, that event, and all those that follow it, will never be
+    ///   processed.
+    ///
+    /// - If one or a few partitions have timestamps far behind the others, only
+    ///   those partitions will be processed until all the old events are
+    ///   processed.  (This is the flip side of the previous pitfall.)
+    ///
+    /// - One or more empty partitions will prevent any data from being
+    ///   processed at all, because there is no way to know the timestamp for
+    ///   the first event that will be added to that partition.
+    ///
+    /// - In a topic with `N` nonempty partitions, at least `N - 1` events will
+    ///   always be left unprocessed (one in each of `N - 1` partitions), because
+    ///   there is no way to know the timestamp for the next event to be added to
+    ///   the partition whose events have been completely processed.
+    #[serde(default)]
+    pub synchronize_partitions: bool,
 }
 
 impl KafkaInputConfig {
+    /// Returns a default [KafkaInputConfig] with the given `kafka_options` and
+    /// `topic`.  To be a usable configuration, `kafka_options` must contain at
+    /// least `bootstrap.servers`.
+    pub fn default(kafka_options: BTreeMap<String, String>, topic: impl Into<String>) -> Self {
+        Self {
+            kafka_options,
+            topic: topic.into(),
+            log_level: None,
+            group_join_timeout_secs: default_group_join_timeout_secs(),
+            poller_threads: None,
+            start_from: KafkaStartFromConfig::default(),
+            region: None,
+            partitions: None,
+            resume_earliest_if_data_expires: false,
+            include_headers: None,
+            include_timestamp: None,
+            include_partition: None,
+            include_offset: None,
+            include_topic: None,
+            synchronize_partitions: false,
+        }
+    }
+
     // Returns the number of threads to use based on configuration, defaults,
     // and system resources.
     pub fn poller_threads(&self) -> usize {
         let max_threads = available_parallelism().map_or(16, NonZeroUsize::get);
         self.poller_threads.unwrap_or(3).clamp(1, max_threads)
+    }
+
+    pub fn metadata_requested(&self) -> bool {
+        self.include_topic == Some(true)
+            || self.include_timestamp == Some(true)
+            || self.include_partition == Some(true)
+            || self.include_offset == Some(true)
+            || self.include_headers == Some(true)
     }
 }
 
@@ -106,6 +232,11 @@ pub enum KafkaStartFromConfig {
     ///
     /// The number of offsets must match the number of partitions in the topic.
     Offsets(Vec<i64>),
+
+    /// Start from a particular timestamp in the topic.
+    ///
+    /// Kafka timestamps are in milliseconds since the epoch.
+    Timestamp(i64),
 }
 
 /// Kafka logging levels.
@@ -145,7 +276,9 @@ impl KafkaInputConfig {
             .entry(option.to_string())
             .or_insert_with(|| val.to_string());
         if option_val != val {
-            Err(AnyError::msg("cannot override '{option}' option: the Kafka transport adapter sets this option to '{val}'"))?;
+            Err(AnyError::msg(
+                "cannot override '{option}' option: the Kafka transport adapter sets this option to '{val}'",
+            ))?;
         }
         Ok(())
     }
@@ -200,10 +333,11 @@ impl KafkaInputConfig {
 
         if let (Some(partitions), KafkaStartFromConfig::Offsets(offsets)) =
             (&self.partitions, &self.start_from)
+            && partitions.len() != offsets.len()
         {
-            if partitions.len() != offsets.len() {
-                anyhow::bail!("the number of partitions ('{partitions:?}') should be equal to the number of offsets '{offsets:?}' specified")
-            }
+            anyhow::bail!(
+                "the number of partitions ('{partitions:?}') should be equal to the number of offsets '{offsets:?}' specified"
+            )
         }
 
         Ok(())
@@ -429,6 +563,7 @@ mod compat {
         /// Current configuration option, which changed type in an incompatible
         /// way soon after it was introduced. No backward compatibility for the
         /// initial form.
+        #[serde(default, with = "crate::serde_via_value")]
         start_from: Option<KafkaStartFromConfig>,
 
         /// Current configuration option that replaces the old `topics`
@@ -455,6 +590,24 @@ mod compat {
 
         /// The Kafka partitions to read from.
         partitions: Option<Vec<i32>>,
+
+        /// By default, if the input connector resumes from a checkpoint and the
+        /// data where it needs to resume has expired from the Kafka topic, the
+        /// input connector fails the pipeline.
+        ///
+        /// Set this to true to change the behavior so that, if data is not
+        /// available on resume, the input connector starts from the earliest
+        /// offsets that are now available.
+        #[serde(default)]
+        pub resume_earliest_if_data_expires: bool,
+
+        include_headers: Option<bool>,
+        include_timestamp: Option<bool>,
+        include_partition: Option<bool>,
+        include_offset: Option<bool>,
+        include_topic: Option<bool>,
+        #[serde(default)]
+        synchronize_partitions: bool,
     }
 
     impl TryFrom<KafkaInputConfigCompat> for super::KafkaInputConfig {
@@ -483,7 +636,11 @@ mod compat {
                     match auto_offset_reset.as_str() {
                         "smallest" | "earliest" | "beginning" => KafkaStartFromConfig::Earliest,
                         "largest" | "latest" | "end" => KafkaStartFromConfig::Latest,
-                        _ => return Err(format!("Unrecognized value {auto_offset_reset:?} for `auto.offset.reset` in Kafka legacy input adapter configuration")),
+                        _ => {
+                            return Err(format!(
+                                "Unrecognized value {auto_offset_reset:?} for `auto.offset.reset` in Kafka legacy input adapter configuration"
+                            ));
+                        }
                     }
                 } else {
                     KafkaStartFromConfig::default()
@@ -508,7 +665,9 @@ mod compat {
                     && key != "enabled_events"
                     && key != "retries"
                 {
-                    return Err(format!("Invalid Kafka input connector configuration key {key:?}: it is not valid for the input connector, nor does it contain `.` as librdkafka configuration options generally do (nor is it one of the few special exceptions to that rule)."));
+                    return Err(format!(
+                        "Invalid Kafka input connector configuration key {key:?}: it is not valid for the input connector, nor does it contain `.` as librdkafka configuration options generally do (nor is it one of the few special exceptions to that rule)."
+                    ));
                 }
             }
 
@@ -521,6 +680,13 @@ mod compat {
                 start_from,
                 region: compat.region,
                 partitions: compat.partitions,
+                resume_earliest_if_data_expires: compat.resume_earliest_if_data_expires,
+                include_headers: compat.include_headers,
+                include_timestamp: compat.include_timestamp,
+                include_partition: compat.include_partition,
+                include_offset: compat.include_offset,
+                include_topic: compat.include_topic,
+                synchronize_partitions: compat.synchronize_partitions,
             })
         }
     }

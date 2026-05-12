@@ -130,7 +130,7 @@ Configure an input connector for each Feldera SQL table that must ingest changes
 Use the `kafka_input` transport with either `json` or `avro` format. Debezium automatically
 creates a Kafka topic for each database table.
 
-Because input from Debezium uses the [Kafka input adapter](kafka), it
+Because input from Debezium uses the [Kafka input connector](kafka), it
 supports [fault tolerance](/pipelines/fault-tolerance) too.
 
 ### JSON
@@ -193,6 +193,17 @@ CREATE TABLE my_table (
   }]'
 )
 ```
+
+::: warning
+
+Notice that the data format provided by the connector contains data
+and metadata columns; for example, a metadata column is the "operation", which
+describes whether the row is inserted or deleted.  The table schema
+should only include the data columns, not the metadata columns.  If
+you need to ingest metadata information, see for example
+[`CONNECTOR_METADATA`](/connectors/sources/kafka/#accessing-kafka-metadata).
+
+:::
 
 ### Avro
 

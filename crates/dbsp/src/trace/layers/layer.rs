@@ -7,14 +7,14 @@ use rand::Rng;
 use rkyv::{Archive, Serialize};
 
 use crate::{
+    DBData, NumEntries,
     algebra::{AddAssignByRef, AddByRef, NegByRef},
     dynamic::{DataTrait, DynVec, Erase, Factory, LeanVec, WithFactory},
     utils::{advance, assume},
-    DBData, NumEntries,
 };
 use size_of::SizeOf;
 use std::{
-    cmp::{min, Ordering},
+    cmp::{Ordering, min},
     fmt::{self, Debug, Display, Formatter},
     ops::Neg,
 };
@@ -165,7 +165,9 @@ where
     ///
     /// Requires that `offs` has a length of `keys + 1`
     unsafe fn assume_invariants(&self) {
-        assume(self.offs.len() == self.keys.len() + 1);
+        unsafe {
+            assume(self.offs.len() == self.keys.len() + 1);
+        }
     }
 
     /// Compute a random sample of size `sample_size` of keys in `self.keys`.
@@ -176,8 +178,11 @@ where
     where
         RG: Rng,
     {
+        output.reserve(sample_size);
         self.keys
-            .sample_slice(0, self.keys.len(), rng, sample_size, output);
+            .sample_slice(0, self.keys.len(), rng, sample_size, &mut |x: &K| {
+                output.push_ref(x)
+            });
     }
 }
 
@@ -312,6 +317,12 @@ where
                 pos: 0,
             }
         }
+    }
+
+    fn approximate_byte_size(&self) -> usize {
+        self.keys.approximate_byte_size()
+            + self.offs.len() * std::mem::size_of::<O>()
+            + self.vals.approximate_byte_size()
     }
 }
 
@@ -1317,6 +1328,10 @@ where
     L: Trie,
     O: OrdOffset,
 {
+    pub fn pos(&self) -> isize {
+        self.pos
+    }
+
     pub fn seek_with<P>(&mut self, predicate: P)
     where
         P: Fn(&K) -> bool,

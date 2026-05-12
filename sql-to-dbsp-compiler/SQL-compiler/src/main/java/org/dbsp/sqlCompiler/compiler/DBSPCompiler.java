@@ -34,29 +34,37 @@ import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlOperatorTable;
+import org.apache.calcite.sql.SqlWriter;
+import org.apache.calcite.sql.SqlWriterConfig;
+import org.apache.calcite.sql.dialect.CalciteSqlDialect;
 import org.apache.calcite.sql.parser.SqlParseException;
+import org.apache.calcite.sql.pretty.SqlPrettyWriter;
 import org.apache.calcite.sql.util.SqlOperatorTables;
+import org.apache.calcite.sql.validate.SqlUserDefinedAggFunction;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceTableOperator;
-import org.dbsp.sqlCompiler.compiler.backend.MerkleInner;
+import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.backend.dot.ToDot;
 import org.dbsp.sqlCompiler.compiler.errors.BaseCompilerException;
 import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
 import org.dbsp.sqlCompiler.compiler.errors.CompilerMessages;
 import org.dbsp.sqlCompiler.compiler.errors.SourceFileContents;
+import org.dbsp.sqlCompiler.compiler.errors.SourcePosition;
 import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
 import org.dbsp.sqlCompiler.compiler.errors.UnsupportedException;
 import org.dbsp.sqlCompiler.compiler.frontend.TypeCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ForeignKey;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ParsedStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.RenameIdentifiers;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.frontend.CalciteToDBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.TableContents;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.SqlToRelCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.CustomFunctions;
+import org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateAggregate;
 import org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateView;
 import org.dbsp.sqlCompiler.compiler.frontend.parser.SqlFragmentIdentifier;
+import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateAggregateStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateFunctionStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateIndexStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateTableStatement;
@@ -83,12 +91,16 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * This class compiles SQL statements into DBSP circuits.
@@ -116,20 +128,6 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
     public ProgramIdentifier canonicalName(String name, boolean nameIsQuoted) {
         String canon = this.options.canonicalName(name, nameIsQuoted);
         return new ProgramIdentifier(canon, nameIsQuoted);
-    }
-
-    public String generateStructName(ProgramIdentifier typeName, List<DBSPTypeStruct.Field> fields) {
-        StringBuilder builder = new StringBuilder();
-        builder.append(typeName);
-        builder.append("[");
-        for (var field: fields) {
-            builder.append(field.getName())
-                    .append(":")
-                    .append(field.getType())
-                    .append(",");
-        }
-        builder.append("]");
-        return MerkleInner.hash(builder.toString()).makeIdentifier("struct");
     }
 
     /** Where does the compiled program come from? */
@@ -169,8 +167,7 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
         this.messages = new CompilerMessages(this);
         this.metadata = new ProgramMetadata();
         this.sqlToRelCompiler = new SqlToRelCompiler(options, this);
-        this.relToDBSPCompiler = new CalciteToDBSPCompiler(true, options,
-                this, this.metadata);
+        this.relToDBSPCompiler = new CalciteToDBSPCompiler(options, this, this.metadata);
         this.sources = new SourceFileContents();
         this.typeCompiler = new TypeCompiler(this);
         this.weightVar = DBSPTypeWeight.INSTANCE.var();
@@ -187,6 +184,9 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
         ToJsonVisitor toJson = new ToJsonVisitor(
                 this, result, this.options.ioOptions.verbosity, remap);
         toJson.apply(circuit);
+        result.append(",").newline();
+        result.appendJsonLabelAndColon("sources");
+        this.writeSourcesAsJson(result);
         result.newline().decrease().append("}");
     }
 
@@ -206,13 +206,17 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
             stream.append("\"").append(Utilities.escapeDoubleQuotes(e.name())).append("\"");
             stream.append(": ");
             RelNode rel = cv.getRel();
-            RelJsonWriter planWriter = new RelJsonWriter(result);
+            RelJsonWriter planWriter = new RelJsonWriter(result, options.ioOptions.verbosity);
             rel.explain(planWriter);
             String json = planWriter.asString();
             stream.appendIndentedStrings(json);
         }
         stream.newline().decrease().append("}");
         return result;
+    }
+
+    public void writeSourcesAsJson(IIndentStream stream) {
+        this.sources.writeAsJson(stream);
     }
 
     // Will be overwritten in the start() function.
@@ -235,7 +239,7 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
         // Declare the system tables
         this.compileInternal(
                 """
-                CREATE TABLE NOW(now TIMESTAMP NOT NULL LATENESS INTERVAL 0 SECONDS);
+                CREATE TABLE NOW(now TIMESTAMP NOT NULL); -- LATENESS INTERVAL 0 SECONDS
                 -- next table will be deleted after view is hooked to proper inputs
                 CREATE TABLE FELDERA_ERROR_TABLE(table_or_view_name VARCHAR NOT NULL, message VARCHAR NOT NULL, metadata VARCHAR NOT NULL);
                 CREATE VIEW ERROR_VIEW AS SELECT * FROM FELDERA_ERROR_TABLE;
@@ -260,8 +264,8 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
         return this.typeCompiler;
     }
 
-    public void registerStruct(DBSPTypeStruct type) {
-        this.globalTypes.register(type);
+    public void registerUDT(ProgramIdentifier name, DBSPTypeStruct type) {
+        this.globalTypes.register(name, type);
     }
 
     @Nullable
@@ -278,6 +282,18 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
         this.messages.setErrorContext(range);
     }
 
+    static final String WARNINGS_ARE_ERRORS = "FELDERA_WARNINGS_ARE_ERRORS";
+
+    boolean warningsAreErrors() {
+        return this.metadata.hasValue(WARNINGS_ARE_ERRORS) && !this.metadata.isFalsy(WARNINGS_ARE_ERRORS);
+    }
+
+    boolean warningIsSilenced(String warning) {
+        String variable = warning.replace(" ", "_");
+        variable = "FELDERA_IGNORE_WARNING_" + variable;
+        return this.metadata.hasValue(variable) && !this.metadata.isFalsy(variable);
+    }
+
     /**
      * Report an error or warning during compilation.
      * @param range      Position in source where error is located.
@@ -288,6 +304,12 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
      */
     public void reportProblem(SourcePositionRange range, boolean warning, boolean continuation,
                               String errorType, String message) {
+        if (warning) {
+            if (this.warningIsSilenced(errorType))
+                return;
+        }
+        if (this.warningsAreErrors())
+            warning = false;
         if (warning)
             this.hasWarnings = true;
         this.messages.reportProblem(range, warning, continuation, errorType, message);
@@ -356,7 +378,7 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
 
             // Check that the referred columns exist and have proper types
             ProgramIdentifier otherTableName = other.tableName.toIdentifier();
-            DBSPSourceTableOperator otherTable = circuit.getInput(otherTableName);
+            IInputOperator otherTable = circuit.getInput(otherTableName);
             if (otherTable == null) {
                 this.reportWarning(other.tableName.getSourcePosition(),
                         "Table not found",
@@ -366,10 +388,10 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                 continue;
             }
 
-            DBSPSourceTableOperator thisTable = circuit.getInput(thisTableName);
+            IInputOperator thisTable = circuit.getInput(thisTableName);
             Utilities.enforce(thisTable != null);
 
-            List<InputColumnMetadata> otherKeys = otherTable.metadata.getPrimaryKeys();
+            List<InputColumnMetadata> otherKeys = otherTable.getMetadata().getPrimaryKeys();
             if (otherKeys.size() != self.columnNames.size()) {
                 this.reportError(self.listPos,
                         "PRIMARY KEY does not match",
@@ -383,7 +405,7 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                 SqlFragmentIdentifier otherColumn = other.columnNames.get(i);
                 ProgramIdentifier selfColumnName = selfColumn.toIdentifier();
                 ProgramIdentifier otherColumnName = otherColumn.toIdentifier();
-                InputColumnMetadata selfMeta = thisTable.metadata.getColumnMetadata(selfColumnName);
+                InputColumnMetadata selfMeta = thisTable.getMetadata().getColumnMetadata(selfColumnName);
                 if (selfMeta == null) {
                     this.reportError(selfColumn.getSourcePosition(),
                             "Column not found",
@@ -391,7 +413,7 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                                     " does not have a column named " + selfColumnName.singleQuote());
                     continue;
                 }
-                InputColumnMetadata otherMeta = otherTable.metadata.getColumnMetadata(otherColumnName);
+                InputColumnMetadata otherMeta = otherTable.getMetadata().getColumnMetadata(otherColumnName);
                 if (otherMeta == null) {
                     this.reportError(otherColumn.getSourcePosition(),
                             "Column not found",
@@ -433,8 +455,10 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
         for (SqlStatements stat : this.toCompile) {
             try {
                 if (stat.many) {
-                    if (stat.statement.isEmpty())
+                    if (stat.statement.isEmpty()) {
+                        this.sqlToRelCompiler.emptyStatement();
                         continue;
+                    }
                     parsed.addAll(this.sqlToRelCompiler.parseStatements(stat.statement, stat.visible));
                 } else {
                     SqlNode node = this.sqlToRelCompiler.parse(stat.statement, stat.visible);
@@ -508,15 +532,54 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
         return true;
     }
 
+    void renameIdentifiers(List<ParsedStatement> statements) {
+        final PrintStream outputStream;
+        try {
+            @Nullable String outputFile = this.options.ioOptions.outputFile;
+            if (outputFile.isEmpty()) {
+                outputStream = System.out;
+            } else {
+                outputStream = new PrintStream(Files.newOutputStream(Paths.get(outputFile)));
+            }
+        } catch (IOException e) {
+            this.compiler().reportError(SourcePositionRange.INVALID,
+                    "Error writing to output file", e.getMessage());
+            return;
+        }
+
+        RenameIdentifiers renamer = new RenameIdentifiers();
+        for (ParsedStatement stat: statements) {
+            if (stat.visible()) {
+                SqlNode renamed = renamer.visitNode(stat.statement());
+                Utilities.enforce(renamed != null);
+                final SqlWriter sqlWriter = new SqlPrettyWriter(
+                        SqlWriterConfig.of()
+                                .withDialect(CalciteSqlDialect.DEFAULT)
+                                .withQuoteAllIdentifiers(false)
+                );
+                renamed.unparse(sqlWriter, 0, 0);
+                outputStream.println(sqlWriter + ";");
+            }
+        }
+        outputStream.close();
+    }
+
     @Nullable DBSPCircuit runAllCompilerStages() {
         List<ParsedStatement> parsed = this.runParser();
         if (this.hasErrors())
             return null;
+
+        if (this.options.ioOptions.anonymize) {
+            this.renameIdentifiers(parsed);
+            return null;
+        }
+
         try {
             // across all tables
             List<ForeignKey> foreignKeys = new ArrayList<>();
             // All UDFs which have no bodies in SQL
             final List<SqlFunction> rustFunctions = new ArrayList<>();
+            final List<SqlUserDefinedAggFunction> aggregateFunctions = new ArrayList<>();
 
             // Compile first the statements that define functions, types, and lateness
             for (ParsedStatement node: parsed) {
@@ -533,6 +596,18 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                         continue;
                     this.relToDBSPCompiler.compile(fe);
                     continue;
+                }
+                if (kind == SqlKind.OTHER && node.statement() instanceof SqlCreateAggregate) {
+                    CreateAggregateStatement stat = this.sqlToRelCompiler.compileCreateAggregate(node, this.sources);
+                    boolean exists = this.sqlToRelCompiler.functionExists(stat.function.getName());
+                    if (exists) {
+                        throw new CompilationError("A function named " + Utilities.singleQuote(stat.function.getName()) +
+                                " is already predefined, or the name is reserved.\nPlease consider using a " +
+                                "different name for the user-defined aggregate",
+                                stat.getCalciteObject());
+                    }
+                    aggregateFunctions.add(stat.function);
+                    this.relToDBSPCompiler.compile(stat);
                 }
                 if (kind == SqlKind.CREATE_FUNCTION) {
                     CreateFunctionStatement stat = this.sqlToRelCompiler.compileCreateFunction(node, this.sources);
@@ -556,8 +631,8 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                     this.relToDBSPCompiler.compile(stat);
                 }
                 if (node.statement() instanceof SqlLateness lateness) {
-                    ProgramIdentifier view = Utilities.toIdentifier(lateness.getView());
-                    ProgramIdentifier column = Utilities.toIdentifier(lateness.getColumn());
+                    ProgramIdentifier view = ProgramIdentifier.fromSqlId(lateness.getView());
+                    ProgramIdentifier column = ProgramIdentifier.fromSqlId(lateness.getColumn());
                     Map<ProgramIdentifier, SqlLateness> perView = this.viewLateness.computeIfAbsent(view, (k) -> new HashMap<>());
                     if (perView.containsKey(column)) {
                         SourcePositionRange range = new SourcePositionRange(lateness.getParserPosition());
@@ -572,11 +647,13 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                 }
             }
 
-            if (!rustFunctions.isEmpty()) {
+            if (!rustFunctions.isEmpty() || !aggregateFunctions.isEmpty()) {
                 // Reload the operator table to include the newly defined Rust function.
                 // These we can load all at the end, since they can't depend on each other.
                 SqlOperatorTable newFunctions = SqlOperatorTables.of(rustFunctions);
                 this.sqlToRelCompiler.addOperatorTable(newFunctions);
+                SqlOperatorTable newAggregates = SqlOperatorTables.of(aggregateFunctions);
+                this.sqlToRelCompiler.addOperatorTable(newAggregates);
             }
 
             // Compile all statements which do not define functions or types
@@ -596,7 +673,7 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
 
                 RelStatement fe;
                 if (node.statement() instanceof SqlCreateView cv) {
-                    ProgramIdentifier viewName = Utilities.toIdentifier(cv.name);
+                    ProgramIdentifier viewName = ProgramIdentifier.fromSqlId(cv.name);
                     Map<ProgramIdentifier, SqlLateness> late = this.viewLateness.getOrDefault(viewName, new HashMap<>());
                     fe = this.sqlToRelCompiler.compileCreateView(node, late, this.sources);
                 } else {
@@ -635,8 +712,9 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                 circuit = this.optimize(circuit);
             return circuit;
         } catch (CalciteContextException e) {
-            this.messages.reportError(e);
-            this.rethrow(e);
+            CompilationError e0 = this.improveErrorMessage(e);
+            this.messages.reportError(e0);
+            this.rethrow(e0);
         } catch (CalciteException e) {
             this.messages.reportError(e);
             this.rethrow(e);
@@ -653,6 +731,10 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                     this.messages.reportError(ex);
                     this.rethrow(ex);
                     handled = true;
+                } else if (t instanceof SqlParseException ex) {
+                    this.messages.reportError(ex);
+                    this.rethrow(e);
+                    handled = true;
                 }
                 current = t;
             }
@@ -667,9 +749,46 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
         return null;
     }
 
+    static final Pattern ITEM_ERROR = Pattern.compile("Cannot apply 'ITEM' to arguments of type 'ITEM\\(([^,]+), ([^']+)\\)'(.*)", Pattern.DOTALL);
+
+    static SourcePositionRange getRange(CalciteContextException e) {
+        return new SourcePositionRange(
+                new SourcePosition(e.getPosLine(), e.getPosColumn()),
+                new SourcePosition(e.getEndPosLine(), e.getEndPosColumn()));
+    }
+
+    /** Rewrite the error message for some Calcite errors which are confusing */
+    private CompilationError improveErrorMessage(CalciteContextException e) {
+        String message = e.getMessage();
+        if (message != null && !message.isEmpty()) {
+            var matcher = ITEM_ERROR.matcher(message);
+            if (matcher.find()) {
+                String source = matcher.group(1);
+                String index = matcher.group(2);
+                String tail = matcher.group(3);
+                String newMessage = "Cannot apply indexing to arguments of type " + source + "[" + index + "]" + tail;
+                return new CompilationError(newMessage, getRange(e));
+            }
+            if (message.contains("'TIMESTAMPDIFF'.")) {
+                // The Calcite parser replaces DATEDIFF with TIMESTAMPDIFF
+                // Try to figure out whether this is what happened and rewrite it.
+                // This heuristic may fail... but will work in general.
+                SourcePositionRange range = getRange(e);
+                String fragment = this.sources.getFragment(range, false);
+                String lower = fragment.toLowerCase(Locale.ENGLISH);
+                if (lower.contains("datediff") && !lower.contains("timestampdiff")) {
+                    message = message.replace("TIMESTAMPDIFF", "DATEDIFF");
+                    return new CompilationError(message, range);
+                }
+            }
+        }
+        return new CompilationError(e);
+    }
+
     void rethrow(RuntimeException e) {
         if (this.options.languageOptions.throwOnError) {
-            this.printMessages();
+            if (!this.options.ioOptions.quiet)
+                this.printMessages();
             throw e;
         }
     }

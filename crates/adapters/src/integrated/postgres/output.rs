@@ -1,162 +1,80 @@
-use std::{
-    collections::HashSet,
-    marker::PhantomPinned,
-    mem::take,
-    pin::{pin, Pin},
-    str::FromStr,
-    sync::Weak,
-    time::{Duration, Instant},
-};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::{io::Write, str::FromStr, sync::Weak, time::Duration};
 
+use super::{
+    error::BackoffError, prepared_statements::PreparedStatements, tls::make_tls_connector,
+};
+use crate::{ControllerError, util::indexed_operation_type};
 use crate::{
-    catalog::{CursorWithPolarity, RecordFormat, SerBatchReader, SerCursor},
+    buffer_op,
+    catalog::{RecordFormat, SerBatchReader, SerCursor},
     controller::{ControllerInner, EndpointId},
-    format::{Encoder, OutputConsumer, MAX_DUPLICATES},
+    flush_op,
+    format::{Encoder, OutputConsumer},
     transport::OutputEndpoint,
-    util::{truncate_ellipse, IndexedOperationType},
+    util::IndexedOperationType,
 };
-use crate::{util::indexed_operation_type, ControllerError};
-use anyhow::{anyhow, bail, Result as AnyResult};
-use feldera_adapterlib::transport::{AsyncErrorCallback, Step};
+use anyhow::{Context, Result as AnyResult, anyhow, bail};
+use feldera_adapterlib::catalog::SplitCursorBuilder;
+use feldera_adapterlib::transport::{AsyncErrorCallback, CommandHandler, Step};
 use feldera_types::{
-    format::{csv::CsvParserConfig, json::JsonFlavor},
+    format::json::JsonFlavor,
     program_schema::{Relation, SqlIdentifier},
-    transport::postgres::PostgresWriterConfig,
+    transport::postgres::{PostgresWriteMode, PostgresWriterConfig},
 };
+use parking_lot::RwLock;
 use postgres::{Client, NoTls, Statement};
-use tracing::{info_span, span::EnteredSpan};
+use serde::Deserialize;
 
-enum BackoffError {
-    Temporary(anyhow::Error),
-    Permanent(anyhow::Error),
+/// Commands sent to all workers at once.
+#[derive(Clone, Copy)]
+enum BroadcastCommand {
+    BatchStart,
+    BatchEnd,
+    Shutdown,
 }
 
-impl BackoffError {
-    fn should_retry(&self) -> bool {
-        match self {
-            BackoffError::Temporary(_) => true,
-            BackoffError::Permanent(_) => false,
-        }
-    }
-
-    fn inner(self) -> anyhow::Error {
-        match self {
-            BackoffError::Permanent(error) | BackoffError::Temporary(error) => {
-                // include the context info
-                anyhow!(error.to_string())
-            }
-        }
-    }
-
-    fn context(self, context: String) -> Self {
-        match self {
-            BackoffError::Temporary(error) => BackoffError::Temporary(error.context(context)),
-            BackoffError::Permanent(error) => BackoffError::Permanent(error.context(context)),
-        }
-    }
+enum WorkerCommand {
+    Broadcast(BroadcastCommand),
+    Encode(SplitCursorBuilder),
 }
 
-impl From<postgres::Error> for BackoffError {
-    fn from(value: postgres::Error) -> Self {
-        use postgres::error::SqlState;
-
-        if value.is_closed()
-            || value.code().is_some_and(|c| {
-                [
-                    SqlState::CONNECTION_FAILURE,
-                    SqlState::CONNECTION_DOES_NOT_EXIST,
-                    SqlState::CONNECTION_EXCEPTION,
-                    SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
-                    SqlState::ADMIN_SHUTDOWN,
-                ]
-                .contains(c)
-            })
-            // value.code() is none when connection is refused by the OS
-            || value.code().is_none()
-        {
-            Self::Temporary(anyhow!("failed to connect to postgres: {value}"))
-        } else {
-            Self::Permanent(anyhow!(
-                "postgres error: permanent: SqlState: {:?}: {value}",
-                value.code()
-            ))
-        }
-    }
+enum WorkerResult {
+    Ok { num_bytes: usize, num_rows: usize },
+    Err(anyhow::Error),
 }
 
-#[derive(Debug, Default)]
-struct RawQueries {
-    insert: String,
-    upsert: String,
-    delete: String,
-}
-
-#[derive(Debug)]
-struct PreparedStatements {
-    insert: Statement,
-    upsert: Statement,
-    delete: Statement,
-}
-
-impl PreparedStatements {
-    fn new(
-        raw_queries: &RawQueries,
-        client: &mut postgres::Client,
-        endpoint_name: &str,
-    ) -> Result<Self, BackoffError> {
-        let err_msg = "\nPlease ensure all field names that are quoted in PostgreSQL are quoted correctly in Feldera as well";
-
-        let insert = client
-            .prepare_typed(&raw_queries.insert, &[postgres::types::Type::VARCHAR])
-            .map_err(|e| {
-                BackoffError::from(e).context(format!(
-                    "failed to prepare insert statement: `{}`: {err_msg}",
-                    &raw_queries.insert
-                ))
-            })?;
-        let upsert = client
-            .prepare_typed(&raw_queries.upsert, &[postgres::types::Type::VARCHAR])
-            .map_err(|e| {
-                BackoffError::from(e).context(format!(
-                    "failed to prepare update statement: `{}`: {err_msg}",
-                    &raw_queries.upsert
-                ))
-            })?;
-        let delete = client
-            .prepare_typed(&raw_queries.delete, &[postgres::types::Type::VARCHAR])
-            .map_err(|e| {
-                BackoffError::from(e).context(format!(
-                    "failed to prepare delete statement: `{}`: {err_msg}",
-                    raw_queries.delete
-                ))
-            })?;
-
-        Ok(PreparedStatements {
-            insert,
-            upsert,
-            delete,
-        })
-    }
-}
-
-pub struct PostgresOutputEndpoint {
+/// A single postgres worker that owns a connection and runs on a dedicated thread.
+struct PostgresWorker {
+    worker_idx: usize,
     endpoint_id: EndpointId,
     endpoint_name: String,
     table: String,
     client: postgres::Client,
-    config: postgres::Config,
+    config: PostgresWriterConfig,
+    extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
     transaction: Option<postgres::Transaction<'static>>,
-    raw_queries: RawQueries,
     prepared_statements: PreparedStatements,
+    insert_buf: Vec<u8>,
+    upsert_buf: Vec<u8>,
+    delete_buf: Vec<u8>,
+    inserts: usize,
+    upserts: usize,
+    deletes: usize,
     key_schema: Relation,
     value_schema: Relation,
     controller: Weak<ControllerInner>,
     num_bytes: usize,
     num_rows: usize,
-    _pin: PhantomPinned,
+    /// Shared counter of records sent to postgres in the current batch.
+    /// Updated atomically after each successful `execute()` call across all
+    /// workers; reset to 0 by the endpoint at batch boundaries.
+    records_written: Arc<AtomicU64>,
 }
 
-impl Drop for PostgresOutputEndpoint {
+impl Drop for PostgresWorker {
     fn drop(&mut self) {
         self.transaction = None;
     }
@@ -164,115 +82,72 @@ impl Drop for PostgresOutputEndpoint {
 
 const PG_CONNECTION_VALIDITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-impl PostgresOutputEndpoint {
-    pub fn new(
+fn connect(config: &PostgresWriterConfig, endpoint_name: &str) -> Result<Client, BackoffError> {
+    let pgcnf = postgres::Config::from_str(&config.uri).map_err(|e| {
+        BackoffError::Permanent(anyhow!("error parsing postgres connection string: {e}"))
+    })?;
+
+    let client = match make_tls_connector(&config.tls, endpoint_name) {
+        Ok(Some(connector)) => {
+            tracing::debug!("CA certificate provided, connecting to postgres with TLS");
+            pgcnf.connect(connector)
+        }
+        Ok(None) => {
+            tracing::debug!("no CA certificates provided, connecting to postgres without TLS");
+            pgcnf.connect(NoTls)
+        }
+        Err(e) => return Err(BackoffError::Permanent(e)),
+    }?;
+
+    Ok(client)
+}
+
+impl PostgresWorker {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        idx: usize,
         endpoint_id: EndpointId,
         endpoint_name: &str,
         config: &PostgresWriterConfig,
-        key_schema: &Option<Relation>,
+        extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
+        key_schema: &Relation,
         value_schema: &Relation,
         controller: Weak<ControllerInner>,
-    ) -> Result<Self, ControllerError> {
+        records_written: Arc<AtomicU64>,
+    ) -> Result<Self, BackoffError> {
         let table = config.table.to_owned();
+        let mut client = connect(config, endpoint_name)?;
 
-        let config = postgres::Config::from_str(&config.uri).map_err(|e| {
-            ControllerError::invalid_transport_configuration(
-                endpoint_name,
-                &format!("error parsing postgres connection string: {e}"),
-            )
-        })?;
+        let prepared_statements =
+            PreparedStatements::new(key_schema, value_schema, config, &mut client)?;
 
-        let mut client = config.connect(NoTls).map_err(|e| {
-            ControllerError::invalid_transport_configuration(
-                endpoint_name,
-                &format!("failed to connect to postgres: {e}"),
-            )
-        })?;
-
-        let key_schema = key_schema
-            .to_owned()
-            .ok_or(ControllerError::not_supported(
-                "Postgres output connector requires the view to have a unique key. Please specify the `index` property in the connector configuration. For more details, see: https://docs.feldera.com/connectors/unique_keys"
-            ))?;
-
-        let keys: Vec<String> = key_schema
-            .fields
-            .iter()
-            .map(|f| f.name.sql_name())
-            .collect();
-
-        let mut raw_queries = RawQueries::default();
-
-        {
-            raw_queries.insert = format!(
-                r#"INSERT INTO "{table}" SELECT * FROM jsonb_populate_recordset(NULL::"{table}", $1::jsonb)"#
-            );
-        }
-
-        {
-            let (table_keys, d_keys): (Vec<_>, Vec<_>) = keys
-                .iter()
-                .map(|k| (format!(r#" "{table}".{k} "#), format!("d.{k}")))
-                .unzip();
-
-            raw_queries.delete = format!(
-                r#"DELETE FROM "{table}" USING (SELECT {} FROM jsonb_populate_recordset(NULL::"{table}", $1::jsonb)) as d where ({}) = ({})"#,
-                keys.iter()
-                    .map(|k| k.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                table_keys.join(", "),
-                d_keys.join(", "),
-            );
-        }
-
-        {
-            let table_alias = "t";
-            let new_alias = "n";
-            let columns = value_schema
-                .fields
-                .iter()
-                .map(|f| {
-                    let f = f.name.sql_name();
-                    format!("{f} = {new_alias}.{f}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            let (table_fields, new_fields): (Vec<_>, Vec<_>) = keys
-                .iter()
-                .map(|f| (format!("{table_alias}.{f}"), format!("{new_alias}.{f}")))
-                .unzip();
-
-            raw_queries.upsert = format!(
-                r#"UPDATE "{table}" AS {table_alias} SET {columns} FROM (SELECT * FROM jsonb_populate_recordset(NULL::"{table}", $1::jsonb)) AS {new_alias} WHERE ({}) = ({})"#,
-                table_fields.join(", "),
-                new_fields.join(", ")
-            );
-        }
-        let prepared_statements = PreparedStatements::new(&raw_queries, &mut client, endpoint_name)
-            .map_err(|e| ControllerError::output_transport_error(endpoint_name, true, e.inner()))?;
-
-        let out = Self {
+        Ok(Self {
+            worker_idx: idx,
             endpoint_id,
             endpoint_name: endpoint_name.to_owned(),
             controller,
             table,
-            config,
+            config: config.clone(),
+            extra_columns,
             client,
             transaction: None,
-            raw_queries,
             prepared_statements,
-            key_schema,
+            key_schema: key_schema.clone(),
             num_rows: 0,
             num_bytes: 0,
+            inserts: 0,
+            upserts: 0,
+            deletes: 0,
+            insert_buf: Vec::with_capacity(config.max_buffer_size_bytes),
+            upsert_buf: Vec::with_capacity(config.max_buffer_size_bytes),
+            delete_buf: Vec::with_capacity(config.max_buffer_size_bytes),
             value_schema: value_schema.to_owned(),
-            _pin: PhantomPinned,
-        };
+            records_written,
+        })
+    }
 
-        let _guard = out.span();
-
-        Ok(out)
+    fn is_cdc(&self) -> bool {
+        matches!(self.config.mode, PostgresWriteMode::Cdc)
     }
 
     fn view_name(&self) -> &SqlIdentifier {
@@ -289,9 +164,15 @@ impl PostgresOutputEndpoint {
         ))
     }
 
-    fn exec_statement(&mut self, stmt: Statement, value: &mut Vec<u8>, name: &str) {
+    fn exec_statement(
+        &mut self,
+        stmt: Statement,
+        mut value: Vec<u8>,
+        name: &str,
+        num_records: usize,
+    ) {
         loop {
-            match self.exec_statement_inner(stmt.clone(), value, name) {
+            match self.exec_statement_inner(stmt.clone(), &mut value, name, num_records) {
                 Ok(_) => return,
                 Err(e) => {
                     let retry = e.should_retry();
@@ -304,6 +185,7 @@ impl PostgresOutputEndpoint {
                         &self.endpoint_name,
                         true,
                         e.inner(),
+                        Some("pg_exec"),
                     );
                     if !retry {
                         return;
@@ -319,6 +201,7 @@ impl PostgresOutputEndpoint {
         stmt: Statement,
         value: &mut Vec<u8>,
         name: &str,
+        num_records: usize,
     ) -> Result<(), BackoffError> {
         if value.last() != Some(&b']') {
             value.push(b']');
@@ -341,66 +224,120 @@ impl PostgresOutputEndpoint {
                 BackoffError::from(e).context(format!("while executing {name} statement: {v}"))
             })?;
 
+        // Report progress: these records have now been sent to postgres within
+        // the open transaction.  The endpoint resets the counter to 0 at batch
+        // boundaries (start, successful commit, failed commit).
+        self.records_written
+            .fetch_add(num_records as u64, Ordering::Relaxed);
+
         value.clear();
         value.push(b'[');
 
         Ok(())
     }
 
-    /// Executes the insert statement within the transaction and resets the
-    /// buffer back to `[`.
-    fn insert(&mut self, value: &mut Vec<u8>) {
-        self.exec_statement(self.prepared_statements.insert.clone(), value, "insert")
+    fn flush_insert(&mut self) {
+        flush_op!(
+            self,
+            buf = insert_buf,
+            counter = inserts,
+            stmt = insert,
+            name = "insert"
+        );
     }
 
-    /// Executes the upsert statement within the transaction and resets the
-    /// buffer back to `[`.
-    fn upsert(&mut self, value: &mut Vec<u8>) {
-        self.exec_statement(self.prepared_statements.upsert.clone(), value, "upsert")
+    fn insert(&mut self, mut value: Vec<u8>) {
+        buffer_op!(
+            self,
+            buf = insert_buf,
+            counter = inserts,
+            stmt = insert,
+            flush_fn = flush_insert,
+            name = "insert",
+            value = value
+        );
     }
 
-    /// Executes the delete statement within the transaction and resets the
-    /// buffer back to `[`.
-    fn delete(&mut self, value: &mut Vec<u8>) {
-        self.exec_statement(self.prepared_statements.delete.clone(), value, "delete")
+    fn flush_upsert(&mut self) {
+        flush_op!(
+            self,
+            buf = upsert_buf,
+            counter = upserts,
+            stmt = upsert,
+            name = "upsert"
+        );
     }
 
-    fn span(&self) -> EnteredSpan {
-        info_span!(
-            "postgres_output",
-            ft = false,
-            id = self.endpoint_id,
-            name = self.endpoint_name,
-            pg_table = self.table,
-        )
-        .entered()
+    fn upsert(&mut self, mut value: Vec<u8>) {
+        buffer_op!(
+            self,
+            buf = upsert_buf,
+            counter = upserts,
+            stmt = upsert,
+            flush_fn = flush_upsert,
+            name = "upsert",
+            value = value
+        );
+    }
+
+    fn flush_delete(&mut self) {
+        flush_op!(
+            self,
+            buf = delete_buf,
+            counter = deletes,
+            stmt = delete,
+            name = "delete"
+        );
+    }
+
+    fn delete(&mut self, mut value: Vec<u8>) {
+        buffer_op!(
+            self,
+            buf = delete_buf,
+            counter = deletes,
+            stmt = delete,
+            flush_fn = flush_delete,
+            name = "delete",
+            value = value
+        );
+    }
+
+    fn flush(&mut self) {
+        self.flush_delete();
+        self.flush_insert();
+        self.flush_upsert();
     }
 
     fn retry_connecting(&mut self) -> Result<(), BackoffError> {
-        let valid = self.client.is_valid(PG_CONNECTION_VALIDITY_TIMEOUT);
-        let Some(controller) = self.controller.upgrade() else {
+        if self.controller.upgrade().is_none() {
             tracing::warn!("controller is shutting down: aborting");
             return Ok(());
         };
-
-        let Err(e) = valid else {
+        if self.client.is_valid(PG_CONNECTION_VALIDITY_TIMEOUT).is_ok() {
             return Ok(());
         };
 
         self.transaction = None;
-        self.client = self.config.connect(NoTls)?;
+        self.client = connect(&self.config, &self.endpoint_name)?;
 
-        self.prepared_statements =
-            PreparedStatements::new(&self.raw_queries, &mut self.client, &self.endpoint_name)
-                .map_err(|e| {
-                    e.context(format!(
-                        "postgres: error preparing statements after reconnecting to postgres
+        self.prepared_statements = PreparedStatements::new(
+            &self.key_schema,
+            &self.value_schema,
+            &self.config,
+            &mut self.client,
+        )
+        .map_err(|e| {
+            e.context(format!(
+                "postgres: error preparing statements after reconnecting to postgres
 These statements were successfully prepared before reconnecting. Does the table {} still exist?",
-                        self.table
-                    ))
-                })?;
+                self.table
+            ))
+        })?;
 
-        tracing::info!("postgres: successfully reconnected to postgres");
+        tracing::info!(
+            "postgres: worker-thread-{} successfully reconnected to postgres",
+            self.worker_idx
+        );
 
         Ok(())
     }
@@ -415,7 +352,10 @@ These statements were successfully prepared before reconnecting. Does the table 
         };
 
         loop {
-            tracing::info!("retrying to connect to postgres");
+            tracing::info!(
+                "worker-thread-{} retrying to connect to postgres",
+                self.worker_idx
+            );
             match self.retry_connecting() {
                 Ok(_) => return,
                 Err(e) => {
@@ -425,6 +365,7 @@ These statements were successfully prepared before reconnecting. Does the table 
                         &self.endpoint_name,
                         true,
                         e.inner(),
+                        Some("pg_conn_retry"),
                     );
                     if !retry {
                         return;
@@ -440,33 +381,28 @@ These statements were successfully prepared before reconnecting. Does the table 
     }
 
     fn batch_start_inner(&mut self) -> Result<(), BackoffError> {
-        let Some(controller) = self.controller.upgrade() else {
+        // Skip the controller check in test/bench mode.
+        #[cfg(not(any(test, feature = "bench-mode")))]
+        if self.controller.upgrade().is_none() {
             tracing::warn!("controller is shutting down: aborting");
             return Ok(());
-        };
+        }
 
         let txn = self.client.transaction()?;
 
-        // Safety
-        //
-        // A transaction is a reference to the `client`. The `client`'s lifetime
-        // is longer than that of a transaction, which only lasts for the
-        // duration of a batch.
-        //
-        // We transmute from Transaction<'a> to Transaction<'static> as it is
-        // a reference to the `client` field in [`PostgresOutputEndpoint`].
-        // This means, that moving [`PostgresOutputEndpoint`] after a batch
-        // has been started, will result in `transaction` being a
-        // dangling pointer.
-        //
-        // TODO: Consider [`std::pin::Pin`]ing the integrated connector.
+        // SAFETY: The transaction borrows `self.client`. Both live on this
+        // worker's dedicated thread and never move. The transaction is committed
+        // or rolled back in `batch_end_inner` before the next batch.
         let transaction: postgres::Transaction<'static> = unsafe { std::mem::transmute(txn) };
         self.transaction = Some(transaction);
 
         Ok(())
     }
 
-    fn batch_end_inner(&mut self) -> Result<(), BackoffError> {
+    /// Flush remaining buffers, commit the transaction, and return (bytes, rows) written.
+    fn batch_end_inner(&mut self) -> Result<(usize, usize), BackoffError> {
+        self.flush();
+
         let transaction = self
             .transaction
             .take()
@@ -476,45 +412,482 @@ These statements were successfully prepared before reconnecting. Does the table 
 
         transaction.commit()?;
 
-        if let Some(controller) = self.controller.upgrade() {
-            controller.status.output_buffer(
-                self.endpoint_id,
-                std::mem::take(&mut self.num_bytes),
-                std::mem::take(&mut self.num_rows),
-            );
+        let num_bytes = std::mem::take(&mut self.num_bytes);
+        let num_rows = std::mem::take(&mut self.num_rows);
+
+        Ok((num_bytes, num_rows))
+    }
+
+    /// Encode records from the cursor into postgres within the current transaction.
+    fn encode_cursor(
+        &mut self,
+        cursor: &mut dyn SerCursor,
+        extra_columns: BTreeMap<String, Option<serde_json::Value>>,
+    ) -> anyhow::Result<()> {
+        while cursor.key_valid() {
+            if let Some(op) = indexed_operation_type(self.view_name(), self.index_name(), cursor)? {
+                cursor.rewind_vals();
+                match op {
+                    IndexedOperationType::Insert => {
+                        let mut buf = Vec::new();
+                        cursor.serialize_val(&mut buf)?;
+                        self.serialize_extra_columns(&mut buf, &extra_columns)?;
+
+                        if self.is_cdc() {
+                            self.serialize_cdc_fields(op, &mut buf)?;
+                        }
+                        self.insert(buf);
+                    }
+                    IndexedOperationType::Delete => {
+                        let mut buf: Vec<u8> = Vec::new();
+
+                        if self.is_cdc() {
+                            cursor.serialize_val(&mut buf)?;
+                            self.serialize_extra_columns(&mut buf, &extra_columns)?;
+                            self.serialize_cdc_fields(op, &mut buf)?;
+                        } else {
+                            cursor.serialize_key(&mut buf)?;
+                        }
+
+                        self.delete(buf);
+                    }
+                    IndexedOperationType::Upsert => {
+                        if cursor.weight() < 0 {
+                            cursor.step_val();
+                        }
+
+                        let mut buf: Vec<u8> = Vec::new();
+                        cursor.serialize_val(&mut buf)?;
+                        self.serialize_extra_columns(&mut buf, &extra_columns)?;
+                        if self.is_cdc() {
+                            self.serialize_cdc_fields(op, &mut buf)?;
+                        }
+                        self.upsert(buf);
+                    }
+                };
+
+                self.num_rows += 1;
+            }
+
+            cursor.step_key();
+        }
+
+        Ok(())
+    }
+
+    fn serialize_cdc_fields(
+        &self,
+        op: IndexedOperationType,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), anyhow::Error> {
+        let op = match op {
+            IndexedOperationType::Insert => "i",
+            IndexedOperationType::Delete => "d",
+            IndexedOperationType::Upsert => "u",
         };
+
+        buf.pop(); // Remove the trailing '}'
+
+        // Insert CDC fields
+        write!(buf, r#","{}":"{}""#, self.config.cdc_op_column, op)
+            .context("failed when encoding CDC op field")?;
+        write!(
+            buf,
+            r#","{}":{}"#,
+            self.config.cdc_ts_column,
+            chrono::Utc::now().timestamp_micros()
+        )
+        .context("failed when encoding CDC TS field")?;
+
+        buf.push(b'}'); // Re-add the trailing '}'
+
+        Ok(())
+    }
+
+    fn serialize_extra_columns(
+        &self,
+        buf: &mut Vec<u8>,
+        extra_columns: &BTreeMap<String, Option<serde_json::Value>>,
+    ) -> Result<(), anyhow::Error> {
+        if extra_columns.is_empty() {
+            return Ok(());
+        }
+
+        let brace = buf.pop(); // Remove the trailing '}'
+
+        debug_assert_eq!(brace, Some(b'}'));
+
+        for (key, value) in extra_columns {
+            write!(
+                buf,
+                r#",{}:{}"#,
+                serde_json::to_string(key).unwrap(),
+                serde_json::to_string(value).unwrap()
+            )
+            .context("failed when encoding extra columns")?;
+        }
+        buf.push(b'}'); // Re-add the trailing '}'
+        Ok(())
+    }
+}
+
+impl PostgresWorker {
+    fn run(
+        mut self,
+        cmd_rx: crossbeam::channel::Receiver<WorkerCommand>,
+        result_tx: crossbeam::channel::Sender<WorkerResult>,
+    ) {
+        while let Ok(cmd) = cmd_rx.recv() {
+            match cmd {
+                WorkerCommand::Broadcast(BroadcastCommand::BatchStart) => loop {
+                    match self.batch_start_inner() {
+                        Ok(()) => {
+                            let _ = result_tx.send(WorkerResult::Ok {
+                                num_bytes: 0,
+                                num_rows: 0,
+                            });
+                            break;
+                        }
+                        Err(e) => {
+                            if e.should_retry() {
+                                tracing::error!(
+                                    "error when trying to start transaction, retrying with backoff: {}",
+                                    e.inner()
+                                );
+                                self.retry_connecting_with_backoff();
+                                continue;
+                            }
+                            let _ = result_tx.send(WorkerResult::Err(e.inner()));
+                            break;
+                        }
+                    }
+                },
+                WorkerCommand::Encode(cursor_builder) => {
+                    let mut cursor = cursor_builder.build();
+                    let extra_columns = self.extra_columns.read().clone();
+                    match self.encode_cursor(&mut cursor, extra_columns) {
+                        Ok(()) => {
+                            let _ = result_tx.send(WorkerResult::Ok {
+                                num_bytes: 0,
+                                num_rows: 0,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = result_tx.send(WorkerResult::Err(e));
+                        }
+                    }
+                }
+                WorkerCommand::Broadcast(BroadcastCommand::BatchEnd) => loop {
+                    match self.batch_end_inner() {
+                        Ok((num_bytes, num_rows)) => {
+                            let _ = result_tx.send(WorkerResult::Ok {
+                                num_bytes,
+                                num_rows,
+                            });
+                            break;
+                        }
+                        Err(e) => {
+                            if e.should_retry() {
+                                tracing::error!(
+                                    "error when trying to commit transaction, retrying with backoff: {}",
+                                    e.inner()
+                                );
+                                self.retry_connecting_with_backoff();
+                                continue;
+                            }
+                            let _ = result_tx.send(WorkerResult::Err(e.inner()));
+                            break;
+                        }
+                    }
+                },
+                WorkerCommand::Broadcast(BroadcastCommand::Shutdown) => break,
+            }
+        }
+    }
+}
+
+struct WorkerHandle {
+    cmd_tx: crossbeam::channel::Sender<WorkerCommand>,
+    result_rx: crossbeam::channel::Receiver<WorkerResult>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Coordinates N parallel `PostgresWorker`s, each on its own thread.
+///
+/// Incoming batches are partitioned by key range so each worker handles
+/// a disjoint slice of the data.
+pub struct PostgresOutputEndpoint {
+    endpoint_id: EndpointId,
+    endpoint_name: String,
+    config: PostgresWriterConfig,
+    extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
+    controller: Weak<ControllerInner>,
+    handles: Vec<WorkerHandle>,
+    txn_start: std::time::Instant,
+    num_bytes: usize,
+    num_rows: usize,
+    /// Running count of records sent to postgres in the current batch, shared
+    /// across all worker threads.  Registered with the controller's metrics
+    /// during construction; reset to 0 at batch boundaries.
+    records_written: Arc<AtomicU64>,
+}
+
+/// Commands supported by the Postgres output connector.
+#[derive(Deserialize)]
+enum PostgresOutputEndpointCommand {
+    /// Set the values of a subset of extra columns.
+    #[serde(rename = "set_extra_columns")]
+    SetExtraColumns(BTreeMap<String, Option<serde_json::Value>>),
+}
+
+struct PostgresOutputEndpointCommandHandler {
+    extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
+    allowed_extra_column_names: HashSet<String>,
+}
+
+impl PostgresOutputEndpointCommandHandler {
+    fn new(
+        extra_columns: Arc<RwLock<BTreeMap<String, Option<serde_json::Value>>>>,
+        config: &PostgresWriterConfig,
+    ) -> Self {
+        Self {
+            extra_columns,
+            allowed_extra_column_names: config.extra_columns.iter().cloned().collect(),
+        }
+    }
+}
+
+impl CommandHandler for PostgresOutputEndpointCommandHandler {
+    fn command(&self, command: serde_json::Value) -> AnyResult<serde_json::Value> {
+        let command = serde_json::from_value::<PostgresOutputEndpointCommand>(command.clone())
+            .map_err(|e| anyhow!("Postgres output connector failed to parse command '{command}' with the following error: {e}"))?;
+
+        match command {
+            PostgresOutputEndpointCommand::SetExtraColumns(extra_columns) => {
+                let unknown: Vec<&str> = extra_columns
+                    .keys()
+                    .filter(|k| !self.allowed_extra_column_names.contains(*k))
+                    .map(|s| s.as_str())
+                    .collect();
+                if !unknown.is_empty() {
+                    let mut allowed: Vec<&str> = self
+                        .allowed_extra_column_names
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect();
+                    allowed.sort_unstable();
+                    bail!(
+                        "set_extra_columns: unknown column name(s) {unknown:?}; allowed names from connector config field `extra_columns` are {allowed:?}"
+                    );
+                }
+
+                let mut configured_extra_columns = self.extra_columns.write();
+                for (key, value) in extra_columns {
+                    configured_extra_columns.insert(key, value);
+                }
+                Ok(serde_json::to_value(&*configured_extra_columns)
+                    .expect("Postgres output connector failed to serialize response"))
+            }
+        }
+    }
+}
+
+impl Drop for PostgresOutputEndpoint {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            let _ = handle
+                .cmd_tx
+                .send(WorkerCommand::Broadcast(BroadcastCommand::Shutdown));
+        }
+        for handle in &mut self.handles {
+            if let Some(thread) = handle.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+/// Ensures `config.extra_columns` has no duplicates and no name matches a column in `value_schema`.
+fn validate_extra_columns_against_value_schema(
+    endpoint_name: &str,
+    config: &PostgresWriterConfig,
+    value_schema: &Relation,
+) -> Result<(), ControllerError> {
+    let value_sql_names: HashSet<String> = value_schema
+        .fields
+        .iter()
+        .map(|f| f.name.name().to_lowercase())
+        .collect();
+
+    let mut seen = HashSet::new();
+    for name in &config.extra_columns {
+        if !seen.insert(name) {
+            return Err(ControllerError::invalid_transport_configuration(
+                endpoint_name,
+                &format!("duplicate name in connector config field 'extra_columns': {name:?}"),
+            ));
+        }
+        if value_sql_names.contains(&name.to_lowercase()) {
+            return Err(ControllerError::invalid_transport_configuration(
+                endpoint_name,
+                &format!(
+                    "connector config 'extra_columns' includes {name:?}, which is already a column in the output view; \
+                     extra columns must not duplicate view columns"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl PostgresOutputEndpoint {
+    pub fn new(
+        endpoint_id: EndpointId,
+        endpoint_name: &str,
+        config: &PostgresWriterConfig,
+        key_schema: &Option<Relation>,
+        value_schema: &Relation,
+        controller: Weak<ControllerInner>,
+    ) -> Result<Self, ControllerError> {
+        config.validate().map_err(|e| {
+            ControllerError::invalid_transport_configuration(endpoint_name, &e.to_string())
+        })?;
+
+        validate_extra_columns_against_value_schema(endpoint_name, config, value_schema)?;
+
+        let key_schema = key_schema
+            .to_owned()
+            .ok_or(ControllerError::not_supported(
+                "Postgres output connector requires the view to have a unique key. Please specify the `index` property in the connector configuration. For more details, see: https://docs.feldera.com/connectors/unique_keys"
+            ))?;
+
+        let num_threads = config.threads;
+        let mut handles = Vec::with_capacity(num_threads);
+
+        // Extra columns are not set initially.
+        let extra_columns = Arc::new(RwLock::new(BTreeMap::new()));
+
+        // Shared progress counter.  Register with the controller so the metric
+        // is exposed; `add_output()` has already been called by this point so
+        // the metrics slot exists.
+        let records_written = Arc::new(AtomicU64::new(0));
+        if let Some(c) = controller.upgrade() {
+            c.status
+                .register_batch_progress_counter(&endpoint_id, records_written.clone());
+        }
+
+        for i in 0..num_threads {
+            let worker = PostgresWorker::new(
+                i,
+                endpoint_id,
+                endpoint_name,
+                config,
+                extra_columns.clone(),
+                &key_schema,
+                value_schema,
+                controller.clone(),
+                records_written.clone(),
+            )
+            .map_err(|e| ControllerError::output_transport_error(endpoint_name, true, e.inner()))?;
+
+            let (cmd_tx, cmd_rx) = crossbeam::channel::bounded(1);
+            let (result_tx, result_rx) = crossbeam::channel::bounded(1);
+
+            let thread_name = format!("pg-output-{endpoint_name}-{i}");
+            let thread = std::thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || worker.run(cmd_rx, result_tx))
+                .map_err(|e| {
+                    ControllerError::output_transport_error(
+                        endpoint_name,
+                        true,
+                        anyhow!("failed to spawn worker thread: {e}"),
+                    )
+                })?;
+
+            handles.push(WorkerHandle {
+                cmd_tx,
+                result_rx,
+                thread: Some(thread),
+            });
+        }
+
+        Ok(Self {
+            endpoint_id,
+            endpoint_name: endpoint_name.to_owned(),
+            config: config.clone(),
+            extra_columns,
+            controller,
+            handles,
+            txn_start: std::time::Instant::now(),
+            num_bytes: 0,
+            num_rows: 0,
+            records_written,
+        })
+    }
+
+    /// Send `cmd` to every worker, wait for all replies, and accumulate byte/row counts.
+    fn broadcast_and_collect(&mut self, cmd: BroadcastCommand) -> Result<(), anyhow::Error> {
+        for handle in &self.handles {
+            let _ = handle.cmd_tx.send(WorkerCommand::Broadcast(cmd));
+        }
+
+        let mut errors: Vec<anyhow::Error> = Vec::new();
+
+        for handle in &self.handles {
+            match handle.result_rx.recv() {
+                Ok(WorkerResult::Ok {
+                    num_bytes,
+                    num_rows,
+                }) => {
+                    self.num_bytes += num_bytes;
+                    self.num_rows += num_rows;
+                }
+                Ok(WorkerResult::Err(e)) => {
+                    errors.push(e);
+                }
+                Err(_) => {
+                    errors.push(anyhow!("worker thread disconnected"));
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            let msg = errors
+                .iter()
+                .map(|e| format!("{e:#}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("{} worker(s) failed: {msg}", errors.len());
+        }
 
         Ok(())
     }
 }
 
 impl OutputConsumer for PostgresOutputEndpoint {
-    /// 1 MiB
     fn max_buffer_size_bytes(&self) -> usize {
-        usize::pow(2, 20)
+        self.config.max_buffer_size_bytes
     }
 
     fn batch_start(&mut self, _step: Step) {
-        loop {
-            match self.batch_start_inner() {
-                Ok(_) => return,
-                Err(err) => {
-                    let Some(controller) = self.controller.upgrade() else {
-                        tracing::warn!("controller is shutting down: aborting");
-                        return;
-                    };
-                    let retry = err.should_retry();
-                    controller.output_transport_error(
-                        self.endpoint_id,
-                        &self.endpoint_name,
-                        true,
-                        anyhow!("postgres: failed to start transaction: {}", err.inner()),
-                    );
-                    if !retry {
-                        return;
-                    }
-                    self.retry_connecting_with_backoff();
-                }
+        self.txn_start = std::time::Instant::now();
+        self.records_written.store(0, Ordering::Relaxed);
+
+        match self.broadcast_and_collect(BroadcastCommand::BatchStart) {
+            Ok(()) => (),
+            Err(err) => {
+                let Some(controller) = self.controller.upgrade() else {
+                    tracing::warn!("controller is shutting down: aborting");
+                    return;
+                };
+                controller.output_transport_error(
+                    self.endpoint_id,
+                    &self.endpoint_name,
+                    true,
+                    anyhow!("failed to start Postgres transaction(s): {err:#}"),
+                    Some("pg_batch_start"),
+                );
             }
         }
     }
@@ -528,32 +901,44 @@ impl OutputConsumer for PostgresOutputEndpoint {
         _: Option<&[u8]>,
         _: Option<&[u8]>,
         _: &[(&str, Option<&[u8]>)],
-        num_records: usize,
+        _num_records: usize,
     ) {
         unreachable!()
     }
 
     fn batch_end(&mut self) {
-        loop {
-            match self.batch_end_inner() {
-                Ok(_) => return,
-                Err(err) => {
-                    let Some(controller) = self.controller.upgrade() else {
-                        tracing::warn!("controller is shutting down: aborting");
-                        return;
-                    };
-                    let retry = err.should_retry();
-                    controller.output_transport_error(
-                        self.endpoint_id,
-                        &self.endpoint_name,
-                        true,
-                        err.inner(),
-                    );
-                    if !retry {
-                        return;
-                    }
-                    self.retry_connecting_with_backoff();
-                }
+        let result = self.broadcast_and_collect(BroadcastCommand::BatchEnd);
+        // Reset progress on every batch_end, regardless of outcome: on success
+        // the records have been committed; on failure the counter would
+        // otherwise leak across batches.
+        self.records_written.store(0, Ordering::Relaxed);
+        match result {
+            Ok(()) => {
+                let elapsed = self.txn_start.elapsed();
+                let num_bytes = std::mem::take(&mut self.num_bytes);
+                let num_rows = std::mem::take(&mut self.num_rows);
+                tracing::debug!(
+                    "postgres: flushed {num_rows} rows and {num_bytes} bytes in {elapsed:?}",
+                );
+
+                if let Some(controller) = self.controller.upgrade() {
+                    controller
+                        .status
+                        .output_buffer(self.endpoint_id, num_bytes, num_rows);
+                };
+            }
+            Err(err) => {
+                let Some(controller) = self.controller.upgrade() else {
+                    tracing::warn!("controller is shutting down: aborting");
+                    return;
+                };
+                controller.output_transport_error(
+                    self.endpoint_id,
+                    &self.endpoint_name,
+                    true,
+                    anyhow!("failed to commit changes to Postgres: {err:#}"),
+                    Some("pg_batch_end"),
+                );
             }
         }
     }
@@ -564,78 +949,68 @@ impl Encoder for PostgresOutputEndpoint {
         self
     }
 
-    fn encode(&mut self, batch: &dyn SerBatchReader) -> anyhow::Result<()> {
-        let mut insert_buffer: Vec<u8> = vec![b'['];
-        let mut delete_buffer: Vec<u8> = vec![b'['];
-        let mut upsert_buffer: Vec<u8> = vec![b'['];
+    fn encode(&mut self, batch: Arc<dyn SerBatchReader>) -> anyhow::Result<()> {
+        let num_workers = self.handles.len();
 
-        let max_buffer_size = OutputConsumer::max_buffer_size_bytes(self);
+        // Split the batch into key-range partitions, one per worker.
+        let mut bounds = batch.keys_factory().default_box();
+        batch.partition_keys(num_workers, &mut *bounds);
 
-        let mut cursor = batch.cursor(RecordFormat::Json(JsonFlavor::Postgres))?;
+        let mut workers_dispatched = 0;
 
-        while cursor.key_valid() {
-            if let Some(op) =
-                indexed_operation_type(self.view_name(), self.index_name(), cursor.as_mut())?
-            {
-                cursor.rewind_vals();
-                match op {
-                    IndexedOperationType::Insert => {
-                        let buf = &mut insert_buffer;
-                        let mut new_buf: Vec<u8> = Vec::new();
-                        if buf.last() != Some(&b'[') {
-                            new_buf.push(b',');
-                        }
-                        cursor.serialize_val(&mut new_buf)?;
-                        if new_buf.len() + buf.len() > max_buffer_size {
-                            self.insert(buf);
-                        }
-                        buf.append(&mut new_buf);
-                    }
-                    IndexedOperationType::Delete => {
-                        let buf = &mut delete_buffer;
-                        let mut new_buf: Vec<u8> = Vec::new();
-                        if buf.last() != Some(&b'[') {
-                            new_buf.push(b',');
-                        }
-                        cursor.serialize_key(&mut new_buf)?;
-                        if new_buf.len() + buf.len() > max_buffer_size {
-                            self.delete(buf);
-                        }
-                        buf.append(&mut new_buf);
-                    }
-                    IndexedOperationType::Upsert => {
-                        if cursor.weight() < 0 {
-                            cursor.step_val();
-                        }
+        for i in 0..=bounds.len() {
+            let Some(cursor_builder) = SplitCursorBuilder::from_bounds(
+                batch.clone(),
+                &*bounds,
+                i,
+                RecordFormat::Json(JsonFlavor::Postgres),
+            ) else {
+                continue;
+            };
 
-                        let buf = &mut upsert_buffer;
-                        let mut new_buf: Vec<u8> = Vec::new();
-                        if buf.last() != Some(&b'[') {
-                            new_buf.push(b',');
-                        }
-                        cursor.serialize_val(&mut new_buf)?;
-                        if new_buf.len() + buf.len() > max_buffer_size {
-                            self.upsert(buf);
-                        }
-                        buf.append(&mut new_buf);
-                    }
-                };
+            assert!(
+                workers_dispatched <= num_workers,
+                "unreachable: attempting to dispatch more workers than `num_workers` {num_workers}"
+            );
 
-                self.num_rows += 1;
-            }
-
-            cursor.step_key();
+            self.handles[workers_dispatched]
+                .cmd_tx
+                .send(WorkerCommand::Encode(cursor_builder))
+                .map_err(|_| anyhow!("worker thread disconnected"))?;
+            workers_dispatched += 1;
         }
 
-        self.delete(&mut delete_buffer);
-        self.insert(&mut insert_buffer);
-        self.upsert(&mut upsert_buffer);
+        // Wait for all dispatched workers to finish.
+        let mut errors: Vec<anyhow::Error> = Vec::new();
+        for i in 0..workers_dispatched {
+            match self.handles[i].result_rx.recv() {
+                Ok(WorkerResult::Ok { .. }) => {}
+                Ok(WorkerResult::Err(e)) => errors.push(e),
+                Err(_) => errors.push(anyhow!("worker thread disconnected")),
+            }
+        }
+
+        if !errors.is_empty() {
+            let msg = errors
+                .iter()
+                .map(|e| format!("{e:#}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!("{} worker(s) failed: {msg}", errors.len());
+        }
 
         Ok(())
     }
 }
 
 impl OutputEndpoint for PostgresOutputEndpoint {
+    fn command_handler(&self) -> Option<Arc<dyn CommandHandler>> {
+        Some(Arc::new(PostgresOutputEndpointCommandHandler::new(
+            self.extra_columns.clone(),
+            &self.config,
+        )))
+    }
+
     fn connect(&mut self, _: AsyncErrorCallback) -> anyhow::Result<()> {
         todo!()
     }
@@ -644,15 +1019,15 @@ impl OutputEndpoint for PostgresOutputEndpoint {
         todo!()
     }
 
-    fn push_buffer(&mut self, buffer: &[u8]) -> anyhow::Result<()> {
+    fn push_buffer(&mut self, _buffer: &[u8]) -> anyhow::Result<()> {
         unreachable!()
     }
 
     fn push_key(
         &mut self,
-        key: Option<&[u8]>,
-        val: Option<&[u8]>,
-        headers: &[(&str, Option<&[u8]>)],
+        _key: Option<&[u8]>,
+        _val: Option<&[u8]>,
+        _headers: &[(&str, Option<&[u8]>)],
     ) -> anyhow::Result<()> {
         unreachable!()
     }
@@ -677,7 +1052,7 @@ mod tests {
     use feldera_adapterlib::errors::journal::ControllerError;
     use feldera_types::{
         program_schema::{ColumnType, Field, Relation, SqlType},
-        transport::postgres::PostgresWriterConfig,
+        transport::postgres::{PostgresTlsConfig, PostgresWriteMode, PostgresWriterConfig},
     };
     use postgres::NoTls;
 
@@ -734,6 +1109,15 @@ mod tests {
         PostgresWriterConfig {
             uri: postgres_url(),
             table: table.into(),
+            tls: PostgresTlsConfig::default(),
+            max_records_in_buffer: None,
+            max_buffer_size_bytes: usize::pow(2, 20),
+            on_conflict_do_nothing: false,
+            mode: PostgresWriteMode::Materialized,
+            cdc_op_column: "__feldera_op".to_owned(),
+            cdc_ts_column: "__feldera_ts".to_owned(),
+            extra_columns: Vec::new(),
+            threads: 4,
         }
     }
 
@@ -878,5 +1262,974 @@ mod tests {
         assert!(err.to_string().contains("Please ensure all field"));
 
         drop_table(&mut client, table);
+    }
+
+    mod parallel {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Weak};
+
+        use chrono::NaiveDateTime;
+        use dbsp::OrdIndexedZSet;
+        use dbsp::utils::Tup2;
+        use feldera_adapterlib::transport::OutputEndpoint;
+        use feldera_macros::IsNone;
+        use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
+        use feldera_types::{deserialize_without_context, serialize_struct};
+        use postgres::NoTls;
+        use size_of::SizeOf;
+
+        use crate::catalog::SerBatch;
+        use crate::controller::EndpointId;
+        use crate::format::Encoder;
+        use crate::static_compile::seroutput::SerBatchImpl;
+
+        use super::super::PostgresOutputEndpoint;
+        use feldera_types::transport::postgres::{
+            PostgresTlsConfig, PostgresWriteMode, PostgresWriterConfig,
+        };
+
+        // Test record types
+
+        #[derive(
+            Debug,
+            Default,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            serde::Serialize,
+            serde::Deserialize,
+            Clone,
+            Hash,
+            SizeOf,
+            rkyv::Archive,
+            rkyv::Serialize,
+            rkyv::Deserialize,
+            IsNone,
+        )]
+        #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+        struct TestRecord {
+            id: i32,
+            b: bool,
+            i: Option<i64>,
+            s: String,
+        }
+
+        deserialize_without_context!(TestRecord);
+
+        serialize_struct!(TestRecord()[4]{
+            id["id"]: i32,
+            b["b"]: bool,
+            i["i"]: Option<i64>,
+            s["s"]: String
+        });
+
+        #[derive(
+            Debug,
+            Default,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            serde::Serialize,
+            serde::Deserialize,
+            Clone,
+            Hash,
+            SizeOf,
+            rkyv::Archive,
+            rkyv::Serialize,
+            rkyv::Deserialize,
+            IsNone,
+        )]
+        #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+        struct TestKey {
+            id: i32,
+        }
+
+        deserialize_without_context!(TestKey);
+
+        serialize_struct!(TestKey()[1]{
+            id["id"]: i32
+        });
+
+        #[derive(
+            Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, Clone, Hash, IsNone,
+        )]
+        struct TestRecordWithExtraColumns {
+            id: i32,
+            b: bool,
+            i: Option<i64>,
+            s: String,
+            #[serde(rename = "EXTRA.COLUMN1")]
+            extra_column1: Option<String>,
+            extra_column2: Option<NaiveDateTime>,
+            extra_column3: Option<i64>,
+            extra_column4: Option<serde_json::Value>,
+        }
+
+        deserialize_without_context!(TestRecordWithExtraColumns);
+
+        // Helpers
+
+        fn key_relation() -> Relation {
+            Relation {
+                name: SqlIdentifier::new("test_idx", false),
+                fields: vec![Field::new("id".into(), ColumnType::int(false))],
+                materialized: false,
+                properties: BTreeMap::new(),
+            }
+        }
+
+        fn value_relation() -> Relation {
+            Relation {
+                name: SqlIdentifier::new("test_view", false),
+                fields: vec![
+                    Field::new("id".into(), ColumnType::int(false)),
+                    Field::new("b".into(), ColumnType::boolean(false)),
+                    Field::new("i".into(), ColumnType::bigint(true)),
+                    Field::new("s".into(), ColumnType::varchar(false)),
+                ],
+                materialized: true,
+                properties: BTreeMap::new(),
+            }
+        }
+
+        fn postgres_url() -> String {
+            std::env::var("POSTGRES_URL")
+                .unwrap_or("postgres://postgres:password@localhost:5432".to_string())
+        }
+
+        fn pg_client() -> postgres::Client {
+            postgres::Client::connect(&postgres_url(), NoTls)
+                .expect("failed to connect to postgres")
+        }
+
+        const TEST_TABLE: &str = "test_parallel_pg_output";
+
+        fn setup_table(client: &mut postgres::Client) {
+            client
+                .execute(
+                    &format!(
+                        r#"CREATE TABLE IF NOT EXISTS "{TEST_TABLE}" (
+                            id int PRIMARY KEY,
+                            b bool NOT NULL,
+                            i int8,
+                            s varchar NOT NULL
+                        )"#
+                    ),
+                    &[],
+                )
+                .expect("failed to create test table");
+            client
+                .execute(&format!(r#"TRUNCATE "{TEST_TABLE}""#), &[])
+                .expect("failed to truncate test table");
+        }
+
+        fn setup_table_with_extra_columns(client: &mut postgres::Client) {
+            client
+                .execute(&format!(r#"DROP TABLE IF EXISTS "{TEST_TABLE}""#), &[])
+                .expect("failed to drop test table");
+
+            client
+                .execute(
+                    &format!(
+                        r#"
+                        CREATE TABLE "{TEST_TABLE}" (
+                            id int PRIMARY KEY,
+                            b bool NOT NULL,
+                            i int8,
+                            s varchar NOT NULL,
+                            "EXTRA.COLUMN1" varchar,
+                            extra_column2 timestamp,
+                            extra_column3 bigint,
+                            extra_column4 json
+                        )"#
+                    ),
+                    &[],
+                )
+                .expect("failed to create test table");
+        }
+
+        fn make_config_with_extra_columns(
+            threads: usize,
+            extra_columns: Vec<String>,
+        ) -> PostgresWriterConfig {
+            PostgresWriterConfig {
+                uri: postgres_url(),
+                table: TEST_TABLE.to_string(),
+                tls: PostgresTlsConfig::default(),
+                max_records_in_buffer: None,
+                max_buffer_size_bytes: usize::pow(2, 20),
+                on_conflict_do_nothing: false,
+                mode: PostgresWriteMode::Materialized,
+                cdc_op_column: "__feldera_op".to_owned(),
+                cdc_ts_column: "__feldera_ts".to_owned(),
+                threads,
+                extra_columns,
+            }
+        }
+
+        fn make_endpoint_with_extra_columns(
+            threads: usize,
+            extra_columns: Vec<String>,
+        ) -> PostgresOutputEndpoint {
+            PostgresOutputEndpoint::new(
+                EndpointId::default(),
+                "test_endpoint",
+                &make_config_with_extra_columns(threads, extra_columns),
+                &Some(key_relation()),
+                &value_relation(),
+                Weak::new(),
+            )
+            .expect("failed to create endpoint")
+        }
+
+        fn make_endpoint(threads: usize) -> PostgresOutputEndpoint {
+            make_endpoint_with_extra_columns(threads, Vec::new())
+        }
+
+        fn build_insert_batch(records: &[TestRecord]) -> Arc<dyn SerBatch> {
+            let tuples: Vec<_> = records
+                .iter()
+                .map(|r| Tup2(Tup2(TestKey { id: r.id }, r.clone()), 1i64))
+                .collect();
+            let zset = OrdIndexedZSet::from_tuples((), tuples);
+            Arc::new(SerBatchImpl::<_, TestKey, TestRecord>::new(zset))
+        }
+
+        fn build_delete_batch(records: &[TestRecord]) -> Arc<dyn SerBatch> {
+            let tuples: Vec<_> = records
+                .iter()
+                .map(|r| Tup2(Tup2(TestKey { id: r.id }, r.clone()), -1i64))
+                .collect();
+            let zset = OrdIndexedZSet::from_tuples((), tuples);
+            Arc::new(SerBatchImpl::<_, TestKey, TestRecord>::new(zset))
+        }
+
+        /// Build an upsert batch: weight -1 for the old value, +1 for the new.
+        fn build_upsert_batch(updates: &[(TestRecord, TestRecord)]) -> Arc<dyn SerBatch> {
+            let mut tuples = Vec::new();
+            for (old, new) in updates {
+                assert_eq!(old.id, new.id);
+                tuples.push(Tup2(Tup2(TestKey { id: old.id }, old.clone()), -1i64));
+                tuples.push(Tup2(Tup2(TestKey { id: new.id }, new.clone()), 1i64));
+            }
+            let zset = OrdIndexedZSet::from_tuples((), tuples);
+            Arc::new(SerBatchImpl::<_, TestKey, TestRecord>::new(zset))
+        }
+
+        fn encode_batch(endpoint: &mut PostgresOutputEndpoint, batch: &Arc<dyn SerBatch>) {
+            endpoint.consumer().batch_start(0);
+            endpoint
+                .encode(batch.clone().arc_as_batch_reader())
+                .unwrap();
+            endpoint.consumer().batch_end();
+        }
+
+        fn query_all(client: &mut postgres::Client) -> Vec<TestRecord> {
+            let rows = client
+                .query(
+                    &format!(r#"SELECT id, b, i, s FROM "{TEST_TABLE}" ORDER BY id"#),
+                    &[],
+                )
+                .expect("failed to query");
+            rows.into_iter()
+                .map(|row| TestRecord {
+                    id: row.get(0),
+                    b: row.get(1),
+                    i: row.get(2),
+                    s: row.get(3),
+                })
+                .collect()
+        }
+
+        fn query_all_with_extra_columns(
+            client: &mut postgres::Client,
+        ) -> Vec<TestRecordWithExtraColumns> {
+            let rows = client
+                .query(
+                    &format!(r#"SELECT id, b, i, s, "EXTRA.COLUMN1", extra_column2, extra_column3, extra_column4 FROM "{TEST_TABLE}" ORDER BY id"#),
+                    &[],
+                )
+                .expect("failed to query");
+            rows.into_iter()
+                .map(|row| TestRecordWithExtraColumns {
+                    id: row.get(0),
+                    b: row.get(1),
+                    i: row.get(2),
+                    s: row.get(3),
+                    extra_column1: row.get(4),
+                    extra_column2: row.get(5),
+                    extra_column3: row.get(6),
+                    extra_column4: row.get(7),
+                })
+                .collect()
+        }
+
+        fn make_records(n: usize) -> Vec<TestRecord> {
+            (0..n)
+                .map(|i| TestRecord {
+                    id: i as i32,
+                    b: i % 2 == 0,
+                    i: if i % 3 == 0 {
+                        None
+                    } else {
+                        Some(i as i64 * 10)
+                    },
+                    s: format!("record_{i}"),
+                })
+                .collect()
+        }
+
+        // Tests
+
+        fn insert_test(threads: usize) {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let records = make_records(100);
+            let batch = build_insert_batch(&records);
+            let mut endpoint = make_endpoint(threads);
+
+            encode_batch(&mut endpoint, &batch);
+
+            let got = query_all(&mut client);
+            assert_eq!(got, records);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_insert_single_thread() {
+            insert_test(1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_insert_multi_thread() {
+            insert_test(4);
+        }
+
+        fn upsert_test(threads: usize) {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let records = make_records(100);
+            let batch = build_insert_batch(&records);
+            let mut endpoint = make_endpoint(threads);
+
+            encode_batch(&mut endpoint, &batch);
+
+            // Update even-id records
+            let updates: Vec<_> = records
+                .iter()
+                .filter(|r| r.id % 2 == 0)
+                .map(|r| {
+                    let mut new = r.clone();
+                    new.s = format!("updated_{}", r.id);
+                    (r.clone(), new)
+                })
+                .collect();
+            let upsert_batch = build_upsert_batch(&updates);
+
+            encode_batch(&mut endpoint, &upsert_batch);
+
+            let got = query_all(&mut client);
+            let expected: Vec<_> = records
+                .iter()
+                .map(|r| {
+                    if r.id % 2 == 0 {
+                        let mut new = r.clone();
+                        new.s = format!("updated_{}", r.id);
+                        new
+                    } else {
+                        r.clone()
+                    }
+                })
+                .collect();
+            assert_eq!(got, expected);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn extra_columns_test() {
+            let mut client = pg_client();
+            setup_table_with_extra_columns(&mut client);
+
+            let records = make_records(100);
+            let batch1 = build_insert_batch(&records[..25]);
+            let batch2 = build_insert_batch(&records[25..50]);
+            let batch3 = build_insert_batch(&records[50..75]);
+            let batch4 = build_insert_batch(&records[75..100]);
+            let mut endpoint = make_endpoint_with_extra_columns(
+                2,
+                vec![
+                    "EXTRA.COLUMN1".to_string(),
+                    "extra_column2".to_string(),
+                    "extra_column3".to_string(),
+                    "extra_column4".to_string(),
+                ],
+            );
+
+            encode_batch(&mut endpoint, &batch1);
+
+            endpoint
+                .command_handler()
+                .unwrap()
+                .command(serde_json::json!({
+                    "set_extra_columns": {
+                        "EXTRA.COLUMN1": "foo1",
+                        "extra_column2": "2026-04-23 14:30:00.123456",
+                        "extra_column3": 100,
+                        "extra_column4": { "foo": "bar" },
+                    }
+                }))
+                .unwrap();
+
+            encode_batch(&mut endpoint, &batch2);
+
+            endpoint
+                .command_handler()
+                .unwrap()
+                .command(serde_json::json!({
+                    "set_extra_columns": {
+                        "EXTRA.COLUMN1": "foo2",
+                        "extra_column2": "2026-04-23T15:30:00",
+                        "extra_column3": 200,
+                        "extra_column4": ["foo", "bar"],
+                    }
+                }))
+                .unwrap();
+
+            encode_batch(&mut endpoint, &batch3);
+
+            endpoint
+                .command_handler()
+                .unwrap()
+                .command(serde_json::json!({
+                    "set_extra_columns": {
+                        "EXTRA.COLUMN1": null,
+                        "extra_column2": null,
+                        "extra_column3": null,
+                        "extra_column4": null,
+                    }
+                }))
+                .unwrap();
+
+            encode_batch(&mut endpoint, &batch4);
+
+            let got = query_all_with_extra_columns(&mut client);
+            let expected1: Vec<_> = records[..25]
+                .iter()
+                .map(|r| TestRecordWithExtraColumns {
+                    id: r.id,
+                    b: r.b,
+                    i: r.i,
+                    s: r.s.clone(),
+                    extra_column1: None,
+                    extra_column2: None,
+                    extra_column3: None,
+                    extra_column4: None,
+                })
+                .collect();
+            let expected2: Vec<_> = records[25..50]
+                .iter()
+                .map(|r| TestRecordWithExtraColumns {
+                    id: r.id,
+                    b: r.b,
+                    i: r.i,
+                    s: r.s.clone(),
+                    extra_column1: Some("foo1".to_string()),
+                    extra_column2: Some(
+                        NaiveDateTime::parse_from_str(
+                            "2026-04-23 14:30:00.123456",
+                            "%Y-%m-%d %H:%M:%S%.f",
+                        )
+                        .unwrap(),
+                    ),
+                    extra_column3: Some(100),
+                    extra_column4: Some(serde_json::json!({ "foo": "bar" })),
+                })
+                .collect();
+            let expected3: Vec<_> = records[50..75]
+                .iter()
+                .map(|r| TestRecordWithExtraColumns {
+                    id: r.id,
+                    b: r.b,
+                    i: r.i,
+                    s: r.s.clone(),
+                    extra_column1: Some("foo2".to_string()),
+                    extra_column2: Some(
+                        NaiveDateTime::parse_from_str("2026-04-23T15:30:00", "%Y-%m-%dT%H:%M:%S")
+                            .unwrap(),
+                    ),
+                    extra_column3: Some(200),
+                    extra_column4: Some(serde_json::json!(["foo", "bar"])),
+                })
+                .collect();
+            let expected4: Vec<_> = records[75..100]
+                .iter()
+                .map(|r| TestRecordWithExtraColumns {
+                    id: r.id,
+                    b: r.b,
+                    i: r.i,
+                    s: r.s.clone(),
+                    extra_column1: None,
+                    extra_column2: None,
+                    extra_column3: None,
+                    extra_column4: None,
+                })
+                .collect();
+            let expected: Vec<_> = expected1
+                .into_iter()
+                .chain(expected2)
+                .chain(expected3)
+                .chain(expected4)
+                .collect();
+            assert_eq!(got, expected);
+
+            // Update records
+            let updates: Vec<_> = records
+                .iter()
+                .map(|r| {
+                    let mut new = r.clone();
+                    new.s = format!("updated_{}", r.id);
+                    (r.clone(), new)
+                })
+                .collect();
+            let upsert_batch = build_upsert_batch(&updates);
+
+            endpoint
+                .command_handler()
+                .unwrap()
+                .command(serde_json::json!({
+                    "set_extra_columns": {
+                        "EXTRA.COLUMN1": "foo3",
+                        "extra_column2": "2026-04-23T16:30:00",
+                        "extra_column3": 300,
+                        "extra_column4": "foo",
+                    }
+                }))
+                .unwrap();
+
+            encode_batch(&mut endpoint, &upsert_batch);
+
+            let got = query_all_with_extra_columns(&mut client);
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|r| {
+                    let mut new = r.clone();
+                    new.s = format!("updated_{}", r.id);
+                    new.extra_column1 = Some("foo3".to_string());
+                    new.extra_column2 = Some(
+                        NaiveDateTime::parse_from_str("2026-04-23T16:30:00", "%Y-%m-%dT%H:%M:%S")
+                            .unwrap(),
+                    );
+                    new.extra_column3 = Some(300);
+                    new.extra_column4 = Some(serde_json::json!("foo"));
+                    new
+                })
+                .collect();
+            assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn extra_columns_duplicate_names_in_config_rejected() {
+            let cfg = make_config_with_extra_columns(1, vec!["a".into(), "a".into()]);
+            let err = match PostgresOutputEndpoint::new(
+                EndpointId::default(),
+                "test_endpoint",
+                &cfg,
+                &Some(key_relation()),
+                &value_relation(),
+                Weak::new(),
+            ) {
+                Ok(_) => panic!("expected duplicate extra_columns to be rejected"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains("duplicate"),
+                "unexpected error: {err:?}"
+            );
+        }
+
+        #[test]
+        fn extra_columns_clash_with_view_column_rejected() {
+            let cfg = make_config_with_extra_columns(1, vec!["id".into()]);
+            let err = match PostgresOutputEndpoint::new(
+                EndpointId::default(),
+                "test_endpoint",
+                &cfg,
+                &Some(key_relation()),
+                &value_relation(),
+                Weak::new(),
+            ) {
+                Ok(_) => panic!("expected extra column name clash with view to be rejected"),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("extra_columns") && msg.contains("output view"),
+                "unexpected error: {err:?}"
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_upsert_single_thread() {
+            upsert_test(1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_upsert_multi_thread() {
+            upsert_test(4);
+        }
+
+        fn delete_test(threads: usize) {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let records = make_records(100);
+            let batch = build_insert_batch(&records);
+            let mut endpoint = make_endpoint(threads);
+
+            encode_batch(&mut endpoint, &batch);
+
+            // Delete odd-id records
+            let to_delete: Vec<_> = records.iter().filter(|r| r.id % 2 == 1).cloned().collect();
+            let delete_batch = build_delete_batch(&to_delete);
+
+            encode_batch(&mut endpoint, &delete_batch);
+
+            let got = query_all(&mut client);
+            let expected: Vec<_> = records.into_iter().filter(|r| r.id % 2 == 0).collect();
+            assert_eq!(got, expected);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_delete_single_thread() {
+            delete_test(1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_delete_multi_thread() {
+            delete_test(4);
+        }
+
+        fn empty_batch_test(threads: usize) {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let batch = build_insert_batch(&[]);
+            let mut endpoint = make_endpoint(threads);
+
+            encode_batch(&mut endpoint, &batch);
+
+            let got = query_all(&mut client);
+            assert!(got.is_empty());
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_empty_batch_single_thread() {
+            empty_batch_test(1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_empty_batch_multi_thread() {
+            empty_batch_test(4);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_single_record_multi_thread() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let records = make_records(1);
+            let batch = build_insert_batch(&records);
+            let mut endpoint = make_endpoint(4);
+
+            encode_batch(&mut endpoint, &batch);
+
+            let got = query_all(&mut client);
+            assert_eq!(got, records);
+        }
+
+        fn multiple_batches_test(threads: usize) {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let mut endpoint = make_endpoint(threads);
+
+            // Batch 1: insert 50 records
+            let records1 = make_records(50);
+            let batch1 = build_insert_batch(&records1);
+            encode_batch(&mut endpoint, &batch1);
+
+            let got = query_all(&mut client);
+            assert_eq!(got, records1);
+
+            // Batch 2: insert 50 more records (ids 50..100)
+            let records2: Vec<_> = (50..100)
+                .map(|i| TestRecord {
+                    id: i,
+                    b: i % 2 == 0,
+                    i: if i % 3 == 0 {
+                        None
+                    } else {
+                        Some(i as i64 * 10)
+                    },
+                    s: format!("record_{i}"),
+                })
+                .collect();
+            let batch2 = build_insert_batch(&records2);
+            encode_batch(&mut endpoint, &batch2);
+
+            let got = query_all(&mut client);
+            let mut all_records = records1;
+            all_records.extend(records2);
+            assert_eq!(got, all_records);
+
+            // Batch 3: update records 0..25
+            let updates: Vec<_> = all_records[..25]
+                .iter()
+                .map(|r| {
+                    let mut new = r.clone();
+                    new.s = format!("batch3_{}", r.id);
+                    (r.clone(), new)
+                })
+                .collect();
+            let batch3 = build_upsert_batch(&updates);
+            encode_batch(&mut endpoint, &batch3);
+
+            let got = query_all(&mut client);
+            let expected: Vec<_> = all_records
+                .iter()
+                .map(|r| {
+                    if r.id < 25 {
+                        let mut new = r.clone();
+                        new.s = format!("batch3_{}", r.id);
+                        new
+                    } else {
+                        r.clone()
+                    }
+                })
+                .collect();
+            assert_eq!(got, expected);
+
+            // Batch 4: delete records 75..100
+            let to_delete: Vec<_> = expected[75..].to_vec();
+            let batch4 = build_delete_batch(&to_delete);
+            encode_batch(&mut endpoint, &batch4);
+
+            let got = query_all(&mut client);
+            assert_eq!(got.len(), 75);
+            assert_eq!(got, expected[..75]);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_multiple_batches_single_thread() {
+            multiple_batches_test(1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_multiple_batches_multi_thread() {
+            multiple_batches_test(4);
+        }
+
+        // ── Progress counter tests ────────────────────────────────────
+
+        use std::sync::atomic::Ordering;
+
+        fn records_written(endpoint: &PostgresOutputEndpoint) -> u64 {
+            endpoint.records_written.load(Ordering::Relaxed)
+        }
+
+        /// Build a config that forces frequent in-batch flushes by capping the
+        /// number of records buffered between `execute()` calls.  This lets
+        /// tests observe the progress counter advance mid-batch instead of
+        /// only at commit time.
+        fn make_endpoint_flush_every(threads: usize, max_records: usize) -> PostgresOutputEndpoint {
+            let mut cfg = make_config_with_extra_columns(threads, Vec::new());
+            cfg.max_records_in_buffer = Some(max_records);
+            PostgresOutputEndpoint::new(
+                EndpointId::default(),
+                "test_endpoint",
+                &cfg,
+                &Some(key_relation()),
+                &value_relation(),
+                Weak::new(),
+            )
+            .expect("failed to create endpoint")
+        }
+
+        fn progress_basic(threads: usize) {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let records = make_records(100);
+            let batch = build_insert_batch(&records);
+            let mut endpoint = make_endpoint(threads);
+
+            assert_eq!(records_written(&endpoint), 0);
+            endpoint.consumer().batch_start(0);
+            assert_eq!(records_written(&endpoint), 0);
+            endpoint
+                .encode(batch.clone().arc_as_batch_reader())
+                .unwrap();
+            endpoint.consumer().batch_end();
+            // Counter resets to 0 at the end of every batch.
+            assert_eq!(records_written(&endpoint), 0);
+
+            // Sanity check: data actually landed in postgres.
+            let got = query_all(&mut client);
+            assert_eq!(got, records);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_single_thread() {
+            progress_basic(1);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_multi_thread() {
+            progress_basic(4);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_empty_batch() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let batch = build_insert_batch(&[]);
+            let mut endpoint = make_endpoint(1);
+
+            endpoint.consumer().batch_start(0);
+            endpoint
+                .encode(batch.clone().arc_as_batch_reader())
+                .unwrap();
+            assert_eq!(records_written(&endpoint), 0);
+            endpoint.consumer().batch_end();
+            assert_eq!(records_written(&endpoint), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_advances_mid_batch_single_thread() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let records = make_records(50);
+            let batch = build_insert_batch(&records);
+            // Force flushes during encode so the counter advances mid-batch.
+            let mut endpoint = make_endpoint_flush_every(1, 10);
+
+            endpoint.consumer().batch_start(0);
+            endpoint
+                .encode(batch.clone().arc_as_batch_reader())
+                .unwrap();
+            // After encode, completed flushes are visible in the counter.
+            // With max_records_in_buffer=10 and 50 records, at least 4 flushes
+            // (40 records) have run; the trailing partial buffer is flushed
+            // during batch_end.
+            assert!(
+                records_written(&endpoint) >= 40,
+                "expected mid-batch progress, got {}",
+                records_written(&endpoint)
+            );
+
+            endpoint.consumer().batch_end();
+            assert_eq!(records_written(&endpoint), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_batch_start_resets() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let mut endpoint = make_endpoint(1);
+
+            // Simulate a stale counter value from an earlier (presumably
+            // crashed) batch and verify that batch_start clears it.
+            endpoint.records_written.store(99, Ordering::Relaxed);
+            endpoint.consumer().batch_start(0);
+            assert_eq!(records_written(&endpoint), 0);
+
+            // Close out cleanly so the worker transaction doesn't leak.
+            endpoint.consumer().batch_end();
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_multiple_batches() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            let mut endpoint = make_endpoint(1);
+
+            // Batch 1: 50 records.
+            let records1 = make_records(50);
+            let batch1 = build_insert_batch(&records1);
+            encode_batch(&mut endpoint, &batch1);
+            assert_eq!(records_written(&endpoint), 0);
+
+            // Batch 2: 30 more records (ids 50..80).
+            let records2: Vec<_> = (50..80)
+                .map(|i| TestRecord {
+                    id: i,
+                    b: i % 2 == 0,
+                    i: Some(i as i64),
+                    s: format!("record_{i}"),
+                })
+                .collect();
+            let batch2 = build_insert_batch(&records2);
+            encode_batch(&mut endpoint, &batch2);
+            assert_eq!(records_written(&endpoint), 0);
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn test_progress_counter_advances_mid_batch_multi_thread() {
+            let mut client = pg_client();
+            setup_table(&mut client);
+
+            // 4 workers, force flush every 5 records so each worker flushes
+            // multiple times.  With 100 records spread across 4 workers, every
+            // worker has ~25 records; 5 flushes of 5 records each.
+            let mut endpoint = make_endpoint_flush_every(4, 5);
+
+            let records = make_records(100);
+            let batch = build_insert_batch(&records);
+
+            endpoint.consumer().batch_start(0);
+            endpoint
+                .encode(batch.clone().arc_as_batch_reader())
+                .unwrap();
+
+            // After encode, completed flushes from all 4 workers are visible.
+            // We can't predict the exact number (depends on how the trailing
+            // partial buffer per worker shakes out), but it must be > 0 and
+            // <= 100.
+            let mid = records_written(&endpoint);
+            assert!(mid > 0, "expected mid-batch progress, got 0");
+            assert!(mid <= 100, "counter exceeds total records: {mid}");
+
+            endpoint.consumer().batch_end();
+            assert_eq!(records_written(&endpoint), 0);
+
+            // Final state in postgres matches all input records.
+            let got = query_all(&mut client);
+            assert_eq!(got, records);
+        }
     }
 }

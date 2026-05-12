@@ -27,10 +27,13 @@ If `WITHIN DISTINCT` is present, argument values are made distinct
 within each value of specified keys before being passed to the
 aggregate function.
 
-Example:
-
-Instead of `SELECT SUM(col)`, you should write `SELECT SUM(CAST col AS
-DECIMAL(10, 4))` if you expect 10-digit results to be possible.
+Most aggregation functions produce results of the same type as the
+input data, but compute using higher precision intermediate data
+types; aggregation of `UNSIGNED` values uses signed types for
+intermediate results.  If you expect the result to require a higher
+precision than the aggregated data type, we recommend converting the
+data to a wider data type, e.g.: instead of `SELECT SUM(col)`, you
+should write `SELECT SUM(CAST col AS BIGINT)`.
 
 <table>
   <tr>
@@ -38,8 +41,8 @@ DECIMAL(10, 4))` if you expect 10-digit results to be possible.
     <th>Description</th>
   </tr>
   <tr>
-     <td><a id="array_agg"></a><code>ARRAY_AGG([ ALL | DISTINCT ] value [ RESPECT NULLS | IGNORE NULLS ] )</code></td>
-     <td>Gathers all values in an array.  The order of the values in the array is unspecified (but it is deterministic).</td>
+     <td><a id="array_agg"></a><code>ARRAY_AGG([ ALL | DISTINCT ] value [ RESPECT NULLS | IGNORE NULLS ] [ORDER BY orderItem [, orderItem]*] )</code></td>
+     <td>Gathers all values in an array.  If `ORDER BY` is not present, the order of the values in the array is unspecified (but it is deterministic).</td>
   </tr>
   <tr>
      <td><a id="avg"></a><code>AVG( [ ALL | DISTINCT ] numeric)</code></td>
@@ -157,7 +160,7 @@ The following window aggregate functions are supported:
     <th>Description</th>
   </tr>
   <tr>
-    <td><a id="window-avg"></a>AVG(numeric)</td>
+    <td><a id="window-avg"></a><code>AVG(</code>numeric<code>)</code></td>
     <td>Returns the average (arithmetic mean) of numeric across all values in window</td>
   </tr>
   <tr>
@@ -170,8 +173,12 @@ The following window aggregate functions are supported:
   </tr>
   <tr>
     <td><a id="dense_rank"></a><code>DENSE_RANK()</code></td>
-    <td>Returns the rank of the current row without gaps.  `DENSE_RANK` is currently only supported if
-        the window is used to compute a TopK aggregate.</td>
+    <td>Returns the rank of the current row without gaps.</td>
+  </tr>
+  <tr>
+    <td><a id="first_value"></a><code>FIRST_VALUE(expression)</code></td>
+    <td>Returns the value of <code>expression</code> at the first row of the window frame.
+    Currently only supported for windows with <code>UNLIMITED RANGE</code>.</td>
   </tr>
   <tr>
     <td><a id="lag"></a><code>LAG(</code><em>expression</em>, [<em>offset</em>, [ <em>default</em> ] ]<code>)</code></td>
@@ -179,6 +186,11 @@ The following window aggregate functions are supported:
         within the partition; if there is no such row, instead returns <em>default</em>.
         Both <em>offset</em> and <em>default</em> are evaluated with respect to the current row.
         If omitted, <em>offset</em> defaults to 1 and <em>default</em> to <code>NULL</code>.</td>
+  </tr>
+  <tr>
+    <td><a id="last_value"></a><code>LAST_VALUE(expression)</code></td>
+    <td>Returns the value of <code>expression</code> at the last row of the window frame.
+    Currently only supported for windows with <code>UNLIMITED RANGE</code></td>
   </tr>
   <tr>
     <td><a id="lead"></a><code>LEAD(</code><em>expression</em>, [<em>offset</em>, [ <em>default</em> ] ]<code>)</code></td>
@@ -197,24 +209,34 @@ The following window aggregate functions are supported:
   </tr>
   <tr>
     <td><a id="rank"></a><code>RANK()</code></td>
-    <td>Returns the rank of the current row with gaps.  `DENSE_RANK` is currently only supported if
-        the window is used to compute a TopK aggregate.</td>
+    <td>Returns the rank of the current row with gaps.</td>
   </tr>
   <tr>
     <td><a id="row_number"></a><code>ROW_NUMBER()</code></td>
-    <td>Returns the number of the current row within its partition, counting from 1.
-    `ROW_NUMBER` is currently only supported if the window is used to compute a TopK aggregate.</td>
+    <td>Returns the number of the current row within its partition, counting from 1.</td>
   </tr>
   <tr>
-    <td><a id="window-sum"></a><code>SUM</code>(<em>numeric</em>)</td>
+    <td><a id="window-sum"></a><code>SUM(</code><em>numeric</em><code>)</code></td>
     <td>Returns the sum of <em>numeric</em> across all values in window</td>
   </tr>
 </table>
 
-Currently, the window aggregate functions `RANK`, `DENSE_RANK` and
-`ROW_NUMBER` are only supported if the compiler detects that they are
-being used to implement a TopK pattern.  This pattern is expressed in
-SQL with the following structure:
+:::warning Potential inefficiency
+
+The window aggregate functions `RANK`, `DENSE_RANK`, and `ROW_NUMBER`
+may be very expensive to evaluate incrementally, because it's possible
+for a very small input change to produce a very large output change:
+inserting or deleting a single row can change the numbering of all
+subsequent rows in the same group.  These functions can have a
+reasonable cost in three circumstances:
+
+- each modified group (created by `PARTITION BY`) is relatively small in size
+
+- new insertions and deletions feature rows that appear towards the
+  end of the order produced by the `ORDER BY` clause
+
+- they are used in a TopK pattern with a small limit.
+  The topK is expressed in SQL with the following structure:
 
 ```sql
 SELECT * FROM (
@@ -223,6 +245,8 @@ SELECT * FROM (
    FROM empsalary) emp
 WHERE rn < 3
 ```
+
+:::
 
 ## Pivots
 
@@ -324,3 +348,96 @@ year | desks | tables | chairs
 2023 |     1 |     2  |
 (3 rows)
 ```
+
+## On the efficiency of aggregates computations
+
+Computing aggregates incrementally is very different from standard
+aggregate evaluation in typical SQL engines.  Some of the observations
+in this section pertain to the current state of the implementation,
+and may change in the future as the implementation improves.  Let us
+assume that the size of the collection aggregated is N, the size of
+the current change is D, the total number of groups is G, and the
+*total number of elements* in the modified groups is M.  Always N > D,
+and N > M > G.
+
+All aggregation functions need to store the result of the aggregation
+internally -- one value per group, so their space overhead is at least
+O(G), but it may be more.
+
+### Window aggregates
+
+Window aggregates (e.g., using `OVER`) are incrementally evaluated for
+each window which changes when a new change is ingested, but are
+otherwise insensitive to the choice of aggregation function or the
+data type.
+
+Window aggregation functions need to store the entire collection that
+is being aggregated -- the space overhead is thus O(N).  The work
+performed is expected to be O(D log N).
+
+### `DISTINCT`
+
+The `DISTINCT` operation can be used with an aggregation or in a
+`SELECT` statement; in both cases the cost of `DISTINCT` is O(N) in
+space and O(D log M) in work.
+
+### Linear aggregation functions
+
+A linear aggregation function can compute the change in an aggregate
+only by looking at the new change -- irrespective of the previous
+value of the aggregate.  Linear aggregation functions comprise:
+
+- `COUNT`
+- `SUM` for all integer, unsigned, and `DECIMAL` data types
+- `AVG` for all integer, unsigned, and `DECIMAL` data types
+- `STDDEV`, `STDDEV_SAMP`, `STDDEV_POP` for all integer, unsigned, and
+   `DECIMAL` data types (note: our current implementation of `STDDEV`
+   is not as efficient as possible)
+
+The space overhead for linear functions is O(G).  The work performed
+for each change is O(D).
+
+### Non-linear aggregation functions
+
+Using a `FILTER` with an aggregation function in general makes it
+non-linear, so using `WHERE` is preferred to using `FILTER`.
+Sometimes the compiler can automatically decompose such an aggregate
+into a filter followed by a standard aggregate.
+
+`COUNTIF` is the same as `COUNT ... FILTER`.
+
+The following functions are non-linear, and require O(N) space and
+O(M) work:
+
+- `BIT_OR`, `BIT_XOR`, `BIT_AND`
+
+Any of the functions listed above as linear are actually non-linear
+when applied to `DOUBLE` or `FLOAT` values.
+
+### Efficient aggregation functions
+
+The following aggregation functions require O(N) space but perform
+only O(D log M) work.
+
+- `MAX`, `MIN`, `ARG_MAX`, `ARG_MIN`
+- `LOGICAL_AND`, `BOOL_AND`, `LOGICAL_OR`, `BOOL_OR`, `EVERY`, `SOME`
+
+### Append only collections
+
+Some aggregates can have more efficient implementations when applied
+to append-only collections.  A table property can be used to indicate
+whether a table is [append-only](streaming.md#append-only-tables).
+Operations such as SELECT, WHERE, JOIN, UNNEST applied to append-only
+collections produce append-only results.  Note the results of
+aggregation are essentially never append-only.
+
+- `MAX`, `MIN`, `ARG_MAX`, `ARG_MIN` are significantly more efficient
+  for append-only collections.  They require O(G) space and O(D) work.
+
+### Expensive aggregation functions
+
+- `ARRAY_AGG` is very expensive, both in terms of space and time.
+  Space cost is O(N), while work performed is proportional O(M).
+
+- The two constructors `ARRAY` and `MAP` with subqueries as arguments
+  have similar costs.

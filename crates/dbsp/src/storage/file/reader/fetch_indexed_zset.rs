@@ -10,10 +10,10 @@ use crate::{
     storage::{
         buffer_cache::BufferCache,
         file::{
-            reader::{
-                decompress, ColumnSpec, DataBlock, Error, FilteredKeys, Reader, TreeBlock, TreeNode,
-            },
             Factories,
+            reader::{
+                ColumnSpec, DataBlock, Error, FilteredKeys, Reader, TreeBlock, TreeNode, decompress,
+            },
         },
     },
     trace::{VecIndexedWSet, VecIndexedWSetFactories},
@@ -50,7 +50,7 @@ where
 {
     pub(super) fn new(
         reader: &'a Reader<(&'static K0, &'static A0, (&'static K1, &'static A1, ()))>,
-        keys: &'b DynVec<K0>,
+        keys: FilteredKeys<'b, K0>,
     ) -> Result<Self, Error> {
         Ok(Self(FetchIndexedZSetInner::Column0(Some(Fetch0::new(
             reader, keys,
@@ -172,7 +172,7 @@ where
 {
     fn new(
         reader: &'a Reader<(&'static K, &'static A, N)>,
-        keys: &'b DynVec<K>,
+        keys: FilteredKeys<'b, K>,
     ) -> Result<Self, Error> {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let factories = reader.columns[0].factories.factories();
@@ -185,9 +185,9 @@ where
         key_stack.reserve_exact(10);
 
         let mut this = Self {
-            keys: FilteredKeys::new(reader, keys),
+            keys,
             reader,
-            cache: (reader.file.cache)(),
+            cache: reader.file.cache(),
             factories,
             sender,
             receiver,
@@ -198,15 +198,15 @@ where
             pending: 0,
             _phantom: PhantomData,
         };
-        if !this.keys.is_empty() {
-            if let Some(node) = &reader.columns[0].root {
-                let mut reads = Vec::new();
-                this.try_read(
-                    Fetch0Read::new(0..this.keys.len(), node.clone()),
-                    &mut reads,
-                )?;
-                this.start_reads(reads);
-            }
+        if !this.keys.is_empty()
+            && let Some(node) = &reader.columns[0].root
+        {
+            let mut reads = Vec::new();
+            this.try_read(
+                Fetch0Read::new(0..this.keys.len(), node.clone()),
+                &mut reads,
+            )?;
+            this.start_reads(reads);
         }
         Ok(this)
     }
@@ -266,6 +266,7 @@ where
                 &read.node,
                 &self.cache,
                 self.reader.file_handle().file_id(),
+                self.reader.file.version,
             )
             .unwrap();
             self.process_read(&read.keys, tree_block, reads)?;
@@ -486,15 +487,15 @@ where
             out_of_order: BTreeMap::new(),
             pending: 0,
         };
-        if !this.rows.is_empty() {
-            if let Some(node) = &source.reader.columns[1].root {
-                let mut reads = Vec::new();
-                this.try_read(
-                    Fetch1Read::new(Rows::new(&this.rows), node.clone()),
-                    &mut reads,
-                )?;
-                this.start_reads(reads);
-            }
+        if !this.rows.is_empty()
+            && let Some(node) = &source.reader.columns[1].root
+        {
+            let mut reads = Vec::new();
+            this.try_read(
+                Fetch1Read::new(Rows::new(&this.rows), node.clone()),
+                &mut reads,
+            )?;
+            this.start_reads(reads);
         }
         Ok(this)
     }
@@ -530,7 +531,7 @@ where
 
     fn results(self, factories: VecIndexedWSetFactories<K0, K1, A1>) -> VecIndexedWSet<K0, K1, A1> {
         assert!(self.is_done());
-        VecIndexedWSet::from_parts(factories, self.keys, self.offs, self.vals, self.diffs)
+        VecIndexedWSet::from_parts(factories, self.keys, self.offs, self.vals, self.diffs, 0)
     }
 
     async fn async_results(
@@ -581,6 +582,7 @@ where
                 &read.node,
                 &self.cache,
                 self.reader.file_handle().file_id(),
+                self.reader.file.version,
             )
             .unwrap();
             self.process_read(read.keys, tree_block, reads)?;

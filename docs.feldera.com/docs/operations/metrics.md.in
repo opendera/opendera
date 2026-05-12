@@ -1,0 +1,127 @@
+<!-- This is a template file for metrics documentation.
+
+To regenerate the metrics documentation, start a Feldera pipeline (any
+one will do) and obtain Prometheus metrics for it with, for example,
+`fda metrics --format=prometheus` or `curl https://server/v0/metrics`.
+Save them to a file named `metrics.txt`, then then run `metrics.py`
+from this directory, like so:
+
+metrics.py metrics.txt
+-->
+
+# Pipeline Metrics
+
+This reference lists all of the metrics that Feldera exports through
+its `/metrics` endpoint in [Prometheus exposition format].  It is
+automatically generated using the documentation embedded in Prometheus
+output.
+
+All of the metrics exported by a particular Feldera pipeline are
+labeled with the pipeline's UUID as `pipeline` and its name as
+`pipeline_name`.  Some metrics have additional labels, as documented
+below.
+
+See [Monitoring and Profiling] for a guide to setting up Prometheus
+and Grafana with Feldera.  The [Feldera template dashboard] is a
+sample Grafana dashboard for Feldera.
+
+[Prometheus exposition format]: https://prometheus.io/docs/instrumenting/exposition_formats
+[Monitoring and Profiling]: /tutorials/monitoring
+[Feldera template dashboard]: https://raw.githubusercontent.com/feldera/feldera/main/deploy/grafana_dashboard.json
+
+# Process Metrics
+
+These metrics report statistics for a running Feldera pipeline
+process.  When a pipeline process is killed and restarts from a
+checkpoint, the new process's metrics are for it alone, not cumulative
+with any previous instantiations.
+
+These metrics are intended to match the standard [Prometheus
+definitions].
+
+[Prometheus definitions]: https://prometheus.io/docs/instrumenting/writing_clientlibs/#process-metrics
+
+{{process_}}
+
+## Feldera metrics
+
+These metrics report statistics for Feldera operations.
+
+{{feldera_}}
+
+## DBSP metrics
+
+These metrics report statistics for [DBSP], the low-level mechanism on
+which Feldera is built.
+
+[DBSP]: https://docs.rs/dbsp/latest/dbsp/
+
+{{dbsp_|compaction_|output_stall_}}
+
+## Record Processing
+
+These metrics report overall counts of records as they pass through
+the pipeline.  They accumulate across checkpoint and resume.
+
+{{records_|output_buffered_}}
+
+## Storage Performance
+
+These metrics report the performance of storage, which allows Feldera
+to work with data larger than memory.
+
+{{storage_|files_}}
+
+## Pipeline Status
+
+These metrics report the status of the pipeline.
+
+{{pipeline_}}
+
+## Input Connectors
+
+These metrics are per-input connector, labeled with `endpoint` set to
+the name of the input connector, which is either the name assigned in
+the SQL program or automatically generated as `unnamed-<number>`,
+where `<number>` counts starting from 1 for the first connector for a
+given table.
+
+These metrics accumulate across checkpoint and resume.
+
+For byte counters, for some input connectors, such as columnar
+formats, bytes are difficult to attribute accurately to records, so
+Feldera approximates.  Feldera also approximately attributes byte
+counts to records when it processes only some of the records in a
+batch in a DBSP step.  This approximation is corrected when the
+remainder of the batch is processed in a subsequent step, so it is
+invisible to users unless a pause or checkpoint happens mid-batch.
+
+{{input_connector_}}
+
+## Output Connectors
+
+These metrics are per-output connector, labeled with `endpoint` set to
+the name of the output connector, which is either the name assigned in
+the SQL program or automatically generated as `unnamed-<number>`,
+where `<number>` counts starting from 1 for the first connector for a
+given view.
+
+These metrics accumulate across checkpoint and resume.
+
+{{output_connector_}}
+
+## Checkpoint Synchronization
+
+These metrics report the status of [checkpoint synchronization].
+
+[checkpoint synchronization]: /pipelines/checkpoint-sync.md
+
+{{checkpoint_sync_}}
+
+## Transactions
+
+These metrics report the status of [transactions].
+
+[transactions]: /pipelines/transactions.md
+
+{{transaction_}}

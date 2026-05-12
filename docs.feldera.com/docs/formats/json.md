@@ -1,13 +1,13 @@
 # JSON Format
 
 Feldera can ingest and output data in the JSON format
-- via [`/ingress`](/api/push-data-to-a-sql-table) and
-  [`/egress`](/api/subscribe-to-a-stream-of-updates-from-a-sql-view-or-table)
+- via [`/ingress`](/api/insert-data) and
+  [`/egress`](/api/subscribe-to-view)
   REST endpoints, or
 - as a payload received from or sent to a connector
 
 Here we document the JSON format supported by Feldera.  The specification
-consists of four parts:
+consists of five parts:
 
 1. [Encoding invividual table rows](#encoding-individual-rows). Describes
    JSON encoding of an individual row in a SQL table or view, e.g.:
@@ -27,7 +27,12 @@ consists of four parts:
    {"insert": {"part": 1, "vendor": 2, "price": 30000}}
    {"insert": {"part": 2, "vendor": 3, "price": 34000}}
    ```
-4. [Configuring JSON event streams](#configuring-json-event-streams).
+
+4. [JSON encoding variations](#configuring-json-flavors).
+   Describes Feldera support for some variations on "vanilla" JSON
+   encoding.
+
+5. [Configuring JSON event streams](#configuring-json-event-streams).
    Describes how the user can specify the JSON format for a stream of events
    when sending and receiving data via connectors or over HTTP.
 
@@ -65,7 +70,7 @@ the JSON encoding of a row would look like this:
     "V":"quod",
     "CC":"voluptatem",
     "T":"05:05:24",
-    "TS":"2023-11-21 23:19:09",
+    "TS":"2023-11-21T23:19:09+00:00",
     "DT":"2495-03-07",
     "AR":[1,2,3,4,5]
 }
@@ -156,7 +161,7 @@ equal and valid. Leading and trailing whitespaces are ignored.
 
 ### `TIMESTAMP`
 
-Specifies dates using the `YYYY-MM-DD HH:MM:SS.fff` format.
+Specifies dates using the `YYYY-MM-DD HH:MM:SS.fff` format:
 
 - `YYYY` is the year from `0001-9999`
 - `MM` is the month from `01-12`
@@ -164,7 +169,13 @@ Specifies dates using the `YYYY-MM-DD HH:MM:SS.fff` format.
 - `HH` is hours from `00-23`.
 - `MM` is minutes from `00-59`.
 - `SS` is seconds from `00-59`.
-- `fff` is the sub-second precision up to 3 digits from `0` to `999`
+- `fff` is the optional sub-second precision up to 3 digits from `0` to `999`.
+
+Feldera can also parse the RFC3339 format `YYYY-MM-DDTHH:MM:SS.fffZ`, where
+
+- `Z` is the timezone offset like +02:00, or literal "Z" for the UTC timezone.
+  Internally Feldera converts the parsed timestamp into UTC time and stores it
+  as a timestamp without time zone.
 
 Note that the same rules as specified in the Date and Time sections apply,
 except that the sub-second precision is limited to three digits (microseconds).
@@ -242,6 +253,42 @@ This format allows one to break up the event stream into transport
 messages so that each message contains a valid JSON document
 by encoding all events in the message as an array.
 
+## Configuring JSON flavors
+
+JSON itself largely exists in only one form, but the way that it is
+used to encode data can vary.  Feldera's JSON format offers
+`json_flavor` as a way to specify which variation of data encoding is
+in use.  Specify `"json_flavor"` as one of the following:
+
+* `"default"`: The default flavor, as documented [above](#types).
+
+* `"debezium_mysql"` or `"debezium_postgres"`: JSON produced by the
+  default configuration of the Debezium [Kafka Connect connector] for
+  MySQL or Postgres, respectively, with `decimal.handling.mode` set to
+  "string".  Used with the [Debezium input connector].
+
+* `"snowflake"`: JSON format accepted by Snowflake using default
+  settings.
+
+* `"kafka_connect_json_converter"`: JSON format accepted by the Kafka
+  Connect `JsonConverter` class.
+
+* `"pandas"`: JSON format used by [Pandas](https://pandas.pydata.org/).
+
+* `"blockchain"`: JSON format used to represent blockchain data.  In
+  particular, this JSON format expects data for SQL BINARY fields to
+  be expressed with [base-58
+  encoding](https://datatracker.ietf.org/doc/html/draft-msporny-base58-03).
+
+* `"c_hex"`: JSON format for hexadecimal binary data.  This JSON
+  format expects data in SQL BINARY fields to be expressed as
+  hexadecimal digits.  Both lowercase and uppercase letters are
+  accepted, and an optional `0x` prefix is allowed.  The output form
+  of SQL BINARY includes the `0x` prefix.
+
+[Debezium input connector]: /connectors/sources/debezium
+[Kafka Connect connector]: https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-data-types
+
 ## Configuring JSON event streams
 
 ### Configure connectors
@@ -275,7 +322,7 @@ See also the [input/output connector tutorial](/tutorials/basics/part3.md).
 
 ### Streaming JSON over HTTP
 
-When sending data to a pipeline over HTTP via the [`/ingress`](/api/push-data-to-a-sql-table)
+When sending data to a pipeline over HTTP via the [`/ingress`](/api/insert-data)
 API endpoint, the data format is specified as part of the URL, e.g.:
 
 ```bash
@@ -290,7 +337,7 @@ curl -X 'POST' 'http://127.0.0.1:8080/v0/pipelines/PIPELINE_NAME/ingress/TABLE_N
 ```
 
 When receiving data from a pipeline over HTTP via the
-[`/egress`](/api/subscribe-to-a-stream-of-updates-from-a-sql-view-or-table)
+[`/egress`](/api/subscribe-to-view)
 API endpoint, we currently only support the insert/delete data change event
 format with array encapsulation.  Specify `?format=json` in the URL
 to choose this encoding for output data.

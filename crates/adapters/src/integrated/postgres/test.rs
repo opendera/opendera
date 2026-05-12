@@ -1,29 +1,22 @@
-use chrono::{NaiveDate, NaiveTime};
-use dbsp::{
-    circuit::CircuitConfig,
-    utils::{Tup1, Tup4},
-    DBSPHandle, Runtime,
-};
-use feldera_adapterlib::catalog::CircuitCatalog;
-use feldera_sqllib::{ByteArray, SqlString, F32, F64};
+use dbsp::{Runtime, utils::Tup1};
+use feldera_sqllib::Variant;
 use feldera_types::{
-    config::PipelineConfig,
     deserialize_table_record,
-    format::json::JsonFlavor,
     program_schema::{ColumnType, Field, Relation, SqlIdentifier},
-    serde_with_context::{DeserializeWithContext, SerializeWithContext, SqlSerdeConfig},
+    serde_with_context::{SerializeWithContext, SqlSerdeConfig},
     serialize_table_record,
+    transport::postgres::{PostgresTlsConfig, PostgresWriteMode},
 };
 use pg::PostgresTestStruct;
-use postgres::NoTls;
-use serde_json::{json, Value};
+use serde_json::json;
 use serial_test::serial;
-use std::{collections::BTreeMap, io::Write, str::FromStr};
+use std::{collections::BTreeMap, io::Write, path::Path};
 use tempfile::NamedTempFile;
 
 use crate::{
-    test::{test_circuit, wait, TestStruct},
     Catalog, Controller,
+    integrated::postgres::test::pg::PostgresTestStructCdc,
+    test::{TestStruct, wait},
 };
 
 fn postgres_url() -> String {
@@ -31,23 +24,59 @@ fn postgres_url() -> String {
         .unwrap_or("postgres://postgres:password@localhost:5432".to_string())
 }
 
+/// Returns the SSL connection URL and TLS config if the SSL environment
+/// variables are set (`POSTGRES_SSL_URL`, `POSTGRES_SSL_CA_LOCATION`,
+/// `POSTGRES_SSL_CLIENT_LOCATION`, `POSTGRES_SSL_CLIENT_KEY_LOCATION`).
+fn postgres_ssl_config() -> (String, PostgresTlsConfig) {
+    let url = std::env::var("POSTGRES_SSL_URL")
+        .unwrap_or("postgres://postgres:secret@localhost:5432/postgres".to_string());
+    let ssl_ca_pem = std::env::var("POSTGRES_SSL_CA_PEM").ok();
+    let ssl_ca_location = std::env::var("POSTGRES_SSL_CA_LOCATION").ok();
+    let ssl_client_pem = std::env::var("POSTGRES_SSL_CLIENT_CERT_PEM").ok();
+    let ssl_client_location = std::env::var("POSTGRES_SSL_CLIENT_LOCATION").ok();
+    let ssl_client_key = std::env::var("POSTGRES_SSL_CLIENT_KEY_PEM").ok();
+    let ssl_client_key_location = std::env::var("POSTGRES_SSL_CLIENT_KEY_LOCATION").ok();
+    let ssl_certificate_chain_location =
+        std::env::var("POSTGRES_SSL_CERTIFICATE_CHAIN_LOCATION").ok();
+    let verify_hostname = std::env::var("POSTGRES_SSL_VERIFY_HOSTNAME")
+        .ok()
+        .and_then(|s| s.parse::<bool>().ok());
+
+    (
+        url,
+        PostgresTlsConfig {
+            ssl_ca_location,
+            ssl_ca_pem,
+            ssl_client_location,
+            ssl_client_key_location,
+            ssl_client_pem,
+            ssl_client_key,
+            ssl_certificate_chain_location,
+            verify_hostname,
+        },
+    )
+}
+
 mod pg {
     use std::collections::BTreeMap;
 
     use chrono::SubsecRound;
-    use dbsp::{circuit::CircuitConfig, typed_batch::TypedBatch, utils::Tup1, DBSPHandle, Runtime};
-    use feldera_sqllib::{SqlDecimal, SqlString, F32, F64};
+    use dbsp::{Runtime, utils::Tup1};
+    use feldera_macros::IsNone;
+    use feldera_sqllib::{F32, F64, SqlDecimal, SqlString, Variant};
     use feldera_types::{
         config::PipelineConfig,
-        deserialize_table_record, deserialize_without_context,
+        deserialize_table_record,
         program_schema::{ColumnType, Field, Relation, SqlIdentifier},
-        serialize_struct, serialize_table_record,
+        serialize_table_record,
+        transport::postgres::PostgresTlsConfig,
     };
-    use num_traits::FromPrimitive;
     use postgres::{NoTls, Row};
-    use rand::{distributions::Standard, prelude::Distribution, Rng};
+    use rand::{Rng, distributions::Standard, prelude::Distribution};
 
-    use crate::{test::TestStruct, Catalog, Controller};
+    use crate::{
+        Catalog, Controller, integrated::postgres::tls::make_tls_connector, test::TestStruct,
+    };
 
     #[derive(Debug, postgres_types::ToSql, postgres_types::FromSql)]
     #[postgres(name = "test_struct")]
@@ -82,6 +111,7 @@ mod pg {
         rkyv::Archive,
         rkyv::Serialize,
         rkyv::Deserialize,
+        IsNone,
     )]
     #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
     pub(super) struct PostgresTestStruct {
@@ -90,7 +120,7 @@ mod pg {
         pub smallint_: i16,
         pub int_: i32,
         pub bigint_: i64,
-        pub decimal_: SqlDecimal,
+        pub decimal_: SqlDecimal<38, 10>,
         pub float_: F32,
         pub double_: F64,
         pub varchar_: SqlString,
@@ -104,6 +134,55 @@ mod pg {
         pub string_array_: Vec<feldera_sqllib::SqlString>,
         pub struct_array_: Vec<TestStruct>,
         pub map_: BTreeMap<feldera_sqllib::SqlString, TestStruct>,
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Clone)]
+    pub(super) struct PostgresTestStructCdc {
+        pub boolean_: bool,
+        pub tinyint_: i8,
+        pub smallint_: i16,
+        pub int_: i32,
+        pub bigint_: i64,
+        pub decimal_: SqlDecimal<38, 10>,
+        pub float_: F32,
+        pub double_: F64,
+        pub varchar_: SqlString,
+        pub time_: feldera_sqllib::Time,
+        pub date_: feldera_sqllib::Date,
+        pub timestamp_: feldera_sqllib::Timestamp,
+        pub variant_: feldera_sqllib::Variant,
+        pub uuid_: feldera_sqllib::Uuid,
+        pub varbinary_: feldera_sqllib::ByteArray,
+        pub struct_: TestStruct,
+        pub string_array_: Vec<feldera_sqllib::SqlString>,
+        pub struct_array_: Vec<TestStruct>,
+        pub map_: BTreeMap<feldera_sqllib::SqlString, TestStruct>,
+        pub __feldera_op: String,
+        pub __feldera_ts: feldera_sqllib::Timestamp,
+    }
+
+    impl PartialEq<PostgresTestStruct> for PostgresTestStructCdc {
+        fn eq(&self, other: &PostgresTestStruct) -> bool {
+            self.boolean_ == other.boolean_
+                && self.tinyint_ == other.tinyint_
+                && self.smallint_ == other.smallint_
+                && self.int_ == other.int_
+                && self.bigint_ == other.bigint_
+                && self.decimal_ == other.decimal_
+                && self.float_ == other.float_
+                && self.double_ == other.double_
+                && self.varchar_ == other.varchar_
+                && self.time_ == other.time_
+                && self.date_ == other.date_
+                && self.timestamp_ == other.timestamp_
+                && self.variant_ == other.variant_
+                && self.uuid_ == other.uuid_
+                && self.varbinary_ == other.varbinary_
+                && self.struct_ == other.struct_
+                && self.string_array_ == other.string_array_
+                && self.struct_array_ == other.struct_array_
+                && self.map_ == other.map_
+        }
     }
 
     serialize_table_record!(PostgresTestStruct[19]{
@@ -128,26 +207,26 @@ mod pg {
         map_["map_"]: BTreeMap<feldera_sqllib::SqlString, TestStruct>
     });
 
-    deserialize_table_record!(PostgresTestStruct["PostgresTestStruct", 19] {
-        (boolean_, "boolean_", false, bool, None),
-        (tinyint_, "tinyint_", false, i8, None),
-        (smallint_, "smallint_", false, i16, None),
-        (int_, "int_", false, i32, None),
-        (bigint_, "bigint_", false, i64, None),
-        (decimal_, "decimal_", false, SqlDecimal, None),
-        (float_, "float_", false, F32, None),
-        (double_, "double_", false, F64, None),
-        (varchar_, "varchar_", false, SqlString, None),
-        (time_, "time_", false, feldera_sqllib::Time, None),
-        (date_, "date_", false, feldera_sqllib::Date, None),
-        (timestamp_, "timestamp_", false, feldera_sqllib::Timestamp, None),
-        (variant_, "variant_", false, feldera_sqllib::Variant, None),
-        (uuid_, "uuid_", false, feldera_sqllib::Uuid, None),
-        (varbinary_, "varbinary_", false, feldera_sqllib::ByteArray, None),
-        (struct_, "struct_", false, TestStruct, None),
-        (string_array_, "string_array_", false, Vec<feldera_sqllib::SqlString>, None),
-        (struct_array_, "struct_array_", false, Vec<TestStruct>, None),
-        (map_, "map_", false, BTreeMap<feldera_sqllib::SqlString, TestStruct>, None)
+    deserialize_table_record!(PostgresTestStruct["PostgresTestStruct", Variant, 19] {
+        (boolean_, "boolean_", false, bool, |_| None),
+        (tinyint_, "tinyint_", false, i8, |_| None),
+        (smallint_, "smallint_", false, i16, |_| None),
+        (int_, "int_", false, i32, |_| None),
+        (bigint_, "bigint_", false, i64, |_| None),
+        (decimal_, "decimal_", false, SqlDecimal<38, 10>, |_| None),
+        (float_, "float_", false, F32, |_| None),
+        (double_, "double_", false, F64, |_| None),
+        (varchar_, "varchar_", false, SqlString, |_| None),
+        (time_, "time_", false, feldera_sqllib::Time, |_| None),
+        (date_, "date_", false, feldera_sqllib::Date, |_| None),
+        (timestamp_, "timestamp_", false, feldera_sqllib::Timestamp, |_| None),
+        (variant_, "variant_", false, feldera_sqllib::Variant, |_| None),
+        (uuid_, "uuid_", false, feldera_sqllib::Uuid, |_| None),
+        (varbinary_, "varbinary_", false, feldera_sqllib::ByteArray, |_| None),
+        (struct_, "struct_", false, TestStruct, |_| None),
+        (string_array_, "string_array_", false, Vec<feldera_sqllib::SqlString>, |_| None),
+        (struct_array_, "struct_array_", false, Vec<TestStruct>, |_| None),
+        (map_, "map_", false, BTreeMap<feldera_sqllib::SqlString, TestStruct>, |_| None)
     });
 
     pub(super) struct TempPgTable {
@@ -155,9 +234,27 @@ mod pg {
         name: String,
     }
 
+    /// Connects a sync postgres client, with TLS if config is provided.
+    pub(super) fn pg_connect(uri: &str, tls: &Option<PostgresTlsConfig>) -> postgres::Client {
+        if let Some(tls) = tls {
+            let connector = make_tls_connector(tls, "test")
+                .expect("failed to build TLS connector")
+                .expect("TLS config should produce a connector");
+            postgres::Client::connect(uri, connector).expect("failed to connect with TLS")
+        } else {
+            postgres::Client::connect(uri, NoTls).expect("failed to connect")
+        }
+    }
+
     impl TempPgTable {
-        fn new(name: &str, uri: String) -> Self {
-            let mut client = postgres::Client::connect(&uri, NoTls).unwrap();
+        fn new(name: &str, uri: String, pk: bool, tls: &Option<PostgresTlsConfig>) -> Self {
+            let mut client = pg_connect(&uri, tls);
+
+            let pk = if pk { "PRIMARY KEY" } else { "" };
+
+            client
+                .execute("DROP TYPE IF EXISTS test_struct", &[])
+                .unwrap();
 
             client
                 .execute(
@@ -180,7 +277,7 @@ CREATE TABLE {name} (
     tinyint_      SMALLINT,
     smallint_     SMALLINT,
     int_          INTEGER,
-    bigint_       BIGINT,
+    bigint_       BIGINT {pk},
     decimal_      DECIMAL,
     float_        REAL,
     double_       DOUBLE PRECISION,
@@ -194,7 +291,9 @@ CREATE TABLE {name} (
     string_array_ VARCHAR ARRAY,
     struct_       test_struct,
     struct_array_ test_struct ARRAY,
-    map_          JSONB
+    map_          JSONB,
+    __feldera_op  CHAR,
+    __feldera_ts  BIGINT
 )"#
                     ),
                     &[],
@@ -242,7 +341,7 @@ CREATE TABLE {name} (
                 bigint_: r.get("bigint_"),
                 decimal_: r
                     .get::<_, String>("decimal_str")
-                    .parse::<SqlDecimal>()
+                    .parse::<SqlDecimal<38, 10>>()
                     .unwrap(),
                 float_: F32::new(r.get("float_")),
                 double_: F64::new(r.get("double_")),
@@ -268,6 +367,51 @@ CREATE TABLE {name} (
                     .map(TestStruct::from)
                     .collect(),
                 map_: serde_json::from_value(r.get::<_, serde_json::Value>("map_")).unwrap(),
+            }
+        }
+    }
+
+    impl From<Row> for PostgresTestStructCdc {
+        fn from(r: Row) -> Self {
+            PostgresTestStructCdc {
+                boolean_: r.get("boolean_"),
+                tinyint_: r.get::<_, i16>("tinyint_") as i8,
+                smallint_: r.get("smallint_"),
+                int_: r.get("int_"),
+                bigint_: r.get("bigint_"),
+                decimal_: r
+                    .get::<_, String>("decimal_str")
+                    .parse::<SqlDecimal<38, 10>>()
+                    .unwrap(),
+                float_: F32::new(r.get("float_")),
+                double_: F64::new(r.get("double_")),
+                varchar_: SqlString::from_ref(r.get("varchar_")),
+                time_: feldera_sqllib::Time::from_time(r.get("time_")),
+                date_: feldera_sqllib::Date::from_date(r.get("date_")),
+                timestamp_: feldera_sqllib::Timestamp::from_naiveDateTime(r.get("timestamp_")),
+                variant_: feldera_sqllib::from_json_string(
+                    &r.get::<_, serde_json::Value>("variant_").to_string(),
+                )
+                .unwrap(),
+                uuid_: r.get::<_, uuid::Uuid>("uuid_").into(),
+                varbinary_: feldera_sqllib::ByteArray::from_vec(r.get::<_, Vec<u8>>("varbinary_")),
+                struct_: { r.get::<_, TempTestStruct>("struct_").into() },
+                string_array_: r
+                    .get::<_, Vec<String>>("string_array_")
+                    .into_iter()
+                    .map(|s| s.into())
+                    .collect(),
+                struct_array_: r
+                    .get::<_, Vec<TempTestStruct>>("struct_array_")
+                    .into_iter()
+                    .map(TestStruct::from)
+                    .collect(),
+                map_: serde_json::from_value(r.get::<_, serde_json::Value>("map_")).unwrap(),
+                __feldera_op: r.get("__feldera_op"),
+                __feldera_ts: feldera_sqllib::Timestamp::from_dateTime(
+                    chrono::DateTime::from_timestamp_micros(r.get::<_, i64>("__feldera_ts"))
+                        .unwrap(),
+                ),
             }
         }
     }
@@ -313,8 +457,13 @@ CREATE TABLE {name} (
             ]
         }
 
-        pub fn create_table(name: &str, uri: String) -> TempPgTable {
-            TempPgTable::new(name, uri)
+        pub fn create_table(
+            name: &str,
+            uri: String,
+            pk: bool,
+            tls: &Option<PostgresTlsConfig>,
+        ) -> TempPgTable {
+            TempPgTable::new(name, uri, pk, tls)
         }
 
         pub fn test_circuit(
@@ -322,7 +471,7 @@ CREATE TABLE {name} (
         ) -> (Controller, crossbeam::channel::Receiver<String>) {
             let schema = PostgresTestStruct::schema();
             let (err_sender, err_receiver) = crossbeam::channel::unbounded();
-            let controller = Controller::with_config(
+            let controller = Controller::with_test_config(
                 move |workers| {
                     Ok({
                         let (circuit, catalog) = Runtime::init_circuit(workers, move |circuit| {
@@ -368,8 +517,8 @@ CREATE TABLE {name} (
                                 }
                             }
 
-                            deserialize_table_record!(KeyStruct["idx", 1] {
-                                (field0, "bigint_", false, i64, None)
+                            deserialize_table_record!(KeyStruct["idx", Variant, 1] {
+                                (field0, "bigint_", false, i64, |_| None)
                             });
                             serialize_table_record!(KeyStruct[1]{
                                 field0["bigint_"]: i64
@@ -395,8 +544,8 @@ CREATE TABLE {name} (
                     })
                 },
                 &config,
-                Box::new(move |e| {
-                    let msg = format!("redis_output_test: error: {e}");
+                Box::new(move |e, _| {
+                    let msg = format!("postgres_output_test: error: {}", e);
                     println!("{msg}");
                     err_sender.send(msg).unwrap()
                 }),
@@ -410,15 +559,16 @@ CREATE TABLE {name} (
     impl Distribution<PostgresTestStruct> for Standard {
         fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> PostgresTestStruct {
             PostgresTestStruct {
-                boolean_: rng.gen(),
-                tinyint_: rng.gen(),
-                smallint_: rng.gen(),
-                int_: rng.gen(),
-                bigint_: rng.gen(),
-                decimal_: SqlDecimal::from_i128_with_scale(rng.gen_range::<i128, _>(-100..100), 3),
-                float_: F32::new((rng.gen::<f32>() * 1000.0).trunc() / 1000.0),
-                double_: F64::new((rng.gen::<f64>() * 1000.0).trunc() / 1000.0),
-                varchar_: rng.gen::<u32>().to_string().into(),
+                boolean_: rng.r#gen(),
+                tinyint_: rng.r#gen(),
+                smallint_: rng.r#gen(),
+                int_: rng.r#gen(),
+                bigint_: rng.r#gen(),
+                decimal_: SqlDecimal::<38, 10>::new(rng.gen_range::<i128, _>(-100..100), 3)
+                    .unwrap(),
+                float_: F32::new((rng.r#gen::<f32>() * 1000.0).trunc() / 1000.0),
+                double_: F64::new((rng.r#gen::<f64>() * 1000.0).trunc() / 1000.0),
+                varchar_: rng.r#gen::<u32>().to_string().into(),
                 time_: feldera_sqllib::Time::from_time(
                     chrono::Utc::now().naive_utc().time().round_subsecs(5),
                 ),
@@ -426,15 +576,15 @@ CREATE TABLE {name} (
                 timestamp_: feldera_sqllib::Timestamp::from_naiveDateTime(
                     chrono::Utc::now().naive_utc(),
                 ),
-                variant_: feldera_sqllib::Variant::String(rng.gen::<u32>().to_string().into()),
+                variant_: feldera_sqllib::Variant::String(rng.r#gen::<u32>().to_string().into()),
                 uuid_: uuid::Uuid::new_v4().into(),
                 varbinary_: feldera_sqllib::ByteArray::from_vec(vec![rng.gen_range(0..127)]),
-                struct_: rng.gen(),
+                struct_: rng.r#gen(),
                 string_array_: vec![],
-                struct_array_: vec![rng.gen()],
+                struct_array_: vec![rng.r#gen()],
                 map_: {
                     let mut map = BTreeMap::new();
-                    map.insert(rng.gen::<u32>().to_string().into(), rng.gen());
+                    map.insert(rng.r#gen::<u32>().to_string().into(), rng.r#gen());
                     map
                 },
             }
@@ -442,15 +592,236 @@ CREATE TABLE {name} (
     }
 }
 
+fn test_pg_on_conflict(on_conflict_do_nothing: bool, mode: PostgresWriteMode) {
+    let table_name = "test_pg_on_conflict";
+    let url = postgres_url();
+    let max_buffer_size_bytes = 1024;
+
+    let mut data: Vec<PostgresTestStruct> = (0..10000).map(|_| rand::random()).collect();
+    let mut insert_file = NamedTempFile::new().unwrap();
+
+    for datum in data.iter() {
+        let buffer: Vec<u8> = Vec::new();
+        let mut serializer = serde_json::Serializer::new(buffer);
+        datum
+            .serialize_with_context(&mut serializer, &SqlSerdeConfig::default())
+            .unwrap();
+        insert_file
+            .as_file_mut()
+            .write_all(&serializer.into_inner())
+            .unwrap();
+        insert_file.write_all(b"\n").unwrap();
+    }
+
+    let mut upsert_data = data
+        .clone()
+        .into_iter()
+        .map(|mut d| {
+            d.varchar_ = "updated".into();
+            d
+        })
+        .collect::<Vec<_>>();
+
+    let mut upsert_file = NamedTempFile::new().unwrap();
+
+    for new in upsert_data.iter() {
+        let buffer: Vec<u8> = Vec::new();
+        let mut serializer = serde_json::Serializer::new(buffer);
+        new.serialize_with_context(&mut serializer, &SqlSerdeConfig::default())
+            .unwrap();
+        upsert_file
+            .as_file_mut()
+            .write_all(&serializer.into_inner())
+            .unwrap();
+    }
+
+    let url_clone = url.clone();
+
+    let get_config = |in_file: &Path| {
+        serde_json::from_value(json!({
+            "name": "test",
+            "workers": 4,
+            "inputs": {
+                "ins": {
+                    "stream": "test_input1",
+                    "transport": {
+                        "name": "file_input",
+                        "config": {
+                            "path": in_file,
+                        },
+                    },
+                    "format": {
+                        "name": "json",
+                        "config": {
+                            "update_format": "raw",
+                            "array": false
+                        }
+                    }
+                }
+            },
+            "outputs": {
+                "test_output1": {
+                    "stream": "test_output1",
+                    "transport": {
+                        "name": "postgres_output",
+                        "config": {
+                            "uri": url_clone,
+                            "table": table_name,
+                            "max_buffer_size_bytes": max_buffer_size_bytes,
+                            "on_conflict_do_nothing": on_conflict_do_nothing,
+                            "mode": match mode {
+                                PostgresWriteMode::Materialized => "materialized",
+                                PostgresWriteMode::Cdc => "cdc",
+                            }
+                        }
+                    },
+                    "index": "idx"
+                }
+            }
+        }))
+        .unwrap()
+    };
+
+    let mut table = PostgresTestStruct::create_table(
+        table_name,
+        url,
+        matches!(mode, PostgresWriteMode::Materialized),
+        &None,
+    );
+
+    let (controller, err_receiver) =
+        PostgresTestStruct::test_circuit(get_config(insert_file.path()));
+
+    controller.start();
+    data.sort();
+
+    wait(
+        || match mode {
+            PostgresWriteMode::Materialized => {
+                let rows = table.query();
+
+                let mut got = rows
+                    .into_iter()
+                    .map(PostgresTestStruct::from)
+                    .collect::<Vec<_>>();
+
+                got.sort();
+
+                data == got || !err_receiver.is_empty()
+            }
+            PostgresWriteMode::Cdc => {
+                let rows = table.query();
+
+                let mut got = rows
+                    .into_iter()
+                    .map(PostgresTestStructCdc::from)
+                    .collect::<Vec<_>>();
+
+                got.sort();
+
+                got == data && got.iter().all(|r| r.__feldera_op.as_str() == "i")
+                    || !err_receiver.is_empty()
+            }
+        },
+        40_000,
+    )
+    .expect("timeout: failed to insert data into postgres");
+
+    controller.stop().unwrap();
+
+    let (controller, err_receiver) =
+        PostgresTestStruct::test_circuit(get_config(upsert_file.path()));
+
+    controller.start();
+    upsert_data.sort();
+
+    let expected = if on_conflict_do_nothing && matches!(mode, PostgresWriteMode::Materialized) {
+        data
+    } else {
+        upsert_data
+    };
+
+    match mode {
+        PostgresWriteMode::Materialized => {
+            wait(
+                || {
+                    let rows = table.query();
+
+                    let mut got = rows
+                        .into_iter()
+                        .map(PostgresTestStruct::from)
+                        .collect::<Vec<_>>();
+
+                    got.sort();
+
+                    got == expected || !err_receiver.is_empty()
+                },
+                40_000,
+            )
+            .expect("timeout: failed to update data into postgres");
+        }
+        PostgresWriteMode::Cdc => {
+            wait(
+                || {
+                    let rows = table.query();
+
+                    let got = rows
+                        .into_iter()
+                        .map(PostgresTestStructCdc::from)
+                        .collect::<Vec<_>>();
+
+                    let mut got: Vec<_> = got
+                        .iter()
+                        .filter(|r| r.varchar_ == "updated".into())
+                        .cloned()
+                        .collect();
+
+                    got.sort();
+
+                    got == expected && got.iter().all(|r| r.__feldera_op.as_str() == "i")
+                        || !err_receiver.is_empty()
+                },
+                40_000,
+            )
+            .expect("timeout: failed to update data into postgres");
+        }
+    }
+
+    controller.stop().unwrap();
+}
+
 #[test]
 #[serial]
-fn test_pg_insert() {
+fn test_pg_on_conflict_do_update() {
+    test_pg_on_conflict(false, PostgresWriteMode::Materialized);
+}
+
+#[test]
+#[serial]
+fn test_pg_on_conflict_do_nothing() {
+    test_pg_on_conflict(true, PostgresWriteMode::Materialized);
+}
+
+#[test]
+#[serial]
+fn test_pg_insert0() {
+    pg_insert0(PostgresWriteMode::Materialized);
+}
+
+#[test]
+#[serial]
+fn test_pg_insert0_cdc() {
+    pg_insert0(PostgresWriteMode::Cdc);
+}
+
+fn pg_insert0(mode: PostgresWriteMode) {
     let table_name = "test_pg_insert";
     let url = postgres_url();
+    let max_buffer_size_bytes = 1024;
 
     // On average 1 record is about 590 bytes, so 2000 records produce a buffer
     // of over 1 MiB
-    let mut data: Vec<PostgresTestStruct> = (0..2000).map(|_| rand::random()).collect();
+    let mut data: Vec<PostgresTestStruct> = (0..10000).map(|_| rand::random()).collect();
 
     let mut temp_file = NamedTempFile::new().unwrap();
 
@@ -465,38 +836,159 @@ fn test_pg_insert() {
         temp_file.write_all(b"\n").unwrap();
     }
 
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-  ins:
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: raw
-        array: false
-outputs:
-  test_output1:
-    stream: test_output1
-    transport:
-      name: postgres_output
-      config:
-        uri: {url}
-        table: {table_name}
-    index: idx
-"#,
-        temp_file.path().display(),
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      "inputs": {
+        "ins": {
+          "stream": "test_input1",
+          "transport": {
+            "name": "file_input",
+            "config": {
+              "path": temp_file.path(),
+              "byte_size_buffer": 2097152
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "update_format": "raw",
+              "array": false
+            }
+          }
+        }
+      },
+      "outputs": {
+        "test_output1": {
+          "stream": "test_output1",
+          "transport": {
+            "name": "postgres_output",
+            "config": {
+              "uri": url,
+              "table": table_name,
+              "max_buffer_size_bytes": max_buffer_size_bytes,
+              "mode": match mode {
+                  PostgresWriteMode::Materialized => "materialized",
+                  PostgresWriteMode::Cdc => "cdc",
+              }
+            }
+          },
+          "index": "idx"
+        }
+      }
+    }))
+    .unwrap();
+
+    let mut table = PostgresTestStruct::create_table(
+        table_name,
+        url,
+        matches!(mode, PostgresWriteMode::Materialized),
+        &None,
     );
 
-    let mut table = PostgresTestStruct::create_table(table_name, url);
+    let (controller, err_receiver) = PostgresTestStruct::test_circuit(config);
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
+    controller.start();
+    data.sort();
+
+    wait(
+        || match mode {
+            PostgresWriteMode::Materialized => {
+                let rows = table.query();
+
+                let mut got = rows
+                    .into_iter()
+                    .map(PostgresTestStruct::from)
+                    .collect::<Vec<_>>();
+
+                got.sort();
+
+                data == got || !err_receiver.is_empty()
+            }
+            PostgresWriteMode::Cdc => {
+                let rows = table.query();
+
+                let mut got = rows
+                    .into_iter()
+                    .map(PostgresTestStructCdc::from)
+                    .collect::<Vec<_>>();
+
+                got.sort();
+
+                got == data && got.iter().all(|r| r.__feldera_op.as_str() == "i")
+                    || !err_receiver.is_empty()
+            }
+        },
+        40_000,
+    )
+    .expect("timeout: failed to insert data into postgres");
+}
+
+#[test]
+#[serial]
+fn test_pg_insert() {
+    let table_name = "test_pg_insert";
+    let url = postgres_url();
+    let max_records_in_buffer = 1000;
+
+    // On average 1 record is about 590 bytes, so 2000 records produce a buffer
+    // of over 1 MiB
+    let mut data: Vec<PostgresTestStruct> = (0..10000).map(|_| rand::random()).collect();
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+
+    for datum in data.iter() {
+        let buffer: Vec<u8> = Vec::new();
+        let mut serializer = serde_json::Serializer::new(buffer);
+        datum
+            .serialize_with_context(&mut serializer, &SqlSerdeConfig::default())
+            .unwrap();
+        let inner = &serializer.into_inner();
+        temp_file.as_file_mut().write_all(inner).unwrap();
+        temp_file.write_all(b"\n").unwrap();
+    }
+
+    let config = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "inputs": {
+            "ins": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_file.path(),
+                        "byte_size_buffer": 2097152
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "update_format": "raw",
+                        "array": false
+                    }
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "postgres_output",
+                    "config": {
+                        "uri": url,
+                        "table": table_name,
+                        "max_records_in_buffer": max_records_in_buffer
+                    }
+                },
+                "index": "idx"
+            }
+        }
+    }))
+    .unwrap();
+
+    let mut table = PostgresTestStruct::create_table(table_name, url, true, &None);
+
     let (controller, err_receiver) = PostgresTestStruct::test_circuit(config);
 
     controller.start();
@@ -515,18 +1007,29 @@ outputs:
 
             data == got || !err_receiver.is_empty()
         },
-        2_000,
+        40_000,
     )
     .expect("timeout: failed to insert data into postgres");
 }
 
 #[test]
 #[serial]
-fn test_pg_upsert() {
+fn test_pg_upsert0() {
+    pg_upsert0(PostgresWriteMode::Materialized);
+}
+
+#[test]
+#[serial]
+fn test_pg_upsert0_cdc() {
+    pg_upsert0(PostgresWriteMode::Cdc);
+}
+
+fn pg_upsert0(mode: PostgresWriteMode) {
     let table_name = "test_pg_upsert";
     let url = postgres_url();
+    let max_buffer_size_bytes = 1024;
 
-    let mut data: Vec<PostgresTestStruct> = (0..2000).map(|_| rand::random()).collect();
+    let mut data: Vec<PostgresTestStruct> = (0..10000).map(|_| rand::random()).collect();
     let mut insert_file = NamedTempFile::new().unwrap();
 
     for datum in data.iter() {
@@ -585,51 +1088,283 @@ fn test_pg_upsert() {
         upsert_file.write_all(b"}\n").unwrap();
     }
 
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-  ins:
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: raw
-        array: false
-  ups:
-    paused: true
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: insert_delete
-        array: false
-outputs:
-  test_output1:
-    stream: test_output1
-    transport:
-      name: postgres_output
-      config:
-        uri: {url}
-        table: {table_name}
-    index: idx
-"#,
-        insert_file.path().display(),
-        upsert_file.path().display(),
+    let config = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "inputs": {
+            "ins": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": insert_file.path(),
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "update_format": "raw",
+                        "array": false
+                    }
+                }
+            },
+            "ups": {
+                "paused": true,
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": upsert_file.path(),
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "update_format": "insert_delete",
+                        "array": false
+                    }
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "postgres_output",
+                    "config": {
+                        "uri": url,
+                        "table": table_name,
+                        "max_buffer_size_bytes": max_buffer_size_bytes,
+                        "mode": match mode {
+                            PostgresWriteMode::Materialized => "materialized",
+                            PostgresWriteMode::Cdc => "cdc",
+                        }
+
+                    }
+                },
+                "index": "idx"
+            }
+        }
+    }))
+    .unwrap();
+
+    let mut table = PostgresTestStruct::create_table(
+        table_name,
+        url,
+        matches!(mode, PostgresWriteMode::Materialized),
+        &None,
     );
 
-    let mut table = PostgresTestStruct::create_table(table_name, url);
+    let (controller, err_receiver) = PostgresTestStruct::test_circuit(config);
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
+    controller.start();
+    data.sort();
+
+    wait(
+        || match mode {
+            PostgresWriteMode::Materialized => {
+                let rows = table.query();
+
+                let mut got = rows
+                    .into_iter()
+                    .map(PostgresTestStruct::from)
+                    .collect::<Vec<_>>();
+
+                got.sort();
+
+                data == got || !err_receiver.is_empty()
+            }
+            PostgresWriteMode::Cdc => {
+                let rows = table.query();
+
+                let mut got = rows
+                    .into_iter()
+                    .map(PostgresTestStructCdc::from)
+                    .collect::<Vec<_>>();
+
+                got.sort();
+
+                got == data && got.iter().all(|r| r.__feldera_op.as_str() == "i")
+                    || !err_receiver.is_empty()
+            }
+        },
+        40_000,
+    )
+    .expect("timeout: failed to insert data into postgres");
+
+    controller
+        .start_input_endpoint("ups")
+        .expect("failed to start upsert input file connector");
+
+    upsert_data.sort();
+
+    wait(
+        || match mode {
+            PostgresWriteMode::Materialized => {
+                let rows = table.query();
+
+                let mut got = rows
+                    .into_iter()
+                    .map(PostgresTestStruct::from)
+                    .collect::<Vec<_>>();
+
+                got.sort();
+
+                got == upsert_data || !err_receiver.is_empty()
+            }
+            PostgresWriteMode::Cdc => {
+                let rows = table.query();
+
+                let got = rows
+                    .into_iter()
+                    .map(PostgresTestStructCdc::from)
+                    .collect::<Vec<_>>();
+
+                let mut deletes = got
+                    .iter()
+                    .filter(|r| r.__feldera_op.as_str() == "d")
+                    .cloned()
+                    .collect::<Vec<_>>();
+                deletes.sort();
+
+                let mut updates = got
+                    .iter()
+                    .filter(|r| r.varchar_ == "updated".into() && r.__feldera_op.as_str() == "i")
+                    .cloned()
+                    .collect::<Vec<_>>();
+                updates.sort();
+
+                deletes == data && updates == upsert_data || !err_receiver.is_empty()
+            }
+        },
+        40_000,
+    )
+    .expect("timeout: failed to update data into postgres");
+}
+
+#[test]
+#[serial]
+fn test_pg_upsert() {
+    let table_name = "test_pg_upsert";
+    let url = postgres_url();
+    let max_records_in_buffer = 1000;
+
+    let mut data: Vec<PostgresTestStruct> = (0..10000).map(|_| rand::random()).collect();
+    let mut insert_file = NamedTempFile::new().unwrap();
+
+    for datum in data.iter() {
+        let buffer: Vec<u8> = Vec::new();
+        let mut serializer = serde_json::Serializer::new(buffer);
+        datum
+            .serialize_with_context(&mut serializer, &SqlSerdeConfig::default())
+            .unwrap();
+        insert_file
+            .as_file_mut()
+            .write_all(&serializer.into_inner())
+            .unwrap();
+        insert_file.write_all(b"\n").unwrap();
+    }
+
+    let mut upsert_data = data
+        .clone()
+        .into_iter()
+        .map(|mut d| {
+            d.varchar_ = "updated".into();
+            d
+        })
+        .collect::<Vec<_>>();
+
+    let mut upsert_file = NamedTempFile::new().unwrap();
+
+    for old in data.iter() {
+        let buffer: Vec<u8> = Vec::new();
+        let mut serializer = serde_json::Serializer::new(buffer);
+        old.serialize_with_context(&mut serializer, &SqlSerdeConfig::default())
+            .unwrap();
+        upsert_file
+            .as_file_mut()
+            .write_all(br#"{"delete": "#)
+            .unwrap();
+        upsert_file
+            .as_file_mut()
+            .write_all(&serializer.into_inner())
+            .unwrap();
+        upsert_file.write_all(b"}\n").unwrap();
+    }
+
+    for new in upsert_data.iter() {
+        let buffer: Vec<u8> = Vec::new();
+        let mut serializer = serde_json::Serializer::new(buffer);
+        new.serialize_with_context(&mut serializer, &SqlSerdeConfig::default())
+            .unwrap();
+        upsert_file
+            .as_file_mut()
+            .write_all(br#"{"insert": "#)
+            .unwrap();
+        upsert_file
+            .as_file_mut()
+            .write_all(&serializer.into_inner())
+            .unwrap();
+        upsert_file.write_all(b"}\n").unwrap();
+    }
+
+    let config = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "inputs": {
+            "ins": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": insert_file.path(),
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "update_format": "raw",
+                        "array": false
+                    }
+                }
+            },
+            "ups": {
+                "paused": true,
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": upsert_file.path(),
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "update_format": "insert_delete",
+                        "array": false
+                    }
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "postgres_output",
+                    "config": {
+                        "uri": url,
+                        "table": table_name,
+                        "max_records_in_buffer": max_records_in_buffer
+                    }
+                },
+                "index": "idx"
+            }
+        }
+    }))
+    .unwrap();
+
+    let mut table = PostgresTestStruct::create_table(table_name, url, true, &None);
+
     let (controller, err_receiver) = PostgresTestStruct::test_circuit(config);
 
     controller.start();
@@ -648,7 +1383,7 @@ outputs:
 
             data == got || !err_receiver.is_empty()
         },
-        2_000,
+        40_000,
     )
     .expect("timeout: failed to insert data into postgres");
 
@@ -670,7 +1405,7 @@ outputs:
 
             got == upsert_data || !err_receiver.is_empty()
         },
-        2_000,
+        40_000,
     )
     .expect("timeout: failed to update data into postgres");
 }
@@ -678,10 +1413,20 @@ outputs:
 #[test]
 #[serial]
 fn test_pg_delete() {
+    pg_delete(PostgresWriteMode::Materialized)
+}
+
+#[test]
+#[serial]
+fn test_pg_delete_cdc() {
+    pg_delete(PostgresWriteMode::Cdc)
+}
+
+fn pg_delete(mode: PostgresWriteMode) {
     let table_name = "test_pg_delete";
     let url = postgres_url();
 
-    let mut data: Vec<PostgresTestStruct> = (0..2000).map(|_| rand::random()).collect();
+    let mut data: Vec<PostgresTestStruct> = (0..10000).map(|_| rand::random()).collect();
     let mut insert_file = NamedTempFile::new().unwrap();
 
     for datum in data.iter() {
@@ -715,70 +1460,105 @@ fn test_pg_delete() {
         delete_file.write_all(b"}\n").unwrap();
     }
 
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-  ins:
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: raw
-        array: false
-  dels:
-    paused: true
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: insert_delete
-        array: false
-outputs:
-  test_output1:
-    stream: test_output1
-    transport:
-      name: postgres_output
-      config:
-        uri: {url}
-        table: {table_name}
-    index: idx
-"#,
-        insert_file.path().display(),
-        delete_file.path().display(),
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      "inputs": {
+        "ins": {
+          "stream": "test_input1",
+          "transport": {
+            "name": "file_input",
+            "config": {
+              "path": insert_file.path()
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "update_format": "raw",
+              "array": false
+            }
+          }
+        },
+        "dels": {
+          "paused": true,
+          "stream": "test_input1",
+          "transport": {
+            "name": "file_input",
+            "config": {
+              "path": delete_file.path()
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "update_format": "insert_delete",
+              "array": false
+            }
+          }
+        }
+      },
+      "outputs": {
+        "test_output1": {
+          "stream": "test_output1",
+          "transport": {
+            "name": "postgres_output",
+            "config": {
+              "uri": url,
+              "table": table_name,
+              "mode": match mode {
+                  PostgresWriteMode::Materialized => "materialized",
+                  PostgresWriteMode::Cdc => "cdc",
+              }
+            }
+          },
+          "index": "idx"
+        }
+      }
+    }))
+    .unwrap();
+
+    let mut table = PostgresTestStruct::create_table(
+        table_name,
+        url,
+        matches!(mode, PostgresWriteMode::Materialized),
+        &None,
     );
 
-    let mut table = PostgresTestStruct::create_table(table_name, url);
-
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
     let (controller, err_receiver) = PostgresTestStruct::test_circuit(config);
 
     controller.start();
+    data.sort();
 
     wait(
-        || {
-            let rows = table.query();
+        || match mode {
+            PostgresWriteMode::Materialized => {
+                let rows = table.query();
 
-            let mut got = rows
-                .into_iter()
-                .map(PostgresTestStruct::from)
-                .collect::<Vec<_>>();
+                let mut got = rows
+                    .into_iter()
+                    .map(PostgresTestStruct::from)
+                    .collect::<Vec<_>>();
 
-            got.sort();
-            data.sort();
+                got.sort();
 
-            data == got || !err_receiver.is_empty()
+                data == got || !err_receiver.is_empty()
+            }
+            PostgresWriteMode::Cdc => {
+                let rows = table.query();
+
+                let mut got = rows
+                    .into_iter()
+                    .map(PostgresTestStructCdc::from)
+                    .collect::<Vec<_>>();
+
+                got.sort();
+
+                got == data && got.iter().all(|r| r.__feldera_op.as_str() == "i")
+                    || !err_receiver.is_empty()
+            }
         },
-        2_000,
+        40_000,
     )
     .expect("timeout: failed to insert data into postgres");
 
@@ -787,27 +1567,50 @@ outputs:
         .expect("failed to start delete input file connector");
 
     wait(
-        || {
-            let rows = table.query();
+        || match mode {
+            PostgresWriteMode::Materialized => {
+                let rows = table.query();
 
-            let got = rows
-                .into_iter()
-                .map(PostgresTestStruct::from)
-                .collect::<Vec<_>>();
+                let got = rows
+                    .into_iter()
+                    .map(PostgresTestStruct::from)
+                    .collect::<Vec<_>>();
 
-            got.is_empty() || !err_receiver.is_empty()
+                got.is_empty() || !err_receiver.is_empty()
+            }
+            PostgresWriteMode::Cdc => {
+                let rows = table.query();
+
+                let got = rows
+                    .into_iter()
+                    .map(PostgresTestStructCdc::from)
+                    .collect::<Vec<_>>();
+
+                let mut got = got
+                    .iter()
+                    .filter(|r| r.__feldera_op.as_str() != "i")
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                got.sort();
+
+                got.len() == data.len()
+                    && got
+                        .iter()
+                        .skip(data.len())
+                        .all(|r| r.__feldera_op.as_str() == "d")
+                    || !err_receiver.is_empty()
+            }
         },
-        2_000,
+        40_000,
     )
     .expect("timeout: failed to delete data from postgres");
 }
 
-#[test]
-fn test_pg_simple() {
-    let url = postgres_url();
+fn pg_simple(url: String, tls: Option<PostgresTlsConfig>) {
     let table_name = "simple_test";
 
-    let mut client = postgres::Client::connect(&url, NoTls).expect("failed to connect to postgres");
+    let mut client = pg::pg_connect(&url, &tls);
     client
         .execute(
             &format!(
@@ -890,66 +1693,89 @@ fn test_pg_simple() {
 
     let idx = "v1_idx";
 
-    let schema = TestStruct::schema();
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-  ins:
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: raw
-        array: true
-  ups:
-    paused: true
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: insert_delete
-        array: true
-  del:
-    paused: true
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: insert_delete
-        array: true
-outputs:
-  test_output1:
-    stream: test_output1
-    transport:
-      name: postgres_output
-      config:
-        uri: {url}
-        table: {table_name}
-    index: {idx}
-"#,
-        input_file.path().display(),
-        upsert_file.path().display(),
-        delete_file.path().display(),
-    );
+    let mut pg_output_config = json!({
+        "uri": url,
+        "table": table_name,
+    });
+    if let Some(ref tls) = tls {
+        let tls_json = serde_json::to_value(tls).unwrap();
+        pg_output_config
+            .as_object_mut()
+            .unwrap()
+            .extend(tls_json.as_object().unwrap().clone());
+    }
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
+    let schema = TestStruct::schema();
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      "inputs": {
+        "ins": {
+          "stream": "test_input1",
+          "transport": {
+            "name": "file_input",
+            "config": {
+              "path": input_file.path(),
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "update_format": "raw",
+              "array": true
+            }
+          }
+        },
+        "ups": {
+          "paused": true,
+          "stream": "test_input1",
+          "transport": {
+            "name": "file_input",
+            "config": {
+              "path": upsert_file.path()
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "update_format": "insert_delete",
+              "array": true
+            }
+          }
+        },
+        "del": {
+          "paused": true,
+          "stream": "test_input1",
+          "transport": {
+            "name": "file_input",
+            "config": {
+              "path": delete_file.path()
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "update_format": "insert_delete",
+              "array": true
+            }
+          }
+        }
+      },
+      "outputs": {
+        "test_output1": {
+          "stream": "test_output1",
+          "transport": {
+            "name": "postgres_output",
+            "config": pg_output_config,
+          },
+          "index": idx
+        }
+      }
+    }))
+    .unwrap();
 
     let (err_sender, err_receiver) = crossbeam::channel::unbounded();
-    let controller = Controller::with_config(
+    let controller = Controller::with_test_config(
         move |workers| {
             Ok({
                 let (circuit, catalog) = Runtime::init_circuit(workers, move |circuit| {
@@ -992,8 +1818,8 @@ outputs:
                             Self { field0: t.0 }
                         }
                     }
-                    deserialize_table_record!(KeyStruct["v1_idx", 1] {
-                        (field0, "id", false, u32, None)
+                    deserialize_table_record!(KeyStruct["v1_idx", Variant, 1] {
+                        (field0, "id", false, u32, |_| None)
                     });
                     serialize_table_record!(KeyStruct[1]{
                         field0["id"]: u32
@@ -1020,7 +1846,7 @@ outputs:
             })
         },
         &config,
-        Box::new(move |e| {
+        Box::new(move |e, _| {
             let msg = format!("postgres_output_test: error: {e}");
             println!("{msg}");
             err_sender.send(msg).unwrap()
@@ -1034,7 +1860,10 @@ outputs:
         ||
             {
                 let rows = client
-                    .query(&format!("SELECT * FROM {table_name}"), &[])
+                    .query(
+                        &format!("SELECT * FROM {table_name} ORDER BY id"),
+                        &[],
+                    )
                     .unwrap();
                 let got: Vec<TestStruct> = rows
                     .into_iter()
@@ -1096,4 +1925,1165 @@ outputs:
     client
         .execute(&format!("DROP TABLE {table_name}"), &[])
         .unwrap();
+}
+
+#[test]
+fn test_pg_simple() {
+    pg_simple(postgres_url(), None);
+}
+
+/// Same as `test_pg_simple` but over a TLS connection.
+#[test]
+fn test_pg_simple_tls() {
+    let (url, tls) = postgres_ssl_config();
+    pg_simple(url, Some(tls));
+}
+
+/// Test the postgres *input* connector over a TLS connection.
+///
+/// Inserts rows into TLS-enabled postgres directly, then reads them back
+/// through the `postgres_input` transport and writes them to a file.
+#[test]
+#[serial]
+fn test_pg_input_tls() {
+    let (url, tls) = postgres_ssl_config();
+    let table_name = "test_pg_input_tls";
+
+    // -- seed the table via the sync client --
+    let mut client = pg::pg_connect(&url, &Some(tls.clone()));
+    client
+        .execute(
+            &format!(
+                r#"CREATE TABLE IF NOT EXISTS {table_name} (
+    id int primary key,
+    b bool not null,
+    i int8,
+    s varchar not null
+)"#
+            ),
+            &[],
+        )
+        .expect("failed to create test table");
+    client
+        .execute(&format!("TRUNCATE {table_name}"), &[])
+        .unwrap();
+    client
+        .execute(
+            &format!("INSERT INTO {table_name} VALUES (1, true, NULL, 'hello')"),
+            &[],
+        )
+        .unwrap();
+    client
+        .execute(
+            &format!("INSERT INTO {table_name} VALUES (2, false, 42, 'world')"),
+            &[],
+        )
+        .unwrap();
+
+    // -- set up the pipeline: postgres_input -> file_output --
+    let output_file = NamedTempFile::new().unwrap();
+    let output_path = output_file.path().to_owned();
+
+    let mut pg_input_config = json!({
+        "uri": url,
+        "query": format!("SELECT * FROM {table_name} ORDER BY id"),
+    });
+    let tls_json = serde_json::to_value(&tls).unwrap();
+    pg_input_config
+        .as_object_mut()
+        .unwrap()
+        .extend(tls_json.as_object().unwrap().clone());
+
+    let schema = TestStruct::schema();
+    let config = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 1,
+        "inputs": {
+            "pg_in": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "postgres_input",
+                    "config": pg_input_config,
+                },
+            },
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": output_path,
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "update_format": "insert_delete",
+                        "array": false,
+                    }
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let (err_sender, err_receiver) = crossbeam::channel::unbounded();
+    let controller = Controller::with_test_config(
+        move |workers| {
+            Ok({
+                let (circuit, catalog) = Runtime::init_circuit(workers, move |circuit| {
+                    let mut catalog = Catalog::new();
+                    let (input, hinput) = circuit.add_input_zset::<TestStruct>();
+
+                    let input_schema = serde_json::to_string(&Relation::new(
+                        "test_input1".into(),
+                        schema.clone(),
+                        false,
+                        BTreeMap::new(),
+                    ))
+                    .unwrap();
+
+                    let output_schema = serde_json::to_string(&Relation::new(
+                        "test_output1".into(),
+                        schema,
+                        false,
+                        BTreeMap::new(),
+                    ))
+                    .unwrap();
+
+                    catalog.register_materialized_input_zset::<_, TestStruct>(
+                        input.clone(),
+                        hinput,
+                        &input_schema,
+                    );
+
+                    catalog
+                        .register_materialized_output_zset::<_, TestStruct>(input, &output_schema);
+
+                    Ok(catalog)
+                })
+                .unwrap();
+                (circuit, Box::new(catalog))
+            })
+        },
+        &config,
+        Box::new(move |e, _| {
+            let msg = format!("test_pg_input_tls: error: {e}");
+            println!("{msg}");
+            err_sender.send(msg).unwrap()
+        }),
+    )
+    .unwrap();
+
+    controller.start();
+
+    // Wait for the output file to contain the expected data.
+    wait(
+        || {
+            let content = std::fs::read_to_string(&output_path).unwrap_or_default();
+            let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+            lines.len() >= 2 || !err_receiver.is_empty()
+        },
+        10_000,
+    )
+    .expect("timeout: postgres input TLS test did not produce output");
+
+    assert!(err_receiver.is_empty(), "unexpected errors in pipeline");
+
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    let rows: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["insert"]["id"], 1);
+    assert_eq!(rows[0]["insert"]["b"], true);
+    assert!(rows[0]["insert"]["i"].is_null());
+    assert_eq!(rows[0]["insert"]["s"], "hello");
+    assert_eq!(rows[1]["insert"]["id"], 2);
+    assert_eq!(rows[1]["insert"]["b"], false);
+    assert_eq!(rows[1]["insert"]["i"], 42);
+    assert_eq!(rows[1]["insert"]["s"], "world");
+
+    controller.stop().unwrap();
+
+    client
+        .execute(&format!("DROP TABLE {table_name}"), &[])
+        .unwrap();
+}
+
+// ===================================================================
+// Postgres CDC input connector integration tests
+//
+// These tests require:
+// - wal_level=logical on the Postgres instance
+// - The connecting user must have REPLICATION privilege
+// - The `with-postgres-cdc` feature must be enabled
+//
+// They are gated behind #[ignore] so they don't run in normal CI.
+// Run with: cargo test -p dbsp_adapters --features with-postgres-cdc -- --ignored
+// ===================================================================
+
+#[cfg(feature = "with-postgres-cdc")]
+mod cdc_tests {
+    use super::*;
+    use crate::test::wait;
+    use pg::pg_connect;
+
+    /// Helper: creates a table, publication, and sets REPLICA IDENTITY FULL.
+    /// Returns a connected client for further DML operations.
+    /// On drop, cleans up the publication and table.
+    struct CdcTestTable {
+        client: postgres::Client,
+        table_name: String,
+        publication_name: String,
+    }
+
+    impl CdcTestTable {
+        fn new_simple(table_name: &str, publication_name: &str, url: &str) -> Self {
+            let mut client = pg_connect(url, &None);
+
+            // Clean up any leftover objects from previous runs.
+            let _ = client.execute(
+                &format!("DROP PUBLICATION IF EXISTS {publication_name}"),
+                &[],
+            );
+            let _ = client.execute(&format!("DROP TABLE IF EXISTS {table_name}"), &[]);
+
+            client
+                .execute(
+                    &format!(
+                        r#"CREATE TABLE {table_name} (
+    id   INTEGER PRIMARY KEY,
+    b    BOOLEAN NOT NULL,
+    i    BIGINT,
+    s    VARCHAR NOT NULL
+)"#
+                    ),
+                    &[],
+                )
+                .expect("failed to create CDC test table");
+
+            client
+                .execute(
+                    &format!("ALTER TABLE {table_name} REPLICA IDENTITY FULL"),
+                    &[],
+                )
+                .expect("failed to set REPLICA IDENTITY FULL");
+
+            client
+                .execute(
+                    &format!("CREATE PUBLICATION {publication_name} FOR TABLE {table_name}"),
+                    &[],
+                )
+                .expect("failed to create publication");
+
+            CdcTestTable {
+                client,
+                table_name: table_name.to_string(),
+                publication_name: publication_name.to_string(),
+            }
+        }
+
+        /// Creates a table with many Postgres types for data type coverage testing.
+        fn new_all_types(table_name: &str, publication_name: &str, url: &str) -> Self {
+            let mut client = pg_connect(url, &None);
+
+            let _ = client.execute(
+                &format!("DROP PUBLICATION IF EXISTS {publication_name}"),
+                &[],
+            );
+            let _ = client.execute(&format!("DROP TABLE IF EXISTS {table_name}"), &[]);
+
+            client
+                .execute(
+                    &format!(
+                        r#"CREATE TABLE {table_name} (
+    id              SERIAL PRIMARY KEY,
+    col_text        TEXT,
+    col_integer     INTEGER,
+    col_bigint      BIGINT,
+    col_boolean     BOOLEAN,
+    col_real        REAL,
+    col_double      DOUBLE PRECISION,
+    col_date        DATE,
+    col_time        TIME,
+    col_timestamp   TIMESTAMP,
+    col_timestamptz TIMESTAMPTZ,
+    col_uuid        UUID,
+    col_jsonb       JSONB,
+    col_bytea       BYTEA,
+    col_numeric     NUMERIC(10,2),
+    col_smallint    SMALLINT,
+    col_int_array   INTEGER[]
+)"#
+                    ),
+                    &[],
+                )
+                .expect("failed to create CDC all-types test table");
+
+            client
+                .execute(
+                    &format!("ALTER TABLE {table_name} REPLICA IDENTITY FULL"),
+                    &[],
+                )
+                .expect("failed to set REPLICA IDENTITY FULL");
+
+            client
+                .execute(
+                    &format!("CREATE PUBLICATION {publication_name} FOR TABLE {table_name}"),
+                    &[],
+                )
+                .expect("failed to create publication");
+
+            CdcTestTable {
+                client,
+                table_name: table_name.to_string(),
+                publication_name: publication_name.to_string(),
+            }
+        }
+
+        fn execute(&mut self, query: &str) {
+            self.client
+                .execute(query, &[])
+                .unwrap_or_else(|e| panic!("failed to execute '{query}': {e}"));
+        }
+    }
+
+    impl Drop for CdcTestTable {
+        fn drop(&mut self) {
+            // Drop replication slots that etl may have created for this publication.
+            // etl creates slots with names based on the publication name.
+            let slots: Vec<String> = self
+                .client
+                .query(
+                    "SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE $1",
+                    &[&format!("%{}%", &self.publication_name)],
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.get::<_, String>("slot_name"))
+                .collect();
+            for slot in slots {
+                let _ = self
+                    .client
+                    .execute(&format!("SELECT pg_drop_replication_slot('{slot}')"), &[]);
+            }
+            let _ = self.client.execute(
+                &format!("DROP PUBLICATION IF EXISTS {}", self.publication_name),
+                &[],
+            );
+            let _ = self
+                .client
+                .execute(&format!("DROP TABLE IF EXISTS {}", self.table_name), &[]);
+        }
+    }
+
+    /// Build a test circuit that reads from CDC input and writes to a file output.
+    /// The input schema matches the "simple" table (id, b, i, s).
+    fn cdc_simple_test_circuit(
+        url: &str,
+        publication: &str,
+        source_table: &str,
+        output_path: &Path,
+    ) -> (Controller, crossbeam::channel::Receiver<String>) {
+        let schema = TestStruct::schema();
+        let config = serde_json::from_value(json!({
+            "name": "cdc_test",
+            "workers": 1,
+            "inputs": {
+                "cdc_in": {
+                    "stream": "test_input1",
+                    "transport": {
+                        "name": "postgres_cdc_input",
+                        "config": {
+                            "uri": url,
+                            "publication": publication,
+                            "source_table": source_table,
+                        },
+                    },
+                },
+            },
+            "outputs": {
+                "test_output1": {
+                    "stream": "test_output1",
+                    "transport": {
+                        "name": "file_output",
+                        "config": {
+                            "path": output_path,
+                        }
+                    },
+                    "format": {
+                        "name": "json",
+                        "config": {
+                            "update_format": "insert_delete",
+                            "array": false,
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let (err_sender, err_receiver) = crossbeam::channel::unbounded();
+        let controller = Controller::with_test_config(
+            move |workers| {
+                Ok({
+                    let (circuit, catalog) = Runtime::init_circuit(workers, move |circuit| {
+                        let mut catalog = Catalog::new();
+                        let (input, hinput) = circuit.add_input_zset::<TestStruct>();
+
+                        let input_schema = serde_json::to_string(&Relation::new(
+                            "test_input1".into(),
+                            schema.clone(),
+                            false,
+                            BTreeMap::new(),
+                        ))
+                        .unwrap();
+
+                        let output_schema = serde_json::to_string(&Relation::new(
+                            "test_output1".into(),
+                            schema,
+                            false,
+                            BTreeMap::new(),
+                        ))
+                        .unwrap();
+
+                        catalog.register_materialized_input_zset::<_, TestStruct>(
+                            input.clone(),
+                            hinput,
+                            &input_schema,
+                        );
+
+                        catalog.register_materialized_output_zset::<_, TestStruct>(
+                            input,
+                            &output_schema,
+                        );
+
+                        Ok(catalog)
+                    })
+                    .unwrap();
+                    (circuit, Box::new(catalog))
+                })
+            },
+            &config,
+            Box::new(move |e, _| {
+                let msg = format!("cdc_test: error: {e}");
+                println!("{msg}");
+                err_sender.send(msg).unwrap()
+            }),
+        )
+        .unwrap();
+
+        (controller, err_receiver)
+    }
+
+    /// Helper struct for the all-types test. Uses simple JSON deserialization
+    /// since the CDC connector produces JSON.
+    #[derive(
+        Debug,
+        Default,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        serde::Serialize,
+        serde::Deserialize,
+        Clone,
+        Hash,
+        size_of::SizeOf,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize,
+        feldera_macros::IsNone,
+    )]
+    #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+    struct CdcAllTypesStruct {
+        id: i32,
+        col_text: Option<String>,
+        col_integer: Option<i32>,
+        col_bigint: Option<i64>,
+        col_boolean: Option<bool>,
+        col_real: Option<feldera_sqllib::F32>,
+        col_double: Option<feldera_sqllib::F64>,
+        col_date: Option<String>,
+        col_time: Option<String>,
+        col_timestamp: Option<String>,
+        col_timestamptz: Option<String>,
+        col_uuid: Option<String>,
+        col_jsonb: Option<feldera_sqllib::Variant>,
+        col_bytea: Option<String>,
+        col_numeric: Option<String>,
+        col_smallint: Option<i16>,
+        col_int_array: Option<Vec<Option<i32>>>,
+    }
+
+    feldera_types::deserialize_table_record!(CdcAllTypesStruct["CdcAllTypesStruct", Variant, 17] {
+        (id, "id", false, i32, |_| None),
+        (col_text, "col_text", true, Option<String>, |_| Some(None)),
+        (col_integer, "col_integer", true, Option<i32>, |_| Some(None)),
+        (col_bigint, "col_bigint", true, Option<i64>, |_| Some(None)),
+        (col_boolean, "col_boolean", true, Option<bool>, |_| Some(None)),
+        (col_real, "col_real", true, Option<feldera_sqllib::F32>, |_| Some(None)),
+        (col_double, "col_double", true, Option<feldera_sqllib::F64>, |_| Some(None)),
+        (col_date, "col_date", true, Option<String>, |_| Some(None)),
+        (col_time, "col_time", true, Option<String>, |_| Some(None)),
+        (col_timestamp, "col_timestamp", true, Option<String>, |_| Some(None)),
+        (col_timestamptz, "col_timestamptz", true, Option<String>, |_| Some(None)),
+        (col_uuid, "col_uuid", true, Option<String>, |_| Some(None)),
+        (col_jsonb, "col_jsonb", true, Option<feldera_sqllib::Variant>, |_| Some(None)),
+        (col_bytea, "col_bytea", true, Option<String>, |_| Some(None)),
+        (col_numeric, "col_numeric", true, Option<String>, |_| Some(None)),
+        (col_smallint, "col_smallint", true, Option<i16>, |_| Some(None)),
+        (col_int_array, "col_int_array", true, Option<Vec<Option<i32>>>, |_| Some(None))
+    });
+
+    feldera_types::serialize_table_record!(CdcAllTypesStruct[17]{
+        id["id"]: i32,
+        col_text["col_text"]: Option<String>,
+        col_integer["col_integer"]: Option<i32>,
+        col_bigint["col_bigint"]: Option<i64>,
+        col_boolean["col_boolean"]: Option<bool>,
+        col_real["col_real"]: Option<feldera_sqllib::F32>,
+        col_double["col_double"]: Option<feldera_sqllib::F64>,
+        col_date["col_date"]: Option<String>,
+        col_time["col_time"]: Option<String>,
+        col_timestamp["col_timestamp"]: Option<String>,
+        col_timestamptz["col_timestamptz"]: Option<String>,
+        col_uuid["col_uuid"]: Option<String>,
+        col_jsonb["col_jsonb"]: Option<feldera_sqllib::Variant>,
+        col_bytea["col_bytea"]: Option<String>,
+        col_numeric["col_numeric"]: Option<String>,
+        col_smallint["col_smallint"]: Option<i16>,
+        col_int_array["col_int_array"]: Option<Vec<Option<i32>>>
+    });
+
+    impl CdcAllTypesStruct {
+        fn schema() -> Vec<Field> {
+            vec![
+                Field::new("id".into(), ColumnType::int(false)),
+                Field::new("col_text".into(), ColumnType::varchar(true)),
+                Field::new("col_integer".into(), ColumnType::int(true)),
+                Field::new("col_bigint".into(), ColumnType::bigint(true)),
+                Field::new("col_boolean".into(), ColumnType::boolean(true)),
+                Field::new("col_real".into(), ColumnType::real(true)),
+                Field::new("col_double".into(), ColumnType::double(true)),
+                Field::new("col_date".into(), ColumnType::varchar(true)),
+                Field::new("col_time".into(), ColumnType::varchar(true)),
+                Field::new("col_timestamp".into(), ColumnType::varchar(true)),
+                Field::new("col_timestamptz".into(), ColumnType::varchar(true)),
+                Field::new("col_uuid".into(), ColumnType::varchar(true)),
+                Field::new("col_jsonb".into(), ColumnType::variant(true)),
+                Field::new("col_bytea".into(), ColumnType::varchar(true)),
+                Field::new("col_numeric".into(), ColumnType::varchar(true)),
+                Field::new("col_smallint".into(), ColumnType::smallint(true)),
+                Field::new(
+                    "col_int_array".into(),
+                    ColumnType::array(true, ColumnType::int(true)),
+                ),
+            ]
+        }
+    }
+
+    fn cdc_all_types_test_circuit(
+        url: &str,
+        publication: &str,
+        source_table: &str,
+        output_path: &Path,
+    ) -> (Controller, crossbeam::channel::Receiver<String>) {
+        let schema = CdcAllTypesStruct::schema();
+        let config = serde_json::from_value(json!({
+            "name": "cdc_all_types_test",
+            "workers": 1,
+            "inputs": {
+                "cdc_in": {
+                    "stream": "test_input1",
+                    "transport": {
+                        "name": "postgres_cdc_input",
+                        "config": {
+                            "uri": url,
+                            "publication": publication,
+                            "source_table": source_table,
+                        },
+                    },
+                },
+            },
+            "outputs": {
+                "test_output1": {
+                    "stream": "test_output1",
+                    "transport": {
+                        "name": "file_output",
+                        "config": {
+                            "path": output_path,
+                        }
+                    },
+                    "format": {
+                        "name": "json",
+                        "config": {
+                            "update_format": "insert_delete",
+                            "array": false,
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let (err_sender, err_receiver) = crossbeam::channel::unbounded();
+        let controller = Controller::with_test_config(
+            move |workers| {
+                Ok({
+                    let (circuit, catalog) = Runtime::init_circuit(workers, move |circuit| {
+                        let mut catalog = Catalog::new();
+                        let (input, hinput) = circuit.add_input_zset::<CdcAllTypesStruct>();
+
+                        let input_schema = serde_json::to_string(&Relation::new(
+                            "test_input1".into(),
+                            schema.clone(),
+                            false,
+                            BTreeMap::new(),
+                        ))
+                        .unwrap();
+
+                        let output_schema = serde_json::to_string(&Relation::new(
+                            "test_output1".into(),
+                            schema,
+                            false,
+                            BTreeMap::new(),
+                        ))
+                        .unwrap();
+
+                        catalog.register_materialized_input_zset::<_, CdcAllTypesStruct>(
+                            input.clone(),
+                            hinput,
+                            &input_schema,
+                        );
+
+                        catalog.register_materialized_output_zset::<_, CdcAllTypesStruct>(
+                            input,
+                            &output_schema,
+                        );
+
+                        Ok(catalog)
+                    })
+                    .unwrap();
+                    (circuit, Box::new(catalog))
+                })
+            },
+            &config,
+            Box::new(move |e, _| {
+                let msg = format!("cdc_all_types_test: error: {e}");
+                println!("{msg}");
+                err_sender.send(msg).unwrap()
+            }),
+        )
+        .unwrap();
+
+        (controller, err_receiver)
+    }
+
+    /// Helper: read output file lines as JSON values.
+    fn read_output_json(path: &Path) -> Vec<serde_json::Value> {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Helper: count the number of "insert" entries in the output.
+    fn count_inserts(rows: &[serde_json::Value]) -> usize {
+        rows.iter().filter(|r| r.get("insert").is_some()).count()
+    }
+
+    /// Helper: count the number of "delete" entries in the output.
+    fn count_deletes(rows: &[serde_json::Value]) -> usize {
+        rows.iter().filter(|r| r.get("delete").is_some()).count()
+    }
+
+    // -------------------------------------------------------------------
+    // Test 1: Basic CDC insert test
+    // -------------------------------------------------------------------
+
+    /// Tests that the CDC connector picks up rows inserted into a Postgres table
+    /// via the initial snapshot and/or logical replication stream.
+    ///
+    /// Requires: wal_level=logical, user with REPLICATION privilege.
+    #[test]
+    #[serial]
+    #[ignore]
+    fn test_cdc_basic_insert() {
+        let url = postgres_url();
+        let table_name = "cdc_test_basic_insert";
+        let publication = "cdc_pub_basic_insert";
+
+        // Pre-insert some rows before starting the pipeline (tests snapshot).
+        let mut table = CdcTestTable::new_simple(table_name, publication, &url);
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (1, true, NULL, 'hello')"
+        ));
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (2, false, 42, 'world')"
+        ));
+
+        let output_file = NamedTempFile::new().unwrap();
+        let output_path = output_file.path().to_owned();
+
+        let (controller, err_receiver) = cdc_simple_test_circuit(
+            &url,
+            publication,
+            &format!("public.{table_name}"),
+            &output_path,
+        );
+
+        controller.start();
+
+        // Wait for the snapshot data to appear in the output.
+        wait(
+            || {
+                let rows = read_output_json(&output_path);
+                count_inserts(&rows) >= 2 || !err_receiver.is_empty()
+            },
+            60_000,
+        )
+        .expect("timeout: CDC basic insert test did not receive snapshot rows");
+
+        assert!(err_receiver.is_empty(), "unexpected errors in CDC pipeline");
+
+        // Now insert more rows while the pipeline is running (tests replication).
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (3, true, 100, 'streaming')"
+        ));
+
+        wait(
+            || {
+                let rows = read_output_json(&output_path);
+                count_inserts(&rows) >= 3 || !err_receiver.is_empty()
+            },
+            60_000,
+        )
+        .expect("timeout: CDC basic insert test did not receive streamed row");
+
+        let rows = read_output_json(&output_path);
+        assert!(count_inserts(&rows) >= 3);
+
+        // Verify the content of the rows
+        let inserts: Vec<&serde_json::Value> =
+            rows.iter().filter_map(|r| r.get("insert")).collect();
+
+        // Check that we have rows with ids 1, 2, 3
+        let ids: Vec<i64> = inserts
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
+            .collect();
+        assert!(ids.contains(&1), "missing row with id=1");
+        assert!(ids.contains(&2), "missing row with id=2");
+        assert!(ids.contains(&3), "missing row with id=3");
+
+        controller.stop().unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 2: Data type coverage test
+    // -------------------------------------------------------------------
+
+    /// Tests CDC replication of all common Postgres data types.
+    ///
+    /// Requires: wal_level=logical, user with REPLICATION privilege.
+    #[test]
+    #[serial]
+    #[ignore]
+    fn test_cdc_all_data_types() {
+        let url = postgres_url();
+        let table_name = "cdc_test_all_types";
+        let publication = "cdc_pub_all_types";
+
+        let mut table = CdcTestTable::new_all_types(table_name, publication, &url);
+
+        // Insert a row with all types populated.
+        table.execute(&format!(
+            r#"INSERT INTO {table_name} (
+                id, col_text, col_integer, col_bigint, col_boolean,
+                col_real, col_double, col_date, col_time,
+                col_timestamp, col_timestamptz, col_uuid, col_jsonb,
+                col_bytea, col_numeric, col_smallint, col_int_array
+            ) VALUES (
+                1, 'hello world', 42, 9876543210, true,
+                3.14, 2.718281828, '2024-06-15', '14:30:00',
+                '2024-01-01 12:00:00', '2024-01-01 12:00:00+00', '550e8400-e29b-41d4-a716-446655440000',
+                '{{"key": "value", "nested": {{"a": 1}}}}',
+                E'\\xDEADBEEF', 12345.67, 7, ARRAY[1, 2, 3]
+            )"#
+        ));
+
+        // Insert a row with NULLs for nullable columns.
+        table.execute(&format!(r#"INSERT INTO {table_name} (id) VALUES (2)"#));
+
+        let output_file = NamedTempFile::new().unwrap();
+        let output_path = output_file.path().to_owned();
+
+        let (controller, err_receiver) = cdc_all_types_test_circuit(
+            &url,
+            publication,
+            &format!("public.{table_name}"),
+            &output_path,
+        );
+
+        controller.start();
+
+        // Wait for both rows to appear.
+        wait(
+            || {
+                let rows = read_output_json(&output_path);
+                count_inserts(&rows) >= 2 || !err_receiver.is_empty()
+            },
+            60_000,
+        )
+        .expect("timeout: CDC all-types test did not receive rows");
+
+        assert!(
+            err_receiver.is_empty(),
+            "unexpected errors in CDC all-types pipeline"
+        );
+
+        let rows = read_output_json(&output_path);
+        let inserts: Vec<&serde_json::Value> =
+            rows.iter().filter_map(|r| r.get("insert")).collect();
+
+        // Find the fully-populated row (id=1).
+        let row1 = inserts
+            .iter()
+            .find(|r| r.get("id").and_then(|v| v.as_i64()) == Some(1))
+            .expect("missing row with id=1");
+
+        // Verify types are present and correctly encoded.
+        assert_eq!(row1["col_text"], json!("hello world"));
+        assert_eq!(row1["col_integer"], json!(42));
+        assert_eq!(row1["col_bigint"], json!(9876543210i64));
+        assert_eq!(row1["col_boolean"], json!(true));
+        // Float values: compare approximately
+        assert!(row1["col_real"].as_f64().unwrap() > 3.13);
+        assert!(row1["col_real"].as_f64().unwrap() < 3.15);
+        assert!(row1["col_double"].as_f64().unwrap() > 2.71);
+        assert!(row1["col_double"].as_f64().unwrap() < 2.72);
+        // Date, time, timestamp are encoded as strings
+        assert!(
+            row1["col_date"].as_str().unwrap().contains("2024-06-15"),
+            "col_date mismatch: {:?}",
+            row1["col_date"]
+        );
+        assert!(
+            row1["col_time"].as_str().unwrap().contains("14:30"),
+            "col_time mismatch: {:?}",
+            row1["col_time"]
+        );
+        assert!(
+            row1["col_timestamp"]
+                .as_str()
+                .unwrap()
+                .contains("2024-01-01"),
+            "col_timestamp mismatch: {:?}",
+            row1["col_timestamp"]
+        );
+        assert!(
+            row1["col_timestamptz"].as_str().unwrap().contains("2024"),
+            "col_timestamptz mismatch: {:?}",
+            row1["col_timestamptz"]
+        );
+        // UUID
+        assert_eq!(
+            row1["col_uuid"].as_str().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        // JSONB - should be passed through as JSON
+        assert!(row1["col_jsonb"].is_object() || row1["col_jsonb"].is_string());
+        // BYTEA - encoded as hex string
+        assert!(
+            row1["col_bytea"].as_str().is_some(),
+            "col_bytea should be a string: {:?}",
+            row1["col_bytea"]
+        );
+        // NUMERIC - encoded as string to preserve precision
+        assert!(
+            row1["col_numeric"].as_str().is_some(),
+            "col_numeric should be a string: {:?}",
+            row1["col_numeric"]
+        );
+        assert_eq!(row1["col_smallint"], json!(7));
+        // Integer array
+        assert!(row1["col_int_array"].is_array());
+        let arr = row1["col_int_array"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+
+        // Find the NULL row (id=2).
+        let row2 = inserts
+            .iter()
+            .find(|r| r.get("id").and_then(|v| v.as_i64()) == Some(2))
+            .expect("missing row with id=2");
+
+        assert!(row2["col_text"].is_null());
+        assert!(row2["col_integer"].is_null());
+        assert!(row2["col_bigint"].is_null());
+        assert!(row2["col_boolean"].is_null());
+        assert!(row2["col_uuid"].is_null());
+        assert!(row2["col_jsonb"].is_null());
+        assert!(row2["col_bytea"].is_null());
+
+        controller.stop().unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 3: Update and delete test
+    // -------------------------------------------------------------------
+
+    /// Tests that the CDC connector correctly captures UPDATE and DELETE operations.
+    ///
+    /// Requires: wal_level=logical, user with REPLICATION privilege, REPLICA IDENTITY FULL.
+    #[test]
+    #[serial]
+    #[ignore]
+    fn test_cdc_update_delete() {
+        let url = postgres_url();
+        let table_name = "cdc_test_upd_del";
+        let publication = "cdc_pub_upd_del";
+
+        let mut table = CdcTestTable::new_simple(table_name, publication, &url);
+
+        let output_file = NamedTempFile::new().unwrap();
+        let output_path = output_file.path().to_owned();
+
+        let (controller, err_receiver) = cdc_simple_test_circuit(
+            &url,
+            publication,
+            &format!("public.{table_name}"),
+            &output_path,
+        );
+
+        controller.start();
+
+        // Give the pipeline a moment to start and establish the replication connection.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Phase 1: Insert rows.
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (1, true, 10, 'alpha')"
+        ));
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (2, false, 20, 'beta')"
+        ));
+
+        wait(
+            || {
+                let rows = read_output_json(&output_path);
+                count_inserts(&rows) >= 2 || !err_receiver.is_empty()
+            },
+            60_000,
+        )
+        .expect("timeout: CDC update/delete test did not receive initial inserts");
+
+        // Phase 2: Update a row.
+        table.execute(&format!(
+            "UPDATE {table_name} SET s = 'alpha_updated', i = 11 WHERE id = 1"
+        ));
+
+        // An UPDATE with REPLICA IDENTITY FULL should produce a delete of the old
+        // row and an insert of the new row in Feldera's insert/delete model.
+        wait(
+            || {
+                let rows = read_output_json(&output_path);
+                // We should see at least one delete (the old row) and one more insert
+                // (the new row) beyond the initial 2 inserts.
+                let ins = count_inserts(&rows);
+                let dels = count_deletes(&rows);
+                (ins >= 3 && dels >= 1) || !err_receiver.is_empty()
+            },
+            60_000,
+        )
+        .expect("timeout: CDC update/delete test did not receive update events");
+
+        // Phase 3: Delete a row.
+        table.execute(&format!("DELETE FROM {table_name} WHERE id = 2"));
+
+        wait(
+            || {
+                let rows = read_output_json(&output_path);
+                let dels = count_deletes(&rows);
+                dels >= 2 || !err_receiver.is_empty()
+            },
+            60_000,
+        )
+        .expect("timeout: CDC update/delete test did not receive delete event");
+
+        assert!(
+            err_receiver.is_empty(),
+            "unexpected errors in CDC update/delete pipeline"
+        );
+
+        let rows = read_output_json(&output_path);
+
+        // Verify the delete for id=2 is present.
+        let deletes: Vec<&serde_json::Value> =
+            rows.iter().filter_map(|r| r.get("delete")).collect();
+        let deleted_ids: Vec<i64> = deletes
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
+            .collect();
+        assert!(
+            deleted_ids.contains(&2),
+            "missing delete for id=2, got deletes: {:?}",
+            deleted_ids
+        );
+
+        // Verify the updated row (id=1, s='alpha_updated') is present in inserts.
+        let inserts: Vec<&serde_json::Value> =
+            rows.iter().filter_map(|r| r.get("insert")).collect();
+        let updated = inserts.iter().find(|r| {
+            r.get("id").and_then(|v| v.as_i64()) == Some(1)
+                && r.get("s").and_then(|v| v.as_str()) == Some("alpha_updated")
+        });
+        assert!(
+            updated.is_some(),
+            "missing updated row (id=1, s='alpha_updated') in inserts"
+        );
+
+        controller.stop().unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Test 4: Restart/resume test
+    // -------------------------------------------------------------------
+
+    /// Tests that the pipeline resumes from the replication slot position after
+    /// restart, instead of re-snapshotting the entire table.
+    ///
+    /// Requires: wal_level=logical, user with REPLICATION privilege.
+    #[test]
+    #[serial]
+    #[ignore]
+    fn test_cdc_restart_resumes_from_slot() {
+        let url = postgres_url();
+        let table_name = "cdc_test_restart";
+        let publication = "cdc_pub_restart";
+
+        // Insert initial rows.
+        let mut table = CdcTestTable::new_simple(table_name, publication, &url);
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (1, true, NULL, 'first')"
+        ));
+
+        // --- First pipeline run ---
+        let output_file_1 = NamedTempFile::new().unwrap();
+        let output_path_1 = output_file_1.path().to_owned();
+
+        let (controller_1, err_receiver_1) = cdc_simple_test_circuit(
+            &url,
+            publication,
+            &format!("public.{table_name}"),
+            &output_path_1,
+        );
+
+        controller_1.start();
+
+        // Wait for the snapshot row to appear.
+        wait(
+            || {
+                let rows = read_output_json(&output_path_1);
+                count_inserts(&rows) >= 1 || !err_receiver_1.is_empty()
+            },
+            60_000,
+        )
+        .expect("timeout: first run did not receive snapshot row");
+
+        assert!(
+            err_receiver_1.is_empty(),
+            "unexpected errors in first pipeline run"
+        );
+
+        // Insert a second row while the pipeline is running.
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (2, false, 42, 'second')"
+        ));
+
+        wait(
+            || {
+                let rows = read_output_json(&output_path_1);
+                count_inserts(&rows) >= 2 || !err_receiver_1.is_empty()
+            },
+            60_000,
+        )
+        .expect("timeout: first run did not receive streamed row");
+
+        // Stop the first pipeline.
+        controller_1.stop().unwrap();
+
+        // Small delay to let the replication slot become inactive.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // --- Second pipeline run (restart) ---
+        let output_file_2 = NamedTempFile::new().unwrap();
+        let output_path_2 = output_file_2.path().to_owned();
+
+        let (controller_2, err_receiver_2) = cdc_simple_test_circuit(
+            &url,
+            publication,
+            &format!("public.{table_name}"),
+            &output_path_2,
+        );
+
+        controller_2.start();
+
+        // Insert a third row in the restarted pipeline.
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (3, true, 99, 'third')"
+        ));
+
+        // Wait for the third row to appear.
+        wait(
+            || {
+                let rows = read_output_json(&output_path_2);
+                count_inserts(&rows) >= 1 || !err_receiver_2.is_empty()
+            },
+            60_000,
+        )
+        .expect("timeout: second run did not receive any rows");
+
+        assert!(
+            err_receiver_2.is_empty(),
+            "unexpected errors in second pipeline run"
+        );
+
+        let rows = read_output_json(&output_path_2);
+        let inserts: Vec<&serde_json::Value> =
+            rows.iter().filter_map(|r| r.get("insert")).collect();
+
+        let ids: Vec<i64> = inserts
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
+            .collect();
+
+        // The third row (id=3) must be present — it was inserted after restart.
+        assert!(
+            ids.contains(&3),
+            "missing row with id=3 after restart, got ids: {ids:?}"
+        );
+
+        // Row id=1 should NOT be re-snapshotted in the second run's output.
+        // If PostgresStore is working correctly, etl resumes from the slot
+        // position and skips the snapshot phase.
+        //
+        // Note: some replay of recent rows (id=2) is acceptable under
+        // at-least-once semantics, but a full re-snapshot (id=1 appearing)
+        // indicates the stored state was not preserved.
+        assert!(
+            !ids.contains(&1),
+            "row id=1 was re-snapshotted after restart — PostgresStore state \
+             was not preserved. Got ids: {ids:?}"
+        );
+
+        controller_2.stop().unwrap();
+    }
 }

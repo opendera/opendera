@@ -80,46 +80,49 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
 
     /**
      * The output that used to be computed by 'old' is now
-     * computed by 'newOp',
-     * @param old    Operator in the previous circuit.
-     * @param newOp  Operator replacing it in the new circuit.
-     * @param add    If true add the operator to the new circuit.
-     *               This may not be necessary if the operator has already been added. */
-    protected void map(OutputPort old, OutputPort newOp, boolean add) {
-        if (!old.equals(newOp)) {
+     * computed by 'newPort',
+     * @param oldPort  Port in the previous circuit.
+     * @param newPort  Port replacing it in the new circuit.
+     * @param add      If true add the newPort.node() operator to the new circuit.
+     *                 This may not be necessary if the operator has already been added. */
+    protected void map(OutputPort oldPort, OutputPort newPort, boolean add) {
+        if (!oldPort.equals(newPort)) {
+            if (this.preservesTypes && oldPort.exists() && newPort.exists()) {
+                Utilities.enforce(oldPort.outputType().sameType(newPort.outputType()),
+                        () -> "Replacing operator with type\n" + oldPort.outputType() +
+                                " with new type\n" + newPort.outputType());
+            }
             Logger.INSTANCE.belowLevel(this, 1)
                     .appendSupplier(this::toString)
                     .append(":")
-                    .appendSupplier(old::toString)
+                    .appendSupplier(oldPort::toString)
                     .append(" -> ")
-                    .appendSupplier(newOp::toString)
+                    .appendSupplier(newPort::toString)
                     .newline();
         }
-        Utilities.putNew(this.remap, old, newOp);
+        Utilities.putNew(this.remap, oldPort, newPort);
         if (add)
-            this.addOperator(newOp.node());
+            this.addOperator(newPort.node());
     }
 
     protected void map(DBSPSimpleOperator old, DBSPSimpleOperator newOp, boolean add) {
         this.map(old.outputPort(), newOp.outputPort(), add);
     }
 
-    protected void map(DBSPOperatorWithError old, DBSPOperatorWithError newOp, boolean add) {
-        this.map(old.getOutput(0), newOp.getOutput(0), add);
-        this.map(old.getOutput(1), newOp.getOutput(1), false);
+    protected void map(IMultiOutput old, IMultiOutput newOp, boolean add) {
+        Utilities.enforce(old.outputCount() == newOp.outputCount());
+        for (int i = 0; i < old.outputCount(); i++) {
+            // Only add for the last port
+            boolean toAdd = i == old.outputCount() - 1 && add;
+            this.map(old.getOutput(i), newOp.getOutput(i), toAdd);
+        }
     }
 
     protected void map(OutputPort old, OutputPort newOp) {
         this.map(old, newOp, true);
         Utilities.enforce(old.node() == this.getCurrent());
         if (!old.equals(newOp)) {
-            long derivedFrom = old.node().derivedFrom;
-            newOp.node().setDerivedFrom(derivedFrom);
-            if (this.preservesTypes) {
-                Utilities.enforce(old.outputType().sameType(newOp.outputType()),
-                        "Replacing operator with type\n" + old.outputType() +
-                                " with new type\n" + newOp.outputType());
-            }
+            newOp.node().setDerivedFrom(old.node());
         }
     }
 
@@ -150,7 +153,7 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
             IDBSPOuterNode node = this.getCurrent();
             if (node.is(ICircuit.class))
                 return;
-            if (operator != node)
+            if (operator != node && operator.derivedFrom == 0)
                 operator.setDerivedFrom(node.getDerivedFrom());
         }
     }
@@ -179,38 +182,41 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
                     .newline()
                     .decrease();
         }
-        DBSPSimpleOperator result = operator.withInputs(sources, this.force);
-        this.map(operator, result);
+        DBSPOperator result = operator.withInputs(sources, this.force);
+        this.map(operator, result.to(DBSPSimpleOperator.class));
     }
 
     /**
      * Replace the specified operator with an equivalent one
      * by replacing all the inputs with their replacements from the 'mapped' map.
      * @param operator  Operator to replace. */
-    public void replace(DBSPOperatorWithError operator) {
-        if (this.visited.contains(operator))
+    public void replaceMultiOutput(IMultiOutput operator) {
+        DBSPOperator op = operator.asOperator();
+        if (this.visited.contains(op))
             // Graph can be a DAG
             return;
-        this.visited.add(operator);
-        List<OutputPort> sources = Linq.map(operator.inputs, this::mapped);
-        if (!Linq.same(sources, operator.inputs)) {
+        this.visited.add(op);
+        List<OutputPort> sources = Linq.map(op.inputs, this::mapped);
+        if (!Linq.same(sources, op.inputs)) {
             Logger.INSTANCE.belowLevel(this, 2)
                     .append(this.toString())
                     .append(" replacing inputs of ")
                     .increase()
                     .append(operator.toString())
                     .append(":")
-                    .joinSupplier(", ", () -> Linq.map(operator.inputs, OutputPort::toString))
+                    .joinSupplier(", ", () -> Linq.map(op.inputs, OutputPort::toString))
                     .newline()
                     .append("with:")
                     .joinSupplier(", ", () -> Linq.map(sources, OutputPort::toString))
                     .newline()
                     .decrease();
         }
-        DBSPOperatorWithError result = operator.withInputs(sources, this.force);
-        result.setDerivedFrom(operator.derivedFrom);
-        this.map(operator.getOutput(0), result.getOutput(0), true);
-        this.map(operator.getOutput(1), result.getOutput(1), false);
+        DBSPOperator result = operator.asOperator().withInputs(sources, this.force);
+        result.setDerivedFrom(op);
+        for (int i = 0; i < operator.outputCount(); i++) {
+            boolean add = i == operator.outputCount() - 1;
+            this.map(operator.getOutput(i), result.getOutput(i), add);
+        }
     }
 
     @Override
@@ -237,6 +243,9 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
     public void postorder(DBSPApplyOperator operator) { this.replace(operator); }
 
     @Override
+    public void postorder(DBSPApplyNOperator operator) { this.replace(operator); }
+
+    @Override
     public void postorder(DBSPDeltaOperator operator) { this.replace(operator); }
 
     @Override
@@ -249,6 +258,12 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
 
     @Override
     public void postorder(DBSPIndexedTopKOperator operator) { this.replace(operator); }
+
+    @Override
+    public void postorder(DBSPRankOperator operator) { this.replace(operator); }
+
+    @Override
+    public void postorder(DBSPRowNumberOperator operator) { this.replace(operator); }
 
     @Override
     public void postorder(DBSPMapIndexOperator operator) { this.replace(operator); }
@@ -367,6 +382,11 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
     }
 
     @Override
+    public void postorder(DBSPAtomicSumOperator operator) {
+        this.replace(operator);
+    }
+
+    @Override
     public void postorder(DBSPStreamJoinOperator operator) {
         this.replace(operator);
     }
@@ -383,6 +403,36 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
 
     @Override
     public void postorder(DBSPJoinOperator operator) {
+        this.replace(operator);
+    }
+
+    @Override
+    public void postorder(DBSPStarJoinOperator operator) {
+        this.replace(operator);
+    }
+
+    @Override
+    public void postorder(DBSPStarJoinIndexOperator operator) {
+        this.replace(operator);
+    }
+
+    @Override
+    public void postorder(DBSPStarJoinFilterMapOperator operator) {
+        this.replace(operator);
+    }
+
+    @Override
+    public void postorder(DBSPLeftJoinOperator operator) {
+        this.replace(operator);
+    }
+
+    @Override
+    public void postorder(DBSPLeftJoinFilterMapOperator operator) {
+        this.replace(operator);
+    }
+
+    @Override
+    public void postorder(DBSPLeftJoinIndexOperator operator) {
         this.replace(operator);
     }
 
@@ -417,7 +467,7 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
     }
 
     @Override
-    public void postorder(DBSPDistinctIncrementalOperator operator) {
+    public void postorder(DBSPBinaryDistinctOperator operator) {
         this.replace(operator);
     }
 
@@ -462,13 +512,19 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
     public void postorder(DBSPIntegrateTraceRetainValuesOperator operator) { this.replace(operator); }
 
     @Override
+    public void postorder(DBSPIntegrateTraceRetainNValuesOperator operator) { this.replace(operator); }
+
+    @Override
     public void postorder(DBSPWaterlineOperator operator) { this.replace(operator); }
 
     @Override
-    public void postorder(DBSPControlledKeyFilterOperator operator) { this.replace(operator); }
+    public void postorder(DBSPControlledKeyFilterOperator operator) { this.replaceMultiOutput(operator); }
 
     @Override
-    public void postorder(DBSPOperatorWithError operator) { this.replace(operator); }
+    public void postorder(DBSPOperatorWithError operator) { this.replaceMultiOutput(operator); }
+
+    @Override
+    public void postorder(DBSPInputMapWithWaterlineOperator operator) { this.replaceMultiOutput(operator); }
 
     public DBSPCircuit getUnderConstructionCircuit() {
         return this.underConstruction.get(0).to(DBSPCircuit.class);
@@ -517,7 +573,7 @@ public class CircuitCloneVisitor extends CircuitVisitor implements IWritesLogs, 
     @Override
     public void postorder(DBSPNestedOperator operator) {
         DBSPNestedOperator result = Utilities.removeLast(this.underConstruction).to(DBSPNestedOperator.class);
-        result.setDerivedFrom(operator.derivedFrom);
+        result.setDerivedFrom(operator);
         result.copyAnnotations(operator);
         if (result.sameCircuit(operator))
             result = operator;

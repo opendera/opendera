@@ -2,9 +2,9 @@
 
 use crate::{
     circuit::{
+        Circuit, OwnershipPreference, Scope, Stream,
         circuit_builder::StreamId,
         operator_traits::{Operator, UnaryOperator},
-        Circuit, OwnershipPreference, Scope, Stream,
     },
     circuit_cache_key,
     dynamic::{ClonableTrait, DataTrait, DynPair, DynUnit},
@@ -12,7 +12,6 @@ use crate::{
         Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, OrdIndexedWSet,
     },
 };
-use minitrace::trace;
 use std::{borrow::Cow, marker::PhantomData, ops::DerefMut};
 
 circuit_cache_key!(IndexId<C, D>(StreamId => Stream<C, D>));
@@ -137,9 +136,9 @@ where
     CO: Batch<Time = ()>,
     CI: BatchReader<Key = DynPair<CO::Key, CO::Val>, Val = DynUnit, Time = (), R = CO::R>,
 {
-    #[trace]
     async fn eval(&mut self, input: &CI) -> CO {
-        let mut builder = <CO as Batch>::Builder::with_capacity(&self.factories, input.len());
+        let mut builder =
+            <CO as Batch>::Builder::with_capacity(&self.factories, input.len(), input.len());
 
         let mut cursor = input.cursor();
         let mut prev_key = self.factories.key_factory().default_box();
@@ -168,7 +167,7 @@ where
     }
 
     // TODO: implement consumers
-    /*#[trace] fn eval_owned(&mut self, input: CI) -> CO {
+    /*fn eval_owned(&mut self, input: CI) -> CO {
         let mut builder = <CO as Batch>::Builder::with_capacity((), input.len());
 
         let mut consumer = input.consumer();
@@ -240,7 +239,6 @@ where
     CI: BatchReader<Val = DynUnit, Time = (), R = CO::R>,
     F: Fn(&CI::Key, &mut DynPair<CO::Key, CO::Val>) + 'static,
 {
-    #[trace]
     async fn eval(&mut self, i: &CI) -> CO {
         let mut tuples = self.factories.weighted_items_factory().default_box();
         tuples.reserve(i.len());
@@ -268,13 +266,13 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
+        Circuit, RootCircuit, ZWeight,
         dynamic::{ClonableTrait, DynData, DynPair, Erase, LeanVec},
         indexed_zset,
         operator::Generator,
         trace::{BatchReaderFactories, Batcher},
         typed_batch::{DynBatch, DynOrdZSet, OrdIndexedZSet},
         utils::Tup2,
-        Circuit, RootCircuit, ZWeight,
     };
 
     #[test]
@@ -327,7 +325,7 @@ mod test {
         .0;
 
         for _ in 0..2 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 
@@ -387,7 +385,7 @@ mod test {
         .0;
 
         for _ in 0..2 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 }

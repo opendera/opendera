@@ -2,20 +2,15 @@
 //!
 //! This is useful for performance testing, not as part of a production system.
 
-use super::{
-    BlockLocation, FileId, FileReader, FileWriter, HasFileId, StorageBackend, StorageError,
-};
-use crate::circuit::metrics::{
-    FILES_CREATED, READS_FAILED, READS_SUCCESS, TOTAL_BYTES_READ, TOTAL_BYTES_WRITTEN,
-    WRITES_SUCCESS,
-};
+use super::{BlockLocation, FileId, FileReader, FileRw, FileWriter, StorageBackend, StorageError};
+use crate::circuit::metrics::FILES_CREATED;
 use crate::storage::buffer_cache::FBuf;
-use feldera_storage::{StorageFileType, StoragePath};
-use metrics::counter;
+use feldera_storage::{FileCommitter, StorageFileType, StoragePath};
+use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{
     collections::HashMap,
-    io::{Error as IoError, ErrorKind},
+    io::ErrorKind,
     sync::{Arc, RwLock},
 };
 
@@ -26,9 +21,12 @@ struct MemoryFile {
     size: u64,
 }
 
-impl HasFileId for MemoryFile {
+impl FileRw for MemoryFile {
     fn file_id(&self) -> FileId {
         self.file_id
+    }
+    fn path(&self) -> &StoragePath {
+        &self.path
     }
 }
 
@@ -84,9 +82,13 @@ impl MemoryWriter {
     }
 }
 
-impl HasFileId for MemoryWriter {
+impl FileRw for MemoryWriter {
     fn file_id(&self) -> FileId {
         self.file.file_id
+    }
+
+    fn path(&self) -> &StoragePath {
+        &self.file.path
     }
 }
 
@@ -102,14 +104,10 @@ impl FileWriter for MemoryWriter {
             .usage
             .fetch_add(data.len() as i64, Ordering::Relaxed);
 
-        counter!(TOTAL_BYTES_WRITTEN).increment(data.len() as u64);
-        counter!(WRITES_SUCCESS).increment(1);
-
         Ok(data)
     }
 
-    fn complete(mut self: Box<Self>) -> Result<(Arc<dyn FileReader>, StoragePath), StorageError> {
-        let path = self.file.path.clone();
+    fn complete(mut self: Box<Self>) -> Result<Arc<dyn FileReader>, StorageError> {
         self.drop.size = 0;
         let file = Arc::new(self.file);
         self.backend
@@ -123,7 +121,7 @@ impl FileWriter for MemoryWriter {
             file,
             keep: AtomicBool::new(false),
         });
-        Ok((reader, path))
+        Ok(reader)
     }
 }
 
@@ -144,9 +142,24 @@ struct MemoryReader {
     keep: AtomicBool,
 }
 
-impl HasFileId for MemoryReader {
+impl Debug for MemoryReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MemoryReader({})", self.file.path)
+    }
+}
+
+impl FileRw for MemoryReader {
     fn file_id(&self) -> FileId {
         self.file.file_id
+    }
+    fn path(&self) -> &StoragePath {
+        &self.file.path
+    }
+}
+
+impl FileCommitter for MemoryReader {
+    fn commit(&self) -> Result<(), StorageError> {
+        Ok(())
     }
 }
 
@@ -157,14 +170,12 @@ impl FileReader for MemoryReader {
 
     fn read_block(&self, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
         if location.after() > self.file.size {
-            counter!(READS_FAILED).increment(1);
-            return Err(IoError::from(ErrorKind::UnexpectedEof).into());
+            return Err(StorageError::stdio(
+                ErrorKind::UnexpectedEof,
+                "read",
+                &self.file.path,
+            ));
         }
-
-        // We know that the read will succeed, we're just not sure how yet, so
-        // increment counters.
-        counter!(TOTAL_BYTES_READ).increment(location.size as u64);
-        counter!(READS_SUCCESS).increment(1);
 
         let index = self
             .file
@@ -210,7 +221,7 @@ impl Drop for MemoryReader {
 impl StorageBackend for MemoryBackend {
     fn create_named(&self, name: &StoragePath) -> Result<Box<dyn FileWriter>, StorageError> {
         let fm = MemoryWriter::new(self.clone(), name);
-        counter!(FILES_CREATED).increment(1);
+        FILES_CREATED.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(fm))
     }
 
@@ -222,7 +233,7 @@ impl StorageBackend for MemoryBackend {
                 file: file.clone(),
                 keep: AtomicBool::new(true),
             })),
-            None => Err(StorageError::StdIo(ErrorKind::NotFound)),
+            None => Err(StorageError::stdio(ErrorKind::NotFound, "open", name)),
         }
     }
 
@@ -253,7 +264,7 @@ impl StorageBackend for MemoryBackend {
                 self.0.usage.fetch_sub(file.size as i64, Ordering::Relaxed);
                 Ok(())
             }
-            None => Err(StorageError::StdIo(ErrorKind::NotFound)),
+            None => Err(StorageError::stdio(ErrorKind::NotFound, "delete", name)),
         }
     }
 

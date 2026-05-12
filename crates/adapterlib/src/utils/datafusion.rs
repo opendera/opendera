@@ -1,6 +1,6 @@
 use crate::errors::journal::ControllerError;
-use anyhow::{anyhow, Error as AnyError};
-use arrow::util::pretty::pretty_format_batches;
+use anyhow::{Error as AnyError, anyhow};
+use arrow::array::Array;
 use datafusion::common::arrow::array::{AsArray, RecordBatch};
 use datafusion::logical_expr::sqlparser::parser::ParserError;
 use datafusion::prelude::{SQLOptions, SessionContext};
@@ -54,31 +54,21 @@ pub async fn execute_singleton_query(
         ));
     }
 
-    Ok(result[0].column(0).as_string::<i32>().value(0).to_string())
+    let column0 = result[0].column(0);
+
+    array_to_string(column0).ok_or_else(|| {
+        anyhow!("internal error: cannot retrieve the output of query '{query}' as a string")
+    })
 }
 
-/// Execute a SQL query that returns a result with exactly one row and column of type `string`.
-pub async fn execute_query_text(
-    datafusion: &SessionContext,
-    query: &str,
-) -> Result<String, AnyError> {
-    let options = SQLOptions::new()
-        .with_allow_ddl(false)
-        .with_allow_dml(false);
-
-    let df = datafusion
-        .sql_with_options(query, options)
-        .await
-        .map_err(|e| anyhow!("error compiling query '{query}': {e}"))?;
-
-    Ok(pretty_format_batches(
-        df.collect()
-            .await
-            .map_err(|e| anyhow!("error executing query '{query}': {e}"))?
-            .as_slice(),
-    )
-    .map_err(|e| anyhow!("error formatting result of query '{query}': {e}"))?
-    .to_string())
+pub fn array_to_string(array: &dyn Array) -> Option<String> {
+    if let Some(string_view_array) = array.as_string_view_opt() {
+        Some(string_view_array.value(0).to_string())
+    } else {
+        array
+            .as_string_opt::<i32>()
+            .map(|array| array.value(0).to_string())
+    }
 }
 
 /// Parse expression only to validate it.
@@ -112,13 +102,13 @@ pub fn validate_timestamp_type(
         )
     {
         return Err(ControllerError::invalid_transport_configuration(
-                    endpoint_name,
-                    &format!(
-                        "timestamp column '{}' has unsupported type {}; supported types for 'timestamp_column' are integer types, DATE, and TIMESTAMP; {docs}",
-                        timestamp.name,
-                        serde_json::to_string(&timestamp.columntype).unwrap()
-                    ),
-                ));
+            endpoint_name,
+            &format!(
+                "timestamp column '{}' has unsupported type {}; supported types for 'timestamp_column' are integer types, DATE, and TIMESTAMP; {docs}",
+                timestamp.name,
+                serde_json::to_string(&timestamp.columntype).unwrap()
+            ),
+        ));
     }
 
     Ok(())
@@ -166,13 +156,18 @@ pub async fn validate_timestamp_column(
     // which requires storing and sorting the entire collection locally.
     let is_zero = execute_singleton_query(
         datafusion,
-        &format!("select cast(({lateness} + {lateness}) = {lateness} as string)"),
+        &format!("select cast((({lateness} + {lateness}) = {lateness}) as string)"),
     )
     .await
     .map_err(|e| ControllerError::invalid_transport_configuration(endpoint_name, &e.to_string()))?;
 
     if &is_zero == "true" {
-        return Err(ControllerError::invalid_transport_configuration(endpoint_name, &format!("invalid LATENESS attribute '{lateness}' of the timestamp column '{timestamp_column}': LATENESS must be greater than zero; {docs}")));
+        return Err(ControllerError::invalid_transport_configuration(
+            endpoint_name,
+            &format!(
+                "invalid LATENESS attribute '{lateness}' of the timestamp column '{timestamp_column}': LATENESS must be greater than zero; {docs}"
+            ),
+        ));
     }
 
     Ok(())

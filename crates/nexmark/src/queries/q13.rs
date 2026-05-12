@@ -164,7 +164,7 @@ mod tests {
         ]]
         .into_iter();
 
-        let (circuit, input_handle) = RootCircuit::build(move |circuit| {
+        let (mut circuit, input_handle) = dbsp::Runtime::init_circuit(1, move |circuit| {
             let (stream, input_handle) = circuit.add_input_zset::<Event>();
 
             let mut expected_output = vec![zset![
@@ -183,7 +183,7 @@ mod tests {
 
         for mut vec in input_vecs {
             input_handle.append(&mut vec);
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 

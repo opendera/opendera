@@ -32,22 +32,16 @@ import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
-import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
 import java.util.List;
 import java.util.Objects;
 
 public final class DBSPConstantOperator extends DBSPSimpleOperator {
-    /** If true generate the constant only on the first step, then generate 0 */
-    public final boolean incremental;
-
-    public DBSPConstantOperator(CalciteRelNode node, DBSPExpression value,
-                                boolean incremental, boolean isMultiset) {
+    public DBSPConstantOperator(CalciteRelNode node, DBSPExpression value, boolean isMultiset) {
         // Notice that we use the 'this.function' field to represent
         // the constant value.  Constants are not ClosureExpressions.
-        super(node, "constant", value, value.getType(), isMultiset, false);
-        this.incremental = incremental;
+        super(node, "constant", value, value.getType(), isMultiset);
     }
 
     @Override
@@ -64,8 +58,7 @@ public final class DBSPConstantOperator extends DBSPSimpleOperator {
             @Nullable DBSPExpression function, DBSPType outputType,
             List<OutputPort> newInputs, boolean force) {
         if (this.mustReplace(force, function, newInputs, outputType)) {
-            return new DBSPConstantOperator(this.getRelNode(), Objects.requireNonNull(function),
-                    this.incremental, this.isMultiset)
+            return new DBSPConstantOperator(this.getRelNode(), Objects.requireNonNull(function), this.isMultiset)
                     .copyAnnotations(this);
         }
         return this;
@@ -74,9 +67,8 @@ public final class DBSPConstantOperator extends DBSPSimpleOperator {
     @SuppressWarnings("unused")
     public static DBSPConstantOperator fromJson(JsonNode node, JsonDecoder decoder) {
         CommonInfo info = DBSPSimpleOperator.commonInfoFromJson(node, decoder);
-        boolean incremental = Utilities.getBooleanProperty(node, "incremental");
         return new DBSPConstantOperator(
-                CalciteEmptyRel.INSTANCE, info.getFunction(), incremental, info.isMultiset())
+                CalciteEmptyRel.INSTANCE, info.getFunction(), info.isMultiset())
                 .addAnnotations(info.annotations(), DBSPConstantOperator.class);
     }
 }

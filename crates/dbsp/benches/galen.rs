@@ -5,12 +5,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use csv::ReaderBuilder;
 use dbsp::{
+    Circuit, OrdZSet, RootCircuit, Runtime, Stream,
     mimalloc::MiMalloc,
     monitor::TraceMonitor,
     operator::CsvSource,
     typed_batch::DynBatchReader,
     utils::{Tup2, Tup3},
-    Circuit, OrdZSet, RootCircuit, Runtime, Stream,
 };
 use std::{
     fs::{self, File, OpenOptions},
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
 
     unpack_galen_data()?;
 
-    let hruntime = Runtime::run(args.workers, move || {
+    let hruntime = Runtime::run(args.workers, move |_parker| {
         let monitor = TraceMonitor::new_panic_on_error();
         let circuit = RootCircuit::build(|circuit| {
             /*
@@ -265,7 +265,7 @@ fn main() -> Result<()> {
         fs::write(GALEN_GRAPH, graph.to_dot()).unwrap();
 
         let start = Instant::now();
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         if Runtime::worker_index() == 0 {
             let elapsed = start.elapsed();

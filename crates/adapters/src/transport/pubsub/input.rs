@@ -1,9 +1,9 @@
 use crate::{
-    transport::{InputQueue, InputReaderCommand, NonFtInputReaderCommand},
     InputConsumer, InputEndpoint, InputReader, Parser, PipelineState, TransportInputEndpoint,
+    transport::{InputQueue, InputReaderCommand, NonFtInputReaderCommand},
 };
-use anyhow::{anyhow, bail, Error as AnyError, Result as AnyResult};
-use chrono::DateTime;
+use anyhow::{Error as AnyError, Result as AnyResult, anyhow, bail};
+use chrono::{DateTime, Utc};
 use dbsp::circuit::tokio::TOKIO;
 use feldera_types::{
     config::FtModel, program_schema::Relation, transport::pubsub::PubSubInputConfig,
@@ -11,7 +11,7 @@ use feldera_types::{
 use futures::StreamExt;
 use google_cloud_gax::conn::Environment;
 use google_cloud_pubsub::{
-    client::{google_cloud_auth::credentials::CredentialsFile, Client, ClientConfig},
+    client::{Client, ClientConfig, google_cloud_auth::credentials::CredentialsFile},
     subscription::{SeekTo, Subscription},
 };
 use std::{
@@ -20,11 +20,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::{
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info_span, Instrument};
+use tracing::{Instrument, debug, info_span};
 
 pub struct PubSubInputEndpoint {
     config: Arc<PubSubInputConfig>,
@@ -54,6 +54,7 @@ impl TransportInputEndpoint for PubSubInputEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         _schema: Relation,
+        _seek: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(PubSubReader::new(
             self.config.clone(),
@@ -76,17 +77,20 @@ impl PubSubReader {
         let span = info_span!("pub_sub_input", subscription = config.subscription.clone());
         let (state_sender, state_receiver) = unbounded_channel();
         let subscription = TOKIO.block_on(Self::subscribe(&config).instrument(span.clone()))?;
-        thread::spawn({
-            move || {
-                let consumer_clone = consumer.clone();
-                TOKIO.block_on(async {
-                    Self::worker_task(subscription, consumer_clone, parser, state_receiver)
-                        .instrument(span)
-                        .await
-                        .unwrap_or_else(|e| consumer.error(true, e));
-                })
-            }
-        });
+        thread::Builder::new()
+            .name("pubsub-input-tokio-wrapper".to_string())
+            .spawn({
+                move || {
+                    let consumer_clone = consumer.clone();
+                    TOKIO.block_on(async {
+                        Self::worker_task(subscription, consumer_clone, parser, state_receiver)
+                            .instrument(span)
+                            .await
+                            .unwrap_or_else(|e| consumer.error(true, e, None));
+                    })
+                }
+            })
+            .expect("failed to spawn PubSub input tokio wrapper thread");
 
         Ok(Self { state_sender })
     }
@@ -154,16 +158,23 @@ impl PubSubReader {
 
                                 let consumer = consumer.clone();
                                 let mut parser = parser.fork();
-                                let token = stream.cancellable();
+                                let token = CancellationToken::new();
+                                let token_clone = token.clone();
                                 let handle = tokio::spawn({
                                     let queue = queue.clone();
                                     async move {
                                         // None if the stream is cancelled
-                                        while let Some(message) = stream.next().await {
+                                        while let Some(message) = tokio::select! {
+                                            message = stream.next() => message,
+                                            _ = token_clone.cancelled() => None,
+                                        } {
                                             let data = message.message.data.as_slice();
-                                            queue.push(parser.parse(data), data.len());
+                                            // Use the time when we start processing the message as the ingestion timestamp,
+                                            // since we don't have a way to get the time we _start_ reading the message.
+                                            let timestamp = Utc::now();
+                                            queue.push(parser.parse(data, None), timestamp);
                                             message.ack().await.unwrap_or_else(|e| {
-                                                consumer.error(false, anyhow!("gRPC error acknowledging Pub/Sub message: {e}"))
+                                                consumer.error(false, anyhow!("gRPC error acknowledging Pub/Sub message: {e}"), Some("pubsub"))
                                             });
                                         }
                                     }
@@ -185,6 +196,10 @@ impl PubSubReader {
 }
 
 impl InputReader for PubSubReader {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         let _ = self.state_sender.send(command.as_nonft().unwrap());
     }
@@ -204,7 +219,7 @@ async fn pubsub_config(config: &PubSubInputConfig) -> Result<ClientConfig, AnyEr
     }
 
     if let Some(pool_size) = config.pool_size {
-        client_config.pool_size = Some(pool_size as usize);
+        client_config.pool_size = pool_size as usize;
     }
 
     if let Some(endpoint) = &config.endpoint {

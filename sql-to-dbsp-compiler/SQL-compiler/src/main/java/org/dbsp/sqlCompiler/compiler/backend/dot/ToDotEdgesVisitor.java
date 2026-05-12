@@ -2,7 +2,6 @@ package org.dbsp.sqlCompiler.compiler.backend.dot;
 
 import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNestedOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperatorWithError;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPViewDeclarationOperator;
@@ -21,10 +20,13 @@ import java.util.Set;
 
 /** This visitor dumps the edges circuit to a dot file. */
 public class ToDotEdgesVisitor extends CircuitVisitor implements IWritesLogs {
+    // Above this level of details show types
+    static final int TYPE_DETAILS = 2;
+
     protected final IndentStream stream;
     // A higher value -> more details
     protected final int details;
-    protected final Set<DBSPOperator> edgesLabeled;
+    protected final Set<OutputPort> edgesLabeled;
 
     public ToDotEdgesVisitor(DBSPCompiler compiler, IndentStream stream, int details) {
         super(compiler);
@@ -36,8 +38,12 @@ public class ToDotEdgesVisitor extends CircuitVisitor implements IWritesLogs {
     public String getEdgeLabel(OutputPort source) {
         DBSPType type = source.getOutputRowType();
         String name = source.node().getCompactName();
+        // Uncomment to show only wide tuples
+        // if (type.getToplevelFieldCount() < 10) return "";
+        if (source.port() != 0)
+            name += " " + source.port();
         return name + " " +
-                ToRustInnerVisitor.toRustString(this.compiler(), type, this.details < 3);
+                ToRustInnerVisitor.toRustString(this.compiler(), type, null, this.details < 4);
     }
 
     @Override
@@ -54,16 +60,15 @@ public class ToDotEdgesVisitor extends CircuitVisitor implements IWritesLogs {
     @Override
     public VisitDecision preorder(DBSPOperatorWithError node) {
         for (OutputPort i : node.inputs) {
-            DBSPOperator input = i.node();
             this.stream.append(this.getPortName(i))
                     .append(" -> ")
                     .append(node.getNodeName(false));
-            if (this.details >= 2 && !this.edgesLabeled.contains(input)) {
+            if (this.details >= TYPE_DETAILS && !this.edgesLabeled.contains(i)) {
                 String label = this.getEdgeLabel(i);
                 this.stream.append(" [xlabel=")
-                        .append(Utilities.doubleQuote(label))
+                        .append(Utilities.doubleQuote(label, false))
                         .append("]");
-                this.edgesLabeled.add(input);
+                this.edgesLabeled.add(i);
             }
             this.stream.append(";")
                     .newline();
@@ -74,16 +79,15 @@ public class ToDotEdgesVisitor extends CircuitVisitor implements IWritesLogs {
     @Override
     public VisitDecision preorder(DBSPSimpleOperator node) {
         for (OutputPort i : node.inputs) {
-            DBSPOperator input = i.node();
             this.stream.append(this.getPortName(i))
                     .append(" -> ")
                     .append(node.getOutputName());
-            if (this.details >= 2 && !this.edgesLabeled.contains(input)) {
+            if (this.details >= TYPE_DETAILS && !this.edgesLabeled.contains(i)) {
                 String label = this.getEdgeLabel(i);
                 this.stream.append(" [xlabel=")
-                        .append(Utilities.doubleQuote(label))
+                        .append(Utilities.doubleQuote(label, false))
                         .append("]");
-                this.edgesLabeled.add(input);
+                this.edgesLabeled.add(i);
             }
             this.stream.append(";")
                     .newline();

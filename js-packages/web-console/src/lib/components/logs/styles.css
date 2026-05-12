@@ -1,0 +1,186 @@
+/* @import '../../../theme.css' theme(reference);
+@import 'tailwindcss'; */
+
+/* base colors */
+
+black {
+  @apply text-white dark:text-dark;
+}
+
+backgroundBlack {
+  @apply bg-white dark:bg-dark;
+}
+
+red {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#c75d58] dark:!text-[#EFA6A2];
+}
+
+backgroundRed {
+  @apply bg-[#c75d58] dark:bg-[#EFA6A2];
+}
+
+green {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#36633f] dark:!text-[#80C990];
+}
+
+backgroundGreen {
+  @apply bg-[#36633f] dark:bg-[#80C990];
+}
+
+yellow {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#c2c255] dark:!text-[#C8C874];
+}
+
+backgroundYellow {
+  @apply bg-[#c2c255] dark:bg-[#C8C874];
+}
+
+blue {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#39559e] dark:!text-[#a3b8ef];
+}
+
+backgroundBlue {
+  @apply bg-[#39559e] dark:bg-[#a3b8ef];
+}
+
+magenta {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#a15295] dark:!text-[#E6A3DC];
+}
+
+backgroundMagenta {
+  @apply bg-[#a15295] dark:bg-[#E6A3DC];
+}
+
+cyan {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#1da0a3] dark:!text-[#50CACD];
+}
+
+backgroundCyan {
+  @apply bg-[#1da0a3] dark:bg-[#50CACD];
+}
+
+white {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#424242] dark:!text-[#dbdbdb];
+}
+
+backgroundWhite {
+  @apply bg-[#424242] dark:bg-[#dbdbdb];
+}
+
+/* bright colors */
+gray {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#bababa] dark:!text-[#454545];
+}
+
+backgroundGray {
+  @apply bg-[#bababa] dark:bg-[#454545];
+}
+
+brightRed {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#cc3333] dark:!text-[#ff5959];
+}
+
+backgroundBrightRed {
+  @apply bg-[#cc3333] dark:bg-[#ff5959];
+}
+
+brightGreen {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#15b328] dark:!text-[#33de47];
+}
+
+backgroundBrightGreen {
+  @apply bg-[#15b328] dark:bg-[#33de47];
+}
+
+brightYellow {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#d4de12] dark:!text-[#f4ff26];
+}
+
+backgroundBrightYellow {
+  @apply bg-[#d4de12] dark:bg-[#f4ff26];
+}
+
+brightBlue {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#1192cf] dark:!text-[#34b3ed];
+}
+
+backgroundBrightBlue {
+  @apply bg-[#1192cf] dark:bg-[#34b3ed];
+}
+
+brightMagenta {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#bf0ba4] dark:!text-[#eb36d0];
+}
+
+backgroundBrightMagenta {
+  @apply bg-[#bf0ba4] dark:bg-[#eb36d0];
+}
+
+brightCyan {
+  --tw-text-opacity: inherit !important;
+  @apply !text-[#06c7cc] dark:!text-[#1fe8ed];
+}
+
+backgroundBrightCyan {
+  @apply bg-[#06c7cc] dark:bg-[#1fe8ed];
+}
+
+brightWhite {
+  --tw-text-opacity: inherit !important;
+  @apply text-dark dark:text-white;
+}
+
+backgroundBrightWhite {
+  @apply text-dark dark:text-white;
+}
+
+/* modifiers */
+
+bold {
+  @apply font-semibold;
+}
+
+dim {
+  @apply text-dark/80 dark:text-white/75;
+}
+
+dim * {
+  @apply text-inherit;
+}
+
+italic {
+  @apply italic;
+}
+
+underline {
+  @apply underline;
+}
+
+inverse {
+  @apply text-white mix-blend-difference;
+}
+
+hidden {
+  @apply opacity-30;
+}
+
+strikethrough {
+  @apply line-through;
+}
+
+overline {
+  @apply overline;
+}

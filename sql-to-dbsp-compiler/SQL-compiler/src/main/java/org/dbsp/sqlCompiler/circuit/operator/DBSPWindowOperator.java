@@ -21,15 +21,13 @@ import java.util.List;
  * elements in the left input are compared with the two scalars
  * in the pair; when they fall between the two limits,
  * they are emitted to the output ZSet. */
-public final class DBSPWindowOperator extends DBSPBinaryOperator {
+public final class DBSPWindowOperator extends DBSPBinaryOperator implements IContainsIntegrator, IIncremental {
     public final boolean lowerInclusive;
     public final boolean upperInclusive;
 
-    public DBSPWindowOperator(
-            CalciteRelNode node, boolean lowerInclusive, boolean upperInclusive,
+    public DBSPWindowOperator(CalciteRelNode node, boolean lowerInclusive, boolean upperInclusive,
             OutputPort data, OutputPort control) {
-        super(node, "window", null, data.outputType(), data.isMultiset(),
-                data, control, false);
+        super(node, "window", null, data.outputType(), data.isMultiset(), data, control);
         // Check that the left input and output are indexed ZSets
         this.getOutputIndexedZSetType();
         this.lowerInclusive = lowerInclusive;
@@ -41,7 +39,7 @@ public final class DBSPWindowOperator extends DBSPBinaryOperator {
             @Nullable DBSPExpression function, DBSPType outputType,
             List<OutputPort> newInputs, boolean force) {
         if (this.mustReplace(force, function, newInputs, outputType)) {
-            Utilities.enforce(newInputs.size() == 2, "Expected 2 inputs, got " + newInputs.size());
+            Utilities.enforce(newInputs.size() == 2, () -> "Expected 2 inputs, got " + newInputs.size());
             if (force || this.inputsDiffer(newInputs))
                 return new DBSPWindowOperator(
                         this.getRelNode(), this.lowerInclusive, this.upperInclusive,

@@ -1,7 +1,10 @@
 use crate::config::ConnectorConfig;
 use crate::secret_ref::{MaybeSecretRef, MaybeSecretRefParseError, SecretRef};
-use serde_yaml::{Mapping, Value};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
+use std::env;
 use std::fmt::Debug;
 use std::fs;
 use std::io::ErrorKind;
@@ -20,25 +23,23 @@ pub enum SecretRefDiscoveryError {
 
 /// Discovers the secret references of the connector configuration.
 pub fn discover_secret_references_in_connector_config(
-    connector_config: &ConnectorConfig,
+    connector_config: &serde_json::Value,
 ) -> Result<BTreeSet<SecretRef>, SecretRefDiscoveryError> {
-    let yaml_value = serde_yaml::to_value(connector_config).map_err(|e| {
-        SecretRefDiscoveryError::SerializationFailed {
-            error: e.to_string(),
-        }
-    })?;
     let mut result = BTreeSet::new();
-    if let Some(transport_config_yaml) = yaml_value.get("transport").and_then(|v| v.get("config")) {
-        result.extend(discover_secret_references_in_yaml(transport_config_yaml)?);
+    if let Some(transport_config_json) = connector_config
+        .get("transport")
+        .and_then(|v| v.get("config"))
+    {
+        result.extend(discover_secret_references_in_json(transport_config_json)?);
     }
-    if let Some(format_config_yaml) = yaml_value.get("format").and_then(|v| v.get("config")) {
-        result.extend(discover_secret_references_in_yaml(format_config_yaml)?);
+    if let Some(format_config_json) = connector_config.get("format").and_then(|v| v.get("config")) {
+        result.extend(discover_secret_references_in_json(format_config_json)?);
     }
     Ok(result)
 }
 
-/// Discovers recursively the secret references in the YAML.
-fn discover_secret_references_in_yaml(
+/// Discovers recursively the secret references in the JSON.
+fn discover_secret_references_in_json(
     value: &Value,
 ) -> Result<BTreeSet<SecretRef>, SecretRefDiscoveryError> {
     Ok(match value {
@@ -54,32 +55,35 @@ fn discover_secret_references_in_yaml(
                 BTreeSet::new()
             }
         }
-        Value::Sequence(seq) => {
+        Value::Array(seq) => {
             let mut result = BTreeSet::new();
             for entry in seq.iter() {
-                result.extend(discover_secret_references_in_yaml(entry)?)
+                result.extend(discover_secret_references_in_json(entry)?)
             }
             result
         }
-        Value::Mapping(mapping) => {
+        Value::Object(mapping) => {
             let mut result = BTreeSet::new();
             for (_k, v) in mapping.into_iter() {
-                result.extend(discover_secret_references_in_yaml(v)?);
+                result.extend(discover_secret_references_in_json(v)?);
             }
             result
         }
-        Value::Tagged(tag_val) => discover_secret_references_in_yaml(&tag_val.value)?,
     })
 }
 
 /// Path of the default secrets directory.
-pub const DEFAULT_SECRETS_DIRECTORY_PATH: &str = "/etc/feldera-secrets";
+pub fn default_secrets_directory() -> &'static Path {
+    Path::new("/etc/feldera-secrets")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, ThisError)]
 pub enum SecretRefResolutionError {
     #[error("{e}")]
     MaybeSecretRefParseFailed { e: MaybeSecretRefParseError },
-    #[error("secret reference '{secret_ref}' resolution failed: file '{path}' does exist but unable to read it due to: {error_kind}")]
+    #[error(
+        "secret reference '{secret_ref}' resolution failed: file '{path}' does exist but unable to read it due to: {error_kind}"
+    )]
     CannotReadSecretFile {
         secret_ref: SecretRef,
         path: String,
@@ -91,12 +95,18 @@ pub enum SecretRefResolutionError {
         "secret reference '{secret_ref}' resolution failed: path '{path}' is not a regular file"
     )]
     SecretPathIsNotRegularFile { secret_ref: SecretRef, path: String },
-    #[error("secret reference '{secret_ref}' resolution failed: cannot determine if '{path}' is an existing file due to: {error_kind}")]
+    #[error(
+        "secret reference '{secret_ref}' resolution failed: cannot determine if '{path}' is an existing file due to: {error_kind}"
+    )]
     SecretFileExistenceUnknown {
         secret_ref: SecretRef,
         path: String,
         error_kind: ErrorKind,
     },
+    #[error(
+        "environment variable reference '{env_ref}' resolution failed: environment variable '{name}' is not set"
+    )]
+    EnvVarNotSet { env_ref: SecretRef, name: String },
     #[error("secret resolution led to a duplicate key in the mapping, which should not happen")]
     DuplicateKeyInMapping,
     #[error("unable to serialize connector configuration: {error}")]
@@ -110,28 +120,33 @@ pub fn resolve_secret_references_in_connector_config(
     secrets_dir: &Path,
     connector_config: &ConnectorConfig,
 ) -> Result<ConnectorConfig, SecretRefResolutionError> {
-    let mut yaml_value = serde_yaml::to_value(connector_config).map_err(|e| {
-        SecretRefResolutionError::SerializationFailed {
-            error: e.to_string(),
-        }
-    })?;
-    if let Some(transport_config_yaml) = yaml_value.get("transport").and_then(|v| v.get("config")) {
-        let transport_config_yaml_resolved =
-            resolve_secret_references_in_yaml(secrets_dir, transport_config_yaml.clone())?;
-        yaml_value["transport"]["config"] = transport_config_yaml_resolved;
-    }
-    if let Some(format_config_yaml) = yaml_value.get("format").and_then(|v| v.get("config")) {
-        let format_config_yaml_resolved =
-            resolve_secret_references_in_yaml(secrets_dir, format_config_yaml.clone())?;
-        yaml_value["format"]["config"] = format_config_yaml_resolved;
-    }
-    let connector_config_resolved = serde_yaml::from_value(yaml_value)
-        .map_err(|_e| SecretRefResolutionError::DeserializationFailed)?;
-    Ok(connector_config_resolved)
+    let connector_config = connector_config.clone();
+    Ok(ConnectorConfig {
+        transport: resolve_secret_references_via_json(secrets_dir, &connector_config.transport)?,
+        format: resolve_secret_references_via_json(secrets_dir, &connector_config.format)?,
+        ..connector_config
+    })
 }
 
-/// Resolves recursively the secret references in the YAML.
-fn resolve_secret_references_in_yaml(
+/// Resolves secret references in `value`.
+pub fn resolve_secret_references_via_json<T>(
+    secrets_dir: &Path,
+    value: &T,
+) -> Result<T, SecretRefResolutionError>
+where
+    T: Serialize + DeserializeOwned,
+{
+    let json_value =
+        serde_json::to_value(value).map_err(|e| SecretRefResolutionError::SerializationFailed {
+            error: e.to_string(),
+        })?;
+    let resolved_json = resolve_secret_references_in_json(secrets_dir, json_value)?;
+    serde_json::from_value(resolved_json)
+        .map_err(|_e| SecretRefResolutionError::DeserializationFailed)
+}
+
+/// Resolves recursively the secret references in the JSON.
+fn resolve_secret_references_in_json(
     secrets_dir: &Path,
     value: Value,
 ) -> Result<Value, SecretRefResolutionError> {
@@ -142,30 +157,26 @@ fn resolve_secret_references_in_yaml(
         Value::String(s) => {
             Value::String(resolve_potential_secret_reference_string(secrets_dir, s)?)
         }
-        Value::Sequence(seq) => Value::Sequence(
+        Value::Array(seq) => Value::Array(
             seq.into_iter()
-                .map(|v| resolve_secret_references_in_yaml(secrets_dir, v))
+                .map(|v| resolve_secret_references_in_json(secrets_dir, v))
                 .collect::<Result<Vec<Value>, SecretRefResolutionError>>()?,
         ),
-        Value::Mapping(mapping) => {
-            let mut new_mapping = Mapping::new();
+        Value::Object(mapping) => {
+            let mut new_mapping = Map::new();
             for (k, v) in mapping.into_iter() {
                 if let Some(_existing) =
-                    new_mapping.insert(k, resolve_secret_references_in_yaml(secrets_dir, v)?)
+                    new_mapping.insert(k, resolve_secret_references_in_json(secrets_dir, v)?)
                 {
                     return Err(SecretRefResolutionError::DuplicateKeyInMapping);
                 }
             }
-            Value::Mapping(new_mapping)
-        }
-        Value::Tagged(mut tag_val) => {
-            tag_val.value = resolve_secret_references_in_yaml(secrets_dir, tag_val.value)?;
-            Value::Tagged(tag_val)
+            Value::Object(new_mapping)
         }
     })
 }
 
-/// Resolves a string which can potentially be a secret reference.
+/// Resolves a string which can potentially be a secret reference or an environment variable reference.
 fn resolve_potential_secret_reference_string(
     secrets_dir: &Path,
     s: String,
@@ -173,8 +184,11 @@ fn resolve_potential_secret_reference_string(
     match MaybeSecretRef::new(s) {
         Ok(maybe_secret_ref) => match maybe_secret_ref {
             MaybeSecretRef::String(plain_str) => Ok(plain_str),
-            MaybeSecretRef::SecretRef(secret_ref) => match &secret_ref {
-                SecretRef::Kubernetes { name, data_key } => {
+            MaybeSecretRef::SecretRef(secret_ref) => match secret_ref {
+                SecretRef::Kubernetes {
+                    ref name,
+                    ref data_key,
+                } => {
                     // Secret reference: `${secret:kubernetes:<name>/<data key>}`
                     // File location: `<secrets dir>/kubernetes/<name>/<data key>`
                     let path = Path::new(secrets_dir)
@@ -218,6 +232,20 @@ fn resolve_potential_secret_reference_string(
                         }
                     }
                 }
+                SecretRef::EnvVar { ref name } => {
+                    // Environment variable reference: `${env:<name>}`
+                    // Resolved by reading the named environment variable from the process.
+                    let name = name.clone();
+                    match env::var(&name) {
+                        Ok(value) => Ok(value),
+                        Err(env::VarError::NotPresent) | Err(env::VarError::NotUnicode(_)) => {
+                            Err(SecretRefResolutionError::EnvVarNotSet {
+                                env_ref: secret_ref,
+                                name,
+                            })
+                        }
+                    }
+                }
             },
         },
         Err(e) => Err(SecretRefResolutionError::MaybeSecretRefParseFailed { e }),
@@ -229,13 +257,13 @@ mod tests {
     use crate::config::{ConnectorConfig, TransportConfig};
     use crate::secret_ref::{MaybeSecretRef, SecretRef};
     use crate::secret_resolver::{
-        discover_secret_references_in_connector_config, discover_secret_references_in_yaml,
-        resolve_potential_secret_reference_string, resolve_secret_references_in_connector_config,
-        resolve_secret_references_in_yaml, SecretRefResolutionError,
+        SecretRefResolutionError, discover_secret_references_in_connector_config,
+        discover_secret_references_in_json, resolve_potential_secret_reference_string,
+        resolve_secret_references_in_connector_config, resolve_secret_references_in_json,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
-    use std::fs::{create_dir_all, File};
+    use std::fs::{File, create_dir_all};
     use std::io::Write;
 
     #[test]
@@ -373,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_resolution_yaml() {
+    fn secret_resolution_json() {
         // Create file at:
         // - <tempdir>/kubernetes/a/b
         // - <tempdir>/kubernetes/c/d
@@ -390,52 +418,72 @@ mod tests {
         let mut file = File::create(data_key_file_path).unwrap();
         file.write_all(b"example2").unwrap();
 
-        // Resolve secrets in YAML
-        let input = r#"
-        a: null
-        b: false,
-        c: 123
-        d: "val1"
-        e: [1, "2"]
-        f:
-          f1: 1
-          f2: "val2"
-        g: !str "val3"
-        "${secret:kubernetes:a/b}": 123
-        "${secret:kubernetes:e/f}": 456
-        s1: "${secret:kubernetes:a/b}"
-        s2: ["${secret:kubernetes:a/b}"]
-        s3:
-          s31: "${secret:kubernetes:a/b}"
-          s32: ["${secret:kubernetes:a/b}", "${secret:kubernetes:c/d}"]
-        s4: !str "${secret:kubernetes:c/d}"
-        "#;
-        let expectation = r#"
-        a: null
-        b: false,
-        c: 123
-        d: "val1"
-        e: [1, "2"]
-        f:
-          f1: 1
-          f2: "val2"
-        g: !str "val3"
-        "${secret:kubernetes:a/b}": 123
-        "${secret:kubernetes:e/f}": 456
-        s1: "example1"
-        s2: ["example1"]
-        s3:
-          s31: "example1"
-          s32: ["example1", "example2"]
-        s4: !str "example2"
-        "#;
+        // Resolve secrets in JSON
+        let input = json!({
+            "a": null,
+            "b": "false,",
+            "c": 123,
+            "d": "val1",
+            "e": [
+                1,
+                "2"
+            ],
+            "f": {
+                "f1": 1,
+                "f2": "val2"
+            },
+            "g": "val3",
+            "${secret:kubernetes:a/b}": 123,
+            "${secret:kubernetes:e/f}": 456,
+            "s1": "${secret:kubernetes:a/b}",
+            "s2": [
+                "${secret:kubernetes:a/b}"
+            ],
+            "s3": {
+                "s31": "${secret:kubernetes:a/b}",
+                "s32": [
+                    "${secret:kubernetes:a/b}",
+                    "${secret:kubernetes:c/d}"
+                ]
+            },
+            "s4": "${secret:kubernetes:c/d}"
+        });
+
+        let expectation = json!({
+            "a": null,
+            "b": "false,",
+            "c": 123,
+            "d": "val1",
+            "e": [
+                1,
+                "2"
+            ],
+            "f": {
+                "f1": 1,
+                "f2": "val2"
+            },
+            "g": "val3",
+            "${secret:kubernetes:a/b}": 123,
+            "${secret:kubernetes:e/f}": 456,
+            "s1": "example1",
+            "s2": [
+                "example1"
+            ],
+            "s3": {
+                "s31": "example1",
+                "s32": [
+                    "example1",
+                    "example2"
+                ]
+            },
+            "s4": "example2"
+        });
         assert_eq!(
-            resolve_secret_references_in_yaml(dir_path, serde_yaml::from_str(input).unwrap())
-                .unwrap(),
-            serde_yaml::from_str::<serde_yaml::Value>(expectation).unwrap()
+            resolve_secret_references_in_json(dir_path, input.clone()).unwrap(),
+            expectation
         );
         assert_eq!(
-            discover_secret_references_in_yaml(&serde_yaml::from_str(input).unwrap()).unwrap(),
+            discover_secret_references_in_json(&input).unwrap(),
             BTreeSet::from([
                 SecretRef::Kubernetes {
                     name: "a".to_string(),
@@ -448,8 +496,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            discover_secret_references_in_yaml(&serde_yaml::from_str(expectation).unwrap())
-                .unwrap(),
+            discover_secret_references_in_json(&expectation).unwrap(),
             BTreeSet::from([])
         );
     }
@@ -494,10 +541,8 @@ mod tests {
             },
             "index": "${secret:kubernetes:e/f}"
         });
-        let connector_config: ConnectorConfig =
-            serde_json::from_value(connector_config_json).unwrap();
         assert_eq!(
-            discover_secret_references_in_connector_config(&connector_config).unwrap(),
+            discover_secret_references_in_connector_config(&connector_config_json).unwrap(),
             BTreeSet::from([
                 SecretRef::Kubernetes {
                     name: "a".to_string(),
@@ -509,6 +554,10 @@ mod tests {
                 },
             ])
         );
+
+        let connector_config: ConnectorConfig =
+            serde_json::from_value(connector_config_json).unwrap();
+
         let connector_config_secrets_resolved =
             resolve_secret_references_in_connector_config(dir_path, &connector_config).unwrap();
 
@@ -530,20 +579,115 @@ mod tests {
         let Some(format_config) = connector_config_secrets_resolved.format else {
             unreachable!();
         };
-        let mut expected_mapping = serde_yaml::Mapping::new();
-        expected_mapping.insert(
-            serde_yaml::Value::String("example".to_string()),
-            serde_yaml::Value::String("example1".to_string()),
-        );
-        assert_eq!(
-            format_config.config,
-            serde_yaml::Value::Mapping(expected_mapping)
-        );
+        assert_eq!(format_config.config, json!({"example": "example1"}));
 
         // Other fields should not be resolved
         assert_eq!(
             connector_config.index,
             Some("${secret:kubernetes:e/f}".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_env_var_success() {
+        // Set the environment variable
+        unsafe {
+            std::env::set_var("FELDERA_TEST_ENV_VAR_ABC123", "my_value");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_potential_secret_reference_string(
+                dir.path(),
+                "${env:FELDERA_TEST_ENV_VAR_ABC123}".to_string()
+            )
+            .unwrap(),
+            "my_value"
+        );
+
+        unsafe {
+            std::env::remove_var("FELDERA_TEST_ENV_VAR_ABC123");
+        }
+    }
+
+    #[test]
+    fn resolve_env_var_not_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_ref_str = "${env:FELDERA_TEST_ENV_VAR_NOT_SET_XYZ}";
+        unsafe {
+            std::env::remove_var("FELDERA_TEST_ENV_VAR_NOT_SET_XYZ");
+        }
+
+        let MaybeSecretRef::SecretRef(expected_ref) =
+            crate::secret_ref::MaybeSecretRef::new(env_ref_str.to_string()).unwrap()
+        else {
+            unreachable!();
+        };
+
+        assert_eq!(
+            resolve_potential_secret_reference_string(dir.path(), env_ref_str.to_string())
+                .unwrap_err(),
+            SecretRefResolutionError::EnvVarNotSet {
+                env_ref: expected_ref,
+                name: "FELDERA_TEST_ENV_VAR_NOT_SET_XYZ".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_env_var_in_connector_config() {
+        unsafe {
+            std::env::set_var("FELDERA_TEST_CONN_VAR_A", "resolved_value_a");
+            std::env::set_var("FELDERA_TEST_CONN_VAR_B", "resolved_value_b");
+        }
+
+        let connector_config_json = json!({
+            "transport": {
+              "name": "datagen",
+              "config": {
+                "plan": [{
+                    "limit": 2,
+                    "fields": {
+                        "col1": { "values": [1, 2] },
+                        "col2": { "values": ["${env:FELDERA_TEST_CONN_VAR_A}", "${env:FELDERA_TEST_CONN_VAR_B}"] }
+                    }
+                }]
+              }
+            },
+            "format": {
+              "name": "json",
+              "config": {
+                "example": "${env:FELDERA_TEST_CONN_VAR_A}"
+              }
+            }
+        });
+
+        let connector_config: ConnectorConfig =
+            serde_json::from_value(connector_config_json).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let resolved =
+            resolve_secret_references_in_connector_config(dir.path(), &connector_config).unwrap();
+
+        let TransportConfig::Datagen(datagen_input_config) = resolved.transport else {
+            unreachable!();
+        };
+        assert_eq!(
+            datagen_input_config.plan[0].fields["col2"]
+                .values
+                .as_ref()
+                .unwrap(),
+            &vec![json!("resolved_value_a"), json!("resolved_value_b")]
+        );
+
+        let Some(format_config) = resolved.format else {
+            unreachable!();
+        };
+        assert_eq!(format_config.config, json!({"example": "resolved_value_a"}));
+
+        unsafe {
+            std::env::remove_var("FELDERA_TEST_CONN_VAR_A");
+            std::env::remove_var("FELDERA_TEST_CONN_VAR_B");
+        }
     }
 }

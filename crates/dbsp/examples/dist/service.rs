@@ -1,6 +1,6 @@
-use chrono::NaiveDate;
 use dbsp::circuit::Layout;
 use dbsp::utils::Tup2;
+use feldera_macros::IsNone;
 use rkyv::Archive;
 use size_of::SizeOf;
 
@@ -19,11 +19,12 @@ use size_of::SizeOf;
     Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct Record {
     pub location: String,
-    pub date: NaiveDate,
+    pub date: i32,
     pub daily_vaccinations: Option<u64>,
 }
 
@@ -42,6 +43,7 @@ pub struct Record {
     Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]

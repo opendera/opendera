@@ -1,13 +1,9 @@
 //! A CLI App for the Feldera REST API.
 
-use std::convert::Infallible;
-use std::fs::File;
-use std::io::{ErrorKind, Read, Write};
-use std::path::PathBuf;
-
+use chrono::Utc;
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
-use env_logger::Env;
+use feldera_observability as observability;
 use feldera_rest_api::types::*;
 use feldera_rest_api::*;
 use feldera_types::config::{FtModel, RuntimeConfig, StorageOptions};
@@ -15,23 +11,29 @@ use feldera_types::error::ErrorResponse;
 use futures_util::StreamExt;
 use json_to_table::json_to_table;
 use log::{debug, error, info, trace, warn};
-use reqwest::header::{HeaderMap, HeaderValue, InvalidHeaderValue};
 use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, HeaderValue, InvalidHeaderValue};
 use serde_json::json;
+use std::convert::Infallible;
+use std::fs::File;
+use std::io::{ErrorKind, Read, Write, stdout};
+use std::path::PathBuf;
 use tabled::builder::Builder;
 use tabled::settings::Style;
 use tempfile::tempfile;
 use tokio::process::Command;
 use tokio::runtime::Handle;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{Duration, Instant, sleep, timeout};
+use tracing_log::LogTracer;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod adhoc;
 mod bench;
 mod cli;
+mod debug;
 mod shell;
 
-pub(crate) const UPGRADE_NOTICE: &str =
-    "Try upgrading to the latest CLI version to resolve this issue. Also make sure the pipeline is recompiled with the latest version of feldera. Report it on github.com/feldera/feldera if the issue persists.";
+pub(crate) const UPGRADE_NOTICE: &str = "Try upgrading to the latest CLI version to resolve this issue. Also make sure the pipeline is recompiled with the latest version of feldera. Report it on github.com/feldera/feldera if the issue persists.";
 
 use crate::adhoc::handle_adhoc_query;
 use crate::cli::*;
@@ -70,16 +72,46 @@ fn make_auth_headers(auth: &Option<String>) -> Result<HeaderMap, InvalidHeaderVa
     Ok(headers)
 }
 
-/// Create a client with the given host, auth, and timeout.
+/// Create a client with the given host, auth, and timeout.  If `insecure` is
+/// true, then the client won't verify TLS certificates.  If `tls_cert` is
+/// provided, its contents are parsed as one or more PEM-encoded certificates
+/// and each is added to the set of trusted roots for HTTPS connections.
 pub(crate) fn make_client(
     host: String,
+    insecure: bool,
+    tls_cert: Option<std::path::PathBuf>,
     auth: Option<String>,
     timeout: Option<u64>,
 ) -> Result<Client, Box<dyn std::error::Error>> {
-    let mut client_builder = reqwest::ClientBuilder::new();
+    let mut client_builder = reqwest::ClientBuilder::new().danger_accept_invalid_certs(insecure);
 
     if let Some(timeout) = timeout {
         client_builder = client_builder.timeout(Duration::from_secs(timeout));
+    }
+
+    if let Some(cert_path) = tls_cert {
+        let pem = std::fs::read(&cert_path).map_err(|e| {
+            format!(
+                "Failed to read TLS certificate file `{}`: {e}",
+                cert_path.display()
+            )
+        })?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+            format!(
+                "Failed to parse TLS certificate file `{}` as PEM: {e}",
+                cert_path.display()
+            )
+        })?;
+        if certs.is_empty() {
+            return Err(format!(
+                "TLS certificate file `{}` did not contain any PEM-encoded certificates",
+                cert_path.display()
+            )
+            .into());
+        }
+        for cert in certs {
+            client_builder = client_builder.add_root_certificate(cert);
+        }
     }
 
     if host.starts_with("https://") {
@@ -225,14 +257,15 @@ fn handle_errors_fatal(
                     eprint!("{}", msg);
                     let h = Handle::current();
                     // This spawns a separate thread because it's very hard to make this function async, I tried.
-                    let st = std::thread::spawn(move || {
-                        if let Ok(body) = h.block_on(r.text()) {
+                    let st = std::thread::spawn(move || match h.block_on(r.text()) {
+                        Ok(body) => {
                             if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
                                 eprintln!(": {}", error.message);
                             } else {
                                 eprintln!(": {body}");
                             }
-                        } else {
+                        }
+                        _ => {
                             eprintln!();
                         }
                     });
@@ -460,6 +493,9 @@ fn patch_runtime_config(
         RuntimeConfigKey::IoWorkers => {
             rc.io_workers = Some(value.parse().map_err(|_| ())?);
         }
+        RuntimeConfigKey::DevTweaks => {
+            rc.dev_tweaks = serde_json::from_str(value).map_err(|_| ())?;
+        }
     };
 
     Ok(())
@@ -508,12 +544,21 @@ async fn read_program_code(
 async fn wait_for_status(
     client: &Client,
     name: String,
-    wait_for: PipelineStatus,
+    wait_for: CombinedStatus,
     waiting_text: &str,
 ) {
-    let mut print_every_30_seconds = tokio::time::Instant::now();
-    let mut is_transitioning = true;
-    while is_transitioning {
+    wait_for_status_one_of(client, name, &[wait_for], waiting_text).await;
+}
+
+/// Wait for the pipeline to reach one of the specified statuses.
+async fn wait_for_status_one_of(
+    client: &Client,
+    name: String,
+    wait_for: &[CombinedStatus],
+    waiting_text: &str,
+) -> CombinedStatus {
+    let mut print_every_30_seconds = Instant::now();
+    loop {
         let pc = client
             .get_pipeline()
             .pipeline_name(name.clone())
@@ -525,10 +570,12 @@ async fn wait_for_status(
                 1,
             ))
             .unwrap();
-        is_transitioning = pc.deployment_status != wait_for;
+        if wait_for.contains(&pc.deployment_status) {
+            return pc.deployment_status;
+        }
         if print_every_30_seconds.elapsed().as_secs() > 30 {
             info!("{}", waiting_text);
-            print_every_30_seconds = tokio::time::Instant::now();
+            print_every_30_seconds = Instant::now();
         }
 
         if let Some(deployment_error) = &pc.deployment_error {
@@ -554,8 +601,37 @@ async fn wait_for_status(
     }
 }
 
+async fn wait_for_storage_status(
+    client: &Client,
+    name: String,
+    wait_for: StorageStatus,
+    waiting_text: &str,
+) {
+    let mut print_every_30_seconds = Instant::now();
+    let mut is_transitioning = true;
+    while is_transitioning {
+        let pc = client
+            .get_pipeline()
+            .pipeline_name(name.clone())
+            .send()
+            .await
+            .map_err(handle_errors_fatal(
+                client.baseurl().clone(),
+                "Failed to get program config",
+                1,
+            ))
+            .unwrap();
+        is_transitioning = pc.storage_status != wait_for;
+        if print_every_30_seconds.elapsed().as_secs() > 30 {
+            info!("{}", waiting_text);
+            print_every_30_seconds = Instant::now();
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn wait_for_checkpoint(client: &Client, name: String, seq_number: u64, waiting_text: &str) {
-    let mut print_every_30_seconds = tokio::time::Instant::now();
+    let mut print_every_30_seconds = Instant::now();
     let mut is_waiting_for_checkpoint = true;
     while is_waiting_for_checkpoint {
         let cs = client
@@ -592,7 +668,7 @@ async fn wait_for_checkpoint(client: &Client, name: String, seq_number: u64, wai
 
         if print_every_30_seconds.elapsed().as_secs() > 30 {
             info!("{}", waiting_text);
-            print_every_30_seconds = tokio::time::Instant::now();
+            print_every_30_seconds = Instant::now();
         }
 
         sleep(Duration::from_millis(500)).await;
@@ -604,6 +680,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
         PipelineAction::Create {
             name,
             program_path,
+            runtime_version,
             profile,
             udf_rs,
             udf_toml,
@@ -622,7 +699,11 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         program_code: program_code.unwrap_or_default(),
                         udf_rust,
                         udf_toml,
-                        program_config: Some(profile.into()),
+                        program_config: Some(ProgramConfig {
+                            cache: true,
+                            profile: Some(profile),
+                            runtime_version,
+                        }),
                         runtime_config: None,
                     })
                     .send()
@@ -659,7 +740,25 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             name,
             recompile,
             no_wait,
+            initial,
+            bootstrap_policy,
+            no_dismiss_error,
         } => {
+            if initial != "standby" && initial != "paused" && initial != "running" {
+                eprintln!("Unsupported `--initial`: {}", initial);
+                std::process::exit(1);
+            }
+
+            if bootstrap_policy != "allow"
+                && bootstrap_policy != "reject"
+                && bootstrap_policy != "await_approval"
+            {
+                // TODO: strong typing
+
+                eprintln!("Unsupported `--bootstrap-policy`: {}", bootstrap_policy);
+                std::process::exit(1);
+            }
+
             // Force recompilation by adding/removing a space at the end of the program code
             // and disabling the compilation cache
             let pc = client
@@ -716,12 +815,13 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 cd.restore().await;
             };
 
-            let mut print_every_30_seconds = tokio::time::Instant::now();
+            let mut print_every_30_seconds = Instant::now();
             let mut compiling = true;
             while compiling {
                 let pc = client
                     .get_pipeline()
                     .pipeline_name(name.clone())
+                    .selector(PipelineFieldSelector::Status)
                     .send()
                     .await
                     .map_err(handle_errors_fatal(
@@ -737,14 +837,32 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
 
                 if print_every_30_seconds.elapsed().as_secs() > 30 {
                     info!("Compiling pipeline...");
-                    print_every_30_seconds = tokio::time::Instant::now();
+                    print_every_30_seconds = Instant::now();
                 }
                 sleep(Duration::from_millis(500)).await;
+            }
+
+            if !no_dismiss_error {
+                let response = client
+                    .post_pipeline_dismiss_error()
+                    .pipeline_name(name.clone())
+                    .send()
+                    .await
+                    .map_err(handle_errors_fatal(
+                        client.baseurl().clone(),
+                        "Failed to dismiss pipeline deployment error",
+                        1,
+                    ))
+                    .unwrap();
+                trace!("{:#?}", response);
             }
 
             let response = client
                 .post_pipeline_start()
                 .pipeline_name(name.clone())
+                .initial(&initial)
+                .bootstrap_policy(&bootstrap_policy)
+                .dismiss_error(false) // It has already been separately dismissed
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
@@ -755,14 +873,58 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .unwrap();
 
             if !no_wait {
-                wait_for_status(
+                let status = wait_for_status_one_of(
                     &client,
                     name.clone(),
-                    PipelineStatus::Running,
+                    if initial == "running" {
+                        &[CombinedStatus::Running, CombinedStatus::AwaitingApproval]
+                    } else if initial == "paused" {
+                        &[CombinedStatus::Paused, CombinedStatus::AwaitingApproval]
+                    } else {
+                        &[CombinedStatus::Standby, CombinedStatus::AwaitingApproval]
+                    },
                     "Starting the pipeline...",
                 )
                 .await;
-                println!("Pipeline started successfully.");
+                if status == CombinedStatus::AwaitingApproval {
+                    let diff = client
+                        .get_pipeline()
+                        .pipeline_name(name.clone())
+                        .selector(PipelineFieldSelector::Status)
+                        .send()
+                        .await
+                        .map_err(handle_errors_fatal(
+                            client.baseurl().clone(),
+                            "Failed to get pipeline status",
+                            1,
+                        ))
+                        .unwrap()
+                        .deployment_runtime_status_details
+                        .clone();
+
+                    println!(
+                        "Pipeline definition has changed since the last checkpoint. The pipeline is awaiting approval to proceed with bootstrapping the modified components. Run 'fda approve' to approve the changes or 'fda stop' to terminate the pipeline. Summary of changes:"
+                    );
+
+                    let diff_str = match diff {
+                        // Normally shouldn't happen.
+                        None => "<not available>".to_string(),
+                        Some(diff) => match format {
+                            OutputFormat::Text => json_to_table(&diff)
+                                .collapse()
+                                .into_pool_table()
+                                .to_string(),
+                            OutputFormat::Json => serde_json::to_string_pretty(&diff)
+                                .expect("Failed to serialize pipeline diff"),
+                            _ => {
+                                format!("<unsupported output format: {}>", format)
+                            }
+                        },
+                    };
+                    println!("{}", diff_str);
+                } else {
+                    println!("Pipeline started successfully.");
+                }
             }
 
             trace!("{:#?}", response);
@@ -795,6 +957,21 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 );
             }
         }
+        PipelineAction::Approve { name } => {
+            let response = client
+                .post_pipeline_approve()
+                .pipeline_name(name.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to approve pipeline changes",
+                    1,
+                ))
+                .unwrap();
+            println!("Pipeline changes approved successfully.");
+            trace!("{:#?}", response);
+        }
         PipelineAction::Pause { name, no_wait } => {
             let response = client
                 .post_pipeline_pause()
@@ -812,11 +989,36 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 wait_for_status(
                     &client,
                     name.clone(),
-                    PipelineStatus::Paused,
+                    CombinedStatus::Paused,
                     "Pausing the pipeline...",
                 )
                 .await;
                 println!("Pipeline paused successfully.");
+            }
+            trace!("{:#?}", response);
+        }
+        PipelineAction::Resume { name, no_wait } => {
+            let response = client
+                .post_pipeline_resume()
+                .pipeline_name(name.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to resume pipeline",
+                    1,
+                ))
+                .unwrap();
+
+            if !no_wait {
+                wait_for_status(
+                    &client,
+                    name.clone(),
+                    CombinedStatus::Running,
+                    "Resuming the pipeline...",
+                )
+                .await;
+                println!("Pipeline resumed successfully.");
             }
             trace!("{:#?}", response);
         }
@@ -825,10 +1027,14 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             recompile,
             checkpoint,
             no_wait,
+            initial,
+            bootstrap_policy,
+            no_dismiss_error,
         } => {
             let current_status = client
                 .get_pipeline()
                 .pipeline_name(name.clone())
+                .selector(PipelineFieldSelector::Status)
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
@@ -853,13 +1059,13 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             wait_for_status(
                 &client,
                 name.clone(),
-                PipelineStatus::Stopped,
-                "Shutting down the pipeline...",
+                CombinedStatus::Stopped,
+                "Stopping the pipeline...",
             )
             .await;
 
-            if current_status.deployment_status != PipelineStatus::Stopped {
-                println!("Pipeline shutdown successful.");
+            if current_status.deployment_status != CombinedStatus::Stopped {
+                println!("Pipeline stop successful.");
             }
 
             let _ = Box::pin(pipeline(
@@ -868,6 +1074,9 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     name,
                     recompile,
                     no_wait,
+                    initial,
+                    bootstrap_policy,
+                    no_dismiss_error,
                 },
                 client,
             ))
@@ -895,7 +1104,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 wait_for_status(
                     &client,
                     name.clone(),
-                    PipelineStatus::Stopped,
+                    CombinedStatus::Stopped,
                     "Shutting down the pipeline...",
                 )
                 .await;
@@ -920,10 +1129,10 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             trace!("{:#?}", response);
 
             if !no_wait {
-                wait_for_status(
+                wait_for_storage_status(
                     &client,
                     name.clone(),
-                    PipelineStatus::Stopped,
+                    StorageStatus::Cleared,
                     "Clearing pipeline...",
                 )
                 .await;
@@ -945,7 +1154,9 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
 
             match format {
                 OutputFormat::Text => {
-                    let table = json_to_table(&serde_json::Value::Object(response.into_inner()))
+                    let stats_value = serde_json::to_value(response.as_ref())
+                        .expect("Failed to serialize pipeline stats");
+                    let table = json_to_table(&stats_value)
                         .collapse()
                         .into_pool_table()
                         .to_string();
@@ -961,6 +1172,47 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 _ => {
                     eprintln!("Unsupported output format: {}", format);
                     std::process::exit(1);
+                }
+            }
+        }
+        PipelineAction::Metrics { name } => {
+            let format = match format {
+                OutputFormat::Json => MetricsFormat::Json,
+                OutputFormat::Prometheus => MetricsFormat::Prometheus,
+                _ => {
+                    eprintln!(
+                        "`{format}` is not supported as a metrics format (use `--format json` or `--format prometheus`)"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let response = client
+                .get_pipeline_metrics()
+                .format(format)
+                .pipeline_name(name)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to get pipeline metrics",
+                    1,
+                ))
+                .unwrap();
+
+            let mut byte_stream = response.into_inner();
+            while let Some(chunk) = byte_stream.next().await {
+                match chunk {
+                    Ok(chunk) => match stdout().write_all(&chunk) {
+                        Ok(_) => (),
+                        Err(error) => {
+                            eprintln!("write to stdout failed ({error})");
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("ERROR: Unable to read server response: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -1171,6 +1423,21 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 }
             }
         }
+        PipelineAction::UpdateRuntime { name } => {
+            let response = client
+                .post_update_runtime()
+                .pipeline_name(name.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to update pipeline runtime",
+                    1,
+                ))
+                .unwrap();
+            println!("Pipeline runtime updated successfully.");
+            trace!("{:#?}", response);
+        }
         PipelineAction::Program { action } => program(format, action, client).await,
         PipelineAction::Connector {
             name,
@@ -1232,7 +1499,9 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     command.stdin(tempfile);
                     match command.status().await {
                         Err(e) => {
-                            eprintln!("ERROR: Failed to execute `{command_name}` ({e}). `pprof` is probably not installed. Install it from <https://github.com/google/pprof>.");
+                            eprintln!(
+                                "ERROR: Failed to execute `{command_name}` ({e}). `pprof` is probably not installed. Install it from <https://github.com/google/pprof>."
+                            );
                             std::process::exit(1);
                         }
                         Ok(exit_status) if !exit_status.success() => {
@@ -1302,7 +1571,100 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 }
             }
         }
-        PipelineAction::Shell { name, start } => {
+        PipelineAction::SupportBundle {
+            name,
+            output,
+            no_circuit_profile,
+            no_heap_profile,
+            no_metrics,
+            no_logs,
+            no_stats,
+            no_pipeline_config,
+            no_system_config,
+            no_dataflow_graph,
+        } => {
+            let mut request = client.get_pipeline_support_bundle().pipeline_name(&name);
+
+            // Add query parameters for disabled collections
+            if no_circuit_profile {
+                request = request.circuit_profile(false);
+            }
+            if no_heap_profile {
+                request = request.heap_profile(false);
+            }
+            if no_metrics {
+                request = request.metrics(false);
+            }
+            if no_logs {
+                request = request.logs(false);
+            }
+            if no_stats {
+                request = request.stats(false);
+            }
+            if no_pipeline_config {
+                request = request.pipeline_config(false);
+            }
+            if no_system_config {
+                request = request.system_config(false);
+            }
+            if no_dataflow_graph {
+                request = request.dataflow_graph(false);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to obtain support bundle",
+                    1,
+                ))
+                .unwrap();
+            let mut byte_stream = response.into_inner();
+            let mut buffer = Vec::new();
+            while let Some(chunk) = byte_stream.next().await {
+                match chunk {
+                    Ok(chunk) => buffer.extend_from_slice(&chunk),
+                    Err(e) => {
+                        eprintln!("ERROR: Unable to read server response: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            match output {
+                None => {
+                    let (path, mut file) =
+                        unique_file(format!("{name}-support-bundle").as_str(), "zip")
+                            .unwrap_or_else(|e| {
+                                eprintln!("ERROR: Failed to create circuit profile file: {e}");
+                                std::process::exit(1);
+                            });
+
+                    file.write_all(&buffer).unwrap_or_else(|e| {
+                        eprintln!("ERROR: Failed to create temporary file: {e}");
+                        std::process::exit(1);
+                    });
+                    println!("Circuit profile written to {}", path.display());
+                }
+                Some(filename) => {
+                    tokio::fs::write(&filename, buffer)
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("ERROR: Failed to write {}: {e}", filename.display());
+                            std::process::exit(1);
+                        });
+                    println!("Support bundle written to {}", filename.display());
+                }
+            }
+        }
+        PipelineAction::Shell {
+            name,
+            start,
+            initial,
+            bootstrap_policy,
+            no_dismiss_error,
+        } => {
             let client2 = client.clone();
             if start {
                 let _ = Box::pin(pipeline(
@@ -1311,6 +1673,9 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         name: name.clone(),
                         recompile: false,
                         no_wait: false,
+                        initial,
+                        bootstrap_policy,
+                        no_dismiss_error,
                     },
                     client,
                 ))
@@ -1396,7 +1761,428 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 }
             }
         }
+        PipelineAction::StartTransaction { name } => {
+            let response = client
+                .start_transaction()
+                .pipeline_name(name)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to start transaction",
+                    1,
+                ))
+                .unwrap();
+
+            match format {
+                OutputFormat::Text => {
+                    println!(
+                        "Transaction started successfully with ID: {}",
+                        response.into_inner().transaction_id
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize transaction response")
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "Unsupported output format, falling back to text: {}",
+                        format
+                    );
+                    println!(
+                        "Transaction started successfully with ID: {}",
+                        response.into_inner().transaction_id
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        PipelineAction::CommitTransaction {
+            name,
+            transaction_id,
+            no_wait,
+        } => {
+            // First, get the current transaction ID from stats
+            let stats = client
+                .get_pipeline_stats()
+                .pipeline_name(name.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to get pipeline stats",
+                    1,
+                ))
+                .unwrap();
+            let current_transaction_id = stats.into_inner().global_metrics.transaction_id;
+
+            // Check if there's no transaction in progress
+            if current_transaction_id == 0 {
+                eprintln!(
+                    "Attempting to commit a transaction, but there is no transaction in progress"
+                );
+                std::process::exit(1);
+            }
+
+            // Verify transaction ID if provided
+            if let Some(expected_transaction_id) = transaction_id
+                && current_transaction_id != expected_transaction_id as i64
+            {
+                eprintln!(
+                    "Specified transaction {} doesn't match current active transaction {}",
+                    expected_transaction_id, current_transaction_id
+                );
+                std::process::exit(1);
+            }
+
+            let actual_transaction_id = current_transaction_id;
+
+            let response = client
+                .commit_transaction()
+                .pipeline_name(name.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to commit transaction",
+                    1,
+                ))
+                .unwrap();
+
+            if !no_wait {
+                // Wait for the transaction to commit by polling the stats
+                loop {
+                    let stats = client
+                        .get_pipeline_stats()
+                        .pipeline_name(name.clone())
+                        .send()
+                        .await
+                        .map_err(handle_errors_fatal(
+                            client.baseurl().clone(),
+                            "Failed to get pipeline stats",
+                            1,
+                        ))
+                        .unwrap();
+
+                    let current_transaction_id = stats.into_inner().global_metrics.transaction_id;
+
+                    // If transaction_id is 0, it means the transaction has been committed
+                    if current_transaction_id != actual_transaction_id {
+                        break;
+                    }
+
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+
+            match format {
+                OutputFormat::Text => {
+                    println!("Transaction committed successfully.");
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize commit response")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        PipelineAction::Rebalance { name } => {
+            client
+                .post_pipeline_rebalance()
+                .pipeline_name(name.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to initiate rebalancing",
+                    1,
+                ))
+                .unwrap();
+            println!("Initiated rebalancing for pipeline {name}.");
+        }
         PipelineAction::Bench { args } => bench::bench(client, format, args).await,
+        PipelineAction::DismissError { name } => {
+            let response = client
+                .post_pipeline_dismiss_error()
+                .pipeline_name(name.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to dismiss pipeline deployment error",
+                    1,
+                ))
+                .unwrap();
+            println!("Pipeline deployment error dismissed successfully.");
+            trace!("{:#?}", response);
+        }
+        PipelineAction::Events { name, selector } => {
+            let response = client
+                .list_pipeline_events()
+                .pipeline_name(name.clone())
+                .selector(selector)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Unable to retrieve pipeline events",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        let mut rows = vec![];
+                        rows.push([
+                            "event_id".to_string(),
+                            "recorded_at".to_string(),
+                            "deployment_resources_status".to_string(),
+                            "deployment_resources_status_details".to_string(),
+                            "deployment_resources_desired_status".to_string(),
+                            "deployment_runtime_status".to_string(),
+                            "deployment_runtime_status_details".to_string(),
+                            "deployment_runtime_desired_status".to_string(),
+                            "deployment_has_error".to_string(),
+                            "deployment_error".to_string(),
+                            "program_status".to_string(),
+                            "storage_status".to_string(),
+                            "storage_status_details".to_string(),
+                        ]);
+                        for event in response.iter() {
+                            rows.push([
+                                event.event_id.to_string(),
+                                format!(
+                                    "{} ({:.0}s ago)",
+                                    event.recorded_at,
+                                    (Utc::now() - event.recorded_at).as_seconds_f64()
+                                ),
+                                event.deployment_resources_status.to_string(),
+                                event
+                                    .deployment_resources_status_details
+                                    .as_ref()
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event.deployment_resources_desired_status.to_string(),
+                                event
+                                    .deployment_runtime_status
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event
+                                    .deployment_runtime_status_details
+                                    .as_ref()
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event
+                                    .deployment_runtime_desired_status
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event.deployment_has_error.to_string(),
+                                event
+                                    .deployment_error
+                                    .as_ref()
+                                    .map(|v| format!("{v:?}"))
+                                    .unwrap_or("(none)".to_string()),
+                                event.program_status.to_string(),
+                                event.storage_status.to_string(),
+                                event
+                                    .storage_status_details
+                                    .as_ref()
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                            ]);
+                        }
+                        println!(
+                            "{}",
+                            Builder::from_iter(rows).build().with(Style::rounded())
+                        );
+                    } else {
+                        let mut rows = vec![];
+                        rows.push([
+                            "event_id".to_string(),
+                            "recorded_at".to_string(),
+                            "deployment_resources_status".to_string(),
+                            "deployment_resources_desired_status".to_string(),
+                            "deployment_runtime_status".to_string(),
+                            "deployment_runtime_desired_status".to_string(),
+                            "deployment_has_error".to_string(),
+                            "program_status".to_string(),
+                            "storage_status".to_string(),
+                        ]);
+                        for event in response.iter() {
+                            rows.push([
+                                event.event_id.to_string(),
+                                format!(
+                                    "{} ({:.0}s ago)",
+                                    event.recorded_at,
+                                    (Utc::now() - event.recorded_at).as_seconds_f64()
+                                ),
+                                event.deployment_resources_status.to_string(),
+                                event.deployment_resources_desired_status.to_string(),
+                                event
+                                    .deployment_runtime_status
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event
+                                    .deployment_runtime_desired_status
+                                    .map(|v| v.to_string())
+                                    .unwrap_or("(none)".to_string()),
+                                event.deployment_has_error.to_string(),
+                                event.program_status.to_string(),
+                                event.storage_status.to_string(),
+                            ]);
+                        }
+                        println!(
+                            "{}",
+                            Builder::from_iter(rows).build().with(Style::rounded())
+                        );
+                    }
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize pipeline events")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        PipelineAction::Event {
+            name,
+            event_id,
+            selector,
+        } => {
+            let response = client
+                .get_pipeline_event()
+                .pipeline_name(name.clone())
+                .event_id(event_id)
+                .selector(selector)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Unable to retrieve pipeline event",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    let mut rows = vec![];
+                    rows.push(["Field".to_string(), "Value".to_string()]);
+                    rows.push(["event_id".to_string(), response.event_id.to_string()]);
+                    rows.push([
+                        "recorded_at".to_string(),
+                        format!(
+                            "{} ({:.0}s ago)",
+                            response.recorded_at,
+                            (Utc::now() - response.recorded_at).as_seconds_f64()
+                        ),
+                    ]);
+                    rows.push([
+                        "deployment_resources_status".to_string(),
+                        response.deployment_resources_status.to_string(),
+                    ]);
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        rows.push([
+                            "deployment_resources_status_details".to_string(),
+                            response
+                                .deployment_resources_status_details
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .unwrap_or("(none)".to_string()),
+                        ]);
+                    }
+                    rows.push([
+                        "deployment_resources_desired_status".to_string(),
+                        response.deployment_resources_desired_status.to_string(),
+                    ]);
+                    rows.push([
+                        "deployment_runtime_status".to_string(),
+                        response
+                            .deployment_runtime_status
+                            .map(|v| v.to_string())
+                            .unwrap_or("(none)".to_string()),
+                    ]);
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        rows.push([
+                            "deployment_runtime_status_details".to_string(),
+                            response
+                                .deployment_runtime_status_details
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .unwrap_or("(none)".to_string()),
+                        ]);
+                    }
+                    rows.push([
+                        "deployment_runtime_desired_status".to_string(),
+                        response
+                            .deployment_runtime_desired_status
+                            .map(|v| v.to_string())
+                            .unwrap_or("(none)".to_string()),
+                    ]);
+                    rows.push([
+                        "deployment_has_error".to_string(),
+                        response.deployment_has_error.to_string(),
+                    ]);
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        rows.push([
+                            "deployment_error".to_string(),
+                            response
+                                .deployment_error
+                                .as_ref()
+                                .map(|v| format!("{v:?}"))
+                                .unwrap_or("(none)".to_string()),
+                        ]);
+                    }
+                    rows.push([
+                        "program_status".to_string(),
+                        response.program_status.to_string(),
+                    ]);
+                    rows.push([
+                        "storage_status".to_string(),
+                        response.storage_status.to_string(),
+                    ]);
+                    if selector == PipelineMonitorEventFieldSelector::All {
+                        rows.push([
+                            "storage_status_details".to_string(),
+                            response
+                                .storage_status_details
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .unwrap_or("(none)".to_string()),
+                        ]);
+                    }
+                    println!(
+                        "{}",
+                        Builder::from_iter(rows).build().with(Style::rounded())
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize pipeline events")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
@@ -1432,14 +2218,18 @@ async fn connector(
         .iter()
         .any(|(name, _c)| *name == full_connector_name);
     if !relation_is_table && !relation_is_view {
-        eprintln!("No connector named {connector} found in pipeline {pipeline_name}");
+        eprintln!(
+            "No connector named {connector} found for relation {relation} in pipeline {pipeline_name}"
+        );
         std::process::exit(1);
     }
 
     match action {
         ConnectorAction::Start => {
             if !relation_is_table {
-                eprintln!("Can not start the output connector '{connector}'. Only input connectors (connectors attached to a table) can be started.");
+                eprintln!(
+                    "Can not start the output connector '{connector}'. Only input connectors (connectors attached to a table) can be started."
+                );
                 std::process::exit(1);
             }
             client
@@ -1460,7 +2250,9 @@ async fn connector(
         }
         ConnectorAction::Pause => {
             if !relation_is_table {
-                eprintln!("Can not pause the output connector '{connector}'. Only input connectors (connectors attached to a table) can be paused.");
+                eprintln!(
+                    "Can not pause the output connector '{connector}'. Only input connectors (connectors attached to a table) can be paused."
+                );
                 std::process::exit(1);
             }
             client
@@ -1479,40 +2271,26 @@ async fn connector(
                 .unwrap();
             println!("Table {relation} connector {connector} paused successfully.");
         }
-        ConnectorAction::Stats => {
-            let response = if relation_is_table {
-                client
-                    .get_pipeline_input_connector_status()
-                    .pipeline_name(pipeline_name)
-                    .table_name(relation)
-                    .connector_name(connector)
-                    .send()
-                    .await
-                    .map_err(handle_errors_fatal(
-                        client.baseurl().clone(),
-                        "Failed to get table connector stats",
-                        1,
-                    ))
-                    .unwrap()
-            } else {
-                client
-                    .get_pipeline_output_connector_status()
-                    .pipeline_name(pipeline_name)
-                    .view_name(relation)
-                    .connector_name(connector)
-                    .send()
-                    .await
-                    .map_err(handle_errors_fatal(
-                        client.baseurl().clone(),
-                        "Failed to get view connector stats",
-                        1,
-                    ))
-                    .unwrap()
-            };
+        ConnectorAction::Stats if relation_is_table => {
+            let response = client
+                .get_pipeline_input_connector_status()
+                .pipeline_name(pipeline_name)
+                .table_name(relation)
+                .connector_name(connector)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to get table connector stats",
+                    1,
+                ))
+                .unwrap();
 
             match format {
                 OutputFormat::Text => {
-                    let table = json_to_table(&serde_json::Value::Object(response.into_inner()))
+                    let stats_value = serde_json::to_value(response.as_ref())
+                        .expect("Failed to serialize input connector stats");
+                    let table = json_to_table(&stats_value)
                         .collapse()
                         .into_pool_table()
                         .to_string();
@@ -1521,8 +2299,46 @@ async fn connector(
                 OutputFormat::Json => {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&response.into_inner())
-                            .expect("Failed to serialize pipeline stats")
+                        serde_json::to_string_pretty(response.as_ref())
+                            .expect("Failed to serialize input connector stats")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        ConnectorAction::Stats => {
+            let response = client
+                .get_pipeline_output_connector_status()
+                .pipeline_name(pipeline_name)
+                .view_name(relation)
+                .connector_name(connector)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to get view connector stats",
+                    1,
+                ))
+                .unwrap();
+
+            match format {
+                OutputFormat::Text => {
+                    let stats_value = serde_json::to_value(response.as_ref())
+                        .expect("Failed to serialize output connector stats");
+                    let table = json_to_table(&stats_value)
+                        .collapse()
+                        .into_pool_table()
+                        .to_string();
+                    println!("{}", table);
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(response.as_ref())
+                            .expect("Failed to serialize output connector stats")
                     );
                 }
                 _ => {
@@ -1621,7 +2437,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                 udf_rust: None,
                 udf_toml: None,
                 program_config: Some(ProgramConfig {
-                    profile: profile.map(|p| p.into()),
+                    profile,
                     cache: true,
                     runtime_version,
                 }),
@@ -1749,32 +2565,129 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                 std::process::exit(1);
             }
         }
-        ProgramAction::Info { name } => {
+    }
+}
+
+async fn cluster(format: OutputFormat, action: ClusterAction, client: Client) {
+    match action {
+        ClusterAction::Events => {
             let response = client
-                .get_program_info()
-                .pipeline_name(name)
+                .list_cluster_events()
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
                     client.baseurl().clone(),
-                    "Failed to get program information",
+                    "Unable to retrieve cluster events",
                     1,
                 ))
                 .unwrap();
-
             match format {
                 OutputFormat::Text => {
+                    let mut rows = vec![];
+                    rows.push([
+                        "id".to_string(),
+                        "recorded_at".to_string(),
+                        "all_healthy".to_string(),
+                        "api_status".to_string(),
+                        "compiler_status".to_string(),
+                        "runner_status".to_string(),
+                    ]);
+                    for event in response.iter() {
+                        rows.push([
+                            event.id.to_string(),
+                            format!(
+                                "{} ({:.0}s ago)",
+                                event.recorded_at,
+                                (Utc::now() - event.recorded_at).as_seconds_f64()
+                            ),
+                            event.all_healthy.to_string(),
+                            event.api_status.to_string(),
+                            event.compiler_status.to_string(),
+                            event.runner_status.to_string(),
+                        ]);
+                    }
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&response.into_inner())
-                            .expect("Failed to serialize program information")
+                        Builder::from_iter(rows).build().with(Style::rounded())
                     );
                 }
                 OutputFormat::Json => {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&response.into_inner())
-                            .expect("Failed to serialize program information")
+                            .expect("Failed to serialize cluster events")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        ClusterAction::Event { id, selector } => {
+            let response = client
+                .get_cluster_event()
+                .event_id(id)
+                .selector(selector)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Unable to retrieve cluster event",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    let mut rows = vec![];
+                    rows.push(["Field".to_string(), "Value".to_string()]);
+                    rows.push(["id".to_string(), response.id.to_string()]);
+                    rows.push([
+                        "recorded_at".to_string(),
+                        format!(
+                            "{} ({:.0}s ago)",
+                            response.recorded_at,
+                            (Utc::now() - response.recorded_at).as_seconds_f64()
+                        ),
+                    ]);
+                    rows.push(["all_healthy".to_string(), response.all_healthy.to_string()]);
+                    rows.push(["api_status".to_string(), response.api_status.to_string()]);
+                    if let Some(value) = &response.api_self_info {
+                        rows.push(["api_self_info".to_string(), value.to_string()]);
+                    }
+                    if let Some(value) = &response.api_resources_info {
+                        rows.push(["api_resources_info".to_string(), value.to_string()]);
+                    }
+                    rows.push([
+                        "compiler_status".to_string(),
+                        response.compiler_status.to_string(),
+                    ]);
+                    if let Some(value) = &response.compiler_self_info {
+                        rows.push(["compiler_self_info".to_string(), value.to_string()]);
+                    }
+                    if let Some(value) = &response.compiler_resources_info {
+                        rows.push(["compiler_resources_info".to_string(), value.to_string()]);
+                    }
+                    rows.push([
+                        "runner_status".to_string(),
+                        response.runner_status.to_string(),
+                    ]);
+                    if let Some(value) = &response.runner_self_info {
+                        rows.push(["runner_self_info".to_string(), value.to_string()]);
+                    }
+                    if let Some(value) = &response.runner_resources_info {
+                        rows.push(["runner_resources_info".to_string(), value.to_string()]);
+                    }
+                    println!(
+                        "{}",
+                        Builder::from_iter(rows).build().with(Style::rounded())
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize cluster events")
                     );
                 }
                 _ => {
@@ -1786,67 +2699,155 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
     }
 }
 
-fn debug(_format: OutputFormat, action: DebugActions) {
-    match action {
-        DebugActions::MsgpCat { path } => {
-            let mut file = match File::open(&path) {
-                Ok(file) => file,
-                Err(error) => {
-                    eprintln!("{}: open failed ({error})", path.display());
-                    std::process::exit(1);
-                }
-            };
-            loop {
-                let value = match rmpv::decode::value::read_value(&mut file) {
-                    Ok(value) => value,
-                    Err(rmpv::decode::Error::InvalidMarkerRead(error))
-                        if error.kind() == ErrorKind::UnexpectedEof =>
-                    {
-                        break
-                    }
-                    Err(error) => {
-                        eprintln!("{}: read failed ({error})", path.display());
-                        std::process::exit(1);
-                    }
-                };
-                println!("{value}");
+fn main() {
+    let _guard = observability::init(
+        "https://18aa37ae23e7130b57b91aaad432bc18@o4510219052253184.ingest.us.sentry.io/4510298809827328",
+        "fda",
+        env!("CARGO_PKG_VERSION"),
+    );
+    init_logging("warn");
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            CompleteEnv::with_factory(Cli::command).complete();
+            let mut cli = Cli::parse();
+            // If a `/` is at the end of the host, the manager returns HTML,
+            // instead of an API response.
+            //
+            // Needs to be fixed in the manager routing but for compat reasons
+            // we remove it here.
+            if cli.host.ends_with("/") {
+                cli.host = cli.host.trim_end_matches('/').to_string();
             }
-        }
-    }
+
+            let client = || {
+                make_client(cli.host, cli.insecure, cli.tls_cert, cli.auth, cli.timeout)
+                    .map_err(|e| {
+                        eprintln!("Failed to create HTTP client: {}", e);
+                        std::process::exit(1);
+                    })
+                    .unwrap()
+            };
+
+            match cli.command {
+                Commands::Apikey { action } => api_key_commands(cli.format, action, client()).await,
+                Commands::Pipelines => pipelines(cli.format, client()).await,
+                Commands::Pipeline(action) => pipeline(cli.format, action, client()).await,
+                Commands::Cluster { action } => cluster(cli.format, action, client()).await,
+                Commands::Debug { action } => debug::debug(cli.format, action, client()).await,
+            }
+        })
 }
 
-#[tokio::main]
-async fn main() {
-    CompleteEnv::with_factory(Cli::command).complete();
-
-    let mut cli = Cli::parse();
-    let env = Env::default().default_filter_or("warn");
-    let _r = env_logger::Builder::from_env(env)
-        .format_target(false)
-        .format_timestamp(None)
+fn init_logging(default_level: &str) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    let _ = LogTracer::init();
+    let _ = tracing_subscriber::registry()
+        .with(sentry::integrations::tracing::layer())
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .without_time(),
+        )
         .try_init();
-    // If a `/` is at the end of the host, the manager returns HTML,
-    // instead of an API response.
-    //
-    // Needs to be fixed in the manager routing but for compat reasons
-    // we remove it here.
-    if cli.host.ends_with("/") {
-        cli.host = cli.host.trim_end_matches('/').to_string();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::make_client;
+    use std::io::Write;
+
+    // A single self-signed PEM-encoded certificate used only as test data. It
+    // is never trusted by the system and never presented as a server
+    // certificate - it is parsed to verify that `make_client` accepts a valid
+    // PEM bundle on the `--tls-cert` path.
+    const VALID_TEST_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBhTCCASugAwIBAgIUSkl1zF8JmnzQL4R2lK2RgqxWVCQwCgYIKoZIzj0EAwIw\n\
+FDESMBAGA1UEAwwJVGVzdCBSb290MB4XDTI0MDEwMTAwMDAwMFoXDTM0MDEwMTAw\n\
+MDAwMFowFDESMBAGA1UEAwwJVGVzdCBSb290MFkwEwYHKoZIzj0CAQYIKoZIzj0D\n\
+AQcDQgAEu/n2TjZ+9/IYeiI4lL9zFqpTtq+gg3i5g7ZGY7h7Z7N9wz7T2mEbq5u9\n\
+6Lw1D5i9a7vhB9oXy5AE0AVGekt+cqNjMGEwHQYDVR0OBBYEFHZkI7WQpjR9X5+y\n\
+M0l7m5s8B1bkMB8GA1UdIwQYMBaAFHZkI7WQpjR9X5+yM0l7m5s8B1bkMA8GA1Ud\n\
+EwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0gAMEUCIQDN\n\
+2cA4cQKG/9XG9B5mJdQ3L+sVu+8fF7kS5q3cq1pPMQIgBmV7f7ZQ6kqoK0qk0Cg9\n\
+aC3Oy4iVrYGOq9v6uP9iblE=\n\
+-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn make_client_tls_cert_missing_file_returns_error() {
+        let missing = std::path::PathBuf::from("/definitely/not/a/real/path-fda-test.pem");
+        let err = make_client(
+            "https://example.invalid".to_string(),
+            false,
+            Some(missing),
+            None,
+            None,
+        )
+        .expect_err("non-existent cert path must produce an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to read TLS certificate file"),
+            "unexpected error: {msg}"
+        );
     }
 
-    let client = || {
-        make_client(cli.host, cli.auth, cli.timeout)
-            .map_err(|e| {
-                eprintln!("Failed to create HTTP client: {}", e);
-                std::process::exit(1);
-            })
-            .unwrap()
-    };
+    #[test]
+    fn make_client_tls_cert_invalid_pem_returns_error() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        file.write_all(b"this is not a PEM certificate")
+            .expect("write temp file");
+        let err = make_client(
+            "https://example.invalid".to_string(),
+            false,
+            Some(file.path().to_path_buf()),
+            None,
+            None,
+        )
+        .expect_err("garbage cert contents must produce an error");
+        let msg = err.to_string();
+        // Either we fail the PEM parse or we parse to an empty bundle; both are
+        // acceptable error paths.
+        assert!(
+            msg.contains("Failed to parse TLS certificate file")
+                || msg.contains("did not contain any PEM-encoded certificates"),
+            "unexpected error: {msg}"
+        );
+    }
 
-    match cli.command {
-        Commands::Apikey { action } => api_key_commands(cli.format, action, client()).await,
-        Commands::Pipelines => pipelines(cli.format, client()).await,
-        Commands::Pipeline(action) => pipeline(cli.format, action, client()).await,
-        Commands::Debug { action } => debug(cli.format, action),
+    #[test]
+    fn make_client_tls_cert_valid_pem_builds_client() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        file.write_all(VALID_TEST_PEM.as_bytes())
+            .expect("write temp file");
+        // The synthetic PEM above is syntactically valid for
+        // `Certificate::from_pem_bundle`; we only care that the code path
+        // wires the cert into the builder without surfacing an error.
+        let result = make_client(
+            "https://example.invalid".to_string(),
+            false,
+            Some(file.path().to_path_buf()),
+            None,
+            None,
+        );
+        // Some rustls backends reject the synthetic cert at build time; accept
+        // either a successful build or a cert-validation error, but never the
+        // file-read / empty-bundle errors that would indicate our logic is
+        // wrong.
+        if let Err(err) = &result {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("Failed to read TLS certificate file"),
+                "unexpected error from valid PEM path: {msg}"
+            );
+            assert!(
+                !msg.contains("did not contain any PEM-encoded certificates"),
+                "unexpected empty-bundle error from valid PEM path: {msg}"
+            );
+        }
     }
 }

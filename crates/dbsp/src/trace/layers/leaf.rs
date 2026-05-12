@@ -1,8 +1,8 @@
 use crate::{
+    DBData, DBWeight, NumEntries,
     algebra::{NegByRef, ZRingValue},
     dynamic::{DataTrait, DynPair, DynVec, Factory, WeightTrait, WeightTraitTyped, WithFactory},
-    utils::{cursor_position_oob, ConsolidatePairedSlices},
-    DBData, DBWeight, NumEntries,
+    utils::{ConsolidatePairedSlices, cursor_position_oob},
 };
 use rand::Rng;
 
@@ -13,7 +13,7 @@ use crate::{
 };
 use size_of::SizeOf;
 use std::{
-    cmp::{min, Ordering},
+    cmp::{Ordering, min},
     fmt::{self, Debug, Display},
     ops::{Deref, DerefMut, Neg},
 };
@@ -22,7 +22,7 @@ use super::{Builder, Cursor, MergeBuilder, Trie, TupleBuilder};
 
 // TODO: the `diff` type is fixed in most use cases (the `weighted` operator
 // being the only exception I can think of, so it will probably pay off to have
-// a verson of this with a statically typed diff type).
+// a version of this with a statically typed diff type).
 pub struct LeafFactories<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> {
     pub key: &'static dyn Factory<K>,
     pub keys: &'static dyn Factory<DynVec<K>>,
@@ -346,8 +346,11 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Leaf<K, R> {
     where
         RG: Rng,
     {
+        output.reserve(sample_size);
         self.keys
-            .sample_slice(0, self.len(), rng, sample_size, output);
+            .sample_slice(0, self.len(), rng, sample_size, &mut |x: &K| {
+                output.push_ref(x)
+            });
     }
 
     pub(crate) fn truncate(&mut self, length: usize) {
@@ -384,6 +387,10 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Trie for Leaf<K, R> {
 
     fn cursor_from(&self, lower: usize, upper: usize) -> Self::Cursor<'_> {
         LeafCursor::new(lower, self, (lower, upper))
+    }
+
+    fn approximate_byte_size(&self) -> usize {
+        self.keys.approximate_byte_size() + self.diffs.approximate_byte_size()
     }
 }
 

@@ -4,8 +4,11 @@ use super::{
 };
 use crate::format::StreamSplitter;
 use crate::{InputBuffer, Parser};
-use anyhow::{bail, Error as AnyError, Result as AnyResult};
-use feldera_adapterlib::transport::Resume;
+use anyhow::{Error as AnyError, Result as AnyResult, bail};
+use chrono::Utc;
+use crossbeam::sync::{Parker, Unparker};
+use feldera_adapterlib::format::BufferSize;
+use feldera_adapterlib::transport::{Resume, Watermark, parse_resume_info};
 use feldera_types::config::FtModel;
 use feldera_types::program_schema::Relation;
 use feldera_types::transport::file::{FileInputConfig, FileOutputConfig};
@@ -14,11 +17,13 @@ use std::collections::VecDeque;
 use std::hash::Hasher;
 use std::io::{Seek, SeekFrom};
 use std::ops::Range;
-use std::thread::{self, Thread};
-use std::{fs::File, io::Write, thread::spawn, time::Duration};
+use std::path::PathBuf;
+use std::thread;
+use std::{fs::File, io::Write, time::Duration};
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{error, info_span};
+use url::Url;
 use xxhash_rust::xxh3::Xxh3Default;
 
 const SLEEP: Duration = Duration::from_millis(200);
@@ -68,14 +73,28 @@ impl TransportInputEndpoint for FileInputEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         _schema: Relation,
+        resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
-        Ok(Box::new(FileInputReader::new(self, consumer, parser)?))
+        Ok(Box::new(FileInputReader::new(
+            self,
+            consumer,
+            parser,
+            resume_info,
+        )?))
     }
 }
 
 pub struct FileInputReader {
     sender: UnboundedSender<InputReaderCommand>,
-    thread: Thread,
+    unparker: Unparker,
+}
+
+fn parse_url(path: &str) -> Option<PathBuf> {
+    let url = Url::parse(path).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    url.to_file_path().ok()
 }
 
 impl FileInputReader {
@@ -83,42 +102,58 @@ impl FileInputReader {
         endpoint: &FileInputEndpoint,
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
+        resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Self> {
+        let resume_info = if let Some(resume_info) = resume_info {
+            Some(parse_resume_info::<Metadata>(&resume_info)?)
+        } else {
+            None
+        };
+
         let config = &endpoint.config;
-        let file = File::open(&config.path).map_err(|e| {
-            AnyError::msg(format!("Failed to open input file '{}': {e}", config.path))
+        let path = parse_url(&config.path).unwrap_or_else(|| PathBuf::from(&config.path));
+        let file = File::open(&path).map_err(|e| {
+            AnyError::msg(format!(
+                "Failed to open input file '{}': {e}",
+                path.display()
+            ))
         })?;
 
         let (sender, receiver) = unbounded_channel();
-        let join_handle = spawn({
-            let follow = config.follow;
-            let path = config.path.clone();
-            let buffer_size = match config.buffer_size_bytes {
-                Some(size) if size > 0 => size,
-                _ => 8192,
-            };
-            move || {
-                let _guard = info_span!("file_input", path).entered();
-                if let Err(error) = Self::worker_thread(
-                    file,
-                    path,
-                    buffer_size,
-                    consumer.as_ref(),
-                    parser,
-                    receiver,
-                    follow,
-                ) {
-                    consumer.error(true, error);
+        let parker = Parker::new();
+        let unparker = parker.unparker().clone();
+        thread::Builder::new()
+            .name("file-input".to_string())
+            .spawn({
+                let follow = config.follow;
+                let path = config.path.clone();
+                let buffer_size = match config.buffer_size_bytes {
+                    Some(size) if size > 0 => size,
+                    _ => 8192,
+                };
+                move || {
+                    let _guard = info_span!("file_input", path).entered();
+                    if let Err(error) = Self::worker_thread(
+                        file,
+                        path,
+                        buffer_size,
+                        consumer.as_ref(),
+                        parser,
+                        receiver,
+                        follow,
+                        resume_info,
+                        parker,
+                    ) {
+                        consumer.error(true, error, None);
+                    }
                 }
-            }
-        });
+            })
+            .expect("failed to spawn file-input thread");
 
-        Ok(Self {
-            sender,
-            thread: join_handle.thread().clone(),
-        })
+        Ok(Self { sender, unparker })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn worker_thread(
         mut file: File,
         path: String,
@@ -127,13 +162,27 @@ impl FileInputReader {
         mut parser: Box<dyn Parser>,
         mut receiver: UnboundedReceiver<InputReaderCommand>,
         follow: bool,
+        resume_info: Option<Metadata>,
+        parker: Parker,
     ) -> AnyResult<()> {
         let mut splitter = StreamSplitter::new(parser.splitter());
 
-        let mut queue = VecDeque::<(Range<u64>, Box<dyn InputBuffer>)>::new();
+        if let Some(resume_info) = resume_info {
+            let offset = resume_info.offsets.end;
+            file.seek(SeekFrom::Start(offset))?;
+            splitter.seek(offset);
+        }
+
+        let mut staged_buffers = VecDeque::new();
+        let mut staged_range = None;
+        let mut staged_hasher = consumer.hasher();
+        let mut staged_amt = BufferSize::default();
+        let mut staged_inputs = Vec::new();
         let mut extending = false;
         let mut eof = false;
         let mut num_records = 0;
+        let mut timestamp = None;
+
         loop {
             loop {
                 let msg = receiver.try_recv();
@@ -145,38 +194,32 @@ impl FileInputReader {
                         extending = false;
                     }
                     Ok(InputReaderCommand::Queue { .. }) => {
-                        let mut total = 0;
-                        let mut hasher = consumer.hasher();
-                        let limit = consumer.max_batch_size();
-                        let mut range: Option<Range<u64>> = None;
-                        while let Some((offsets, mut buffer)) = queue.pop_front() {
-                            range = match range {
-                                Some(range) => Some(range.start..offsets.end),
-                                None => Some(offsets),
-                            };
-                            total += buffer.len();
-                            if let Some(hasher) = hasher.as_mut() {
-                                buffer.hash(hasher);
-                            }
-                            buffer.flush();
-                            if total >= limit {
-                                break;
-                            }
+                        if staged_buffers.is_empty() {
+                            staged_buffers.push_back((
+                                parser.stage(std::mem::take(&mut staged_inputs)),
+                                timestamp.unwrap_or_else(Utc::now),
+                                std::mem::take(&mut staged_amt),
+                                staged_hasher.as_ref().map(|h| h.finish()),
+                                staged_range.take().unwrap_or({
+                                    let ofs = splitter.position();
+                                    ofs..ofs
+                                }),
+                            ));
+                            timestamp = None;
+                            staged_hasher = consumer.hasher();
                         }
-
-                        let offsets = range.unwrap_or_else(|| {
-                            let ofs = splitter.position();
-                            ofs..ofs
-                        });
+                        let (mut staged_buffers, timestamp, amt, hash, offsets) =
+                            staged_buffers.pop_front().unwrap();
                         let seek = serde_json::to_value(Metadata {
                             offsets: offsets.clone(),
                         })
                         .unwrap();
 
+                        staged_buffers.flush();
                         let resume = match get_barrier(&path) {
-                            None => Resume::new_metadata_only(seek, hasher),
+                            None => Resume::new_metadata_only(seek, hash),
                             Some(barrier) => {
-                                num_records += total;
+                                num_records += amt.records;
                                 if num_records < barrier {
                                     Resume::Barrier
                                 } else {
@@ -184,21 +227,14 @@ impl FileInputReader {
                                 }
                             }
                         };
-
-                        consumer.extended(total, Some(resume));
-                    }
-                    Ok(InputReaderCommand::Seek(metadata)) => {
-                        let Metadata { offsets } = serde_json::from_value(metadata)?;
-                        let offset = offsets.end;
-                        file.seek(SeekFrom::Start(offset))?;
-                        splitter.seek(offset);
+                        consumer.extended(amt, Some(resume), vec![Watermark::new(timestamp, None)]);
                     }
                     Ok(InputReaderCommand::Replay { metadata, .. }) => {
-                        let Metadata { offsets } = serde_json::from_value(metadata)?;
+                        let Metadata { offsets } = serde_json_path_to_error::from_value(metadata)?;
                         file.seek(SeekFrom::Start(offsets.start))?;
                         splitter.seek(offsets.start);
                         let mut remainder = (offsets.end - offsets.start) as usize;
-                        let mut num_records = 0;
+                        let mut total = BufferSize::empty();
                         let mut hasher = Xxh3Default::new();
                         while remainder > 0 {
                             let n = splitter.read(&mut file, buffer_size, remainder)?;
@@ -208,15 +244,15 @@ impl FileInputReader {
                             }
                             remainder -= n;
                             while let Some(chunk) = splitter.next(remainder == 0) {
-                                let (mut buffer, errors) = parser.parse(chunk);
+                                let (mut buffer, errors) = parser.parse(chunk, None);
                                 consumer.parse_errors(errors);
-                                consumer.buffered(buffer.len(), chunk.len());
-                                num_records += buffer.len();
+                                consumer.buffered(buffer.len());
+                                total += buffer.len();
                                 buffer.hash(&mut hasher);
                                 buffer.flush();
                             }
                         }
-                        consumer.replayed(num_records, hasher.finish());
+                        consumer.replayed(total, hasher.finish());
                     }
                     Ok(InputReaderCommand::Disconnect) => return Ok(()),
                     Err(TryRecvError::Empty) => break,
@@ -225,14 +261,14 @@ impl FileInputReader {
             }
 
             if !extending || eof {
-                thread::park();
+                parker.park();
                 continue;
             }
 
             let n = splitter.read(&mut file, buffer_size, usize::MAX)?;
             if n == 0 {
                 if follow {
-                    thread::park_timeout(SLEEP);
+                    parker.park_timeout(SLEEP);
                     continue;
                 }
                 eof = true;
@@ -242,15 +278,39 @@ impl FileInputReader {
                 let Some(chunk) = splitter.next(eof) else {
                     break;
                 };
-                let (buffer, errors) = parser.parse(chunk);
-                let num_records = buffer.len();
-                let num_bytes = chunk.len();
+                let (buffer, errors) = parser.parse(chunk, None);
                 consumer.parse_errors(errors);
 
                 if let Some(buffer) = buffer {
+                    // Set the timestamp we start getting new data to be staged as ingestion timestamp.
+                    if timestamp.is_none() {
+                        timestamp = Some(Utc::now());
+                    }
+
                     let end = splitter.position();
-                    queue.push_back((start..end, buffer));
-                    consumer.buffered(num_records, num_bytes);
+                    let amt = buffer.len();
+                    staged_amt += amt;
+                    staged_range = match staged_range {
+                        Some(range) => Some(range.start..end),
+                        None => Some(start..end),
+                    };
+                    if let Some(staged_hasher) = &mut staged_hasher {
+                        buffer.hash(staged_hasher);
+                    }
+                    staged_inputs.push(buffer);
+                    consumer.buffered(amt);
+
+                    if staged_amt.records >= consumer.max_batch_size() {
+                        staged_buffers.push_back((
+                            parser.stage(std::mem::take(&mut staged_inputs)),
+                            timestamp.unwrap_or_else(Utc::now),
+                            std::mem::take(&mut staged_amt),
+                            staged_hasher.as_ref().map(|h| h.finish()),
+                            staged_range.take().unwrap(),
+                        ));
+                        timestamp = None;
+                        staged_hasher = consumer.hasher();
+                    }
                 }
             }
             if n == 0 && !follow {
@@ -261,9 +321,13 @@ impl FileInputReader {
 }
 
 impl InputReader for FileInputReader {
+    fn as_any(self: std::sync::Arc<Self>) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: super::InputReaderCommand) {
         let _ = self.sender.send(command);
-        self.thread.unpark();
+        self.unparker.unpark();
     }
 
     fn is_closed(&self) -> bool {
@@ -296,7 +360,7 @@ impl FileOutputEndpoint {
 impl OutputEndpoint for FileOutputEndpoint {
     fn connect(
         &mut self,
-        _async_error_callback: Box<dyn Fn(bool, AnyError) + Send + Sync>,
+        _async_error_callback: Box<dyn Fn(bool, AnyError, Option<&'static str>) + Send + Sync>,
     ) -> AnyResult<()> {
         Ok(())
     }
@@ -331,13 +395,15 @@ however the File transport does not support this representation."
 
 #[cfg(test)]
 mod test {
-    use crate::test::{mock_input_pipeline, wait, DEFAULT_TIMEOUT_MS};
+    use crate::test::{DEFAULT_TIMEOUT_MS, mock_input_pipeline, wait};
     use csv::WriterBuilder as CsvWriterBuilder;
     use feldera_types::deserialize_without_context;
     use feldera_types::program_schema::Relation;
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
     use std::{io::Write, thread::sleep, time::Duration};
     use tempfile::NamedTempFile;
+    use url::Url;
 
     #[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone)]
     pub struct TestStruct {
@@ -364,24 +430,24 @@ mod test {
 
         // Create a transport endpoint attached to the file.
         // Use a very small buffer size for testing.
-        let config_str = format!(
-            r#"
-stream: test_input
-transport:
-    name: file_input
-    config:
-        path: {:?}
-        buffer_size_bytes: 5
-format:
-    name: csv
-    config:
-        delimiter: "|"
-        headers: true
-"#,
-            temp_file.path().to_str().unwrap()
-        );
-
-        println!("Config:\n{}", config_str);
+        let config = serde_json::from_value(json!({
+            "stream": "test_input",
+            "transport": {
+                "name": "file_input",
+                "config": {
+                    "path": temp_file.path(),
+                    "buffer_size_bytes": 5
+                }
+            },
+            "format": {
+                "name": "csv",
+                "config": {
+                    "delimiter": "|",
+                    "headers": true
+                }
+            }
+        }))
+        .unwrap();
 
         let mut writer = CsvWriterBuilder::new()
             .has_headers(true)
@@ -392,11 +458,8 @@ format:
         }
         writer.flush().unwrap();
 
-        let (endpoint, consumer, _parser, zset) = mock_input_pipeline::<TestStruct, TestStruct>(
-            serde_yaml::from_str(&config_str).unwrap(),
-            Relation::empty(),
-        )
-        .unwrap();
+        let (endpoint, consumer, _parser, zset) =
+            mock_input_pipeline::<TestStruct, TestStruct>(config, Relation::empty()).unwrap();
 
         sleep(Duration::from_millis(10));
 
@@ -425,35 +488,32 @@ format:
             TestStruct::new("bar".to_string(), false, -10),
         ];
         let temp_file = NamedTempFile::new().unwrap();
+        let temp_file_url = Url::from_file_path(temp_file.path()).unwrap();
 
         // Create a transport endpoint attached to the file.
         // Use a very small buffer size for testing.
-        let config_str = format!(
-            r#"
-stream: test_input
-transport:
-    name: file_input
-    config:
-        path: {:?}
-        buffer_size_bytes: 5
-        follow: true
-format:
-    name: csv
-"#,
-            temp_file.path().to_str().unwrap()
-        );
-
-        println!("Config:\n{}", config_str);
+        let config = serde_json::from_value(json!({
+            "stream": "test_input",
+            "transport": {
+                "name": "file_input",
+                "config": {
+                    "path": temp_file_url,
+                    "buffer_size_bytes": 5,
+                    "follow": true
+                }
+            },
+            "format": {
+                "name": "csv"
+            }
+        }))
+        .unwrap();
 
         let mut writer = CsvWriterBuilder::new()
             .has_headers(false)
             .from_writer(temp_file.as_file());
 
-        let (endpoint, consumer, parser, zset) = mock_input_pipeline::<TestStruct, TestStruct>(
-            serde_yaml::from_str(&config_str).unwrap(),
-            Relation::empty(),
-        )
-        .unwrap();
+        let (endpoint, consumer, parser, zset) =
+            mock_input_pipeline::<TestStruct, TestStruct>(config, Relation::empty()).unwrap();
 
         endpoint.extend();
 

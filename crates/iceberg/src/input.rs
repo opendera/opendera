@@ -1,10 +1,7 @@
 use crate::iceberg_input_serde_config;
 use anyhow::{anyhow, bail, Error as AnyError, Result as AnyResult};
 use chrono::{DateTime, Utc};
-use datafusion::{
-    arrow::array::AsArray,
-    prelude::{DataFrame, SQLOptions, SessionContext},
-};
+use datafusion::prelude::{DataFrame, SQLOptions, SessionContext};
 use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::{
     catalog::{ArrowStream, InputCollectionHandle},
@@ -15,8 +12,8 @@ use feldera_adapterlib::{
         IntegratedInputEndpoint, NonFtInputReaderCommand,
     },
     utils::datafusion::{
-        execute_query_collect, execute_singleton_query, timestamp_to_sql_expression,
-        validate_sql_expression, validate_timestamp_column,
+        array_to_string, execute_query_collect, execute_singleton_query,
+        timestamp_to_sql_expression, validate_sql_expression, validate_timestamp_column,
     },
     PipelineState,
 };
@@ -26,15 +23,19 @@ use feldera_types::{
     transport::iceberg::{IcebergCatalogType, IcebergReaderConfig},
 };
 use futures_util::StreamExt;
+use iceberg::CatalogBuilder;
 use iceberg::{io::FileIO, spec::TableMetadata, table::Table as IcebergTable, Catalog, TableIdent};
 use iceberg_catalog_glue::{
-    GlueCatalog, GlueCatalogConfig, AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME,
-    AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+    GlueCatalogBuilder, AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME,
+    AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_URI,
+    GLUE_CATALOG_PROP_WAREHOUSE,
 };
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
-use iceberg_datafusion::IcebergTableProvider;
+use iceberg_catalog_rest::{
+    RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
+};
+use iceberg_datafusion::IcebergStaticTableProvider;
 use log::{debug, info, trace};
-use std::sync::Arc;
+use std::{sync::Arc, thread};
 use tokio::{
     select,
     sync::{
@@ -83,6 +84,7 @@ impl IntegratedInputEndpoint for IcebergInputEndpoint {
     fn open(
         self: Box<Self>,
         input_handle: &InputCollectionHandle,
+        _seek: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(IcebergInputReader::new(
             &self.inner,
@@ -124,13 +126,16 @@ impl IcebergInputReader {
             .configure_arrow_deserializer(iceberg_input_serde_config())?;
         let schema = input_handle.schema.clone();
 
-        std::thread::spawn(move || {
-            TOKIO.block_on(async {
-                let _ = endpoint_clone
-                    .worker_task(input_stream, schema, receiver_clone, init_status_sender)
-                    .await;
+        thread::Builder::new()
+            .name("iceberg-input-tokio-wrapper".to_string())
+            .spawn(move || {
+                TOKIO.block_on(async {
+                    let _ = endpoint_clone
+                        .worker_task(input_stream, schema, receiver_clone, init_status_sender)
+                        .await;
+                })
             })
-        });
+            .expect("failed to spawn iceberg-input tokio wrapper thread");
 
         init_status_receiver.blocking_recv().ok_or_else(|| {
             anyhow!("worker thread terminated unexpectedly during initialization")
@@ -144,6 +149,10 @@ impl IcebergInputReader {
 }
 
 impl InputReader for IcebergInputReader {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         match command.as_nonft().unwrap() {
             NonFtInputReaderCommand::Queue => self.inner.queue.queue(),
@@ -291,7 +300,7 @@ impl IcebergInputEndpointInner {
     ) {
         self.read_ordered_snapshot_inner(input_stream, schema, receiver)
             .await
-            .unwrap_or_else(|e| self.consumer.error(true, e));
+            .unwrap_or_else(|e| self.consumer.error(true, e, None));
     }
 
     async fn read_ordered_snapshot_inner(
@@ -344,14 +353,17 @@ impl IcebergInputEndpointInner {
                 ));
         }
 
-        let min = bounds[0]
-            .column(0)
-            .as_string_opt::<i32>()
-            .ok_or_else(|| anyhow!("internal error: cannot retrieve the output of query '{bounds_query}' as a string"))?
-            .value(0)
-            .to_string();
+        let min = array_to_string(bounds[0].column(0)).ok_or_else(|| {
+            anyhow!(
+                "internal error: cannot retrieve the first column in the output of query '{bounds_query}' as a string"
+            )
+        })?;
 
-        let max = bounds[0].column(1).as_string::<i32>().value(0).to_string();
+        let max = array_to_string(bounds[0].column(1)).ok_or_else(|| {
+            anyhow!(
+                "internal error: cannot retrieve the second column in the output of query '{bounds_query}' as a string"
+            )
+        })?;
 
         info!(
             "iceberg {}: reading table snapshot in the range '{min} <= {timestamp_column} <= {max}'",
@@ -506,7 +518,10 @@ impl IcebergInputEndpointInner {
     }
 
     async fn open_table_glue(&self) -> Result<IcebergTable, ControllerError> {
-        let builder = GlueCatalogConfig::builder().warehouse(
+        let mut props = self.config.fileio_config.clone();
+
+        props.insert(
+            GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
             self.config
                 .glue_catalog_config
                 .warehouse
@@ -515,10 +530,13 @@ impl IcebergInputEndpointInner {
                 .clone(),
         );
 
-        let builder = builder.catalog_id_opt(self.config.glue_catalog_config.id.clone());
-        let builder = builder.uri_opt(self.config.glue_catalog_config.endpoint.clone());
+        if let Some(id) = self.config.glue_catalog_config.id.as_ref() {
+            props.insert(GLUE_CATALOG_PROP_CATALOG_ID.to_string(), id.clone());
+        }
 
-        let mut props = self.config.fileio_config.clone();
+        if let Some(endpoint) = self.config.glue_catalog_config.endpoint.as_ref() {
+            props.insert(GLUE_CATALOG_PROP_URI.to_string(), endpoint.clone());
+        }
 
         self.config
             .glue_catalog_config
@@ -559,17 +577,16 @@ impl IcebergInputEndpointInner {
             .as_ref()
             .map(|region_name| props.insert(AWS_REGION_NAME.to_string(), region_name.clone()));
 
-        let builder = builder.props(props);
-
-        let catalog_config = builder.build();
-
-        let catalog = GlueCatalog::new(catalog_config).await.map_err(|e| {
-            ControllerError::input_transport_error(
-                &self.endpoint_name,
-                true,
-                anyhow!("error creating Glue catalog client: {e}"),
-            )
-        })?;
+        let catalog = GlueCatalogBuilder::default()
+            .load("glue".to_string(), props)
+            .await
+            .map_err(|e| {
+                ControllerError::input_transport_error(
+                    &self.endpoint_name,
+                    true,
+                    anyhow!("error creating Glue catalog client: {e}"),
+                )
+            })?;
 
         let table_ident = self.table_ident().unwrap()?;
 
@@ -583,7 +600,10 @@ impl IcebergInputEndpointInner {
     }
 
     async fn open_table_rest(&self) -> Result<IcebergTable, ControllerError> {
-        let builder = RestCatalogConfig::builder().uri(
+        let mut props = self.config.fileio_config.clone();
+
+        props.insert(
+            REST_CATALOG_PROP_URI.to_string(),
             self.config
                 .rest_catalog_config
                 .uri
@@ -592,9 +612,9 @@ impl IcebergInputEndpointInner {
                 .clone(),
         );
 
-        let builder = builder.warehouse_opt(self.config.rest_catalog_config.warehouse.clone());
-
-        let mut props = self.config.fileio_config.clone();
+        if let Some(warehouse) = self.config.rest_catalog_config.warehouse.as_ref() {
+            props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
+        }
 
         self.config
             .rest_catalog_config
@@ -646,11 +666,16 @@ impl IcebergInputEndpointInner {
             }
         };
 
-        let builder = builder.props(props);
-
-        let catalog_config = builder.build();
-
-        let catalog = RestCatalog::new(catalog_config);
+        let catalog = RestCatalogBuilder::default()
+            .load("rest".to_string(), props)
+            .await
+            .map_err(|e| {
+                ControllerError::input_transport_error(
+                    &self.endpoint_name,
+                    true,
+                    anyhow!("error creating Rest catalog client: {e}"),
+                )
+            })?;
 
         let table_ident = self.table_ident().unwrap()?;
 
@@ -720,9 +745,10 @@ impl IcebergInputEndpointInner {
 
         let provider = match snapshot_id {
             Some(snapshot_id) => {
-                IcebergTableProvider::try_new_from_table_snapshot(table.clone(), snapshot_id).await
+                IcebergStaticTableProvider::try_new_from_table_snapshot(table.clone(), snapshot_id)
+                    .await
             }
-            None => IcebergTableProvider::try_new_from_table(table.clone()).await,
+            None => IcebergStaticTableProvider::try_new_from_table(table.clone()).await,
         }
         .map_err(|e| {
             ControllerError::invalid_transport_configuration(
@@ -779,7 +805,7 @@ impl IcebergInputEndpointInner {
             Ok(df) => df,
             Err(e) => {
                 self.consumer
-                    .error(true, anyhow!("error compiling query '{query}': {e}"));
+                    .error(true, anyhow!("error compiling query '{query}': {e}"), None);
                 return;
             }
         };
@@ -811,32 +837,37 @@ impl IcebergInputEndpointInner {
         let mut stream = match dataframe.execute_stream().await {
             Err(e) => {
                 self.consumer
-                    .error(true, anyhow!("error retrieving {descr}: {e:?}"));
+                    .error(true, anyhow!("error retrieving {descr}: {e:?}"), None);
                 return;
             }
             Ok(stream) => stream,
         };
 
         let mut num_batches = 0;
+
+        // Use the timestamp when we start retrieving the next batch as the ingestion timestamp.
+        let mut timestamp = Utc::now();
+
         while let Some(batch) = stream.next().await {
             wait_running(receiver).await;
+
             let batch = match batch {
                 Ok(batch) => batch,
                 Err(e) => {
                     self.consumer.error(
                         false,
                         anyhow!("error retrieving batch {num_batches} of {descr}: {e:?}"),
+                        Some("iceberg-batch"),
                     );
                     continue;
                 }
             };
             // info!("schema: {}", batch.schema());
             num_batches += 1;
-            let bytes = batch.get_array_memory_size();
             let result = if polarity {
-                input_stream.insert(&batch)
+                input_stream.insert(&batch, &None)
             } else {
-                input_stream.delete(&batch)
+                input_stream.delete(&batch, &None)
             };
             let errors = result.map_or_else(
                 |e| {
@@ -848,7 +879,10 @@ impl IcebergInputEndpointInner {
                 },
                 |()| Vec::new(),
             );
-            self.queue.push((input_stream.take_all(), errors), bytes);
+            self.queue
+                .push((input_stream.take_all(), errors), timestamp);
+
+            timestamp = Utc::now();
         }
     }
 }

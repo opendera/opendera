@@ -1,6 +1,5 @@
-use feldera_sqllib::{ByteArray, Date, SqlDecimal, SqlString, Timestamp, Uuid, Variant, F32, F64};
+use feldera_sqllib::{ByteArray, Date, F32, F64, SqlDecimal, SqlString, Timestamp, Uuid, Variant};
 use feldera_types::{
-    config::PipelineConfig,
     format::json::JsonFlavor,
     serde_with_context::{SerializeWithContext, SqlSerdeConfig},
 };
@@ -15,8 +14,8 @@ use std::{
 use tempfile::NamedTempFile;
 
 use crate::{
-    test::{data::TestStruct, test_circuit, wait, DeltaTestStruct},
     Controller,
+    test::{DeltaTestStruct, data::TestStruct, test_circuit, wait},
 };
 
 fn redis_url() -> String {
@@ -32,15 +31,15 @@ fn test_redis_output() {
         bigint: 1,
         binary: ByteArray::new(&[0, 1, 2]),
         boolean: false,
-        date: Date::new(1),
-        decimal_10_3: SqlDecimal::from_i128_with_scale(123i128, 2),
+        date: Date::from_days(1),
+        decimal_10_3: SqlDecimal::new(123i128, 2).unwrap(),
         double: F64::from_str("1.123").unwrap(),
         float: F32::from_str("1.123").unwrap(),
         int: 1,
         smallint: 2,
         string: "test".to_owned(),
         unused: None,
-        timestamp_ntz: Timestamp::new(1),
+        timestamp_ntz: Timestamp::from_milliseconds(1),
         tinyint: 1,
         string_array: vec!["a".to_owned(), "b".to_owned()],
         struct1: TestStruct {
@@ -123,64 +122,77 @@ fn test_redis_output() {
         .unwrap();
 
     let schema = DeltaTestStruct::schema();
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-  file1:
-    paused: true
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: insert_delete
-        array: true
-  file2:
-    paused: true
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: insert_delete
-        array: true
-outputs:
-  test_output1:
-    stream: test_output1
-    transport:
-      name: redis_output
-      config:
-        connection_string: {}
-        key_separator: ':'
-    format:
-      name: json
-      config:
-        key_fields:
-        - struct1
-        - decimal_10_3
-"#,
-        temp_input_file1.path().display(),
-        temp_input_file2.path().display(),
-        redis_url()
-    );
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      "inputs": {
+        "file1": {
+          "paused": true,
+          "stream": "test_input1",
+          "transport": {
+            "name": "file_input",
+            "config": {
+              "path": temp_input_file1.path(),
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "update_format": "insert_delete",
+              "array": true
+            }
+          }
+        },
+        "file2": {
+          "paused": true,
+          "stream": "test_input1",
+          "transport": {
+            "name": "file_input",
+            "config": {
+              "path": temp_input_file2.path(),
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "update_format": "insert_delete",
+              "array": true
+            }
+          }
+        }
+      },
+      "outputs": {
+        "test_output1": {
+          "stream": "test_output1",
+          "transport": {
+            "name": "redis_output",
+            "config": {
+              "connection_string": redis_url(),
+              "key_separator": ":"
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "key_fields": [
+                "struct1",
+                "decimal_10_3"
+              ]
+            }
+          }
+        }
+      }
+    }))
+    .unwrap();
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
     let schema = schema.to_vec();
 
     let (err_sender, err_receiver) = crossbeam::channel::unbounded();
 
-    let controller = Controller::with_config(
+    let controller = Controller::with_test_config(
         move |workers| Ok(test_circuit::<DeltaTestStruct>(workers, &schema, &[None])),
         &config,
-        Box::new(move |e| {
+        Box::new(move |e, _| {
             let msg = format!("redis_output_test: error: {e}");
             println!("{msg}");
             err_sender.send(msg).unwrap()
@@ -262,48 +274,57 @@ fn test_redis_output_fail() {
         .unwrap();
 
     let schema = TestStruct::schema();
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-  file1:
-    stream: test_input1
-    transport:
-      name: file_input
-      config:
-        path: {}
-    format:
-      name: json
-      config:
-        update_format: raw
-        array: false
-outputs:
-  test_output1:
-    stream: test_output1
-    transport:
-      name: redis_output
-      config:
-        connection_string: {}
-        key_separator: ':'
-    format:
-      name: csv
-      config:
-        key_fields:
-        - s
-        - id
-"#,
-        temp_input_file1.path().display(),
-        redis_url()
-    );
+    let config = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "inputs": {
+            "file1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file1.path()
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "update_format": "raw",
+                        "array": false
+                    }
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "redis_output",
+                    "config": {
+                        "connection_string": redis_url(),
+                        "key_separator": ":"
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {
+                        "key_fields": [
+                            "s",
+                            "id"
+                        ]
+                    }
+                }
+            }
+        }
+    }))
+    .unwrap();
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
     let schema = schema.to_vec();
 
-    let Err(err) = Controller::with_config(
+    let Err(err) = Controller::with_test_config(
         move |workers| Ok(test_circuit::<TestStruct>(workers, &schema, &[None])),
         &config,
-        Box::new(move |e| {
+        Box::new(move |e, _| {
             let msg = format!("redis_output_test: error: {e}");
             println!("{msg}");
         }),

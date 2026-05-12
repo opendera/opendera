@@ -95,7 +95,7 @@ First, make sure you have [Docker](https://docs.docker.com/) installed. Then run
 following command:
 
 ```text
-docker run -p 8080:8080 --tty --rm -it ghcr.io/feldera/pipeline-manager:latest
+docker run -p 8080:8080 --tty --rm -it images.feldera.com/feldera/pipeline-manager:latest
 ```
 
 Once the container image downloads and you see the Feldera logo on your terminal, visit
@@ -107,15 +107,30 @@ if you'd like to experiment with Kafka and other auxiliary services.
 
 ## ⚙️ Running Feldera from sources
 
-To run Feldera from sources, first install required dependencies:
+To run Feldera from sources, ensure at least 6 GB of free space in the sources directory and an additional 7 GB in your home directory, then install the required dependencies:
 
 - [Rust tool chain](https://www.rust-lang.org/tools/install)
 - cmake
 - libssl-dev
 - libsasl2-dev
-- Java Development Kit (JDK), version 19 or newer
+- golang-go (required to build aws-lc-fips-sys when using rustls FIPS)
+- pkg-config
+- libzstd-dev
+- clang
+- Java Development Kit (JDK), version 19 or newer (21 is recommended)
 - maven
 - [Bun](https://bun.sh/docs/installation)
+- [nodejs v20](https://github.com/nodesource/distributions/blob/master/DEV_README.md)
+
+On MacOS, after installing the Rust tool chain, the remaining dependencies can be installed with:
+```
+xcode-select --install
+```
+for Xcode tools that includes clang, and
+```
+brew install cmake openssl cyrus-sasl go pkg-config zstd openjdk@21 maven oven-sh/bun/bun node@20
+```
+for the rest.
 
 After that, the first step is to build the SQL compiler:
 
@@ -185,3 +200,4 @@ The model provides two things:
    with its formal semantics) and efficiently. Efficiency here means, in a
    nutshell, that the cost of processing a set of input events is proportional to
    the size of the input rather than the entire state of the database.
+

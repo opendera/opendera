@@ -46,7 +46,7 @@ public class OptimizeIncrementalVisitor extends CircuitCloneVisitor {
 
     /** If a nested operator is here the integrators from the input will be
      * pushed to its output. */
-    final Set<ICircuit> pushIntegators = new HashSet<>();
+    final Set<ICircuit> pushIntegrators = new HashSet<>();
 
     @Override
     public void postorder(DBSPDifferentiateOperator operator) {
@@ -67,7 +67,9 @@ public class OptimizeIncrementalVisitor extends CircuitCloneVisitor {
     public void linear(DBSPUnaryOperator operator) {
         OutputPort source = this.mapped(operator.input());
         if (source.node().is(DBSPIntegrateOperator.class)) {
-            DBSPSimpleOperator replace = operator.withInputs(source.node().inputs, true);
+            DBSPSimpleOperator replace = operator
+                    .withInputs(source.node().inputs, true)
+                    .to(DBSPSimpleOperator.class);
             this.addOperator(replace);
             DBSPIntegrateOperator integral = new DBSPIntegrateOperator(
                     operator.getRelNode(), replace.outputPort());
@@ -127,7 +129,7 @@ public class OptimizeIncrementalVisitor extends CircuitCloneVisitor {
             DBSPSimpleOperator replace = new DBSPJoinOperator(operator.getRelNode(),
                     operator.getOutputZSetType(),
                     operator.getFunction(), operator.isMultiset,
-                    sourceSource.get(0), sourceSource.get(1));
+                    sourceSource.get(0), sourceSource.get(1), operator.balanced);
             this.addOperator(replace);
             DBSPIntegrateOperator integral = new DBSPIntegrateOperator(
                     operator.getRelNode(), replace.outputPort());
@@ -145,7 +147,7 @@ public class OptimizeIncrementalVisitor extends CircuitCloneVisitor {
             DBSPSimpleOperator replace = new DBSPJoinIndexOperator(operator.getRelNode(),
                     operator.getOutputIndexedZSetType(),
                     operator.getFunction(), operator.isMultiset,
-                    sourceSource.get(0), sourceSource.get(1));
+                    sourceSource.get(0), sourceSource.get(1), operator.balanced);
             this.addOperator(replace);
             DBSPIntegrateOperator integral = new DBSPIntegrateOperator(operator.getRelNode(), replace.outputPort());
             this.map(operator, integral);
@@ -174,7 +176,23 @@ public class OptimizeIncrementalVisitor extends CircuitCloneVisitor {
         List<OutputPort> sources = Linq.map(operator.inputs, this::mapped);
         if (Linq.all(sources, s -> s.node().is(DBSPIntegrateOperator.class))) {
             List<OutputPort> sourceSource = Linq.map(sources, s -> s.node().inputs.get(0));
-            DBSPSimpleOperator replace = new DBSPSumOperator(operator.getRelNode(), sourceSource);
+            DBSPSimpleOperator replace = new DBSPSumOperator(operator.getRelNode(), sourceSource)
+                    .addAnnotations(operator.annotations, DBSPSimpleOperator.class);
+            this.addOperator(replace);
+            DBSPIntegrateOperator integral = new DBSPIntegrateOperator(operator.getRelNode(), replace.outputPort());
+            this.map(operator, integral);
+            return;
+        }
+        super.postorder(operator);
+    }
+
+    @Override
+    public void postorder(DBSPAtomicSumOperator operator) {
+        List<OutputPort> sources = Linq.map(operator.inputs, this::mapped);
+        if (Linq.all(sources, s -> s.node().is(DBSPIntegrateOperator.class))) {
+            List<OutputPort> sourceSource = Linq.map(sources, s -> s.node().inputs.get(0));
+            DBSPSimpleOperator replace = new DBSPAtomicSumOperator(operator.getRelNode(), sourceSource)
+                    .addAnnotations(operator.annotations, DBSPSimpleOperator.class);
             this.addOperator(replace);
             DBSPIntegrateOperator integral = new DBSPIntegrateOperator(operator.getRelNode(), replace.outputPort());
             this.map(operator, integral);
@@ -230,11 +248,12 @@ public class OptimizeIncrementalVisitor extends CircuitCloneVisitor {
         // If the parent has integrators on all inputs, consume them here.
         // They will be "resurfaced" in postorder(DBSPNestedOperator)
         ICircuit parent = this.getParent();
-        if (this.pushIntegators.contains(parent)) {
+        if (this.pushIntegrators.contains(parent)) {
             OutputPort source = this.mapped(operator.input());
             Utilities.enforce(source.node().is(DBSPIntegrateOperator.class));
             DBSPSimpleOperator result = operator.withInputs(
-                    Linq.list(source.node().to(DBSPUnaryOperator.class).input()), true);
+                    Linq.list(source.node().to(DBSPUnaryOperator.class).input()), true)
+                    .to(DBSPSimpleOperator.class);
             this.map(operator, result);
             return;
         }
@@ -250,20 +269,20 @@ public class OptimizeIncrementalVisitor extends CircuitCloneVisitor {
         List<OutputPort> sources = Linq.map(operator.inputs, this::mapped);
         boolean allIntegrators = Linq.all(sources, s -> s.node().is(DBSPIntegrateOperator.class));
         if (allIntegrators) {
-            this.pushIntegators.add(operator);
+            this.pushIntegrators.add(operator);
         }
         return VisitDecision.CONTINUE;
     }
 
     public void postorder(DBSPNestedOperator operator) {
-        if (!this.pushIntegators.contains(operator)) {
+        if (!this.pushIntegrators.contains(operator)) {
             super.postorder(operator);
             return;
         }
 
         // The rest is a copy of super.postorder, with the added integrators
         DBSPNestedOperator result = Utilities.removeLast(this.underConstruction).to(DBSPNestedOperator.class);
-        result.setDerivedFrom(operator.derivedFrom);
+        result.setDerivedFrom(operator);
         result.copyAnnotations(operator);
 
         if (result.sameCircuit(operator))

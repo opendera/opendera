@@ -71,7 +71,7 @@ public class EquivalenceTests {
         DBSPClosureExpression closure = body.closure(var.asParameter());
 
         DBSPOperator fake = new DBSPConstantOperator(
-                CalciteEmptyRel.INSTANCE, new DBSPZSetExpression(new DBSPBoolLiteral()), false, false);
+                CalciteEmptyRel.INSTANCE, new DBSPZSetExpression(new DBSPBoolLiteral()), false);
         ValueNumbering numbering = new ValueNumbering(compiler);
         numbering.setOperatorContext(fake);
         numbering.apply(closure);
@@ -118,7 +118,7 @@ public class EquivalenceTests {
         DBSPClosureExpression closure = block.closure(var.asParameter());
 
         DBSPOperator fake = new DBSPConstantOperator(
-                CalciteEmptyRel.INSTANCE, new DBSPZSetExpression(new DBSPBoolLiteral()), false, false);
+                CalciteEmptyRel.INSTANCE, new DBSPZSetExpression(new DBSPBoolLiteral()), false);
         ValueNumbering numbering = new ValueNumbering(compiler);
         numbering.setOperatorContext(fake);
         numbering.apply(closure);
@@ -157,7 +157,7 @@ public class EquivalenceTests {
         numbering.apply(closure);
         ExpressionsCSE cse = new ExpressionsCSE(compiler, numbering.canonical);
         DBSPOperator fake = new DBSPConstantOperator(
-                CalciteEmptyRel.INSTANCE, new DBSPZSetExpression(new DBSPBoolLiteral()), false, false);
+                CalciteEmptyRel.INSTANCE, new DBSPZSetExpression(new DBSPBoolLiteral()), false);
         cse.setOperatorContext(fake);
         cse.apply(closure);
         IDBSPInnerNode translated = cse.get(closure);
@@ -251,5 +251,13 @@ public class EquivalenceTests {
                 y.deepCopy().to(DBSPVariablePath.class),
                 x.deepCopy().to(DBSPVariablePath.class));
         Assert.assertTrue(EquivalenceContext.equiv(blockLambda0, blockLambda1));
+
+        DBSPTypeTuple ii = new DBSPTypeTuple(i32, i32);
+        DBSPTypeTuple iii = new DBSPTypeTuple(i32, i32, i32);
+        DBSPVariablePath x5 = new DBSPVariablePath("x", ii);
+        DBSPVariablePath y5 = new DBSPVariablePath("y", iii);
+        DBSPExpression x0 = x5.field(0).closure(x5);
+        DBSPExpression y0 = y5.field(0).closure(y5);
+        Assert.assertFalse(EquivalenceContext.equiv(x0, y0));
     }
 }

@@ -16,9 +16,10 @@
         <maven.compiler.source>19</maven.compiler.source>
         <maven.compiler.target>19</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <calcite.version>1.41.0</calcite.version>
-        <jackson.version>2.17.1</jackson.version>
+        <calcite.version>1.42.0</calcite.version>
+        <jackson.version>2.21.1</jackson.version>
         <janino.version>3.1.12</janino.version>
+        <project.version>0.296.0</project.version>
     </properties>
 
     <repositories>
@@ -188,9 +189,17 @@
                 </executions>
             </plugin>
         </plugins>
+        <!-- This substitutes the program.version from pom.xml to the resource file version.properties -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
     </build>
 
     <dependencies>
+        <!-- Something needs this -->
         <dependency>
             <groupId>org.apiguardian</groupId>
             <artifactId>apiguardian-api</artifactId>
@@ -206,11 +215,13 @@
             <artifactId>commons-math3</artifactId>
             <version>3.6.1</version>
         </dependency>
+        <!-- For unsigned integers -->
         <dependency>
             <groupId>org.jooq</groupId>
             <artifactId>joou-java-6</artifactId>
             <version>0.9.4</version>
         </dependency>
+        <!-- Janino used by Calcite; here we control the version -->
         <dependency>
             <groupId>org.codehaus.janino</groupId>
             <artifactId>janino</artifactId>
@@ -221,15 +232,17 @@
             <artifactId>commons-compiler</artifactId>
             <version>${janino.version}</version>
         </dependency>
+        <!-- Jetbrains annotations Used for @Contract -->
         <dependency>
             <groupId>org.jetbrains</groupId>
             <artifactId>annotations</artifactId>
             <version>26.0.2</version>
         </dependency>
+        <!-- Needed by Calcite -->
         <dependency>
             <groupId>com.jayway.jsonpath</groupId>
             <artifactId>json-path</artifactId>
-            <version>2.9.0</version>
+            <version>2.10.0</version>
         </dependency>
         <dependency>
             <groupId>commons-codec</groupId>
@@ -241,6 +254,11 @@
             <artifactId>jackson-dataformat-csv</artifactId>
             <version>${jackson.version}</version>
             <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-core</artifactId>
+            <version>${jackson.version}</version>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.dataformat</groupId>
@@ -262,7 +280,7 @@
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-text</artifactId>
-            <version>1.10.0</version>
+            <version>1.15.0</version>
         </dependency>
         <!-- Seemingly needed by calcite -->
         <dependency>
@@ -280,11 +298,6 @@
             <artifactId>calcite-linq4j</artifactId>
             <version>${calcite.version}</version>
         </dependency>
-        <dependency>
-            <groupId>org.apache.calcite</groupId>
-            <artifactId>calcite-server</artifactId>
-            <version>${calcite.version}</version>
-        </dependency>
         <!-- GEO library -->
         <dependency>
             <groupId>org.locationtech.jts</groupId>
@@ -294,7 +307,13 @@
         <dependency>
             <groupId>org.apache.calcite.avatica</groupId>
             <artifactId>avatica-core</artifactId>
-            <version>1.25.0</version>
+            <version>1.27.0</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>com.fasterxml.jackson.core</groupId>
+                    <artifactId>jackson-core</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <dependency>
             <groupId>junit</groupId>
@@ -307,7 +326,7 @@
         <dependency>
             <groupId>org.xerial</groupId>
             <artifactId>sqlite-jdbc</artifactId>
-            <version>3.42.0.0</version>
+            <version>3.45.3.0</version>
             <scope>test</scope>
         </dependency>
         <!-- Command-line parsing -->
@@ -315,18 +334,6 @@
             <groupId>org.jcommander</groupId>
             <artifactId>jcommander</artifactId>
             <version>2.0</version>
-        </dependency>
-        <!-- HyperSQL Java database -->
-        <dependency>
-            <groupId>org.hsqldb</groupId>
-            <artifactId>hsqldb</artifactId>
-            <version>2.7.2</version>
-            <classifier>jdk8</classifier>
-        </dependency>
-        <dependency>
-            <groupId>io.confluent</groupId>
-            <artifactId>kafka-schema-registry-client</artifactId>
-            <version>7.9.0</version>
         </dependency>
     </dependencies>
 </project>

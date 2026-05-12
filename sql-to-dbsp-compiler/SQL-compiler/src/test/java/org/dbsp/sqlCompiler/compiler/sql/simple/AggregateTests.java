@@ -1,7 +1,12 @@
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
+import org.dbsp.sqlCompiler.circuit.operator.DBSPChainAggregateOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamAggregateOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
+import org.dbsp.sqlCompiler.ir.aggregate.DBSPMinMax;
+import org.junit.Assert;
 import org.junit.Test;
 
 public class AggregateTests extends SqlIoTest {
@@ -38,7 +43,7 @@ public class AggregateTests extends SqlIoTest {
                    I INT NOT NULL,
                    J INT,
                    K INT
-                );
+                ) with ('append_only' = 'true');
                 INSERT INTO NN VALUES
                    (0, 0, 0),
                    (1, 1, 1),
@@ -63,6 +68,21 @@ public class AggregateTests extends SqlIoTest {
                 -------------------------
                  0 | 2  | 0  | NULL | 0
                  1 | 3  | 1  | NULL | 1
+                (2 rows)
+                
+                SELECT ARG_MIN(I, I), ARG_MIN(I, J), ARG_MIN(J, I), ARG_MIN(J, J)
+                FROM NN;
+                 ii | ij | ji   | jj
+                --------------------
+                 0  | 0  | 0    | 0
+                (1 row)
+
+                SELECT K, ARG_MIN(I, I), ARG_MIN(I, J), ARG_MIN(J, I), ARG_MIN(J, J)
+                FROM NN GROUP BY K;
+                 k | ii | ij | ji   | jj
+                -------------------------
+                 0 | 0  | 0  | 0    | 0
+                 1 | 1  | 1  | 1    | 1
                 (2 rows)""");
     }
 
@@ -86,6 +106,53 @@ public class AggregateTests extends SqlIoTest {
                  20 | { 3, 5 }
                  30 | { 3, 5 }
                 (6 rows)""");
+    }
+
+    @Test
+    public void issue4777() {
+        // validated using Postgres, but second result is not deterministic
+        this.qs("""
+                SELECT ARRAY_AGG(parentId ORDER BY id)
+                FROM warehouse;
+                  array
+                ----------
+                 { 5, 3, 5, 20, 20, 20 }
+                (1 row)
+                
+                SELECT ARRAY_AGG(id ORDER BY parentId)
+                FROM warehouse;
+                  array
+                ----------
+                 { 3, 1, 5, 10, 20, 30 }
+                (1 row)
+                
+                SELECT ARRAY_AGG(id ORDER BY parentId, id)
+                FROM warehouse;
+                  array
+                ----------
+                 { 3, 1, 5, 10, 20, 30 }
+                (1 row)
+                
+                SELECT ARRAY_AGG(id ORDER BY parentId, id, id DESC)
+                FROM warehouse;
+                  array
+                ----------
+                 { 3, 1, 5, 10, 20, 30 }
+                (1 row)
+                
+                SELECT ARRAY_AGG(id ORDER BY parentId, parentId DESC, id)
+                FROM warehouse;
+                  array
+                ----------
+                 { 3, 1, 5, 10, 20, 30 }
+                (1 row)
+                
+                SELECT ARRAY_AGG(id ORDER BY parentId, id DESC)
+                FROM warehouse;
+                  array
+                ----------
+                 { 3, 5, 1, 30, 20, 10 }
+                (1 row)""");
     }
 
     @Test
@@ -157,6 +224,25 @@ public class AggregateTests extends SqlIoTest {
                  20 | { 3, 5, 20 }
                  30 | { 3, 5, 20 }
                 (6 rows)""");
+
+        this.qs("""
+                SELECT
+                  id,
+                  (SELECT ARRAY(
+                    SELECT id FROM warehouse WHERE parentId = warehouse.id
+                    LIMIT 2
+                  )) AS first_children
+                FROM warehouse;
+                 id |  array
+                ---------------
+                 1  | { 3, 5 }
+                 3  | { 3, 5 }
+                 5  | { 3, 5 }
+                 10 | { 3, 5 }
+                 20 | { 3, 5 }
+                 30 | { 3, 5 }
+                (6 rows)""");
+
     }
 
     @Test
@@ -168,6 +254,44 @@ public class AggregateTests extends SqlIoTest {
                 ---
                  0
                 (1 row)""");
+
+        var cc = this.getCC("CREATE VIEW V AS SELECT ARG_MIN(V, B) FROM T;");
+        CircuitVisitor visitor = new CircuitVisitor(cc.compiler) {
+            boolean found = false;
+
+            @Override
+            public void postorder(DBSPStreamAggregateOperator operator) {
+                // Code generated uses DBSP ArgMinSome aggregator
+                Assert.assertSame(DBSPMinMax.Aggregation.ArgMinSome,
+                        operator.getFunction().to(DBSPMinMax.class).aggregation);
+                found = true;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertTrue(found);
+            }
+        };
+        cc.visit(visitor);
+
+        cc = this.getCC("CREATE VIEW V AS SELECT MIN(B) FROM T;");
+        visitor = new CircuitVisitor(cc.compiler) {
+            boolean found = false;
+
+            @Override
+            public void postorder(DBSPStreamAggregateOperator operator) {
+                // Code generated uses MinSome1 DBSP aggregator
+                Assert.assertSame(DBSPMinMax.Aggregation.MinSome1,
+                        operator.getFunction().to(DBSPMinMax.class).aggregation);
+                found = true;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertTrue(found);
+            }
+        };
+        cc.visit(visitor);
     }
 
     @Test
@@ -328,5 +452,50 @@ public class AggregateTests extends SqlIoTest {
                 ---------------
                  3 | 3 | 3 | 3
                 (1 row)""");
+    }
+
+    @Test
+    public void testArgMinMin() {
+        var cc = this.getCC("CREATE VIEW V AS SELECT ARG_MIN(I, J), MIN(J), MAX(J) FROM NN;");
+        CircuitVisitor visitor = new CircuitVisitor(cc.compiler) {
+            int chains = 0;
+
+            @Override
+            public void postorder(DBSPChainAggregateOperator operator) {
+                this.chains++;
+            }
+
+            public void postorder(DBSPStreamAggregateOperator operator) {
+                Assert.fail("There should be no aggregate operators");
+            }
+
+            @Override
+            public void endVisit() {
+                // MIN, ARG_MIN, MAX are combined in a single operator
+                Assert.assertEquals(1, this.chains);
+            }
+        };
+        cc.visit(visitor);
+
+        cc = this.getCC("CREATE VIEW V AS SELECT K, ARG_MIN(I, J), MIN(J), MAX(J) FROM NN GROUP BY k;");
+        visitor = new CircuitVisitor(cc.compiler) {
+            int chains = 0;
+
+            @Override
+            public void postorder(DBSPChainAggregateOperator operator) {
+                this.chains++;
+            }
+
+            public void postorder(DBSPStreamAggregateOperator operator) {
+                Assert.fail("There should be no aggregate operators");
+            }
+
+            @Override
+            public void endVisit() {
+                // MIN, ARG_MIN, MAX are combined in a single operator
+                Assert.assertEquals(1, this.chains);
+            }
+        };
+        cc.visit(visitor);
     }
 }

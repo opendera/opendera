@@ -1,9 +1,10 @@
 use anyhow::Result;
+use dbsp::typed_batch::IndexedZSetReader;
 use dbsp::{
-    indexed_zset,
+    Circuit, NestedCircuit, OrdIndexedZSet, Runtime, Stream, indexed_zset,
     operator::{Generator, Min},
     utils::{Tup2, Tup3, Tup4},
-    zset_set, Circuit, NestedCircuit, OrdIndexedZSet, Runtime, Stream,
+    zset_set,
 };
 
 type Accumulator =
@@ -115,7 +116,7 @@ fn main() -> Result<()> {
     for i in 0..STEPS {
         let iteration = i + 1;
         println!("Iteration {} starts...", iteration);
-        circuit_handle.step()?;
+        circuit_handle.transaction()?;
         let output = output_handle.consolidate();
         assert_eq!(output, expected_outputs.next().unwrap());
         output.iter().for_each(

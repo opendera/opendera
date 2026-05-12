@@ -72,19 +72,42 @@ public class CompilerCircuitStream extends CompilerCircuit {
         this.stream.addPair(input, output);
     }
 
-    /** Execute some insert/delete statements using HSQLDB and compare the result
-     * with the one produced by the circuit.
-     * @param program program that creates the circuit.
+    /** Like step, but every record in the output has weight one, and the
+     * weight column is omitted for the expected output. */
+    public void stepWeightOne(String script, String expected) {
+        String[] lines = expected.split("\n");
+        boolean inHeader = true;
+        for (int i = 0; i < lines.length; i++) {
+            var l = lines[i];
+            if (inHeader && l.contains("---")) {
+                inHeader = false;
+                continue;
+            }
+            if (inHeader)
+                continue;
+            lines[i] = l + "| 1";
+        }
+        this.step(script, String.join("\n", lines));
+    }
+
+    public void step(Change input, Change output) {
+        this.stream.addPair(input, output);
+    }
+
+    /** Execute some insert/delete statements using sqlite and return the produced result.
+     * @param program program to execute
      * @param script program that inserts data in tables */
-    public void compareDB(String program, String script) throws ClassNotFoundException, SQLException {
-        Class.forName("org.hsqldb.jdbcDriver");
+    public Change computeOutputResultWithDB(String program, String script) throws SQLException {
         // a new instance of the database for each script
-        String jdbcUrl = "jdbc:hsqldb:mem:db";
+        String jdbcUrl = "jdbc:sqlite::memory:";
         Connection connection = DriverManager.getConnection(jdbcUrl, "", "");
         program += script;
         // not very robust
         String[] stats = program.split(";");
         for (String stat: stats) {
+            if (stat.isBlank())
+                continue;
+            stat = stat.replace("MATERIALIZED", "");
             try (Statement s = connection.createStatement()) {
                 s.execute(stat);
             }
@@ -93,19 +116,22 @@ public class CompilerCircuitStream extends CompilerCircuit {
                 Linq.list(circuit.sinkOperators.values()), o -> !o.metadata.system);
         String view = sinks.get(0).viewName.toString();
         String query = "SELECT * FROM " + view;
+        Change change;
         try (Statement stmt = connection.createStatement()) {
             ResultSet rs = stmt.executeQuery(query);
-            Change change = TableParser.fromResultSet(rs, this.circuit.getSingleOutputType());
-            this.stream.addPair(this.toChange(script), change);
+            change = TableParser.fromResultSet(rs, this.circuit.getSingleOutputType());
         }
 
-        try (Statement s = connection.createStatement()) {
-            s.execute("DROP SCHEMA PUBLIC CASCADE;");
-        }
-        try (Statement s = connection.createStatement()) {
-            s.execute("SHUTDOWN;");
-        }
         connection.close();
+        return change;
+    }
+
+    /** Execute some insert/delete statements using an embedded DB and compare the result
+     * with the one produced by the circuit.
+     * @param script program that inserts data in tables */
+    public void compareDB(String program, String script) throws SQLException {
+        Change change = this.computeOutputResultWithDB(program, script);
+        this.stream.addPair(this.toChange(script), change);
     }
 
     public void addChange(InputOutputChange ioChange) {

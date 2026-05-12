@@ -58,6 +58,14 @@ public final class DBSPI128Literal extends DBSPIntLiteral implements IsNumericLi
     }
 
     @Override
+    public int compare(IsNumericLiteral other) {
+        DBSPI128Literal oi = other.to(DBSPI128Literal.class);
+        Utilities.enforce(this.value != null);
+        Utilities.enforce(oi.value != null);
+        return this.value.compareTo(oi.value);
+    }
+
+    @Override
     public boolean gt0() {
         Utilities.enforce(this.value != null);
         return this.value.compareTo(BigInteger.ZERO) > 0;
@@ -106,7 +114,7 @@ public final class DBSPI128Literal extends DBSPIntLiteral implements IsNumericLi
                     .append(this.type)
                     .append(")null");
         else
-            return builder.append(this.value.toString());
+            return builder.append(this.wrapSome(this.value.toString()));
     }
 
     @Override

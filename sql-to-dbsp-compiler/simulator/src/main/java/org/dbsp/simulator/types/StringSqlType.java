@@ -1,12 +1,9 @@
 package org.dbsp.simulator.types;
 
 public class StringSqlType extends SqlTypeBase {
-    public StringSqlType(int precision) {
-        super(SqlTypeName.VARCHAR, precision);
-    }
+    public static final StringSqlType INSTANCE = new StringSqlType();
 
-    public StringSqlType() {
+    private StringSqlType() {
         super(SqlTypeName.VARCHAR);
     }
-
 }

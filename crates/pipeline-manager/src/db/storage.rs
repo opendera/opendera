@@ -1,5 +1,11 @@
+use crate::api::support_data_collector::SupportBundleData;
 use crate::db::error::DBError;
 use crate::db::types::api_key::{ApiKeyDescr, ApiPermission};
+use crate::db::types::monitor::{
+    ClusterMonitorEvent, ClusterMonitorEventId, ExtendedClusterMonitorEvent,
+    ExtendedPipelineMonitorEvent, NewClusterMonitorEvent, PipelineMonitorEvent,
+    PipelineMonitorEventId,
+};
 use crate::db::types::pipeline::{
     ExtendedPipelineDescr, ExtendedPipelineDescrMonitoring, PipelineDescr, PipelineId,
 };
@@ -8,6 +14,7 @@ use crate::db::types::tenant::TenantId;
 use crate::db::types::version::Version;
 use async_trait::async_trait;
 use feldera_types::error::ErrorResponse;
+use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -30,16 +37,31 @@ impl ExtendedPipelineDescrRunner {
                 created_at: pipeline.created_at,
                 version: pipeline.version,
                 platform_version: pipeline.platform_version.clone(),
+                program_config: pipeline.program_config.clone(),
                 program_version: pipeline.program_version,
                 program_status: pipeline.program_status,
                 program_status_since: pipeline.program_status_since,
-                deployment_status: pipeline.deployment_status,
-                deployment_status_since: pipeline.deployment_status_since,
-                deployment_desired_status: pipeline.deployment_desired_status,
                 deployment_error: pipeline.deployment_error.clone(),
                 deployment_location: pipeline.deployment_location.clone(),
                 refresh_version: pipeline.refresh_version,
                 storage_status: pipeline.storage_status,
+                storage_status_details: pipeline.storage_status_details.clone(),
+                deployment_id: pipeline.deployment_id,
+                deployment_initial: pipeline.deployment_initial,
+                deployment_resources_status: pipeline.deployment_resources_status,
+                deployment_resources_status_since: pipeline.deployment_resources_status_since,
+                deployment_resources_desired_status: pipeline.deployment_resources_desired_status,
+                deployment_resources_desired_status_since: pipeline
+                    .deployment_resources_desired_status_since,
+                deployment_runtime_status: pipeline.deployment_runtime_status,
+                deployment_runtime_status_details: pipeline
+                    .deployment_runtime_status_details
+                    .clone(),
+                deployment_runtime_status_since: pipeline.deployment_runtime_status_since,
+                deployment_runtime_desired_status: pipeline.deployment_runtime_desired_status,
+                bootstrap_policy: pipeline.bootstrap_policy,
+                deployment_runtime_desired_status_since: pipeline
+                    .deployment_runtime_desired_status_since,
             },
         }
     }
@@ -62,6 +84,9 @@ pub(crate) trait Storage {
         name: String,
         provider: String,
     ) -> Result<TenantId, DBError>;
+
+    /// Retrieves the tenant name for a given tenant ID.
+    async fn get_tenant_name(&self, tenant_id: TenantId) -> Result<String, DBError>;
 
     /// Retrieves the list of all API keys.
     async fn list_api_keys(&self, tenant_id: TenantId) -> Result<Vec<ApiKeyDescr>, DBError>;
@@ -157,10 +182,31 @@ pub(crate) trait Storage {
         new_id: Uuid, // Only used if the pipeline happens to not exist
         original_name: &str,
         platform_version: &str,
+        bump_platform_version: bool,
         pipeline: PipelineDescr,
     ) -> Result<(bool, ExtendedPipelineDescr), DBError>;
 
+    /// Testing only: update the platform_version field of a pipeline.
+    ///
+    /// Used to simulate pipelines compiled by a previous version of the platform.
+    async fn testing_force_update_platform_version(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        platform_version: &str,
+    ) -> Result<(), DBError>;
+
     /// Updates an existing pipeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `platform_version` - the currently running Feldera platform version. If `bump_platform_version` is true,
+    ///    pipeline's platform_version will be set to this value.
+    /// * `bump_platform_version` - if true, the platform_version of the pipeline will be updated to the
+    ///    provided `platform_version`. In addition, the platform_version will be updated unconditionally
+    ///    if the program code or program settings are getting updated by this request.
+    /// * Other arguments correspond to fields that can be updated. If an argument is `None`, the corresponding
+    ///   field is not updated.
     #[allow(clippy::too_many_arguments)]
     async fn update_pipeline(
         &self,
@@ -169,6 +215,7 @@ pub(crate) trait Storage {
         name: &Option<String>,
         description: &Option<String>,
         platform_version: &str,
+        bump_platform_version: bool,
         runtime_config: &Option<serde_json::Value>,
         program_code: &Option<String>,
         udf_rust: &Option<String>,
@@ -227,7 +274,7 @@ pub(crate) trait Storage {
         rust_compilation: &RustCompilationInfo,
         program_binary_source_checksum: &str,
         program_binary_integrity_checksum: &str,
-        program_binary_url: &str,
+        program_info_integrity_checksum: &str,
     ) -> Result<(), DBError>;
 
     /// Transitions program status to `SqlError`.
@@ -257,90 +304,107 @@ pub(crate) trait Storage {
         system_error: &str,
     ) -> Result<(), DBError>;
 
-    /// Sets deployment desired status to `Running`.
-    async fn set_deployment_desired_status_running(
+    /// Dismisses the `deployment_error`.
+    async fn dismiss_deployment_error(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+    ) -> Result<(), DBError>;
+
+    /// Sets deployment desired status to `Provisioned`.
+    async fn set_deployment_resources_desired_status_provisioned(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        initial: RuntimeDesiredStatus,
+        bootstrap_policy: BootstrapPolicy,
+        dismiss_error: bool,
+    ) -> Result<PipelineId, DBError>;
+
+    /// Sets deployment desired status to `Stopped` if it is not in currently `Provisioned`.
+    /// Returns `true` for the boolean if it was set to stopped.
+    #[allow(dead_code)] // Only used by non-forceful stop in Enterprise edition
+    async fn set_deployment_resources_desired_status_stopped_if_not_provisioned(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+    ) -> Result<(bool, PipelineId), DBError>;
+
+    /// Sets deployment desired status to `Stopped`.
+    async fn set_deployment_resources_desired_status_stopped(
         &self,
         tenant_id: TenantId,
         pipeline_name: &str,
     ) -> Result<PipelineId, DBError>;
 
-    /// Sets deployment desired status to `Paused`.
-    async fn set_deployment_desired_status_paused(
-        &self,
-        tenant_id: TenantId,
-        pipeline_name: &str,
-    ) -> Result<PipelineId, DBError>;
-
-    /// Sets deployment desired status to `Suspended` or `Stopped` depending on state.
-    async fn set_deployment_desired_status_suspended_or_stopped(
-        &self,
-        tenant_id: TenantId,
-        pipeline_name: &str,
-        force: bool,
-    ) -> Result<PipelineId, DBError>;
-
-    /// Transitions deployment status to `Provisioning`.
-    async fn transit_deployment_status_to_provisioning(
+    /// Transitions resources status to `Provisioning`.
+    async fn transit_deployment_resources_status_to_provisioning(
         &self,
         tenant_id: TenantId,
         pipeline_id: PipelineId,
         version_guard: Version,
+        deployment_id: Uuid,
         deployment_config: serde_json::Value,
     ) -> Result<(), DBError>;
 
-    /// Transitions deployment status to `Initializing`.
-    async fn transit_deployment_status_to_initializing(
+    /// Remains resources status `Provisioning`.
+    async fn remain_deployment_resources_status_provisioning(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        version_guard: Version,
+        deployment_resources_status_details: serde_json::Value,
+    ) -> Result<(), DBError>;
+
+    /// Transitions resources status to `Provisioned`.
+    #[allow(clippy::too_many_arguments)]
+    async fn transit_deployment_resources_status_to_provisioned(
         &self,
         tenant_id: TenantId,
         pipeline_id: PipelineId,
         version_guard: Version,
         deployment_location: &str,
+        deployment_resources_status_details: serde_json::Value,
+        deployment_runtime_status: RuntimeStatus,
+        deployment_runtime_status_details: serde_json::Value,
+        deployment_runtime_desired_status: RuntimeDesiredStatus,
     ) -> Result<(), DBError>;
 
-    /// Transitions deployment status to `Running`.
-    async fn transit_deployment_status_to_running(
+    /// Remains resources status `Provisioned`.
+    #[allow(clippy::too_many_arguments)]
+    async fn remain_deployment_resources_status_provisioned(
         &self,
         tenant_id: TenantId,
         pipeline_id: PipelineId,
         version_guard: Version,
+        deployment_resources_status_details: serde_json::Value,
+        deployment_runtime_status: RuntimeStatus,
+        deployment_runtime_status_details: serde_json::Value,
+        deployment_runtime_desired_status: RuntimeDesiredStatus,
+        storage_status_details: Option<serde_json::Value>,
     ) -> Result<(), DBError>;
 
-    /// Transitions deployment status to `Paused`.
-    async fn transit_deployment_status_to_paused(
-        &self,
-        tenant_id: TenantId,
-        pipeline_id: PipelineId,
-        version_guard: Version,
-    ) -> Result<(), DBError>;
-
-    /// Transitions deployment status to `Unavailable`.
-    async fn transit_deployment_status_to_unavailable(
-        &self,
-        tenant_id: TenantId,
-        pipeline_id: PipelineId,
-        version_guard: Version,
-    ) -> Result<(), DBError>;
-
-    /// Transitions deployment status to `Suspending`.
-    async fn transit_deployment_status_to_suspending(
-        &self,
-        tenant_id: TenantId,
-        pipeline_id: PipelineId,
-        version_guard: Version,
-    ) -> Result<(), DBError>;
-
-    /// Transitions deployment status to `Stopping`.
-    async fn transit_deployment_status_to_stopping(
+    /// Transitions resources status to `Stopping`.
+    async fn transit_deployment_resources_status_to_stopping(
         &self,
         tenant_id: TenantId,
         pipeline_id: PipelineId,
         version_guard: Version,
         deployment_error: Option<ErrorResponse>,
-        suspend_info: Option<serde_json::Value>,
+        storage_status_details: Option<serde_json::Value>,
     ) -> Result<(), DBError>;
 
-    /// Transitions deployment status to `Stopped`.
-    async fn transit_deployment_status_to_stopped(
+    /// Remains resources status `Stopping`.
+    async fn remain_deployment_resources_status_stopping(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        version_guard: Version,
+        deployment_resources_status_details: serde_json::Value,
+    ) -> Result<(), DBError>;
+
+    /// Transitions resources status to `Stopped`.
+    async fn transit_deployment_resources_status_to_stopped(
         &self,
         tenant_id: TenantId,
         pipeline_id: PipelineId,
@@ -348,7 +412,7 @@ pub(crate) trait Storage {
     ) -> Result<(), DBError>;
 
     /// Transitions storage status to `Clearing`.
-    async fn transit_storage_status_to_clearing(
+    async fn transit_storage_status_to_clearing_if_not_cleared(
         &self,
         tenant_id: TenantId,
         pipeline_name: &str,
@@ -359,6 +423,13 @@ pub(crate) trait Storage {
         &self,
         tenant_id: TenantId,
         pipeline_id: PipelineId,
+    ) -> Result<(), DBError>;
+
+    /// Increments notify counter such that any LISTEN mechanism is appraised.
+    async fn increment_notify_counter(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
     ) -> Result<(), DBError>;
 
     /// Retrieves a list of all pipeline ids across all tenants.
@@ -381,13 +452,22 @@ pub(crate) trait Storage {
     /// If the platform version is not the current one, its `platform_version` will be updated and
     /// the `program_status` will be set back to `Pending` (if not already) such that the SQL
     /// compiler can pick it up again.
-    async fn clear_ongoing_sql_compilation(&self, platform_version: &str) -> Result<(), DBError>;
+    /// Only the owner worker (by modulo) resets `CompilingSql` pipelines to `Pending`
+    /// This ensures that only the assigned worker for a pipeline can reset its status.
+    async fn clear_ongoing_sql_compilation_for_worker(
+        &self,
+        platform_version: &str,
+        worker_id: usize,
+        total_workers: usize,
+    ) -> Result<(), DBError>;
 
     /// Retrieves the pipeline which is stopped, whose program status has been Pending
     /// for the longest, and is of the current platform version. Returns `None` if none is found.
     async fn get_next_sql_compilation(
         &self,
         platform_version: &str,
+        worker_id: usize,
+        total_workers: usize,
     ) -> Result<Option<(TenantId, ExtendedPipelineDescr)>, DBError>;
 
     /// Determines what to do with pipelines that are `SqlCompiled` and `CompilingRust`.
@@ -398,18 +478,117 @@ pub(crate) trait Storage {
     /// If the platform version is not the current one, its `platform_version` will be updated and
     /// the `program_status` will be set back to `Pending` such that the Rust compiler can pick it
     /// up again.
-    async fn clear_ongoing_rust_compilation(&self, platform_version: &str) -> Result<(), DBError>;
+    /// Only the owner worker (by modulo) resets stuck `CompilingRust` pipelines to `SqlCompiled`.
+    /// This ensures that only the assigned worker for a pipeline can reset its status.
+    async fn clear_ongoing_rust_compilation_for_worker(
+        &self,
+        platform_version: &str,
+        worker_id: usize,
+        total_workers: usize,
+    ) -> Result<(), DBError>;
 
     /// Retrieves the pipeline which is stopped, whose program status has been SqlCompiled
     /// for the longest, and is of the current platform version. Returns `None` if none is found.
     async fn get_next_rust_compilation(
         &self,
         platform_version: &str,
+        worker_id: usize,
+        total_workers: usize,
     ) -> Result<Option<(TenantId, ExtendedPipelineDescr)>, DBError>;
 
     /// Retrieves the list of fully compiled pipeline programs (pipeline identifier, program version,
-    /// program binary source checksum, program binary integrity checksum) across all tenants.
+    /// program binary source checksum, program binary integrity checksum) AND pipeline programs that
+    /// are currently being compiled (pipeline identifier, program version) across all tenants.
     async fn list_pipeline_programs_across_all_tenants(
         &self,
-    ) -> Result<Vec<(PipelineId, Version, String, String)>, DBError>;
+    ) -> Result<
+        Vec<(
+            PipelineId,
+            Version,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+        DBError,
+    >;
+
+    async fn get_support_bundle_data(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        how_many: u64,
+    ) -> Result<(ExtendedPipelineDescrMonitoring, Vec<SupportBundleData>), DBError>;
+
+    async fn list_cluster_monitor_events(&self) -> Result<Vec<ClusterMonitorEvent>, DBError>;
+
+    async fn get_cluster_monitor_event_short(
+        &self,
+        event_id: ClusterMonitorEventId,
+    ) -> Result<ClusterMonitorEvent, DBError>;
+
+    async fn get_cluster_monitor_event_extended(
+        &self,
+        event_id: ClusterMonitorEventId,
+    ) -> Result<ExtendedClusterMonitorEvent, DBError>;
+
+    async fn get_latest_cluster_monitor_event_short(&self) -> Result<ClusterMonitorEvent, DBError>;
+
+    async fn get_latest_cluster_monitor_event_extended(
+        &self,
+    ) -> Result<ExtendedClusterMonitorEvent, DBError>;
+
+    async fn new_cluster_monitor_event(
+        &self,
+        new_id: Uuid,
+        event_descr: NewClusterMonitorEvent,
+    ) -> Result<(), DBError>;
+
+    async fn delete_cluster_monitor_events_beyond_retention(
+        &self,
+        retention_hours: u16,
+        retention_num: u16,
+    ) -> Result<(u64, u64), DBError>;
+
+    async fn list_pipeline_monitor_events_short(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: String,
+    ) -> Result<Vec<PipelineMonitorEvent>, DBError>;
+
+    async fn list_pipeline_monitor_events_extended(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: String,
+    ) -> Result<Vec<ExtendedPipelineMonitorEvent>, DBError>;
+
+    async fn get_pipeline_monitor_event_short(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: String,
+        event_id: PipelineMonitorEventId,
+    ) -> Result<PipelineMonitorEvent, DBError>;
+
+    async fn get_pipeline_monitor_event_extended(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: String,
+        event_id: PipelineMonitorEventId,
+    ) -> Result<ExtendedPipelineMonitorEvent, DBError>;
+
+    async fn get_latest_pipeline_monitor_event_short(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: String,
+    ) -> Result<PipelineMonitorEvent, DBError>;
+
+    async fn get_latest_pipeline_monitor_event_extended(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: String,
+    ) -> Result<ExtendedPipelineMonitorEvent, DBError>;
+
+    async fn delete_pipeline_monitor_events_exceeding_retention(
+        &self,
+        retention_num: u32,
+    ) -> Result<u64, DBError>;
 }

@@ -1,28 +1,21 @@
 use feldera_types::config::StorageConfig;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::{
-    operator::{
-        time_series::{RelOffset, RelRange},
-        Max, Min,
-    },
-    utils::{Tup2, Tup3},
     CmpFunc, DBData, OrdZSet, OutputHandle, RootCircuit, Runtime, Stream, ZSetHandle, ZWeight,
+    circuit::dbsp_handle::CircuitStorageConfig,
+    default_hash,
+    operator::{
+        Max, Min,
+        time_series::{RelOffset, RelRange},
+    },
+    typed_batch::SpineSnapshot,
+    utils::{Tup2, Tup3, Tup4, test::init_test_logger},
 };
-use std::{fmt::Debug, marker::PhantomData, sync::Arc};
+use std::{cmp::Ordering, fmt::Debug, marker::PhantomData, path::PathBuf, sync::Arc};
 
-use super::{dbsp_handle::Mode, CircuitConfig, CircuitStorageConfig};
+use super::{CircuitConfig, dbsp_handle::Mode};
 
-fn init_logging() {
-    let _ = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_test_writer())
-        .with(
-            EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new("debug"))
-                .unwrap(),
-        )
-        .try_init();
-}
+const NUM_WORKERS: usize = 4;
 
 /// A trait that defines 0, 1, or multiple input or output streams.
 trait TestDataType {
@@ -53,7 +46,7 @@ macro_rules! impl_test_data {
             $($t: DBData),*
         {
             type InputHandles = ($(ZSetHandle<$t>),*);
-            type OutputHandles = ($(OutputHandle<OrdZSet<$t>>),*);
+            type OutputHandles = ($(OutputHandle<SpineSnapshot<OrdZSet<$t>>>),*);
             type Chunk = ($(Vec<Tup2<$t, ZWeight>>),*);
             type ZSet = ($(OrdZSet<$t>),*);
 
@@ -64,14 +57,14 @@ macro_rules! impl_test_data {
             }
 
             fn read_outputs(handles: &Self::OutputHandles) -> Self::ZSet {
-                ($(handles.$name.consolidate()),*)
+                ($(SpineSnapshot::<OrdZSet<$t>>::concat(&handles.$name.take_from_all()).consolidate()),*)
             }
         }
     };
 }
 
 impl_test_data!(TestData2, 0: T1, 1: T2);
-impl_test_data!(TestData3, 0: T1, 1: T2, 2: T3);
+impl_test_data!(TestData4, 0: T1, 1: T2, 2: T3, 3: T4);
 
 struct TestData1<T1: DBData> {
     phantom: PhantomData<T1>,
@@ -93,7 +86,7 @@ where
     T1: DBData,
 {
     type InputHandles = ZSetHandle<T1>;
-    type OutputHandles = OutputHandle<OrdZSet<T1>>;
+    type OutputHandles = OutputHandle<SpineSnapshot<OrdZSet<T1>>>;
     type Chunk = Vec<Tup2<T1, ZWeight>>;
     type ZSet = OrdZSet<T1>;
 
@@ -102,7 +95,7 @@ where
     }
 
     fn read_outputs(handles: &Self::OutputHandles) -> Self::ZSet {
-        handles.consolidate()
+        SpineSnapshot::<OrdZSet<T1>>::concat(&handles.take_from_all()).consolidate()
     }
 }
 
@@ -170,22 +163,68 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
     O2: TestDataType,
     O3: TestDataType,
 {
+    // Run with replay step size < splitter chunk size.
+    test_replay_with_step_size::<I1, I2, I3, O1, O2, O3>(
+        circuit_constructor1.clone(),
+        circuit_constructor2.clone(),
+        inputs1.clone(),
+        inputs2_1.clone(),
+        inputs2_2.clone(),
+        inputs3.clone(),
+        Some(1),
+    );
+
+    // Run without replay step size > splitter chunk size.
+    test_replay_with_step_size::<I1, I2, I3, O1, O2, O3>(
+        circuit_constructor1,
+        circuit_constructor2,
+        inputs1,
+        inputs2_1,
+        inputs2_2,
+        inputs3,
+        None,
+    );
+}
+
+fn test_replay_with_step_size<I1, I2, I3, O1, O2, O3>(
+    circuit_constructor1: CircuitFn<I1, I2, O1, O2>,
+    circuit_constructor2: CircuitFn<I2, I3, O2, O3>,
+    inputs1: Vec<I1::Chunk>,
+    inputs2_1: Vec<I2::Chunk>,
+    inputs2_2: Vec<I2::Chunk>,
+    inputs3: Vec<I3::Chunk>,
+    replay_step_size: Option<usize>,
+) where
+    I1: TestDataType,
+    I2: TestDataType,
+    I3: TestDataType,
+    O1: TestDataType,
+    O2: TestDataType,
+    O3: TestDataType,
+{
     assert_eq!(inputs1.len(), inputs2_1.len());
     assert_eq!(inputs2_2.len(), inputs3.len());
 
-    init_logging();
+    init_test_logger();
 
-    let mut circuit_config = CircuitConfig::with_workers(4).with_mode(Mode::Persistent);
     let path = tempfile::tempdir().unwrap().keep();
     println!("Running replay_test in {}", path.display());
 
-    let config = StorageConfig {
-        path: path.to_string_lossy().into_owned(),
-        cache: Default::default(),
-    };
-    let options = Default::default();
-
-    circuit_config.storage = Some(CircuitStorageConfig::for_config(config, options).unwrap());
+    fn circuit_config(path: &PathBuf) -> CircuitConfig {
+        CircuitConfig::with_workers(NUM_WORKERS)
+            .with_splitter_chunk_size_records(2)
+            .with_mode(Mode::Persistent)
+            .with_storage(Some(
+                CircuitStorageConfig::for_config(
+                    StorageConfig {
+                        path: path.to_string_lossy().into_owned(),
+                        cache: Default::default(),
+                    },
+                    Default::default(),
+                )
+                .unwrap(),
+            ))
+    }
 
     // Create both reference circuits, feed I1 and I2 to circuit1; feed I2 and I3 to circuit2.
     let mut reference_output1 = Vec::new();
@@ -194,9 +233,10 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
     let mut reference_output3 = Vec::new();
 
     {
+        println!("Running first circuit to get reference output");
         let circuit_constructor1_clone = circuit_constructor1.clone();
         let (mut circuit, (input_handles1, input_handles2, output_handles1, output_handles2)) =
-            Runtime::init_circuit(&circuit_config, move |circuit| {
+            Runtime::init_circuit(circuit_config(&path), move |circuit| {
                 Ok(circuit_constructor1_clone(circuit))
             })
             .unwrap();
@@ -205,7 +245,7 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
             I1::push_inputs(data1.clone(), &input_handles1);
             I2::push_inputs(data2.clone(), &input_handles2);
 
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
 
             reference_output1.push(O1::read_outputs(&output_handles1));
             reference_output2.push(O2::read_outputs(&output_handles2));
@@ -214,16 +254,17 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
         for data2 in inputs2_2.iter() {
             I2::push_inputs(data2.clone(), &input_handles2);
 
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
 
             reference_output2.push(O2::read_outputs(&output_handles2));
         }
 
         circuit.kill().unwrap();
 
+        println!("Running second circuit to get reference output");
         let circuit_constructor2_clone = circuit_constructor2.clone();
         let (mut circuit, (input_handles2, input_handles3, output_handles2, output_handles3)) =
-            Runtime::init_circuit(&circuit_config, move |circuit| {
+            Runtime::init_circuit(circuit_config(&path), move |circuit| {
                 Ok(circuit_constructor2_clone(circuit))
             })
             .unwrap();
@@ -231,7 +272,7 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
         for data2 in inputs2_1.iter() {
             I2::push_inputs(data2.clone(), &input_handles2);
 
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
 
             reference_output2_2.push(O2::read_outputs(&output_handles2));
         }
@@ -240,7 +281,7 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
             I2::push_inputs(data2.clone(), &input_handles2);
             I3::push_inputs(data3.clone(), &input_handles3);
 
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
 
             reference_output2_2.push(O2::read_outputs(&output_handles2));
             reference_output3.push(O3::read_outputs(&output_handles3));
@@ -257,11 +298,13 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
     let mut actual_output3 = Vec::new();
 
     let checkpoint = {
+        println!("Running first circuit to create checkpoint");
+
         // Create the first circuit.
         let circuit_constructor1_clone = circuit_constructor1.clone();
 
         let (mut circuit, (input_handles1, input_handles2, output_handles1, output_handles2)) =
-            Runtime::init_circuit(&circuit_config, move |circuit| {
+            Runtime::init_circuit(circuit_config(&path), move |circuit| {
                 Ok(circuit_constructor1_clone(circuit))
             })
             .unwrap();
@@ -271,14 +314,14 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
             I1::push_inputs(data1.clone(), &input_handles1);
             I2::push_inputs(data2.clone(), &input_handles2);
 
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
 
             actual_output1.push(O1::read_outputs(&output_handles1));
             actual_output2.push(O2::read_outputs(&output_handles2));
         }
 
         // Checkpoint.
-        let checkpoint = circuit.commit().unwrap();
+        let checkpoint = circuit.checkpoint().run().unwrap();
         circuit.kill().unwrap();
         checkpoint
     };
@@ -289,19 +332,23 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
         println!("Restarting circuit from checkpoint {}", checkpoint.uuid);
 
         // Restart the second circuit from the checkpoint.
-        let mut circuit_config = circuit_config.clone();
+        let mut circuit_config = circuit_config(&path);
         circuit_config.storage.as_mut().unwrap().init_checkpoint = Some(checkpoint.uuid);
 
         let circuit_constructor2_clone = circuit_constructor2.clone();
 
         let (mut circuit, (input_handles2, input_handles3, output_handles2, output_handles3)) =
-            Runtime::init_circuit(&circuit_config, move |circuit| {
+            Runtime::init_circuit(circuit_config, move |circuit| {
                 Ok(circuit_constructor2_clone(circuit))
             })
             .unwrap();
 
+        if let Some(replay_step_size) = replay_step_size {
+            circuit.set_replay_step_size(replay_step_size);
+        }
+
         while circuit.bootstrap_in_progress() {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
         println!("Replay finished");
 
@@ -310,11 +357,13 @@ fn test_replay<I1, I2, I3, O1, O2, O3>(
             I2::push_inputs(data2.clone(), &input_handles2);
             I3::push_inputs(data3.clone(), &input_handles3);
 
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
 
             actual_output2.push(O2::read_outputs(&output_handles2));
             actual_output3.push(O3::read_outputs(&output_handles3));
         }
+
+        println!("Additional transactions completed");
 
         circuit.kill().unwrap();
     }
@@ -341,22 +390,32 @@ fn chain(from: u64, to: u64) -> Vec<Vec<Tup2<Tup2<u64, u64>, ZWeight>>> {
 // No state to checkpoint or replay.
 fn linear_circuit1(
     circuit: &mut RootCircuit,
-) -> (ZSetHandle<u64>, (), OutputHandle<OrdZSet<u64>>, ()) {
+) -> (
+    ZSetHandle<u64>,
+    (),
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    (),
+) {
     let (input_stream, input_handle) = circuit.add_input_zset::<u64>();
     let output_handle = input_stream
         .map(|x| x % 1000)
-        .output_persistent(Some("output1"));
+        .accumulate_output_persistent(Some("output1"));
 
     (input_handle, (), output_handle, ())
 }
 
 fn linear_circuit2(
     circuit: &mut RootCircuit,
-) -> ((), ZSetHandle<u64>, (), OutputHandle<OrdZSet<u64>>) {
+) -> (
+    (),
+    ZSetHandle<u64>,
+    (),
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+) {
     let (input_stream, input_handle) = circuit.add_input_zset::<u64>();
     let output_handle = input_stream
         .map(|x| x >> 1)
-        .output_persistent(Some("output2"));
+        .accumulate_output_persistent(Some("output2"));
 
     ((), input_handle, (), output_handle)
 }
@@ -392,8 +451,8 @@ fn linear_circuit_materialized_inputs1(
 ) -> (
     ZSetHandle<u64>,
     ZSetHandle<u64>,
-    OutputHandle<OrdZSet<u64>>,
-    OutputHandle<OrdZSet<u64>>,
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
     input_stream1.set_persistent_id(Some("input1"));
@@ -407,11 +466,11 @@ fn linear_circuit_materialized_inputs1(
 
     let output_handle1 = input_stream1
         .map(|x| x % 1000)
-        .output_persistent(Some("output1"));
+        .accumulate_output_persistent(Some("output1"));
 
     let output_handle2 = input_stream2
         .map(|x| x + 5)
-        .output_persistent(Some("output2"));
+        .accumulate_output_persistent(Some("output2"));
 
     (input_handle1, input_handle2, output_handle1, output_handle2)
 }
@@ -421,8 +480,8 @@ fn linear_circuit_materialized_inputs2(
 ) -> (
     ZSetHandle<u64>,
     ZSetHandle<u64>,
-    OutputHandle<OrdZSet<u64>>,
-    OutputHandle<OrdZSet<u64>>,
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
 ) {
     let (input_stream2, input_handle2) = circuit.add_input_zset::<u64>();
     input_stream2.set_persistent_id(Some("input2"));
@@ -435,11 +494,11 @@ fn linear_circuit_materialized_inputs2(
 
     let output_handle2 = input_stream2
         .map(|x| x + 5)
-        .output_persistent(Some("output2"));
+        .accumulate_output_persistent(Some("output2"));
 
     let output_handle3 = input_stream3
         .map(|x| x >> 1)
-        .output_persistent(Some("output3"));
+        .accumulate_output_persistent(Some("output3"));
 
     (input_handle2, input_handle3, output_handle2, output_handle3)
 }
@@ -482,7 +541,10 @@ fn linear_circuit_materialized_inputs1_2(
 ) -> (
     ZSetHandle<u64>,
     ZSetHandle<u64>,
-    (OutputHandle<OrdZSet<u64>>, OutputHandle<OrdZSet<u64>>),
+    (
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    ),
     (),
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
@@ -497,11 +559,11 @@ fn linear_circuit_materialized_inputs1_2(
 
     let output_handle1 = input_stream1
         .map(|x| x % 1000)
-        .output_persistent(Some("output1"));
+        .accumulate_output_persistent(Some("output1"));
 
     let output_handle2 = input_stream2
         .map(|x| x + 5)
-        .output_persistent(Some("output2"));
+        .accumulate_output_persistent(Some("output2"));
 
     (
         input_handle1,
@@ -517,7 +579,10 @@ fn linear_circuit_materialized_inputs2_2(
     ZSetHandle<u64>,
     ZSetHandle<u64>,
     (),
-    (OutputHandle<OrdZSet<u64>>, OutputHandle<OrdZSet<u64>>),
+    (
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    ),
 ) {
     let (input_stream2, input_handle2) = circuit.add_input_zset::<u64>();
     input_stream2.set_persistent_id(Some("input2"));
@@ -530,11 +595,11 @@ fn linear_circuit_materialized_inputs2_2(
 
     let output_handle2 = input_stream2
         .map(|x| x + 5)
-        .output_persistent(Some("output2_2"));
+        .accumulate_output_persistent(Some("output2_2"));
 
     let output_handle3 = input_stream3
         .map(|x| x >> 1)
-        .output_persistent(Some("output3"));
+        .accumulate_output_persistent(Some("output3"));
 
     (
         input_handle2,
@@ -567,25 +632,34 @@ fn test_linear_circuit_materialized_inputs_with_backfill() {
 //
 // Pipeline 1:
 //
+//        |----------------------|
+//        |                      v
+//        |              |----->join--->
+//        |              |
 // ---> input1 ---> join --> output1
 //                   ^
 // ---> input2 ------|
 //
 // Pipeline 2 (adds another join):
 //
+//        |----------------------|
+//        |                      v
+//        |              |----->join--->
+//        |              |
 // ---> input1 ---> join --> output1
-//                   ^
-// ---> input2 ------|
-//                   v
-// ---> input3 ---> join --> output2
+//                   ^    |
+// ---> input2 ------|    |------------>join-->output2
+//                   v    |
+// ---> input3 ---> join --
 //
 fn join_circuit1(
+    balancing: bool,
     circuit: &mut RootCircuit,
 ) -> (
     (),
     (ZSetHandle<u64>, ZSetHandle<u64>),
     (),
-    OutputHandle<OrdZSet<u64>>,
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
     input_stream1.set_persistent_id(Some("input1"));
@@ -593,9 +667,8 @@ fn join_circuit1(
     let (input_stream2, input_handle2) = circuit.add_input_zset::<u64>();
     input_stream2.set_persistent_id(Some("input2"));
 
-    // These integrals will be used for replay input streams.
-    input_stream1.integrate_trace();
-    input_stream2.integrate_trace();
+    // Note: we don't need to manually create integrals of the input streams, as they can be replayed from the
+    // integrals maintained internally by the join operator.
 
     let input_stream1_indexed = input_stream1
         .map_index(|x| (*x, *x))
@@ -604,20 +677,41 @@ fn join_circuit1(
         .map_index(|x| (*x, *x))
         .set_persistent_id(Some("input_stream2_indexed"));
 
-    let output_handle1 = input_stream1_indexed
-        .join(&input_stream2_indexed, |key, _v1, _v2| *key)
-        .output_persistent(Some("output1"));
+    let (_j1_indexed, output_handle1) = if balancing {
+        let j1 = input_stream1_indexed
+            .join_balanced_inner(&input_stream2_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j1"));
+
+        let j1_indexed = j1
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j1-indexed"));
+        j1_indexed.join_balanced_inner(&input_stream1_indexed, |key, _v1, _v2| *key);
+
+        (j1_indexed, j1.accumulate_output_persistent(Some("output1")))
+    } else {
+        let j1 = input_stream1_indexed
+            .join(&input_stream2_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j1"));
+
+        let j1_indexed = j1
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j1-indexed"));
+        j1_indexed.join(&input_stream1_indexed, |key, _v1, _v2| *key);
+
+        (j1_indexed, j1.accumulate_output_persistent(Some("output1")))
+    };
 
     ((), (input_handle1, input_handle2), (), output_handle1)
 }
 
 fn join_circuit2(
+    balancing: bool,
     circuit: &mut RootCircuit,
 ) -> (
     (ZSetHandle<u64>, ZSetHandle<u64>),
     ZSetHandle<u64>,
-    OutputHandle<OrdZSet<u64>>,
-    OutputHandle<OrdZSet<u64>>,
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
     input_stream1.set_persistent_id(Some("input1"));
@@ -628,10 +722,10 @@ fn join_circuit2(
     let (input_stream3, input_handle3) = circuit.add_input_zset::<u64>();
     input_stream3.set_persistent_id(Some("input3"));
 
-    // These integrals will be used for replay input streams.
-    input_stream1.integrate_trace();
-    input_stream2.integrate_trace();
-    input_stream3.integrate_trace();
+    // // These integrals will be used for replay input streams.
+    // input_stream1.integrate_trace();
+    // input_stream2.integrate_trace();
+    // input_stream3.integrate_trace();
 
     let input_stream1_indexed = input_stream1
         .map_index(|x| (*x, *x))
@@ -643,13 +737,61 @@ fn join_circuit2(
         .map_index(|x| (*x, *x))
         .set_persistent_id(Some("input_stream3_indexed"));
 
-    let output_handle1 = input_stream1_indexed
-        .join(&input_stream2_indexed, |key, _v1, _v2| *key)
-        .output_persistent(Some("output1"));
+    let (j1_indexed, output_handle1) = if balancing {
+        let j1 = input_stream1_indexed
+            .join_balanced_inner(&input_stream2_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j1"));
 
-    let output_handle2 = input_stream2_indexed
-        .join(&input_stream3_indexed, |key, _v1, _v2| *key)
-        .output_persistent(Some("output2"));
+        let j1_indexed = j1
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j1-indexed"));
+
+        j1_indexed.join_balanced_inner(&input_stream1_indexed, |key, _v1, _v2| *key);
+
+        (j1_indexed, j1.accumulate_output_persistent(Some("output1")))
+    } else {
+        let j1 = input_stream1_indexed
+            .join(&input_stream2_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j1"));
+
+        let j1_indexed = j1
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j1-indexed"));
+
+        j1_indexed.join(&input_stream1_indexed, |key, _v1, _v2| *key);
+
+        (j1_indexed, j1.accumulate_output_persistent(Some("output1")))
+    };
+
+    let output_handle2 = if balancing {
+        let j2 = input_stream2_indexed
+            .join_balanced_inner(&input_stream3_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j2"));
+
+        let j2_indexed = j2
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j2-indexed"));
+
+        let j3 = j2_indexed
+            .join_balanced_inner(&j1_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j3"));
+
+        j3.accumulate_output_persistent(Some("output2"))
+    } else {
+        let j2 = input_stream2_indexed
+            .join(&input_stream3_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j2"));
+
+        let j2_indexed = j2
+            .map_index(|x| (*x, *x))
+            .set_persistent_id(Some("j2-indexed"));
+
+        let j3 = j2_indexed
+            .join(&j1_indexed, |key, _v1, _v2| *key)
+            .set_persistent_id(Some("j3"));
+
+        j3.accumulate_output_persistent(Some("output2"))
+    };
 
     (
         (input_handle1, input_handle2),
@@ -662,12 +804,258 @@ fn join_circuit2(
 #[test]
 fn test_join_circuit() {
     test_replay::<(), TestData2<u64, u64>, TestData1<u64>, (), TestData1<u64>, TestData1<u64>>(
-        Arc::new(join_circuit1),
-        Arc::new(join_circuit2),
+        Arc::new(|circuit| join_circuit1(false, circuit)),
+        Arc::new(|circuit| join_circuit2(false, circuit)),
         std::iter::repeat_n((), 2).collect(),
         std::iter::zip(sequence(0, 2), sequence(2, 4)).collect(),
         std::iter::zip(sequence(2, 4), sequence(0, 2)).collect(),
         sequence(1, 3),
+    );
+}
+
+#[test]
+fn test_balanced_join_circuit() {
+    test_replay::<(), TestData2<u64, u64>, TestData1<u64>, (), TestData1<u64>, TestData1<u64>>(
+        Arc::new(|circuit| join_circuit1(true, circuit)),
+        Arc::new(|circuit| join_circuit2(true, circuit)),
+        std::iter::repeat_n((), 2).collect(),
+        std::iter::zip(sequence(0, 2), sequence(2, 4)).collect(),
+        std::iter::zip(sequence(2, 4), sequence(0, 2)).collect(),
+        sequence(1, 3),
+    );
+}
+
+// Test adaptive joins+bootstrapping:
+//
+// This test modifies the join cluster by adding an extra join to it.
+// Depending on the pre-commit partitioning policies, the circuit should be able
+// to either bootstrap the new join only or the entire cluster.
+//
+// Pipeline 1:
+//
+// ---> input1 ---> join --> output1
+//                   ^
+// ---> input2 ------|
+//
+//
+// ---> input3 ---> join --> output2
+//                   ^
+// ---> input4 ------|
+//
+//
+// Pipeline 2:
+//
+// ---> input1 ---> join --> output1
+//                   ^
+// ---> input2 ------|
+//                   v
+//         |-------> join --> output3
+//         |
+//         |
+// ---> input3 ---> join --> output2
+//                   ^
+// ---> input4 ------|
+fn balancer_circuit1(
+    circuit: &mut RootCircuit,
+) -> (
+    (),
+    (
+        ZSetHandle<u64>,
+        ZSetHandle<u64>,
+        ZSetHandle<u64>,
+        ZSetHandle<u64>,
+    ),
+    (),
+    (
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    ),
+) {
+    let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
+    input_stream1.set_persistent_id(Some("input1"));
+
+    let (input_stream2, input_handle2) = circuit.add_input_zset::<u64>();
+    input_stream2.set_persistent_id(Some("input2"));
+
+    let (input_stream3, input_handle3) = circuit.add_input_zset::<u64>();
+    input_stream3.set_persistent_id(Some("input3"));
+
+    let (input_stream4, input_handle4) = circuit.add_input_zset::<u64>();
+    input_stream4.set_persistent_id(Some("input4"));
+
+    // These integrals will be used for replay input streams.
+    input_stream1.integrate_trace();
+    input_stream2.integrate_trace();
+    input_stream3.integrate_trace();
+    input_stream4.integrate_trace();
+
+    let input_stream1_indexed = input_stream1
+        .map_index(|x| (*x, *x))
+        .set_persistent_id(Some("input_stream1_indexed"));
+    let input_stream2_indexed = input_stream2
+        .map_index(|x| (*x, *x))
+        .set_persistent_id(Some("input_stream2_indexed"));
+    let input_stream3_indexed = input_stream3
+        .map_index(|x| (*x, *x))
+        .set_persistent_id(Some("input_stream3_indexed"));
+    let input_stream4_indexed = input_stream4
+        .map_index(|x| (*x, *x))
+        .set_persistent_id(Some("input_stream4_indexed"));
+
+    let output_handle1 = input_stream1_indexed
+        .join_balanced_inner(&input_stream2_indexed, |key, _v1, _v2| *key)
+        .accumulate_output_persistent(Some("output1"));
+
+    let output_handle2 = input_stream3_indexed
+        .join_balanced_inner(&input_stream4_indexed, |key, _v1, _v2| *key)
+        .accumulate_output_persistent(Some("output2"));
+
+    (
+        (),
+        (input_handle1, input_handle2, input_handle3, input_handle4),
+        (),
+        (output_handle1, output_handle2),
+    )
+}
+
+fn balancer_circuit2(
+    circuit: &mut RootCircuit,
+) -> (
+    (
+        ZSetHandle<u64>,
+        ZSetHandle<u64>,
+        ZSetHandle<u64>,
+        ZSetHandle<u64>,
+    ),
+    (),
+    (
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    ),
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+) {
+    let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
+    input_stream1.set_persistent_id(Some("input1"));
+
+    let (input_stream2, input_handle2) = circuit.add_input_zset::<u64>();
+    input_stream2.set_persistent_id(Some("input2"));
+
+    let (input_stream3, input_handle3) = circuit.add_input_zset::<u64>();
+    input_stream3.set_persistent_id(Some("input3"));
+
+    let (input_stream4, input_handle4) = circuit.add_input_zset::<u64>();
+    input_stream4.set_persistent_id(Some("input4"));
+
+    // These integrals will be used for replay input streams.
+    input_stream1.integrate_trace();
+    input_stream2.integrate_trace();
+    input_stream3.integrate_trace();
+    input_stream4.integrate_trace();
+
+    let input_stream1_indexed = input_stream1
+        .map_index(|x| (*x, *x))
+        .set_persistent_id(Some("input_stream1_indexed"));
+    let input_stream2_indexed = input_stream2
+        .map_index(|x| (*x, *x))
+        .set_persistent_id(Some("input_stream2_indexed"));
+    let input_stream3_indexed = input_stream3
+        .map_index(|x| (*x, *x))
+        .set_persistent_id(Some("input_stream3_indexed"));
+    let input_stream4_indexed = input_stream4
+        .map_index(|x| (*x, *x))
+        .set_persistent_id(Some("input_stream4_indexed"));
+
+    let output_handle1 = input_stream1_indexed
+        .join_balanced_inner(&input_stream2_indexed, |key, _v1, _v2| *key)
+        .accumulate_output_persistent(Some("output1"));
+
+    let output_handle2 = input_stream3_indexed
+        .join_balanced_inner(&input_stream4_indexed, |key, _v1, _v2| *key)
+        .accumulate_output_persistent(Some("output2"));
+
+    let output_handle3 = input_stream2_indexed
+        .join_balanced_inner(&input_stream3_indexed, |key, _v1, _v2| *key)
+        .accumulate_output_persistent(Some("output3"));
+
+    (
+        (input_handle1, input_handle2, input_handle3, input_handle4),
+        (),
+        (output_handle1, output_handle2),
+        output_handle3,
+    )
+}
+
+/// Keep inputs perfectly balanced.
+///
+/// All collections should be partitioned using PartitioningPolicy::Shard.
+/// The cluster should be able to bootstrap the new join only.
+#[test]
+fn test_balancer1() {
+    test_replay::<(), TestData4<u64, u64, u64, u64>, (), (), TestData2<u64, u64>, TestData1<u64>>(
+        Arc::new(|circuit| balancer_circuit1(circuit)),
+        Arc::new(|circuit| balancer_circuit2(circuit)),
+        vec![(); 100],
+        itertools::izip!(
+            sequence(0, 100),
+            sequence(0, 100),
+            sequence(0, 100),
+            sequence(0, 100),
+        )
+        .collect(),
+        itertools::izip!(
+            sequence(100, 200),
+            sequence(100, 200),
+            sequence(100, 200),
+            sequence(100, 200)
+        )
+        .collect(),
+        vec![(); 100],
+    );
+}
+
+/// Keep inputs skewed, so that both sides of the new join PartitioningPolicy::Broadcast,
+/// so the cluster cannot be bootstrapped without backfilling the entire cluster.
+#[test]
+fn test_balancer2() {
+    let skewed_sequence_small1 = (0..1000)
+        .filter(|x| default_hash(&x) % NUM_WORKERS as u64 == 0)
+        .map(|x| vec![Tup2(x, 1)])
+        .collect::<Vec<_>>();
+
+    let skewed_sequence_large1 = (0..1000)
+        .filter(|x| default_hash(&x) % NUM_WORKERS as u64 == 0)
+        .map(|x| vec![Tup2(x, 100)])
+        .collect::<Vec<_>>();
+
+    let skewed_sequence_small2 = (1000..2000)
+        .filter(|x| default_hash(&x) % NUM_WORKERS as u64 == 0)
+        .map(|x| vec![Tup2(x, 1)])
+        .collect::<Vec<_>>();
+
+    let skewed_sequence_large2 = (1000..2000)
+        .filter(|x| default_hash(&x) % NUM_WORKERS as u64 == 0)
+        .map(|x| vec![Tup2(x, 100)])
+        .collect::<Vec<_>>();
+
+    test_replay::<(), TestData4<u64, u64, u64, u64>, (), (), TestData2<u64, u64>, TestData1<u64>>(
+        Arc::new(|circuit| balancer_circuit1(circuit)),
+        Arc::new(|circuit| balancer_circuit2(circuit)),
+        vec![(); skewed_sequence_small1.len()],
+        itertools::izip!(
+            skewed_sequence_large1.clone(),
+            skewed_sequence_small1.clone(),
+            skewed_sequence_small1.clone(),
+            skewed_sequence_large1.clone(),
+        )
+        .collect(),
+        itertools::izip!(
+            skewed_sequence_large2.clone(),
+            skewed_sequence_small2.clone(),
+            skewed_sequence_small2.clone(),
+            skewed_sequence_large2.clone(),
+        )
+        .collect(),
+        vec![(); skewed_sequence_small2.len()],
     );
 }
 
@@ -685,7 +1073,12 @@ fn test_join_circuit() {
 //
 fn aggregate_circuit1(
     circuit: &mut RootCircuit,
-) -> ((), ZSetHandle<u64>, (), OutputHandle<OrdZSet<u64>>) {
+) -> (
+    (),
+    ZSetHandle<u64>,
+    (),
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
     input_stream1.set_persistent_id(Some("input1"));
 
@@ -703,7 +1096,7 @@ fn aggregate_circuit1(
         .map(|(_k, v)| *v)
         .set_persistent_id(Some("aggregate1_flat"));
 
-    let output_handle1 = aggregate1_flat.output_persistent(Some("output1"));
+    let output_handle1 = aggregate1_flat.accumulate_output_persistent(Some("output1"));
 
     ((), input_handle1, (), output_handle1)
 }
@@ -713,8 +1106,11 @@ fn aggregate_circuit2(
 ) -> (
     ZSetHandle<u64>,
     (),
-    OutputHandle<OrdZSet<u64>>,
-    (OutputHandle<OrdZSet<u64>>, OutputHandle<OrdZSet<u64>>),
+    OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    (
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<u64>>>,
+    ),
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
     input_stream1.set_persistent_id(Some("input1"));
@@ -749,9 +1145,9 @@ fn aggregate_circuit2(
         .map(|(_k, v)| *v)
         .set_persistent_id(Some("aggregate3_flat"));
 
-    let output_handle1 = aggregate1_flat.output_persistent(Some("output1"));
-    let output_handle2 = aggregate2_flat.output_persistent(Some("output2"));
-    let output_handle3 = aggregate3_flat.output_persistent(Some("output3"));
+    let output_handle1 = aggregate1_flat.accumulate_output_persistent(Some("output1"));
+    let output_handle2 = aggregate2_flat.accumulate_output_persistent(Some("output2"));
+    let output_handle3 = aggregate3_flat.accumulate_output_persistent(Some("output3"));
 
     (
         input_handle1,
@@ -791,7 +1187,7 @@ fn recursive_circuit1(
     (),
     ZSetHandle<Tup2<u64, u64>>,
     (),
-    OutputHandle<OrdZSet<Tup2<u64, u64>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, u64>>>>,
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<Tup2<u64, u64>>();
     input_stream1.set_persistent_id(Some("input1"));
@@ -809,7 +1205,7 @@ fn recursive_circuit1(
         })
         .unwrap();
 
-    let output_handle1 = paths.output_persistent(Some("output1"));
+    let output_handle1 = paths.accumulate_output_persistent(Some("output1"));
 
     ((), input_handle1, (), output_handle1)
 }
@@ -819,8 +1215,8 @@ fn recursive_circuit2(
 ) -> (
     ZSetHandle<Tup2<u64, u64>>,
     (),
-    OutputHandle<OrdZSet<Tup2<u64, u64>>>,
-    OutputHandle<OrdZSet<Tup2<u64, u64>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, u64>>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, u64>>>>,
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<Tup2<u64, u64>>();
     input_stream1.set_persistent_id(Some("input1"));
@@ -838,8 +1234,8 @@ fn recursive_circuit2(
         })
         .unwrap();
 
-    let output_handle1 = paths.output_persistent(Some("output1"));
-    let output_handle2 = paths.output_persistent(Some("output2"));
+    let output_handle1 = paths.accumulate_output_persistent(Some("output1"));
+    let output_handle2 = paths.accumulate_output_persistent(Some("output2"));
 
     (input_handle1, (), output_handle1, output_handle2)
 }
@@ -884,13 +1280,22 @@ impl<T: DBData> CmpFunc<T> for Asc<T> {
     }
 }
 
+/// Total order for `Tup2` values: by first `u64`, then second (used with `rank_custom_order`).
+struct RankValOrd(PhantomData<()>);
+
+impl CmpFunc<Tup2<u64, u64>> for RankValOrd {
+    fn cmp(left: &Tup2<u64, u64>, right: &Tup2<u64, u64>) -> Ordering {
+        left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+    }
+}
+
 fn lag_circuit1(
     circuit: &mut RootCircuit,
 ) -> (
     (),
     ZSetHandle<u64>,
     (),
-    OutputHandle<OrdZSet<Tup2<u64, u64>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, u64>>>>,
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
     input_stream1.set_persistent_id(Some("input1"));
@@ -912,7 +1317,7 @@ fn lag_circuit1(
 
     let lag1_flat = lag1.map(|(_k, v)| *v).set_persistent_id(Some("lag1_flat"));
 
-    let output_handle1 = lag1_flat.output_persistent(Some("output1"));
+    let output_handle1 = lag1_flat.accumulate_output_persistent(Some("output1"));
 
     ((), input_handle1, (), output_handle1)
 }
@@ -922,10 +1327,10 @@ fn lag_circuit2(
 ) -> (
     ZSetHandle<u64>,
     (),
-    OutputHandle<OrdZSet<Tup2<u64, u64>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, u64>>>>,
     (
-        OutputHandle<OrdZSet<Tup3<u64, u64, u64>>>,
-        OutputHandle<OrdZSet<Tup2<u64, u64>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<Tup3<u64, u64, u64>>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, u64>>>>,
     ),
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
@@ -970,9 +1375,9 @@ fn lag_circuit2(
 
     let lag3_flat = lag3.map(|(_k, v)| *v).set_persistent_id(Some("lag3_flat"));
 
-    let output_handle1 = lag1_flat.output_persistent(Some("output1"));
-    let output_handle2 = lag2_flat.output_persistent(Some("output2"));
-    let output_handle3 = lag3_flat.output_persistent(Some("output3"));
+    let output_handle1 = lag1_flat.accumulate_output_persistent(Some("output1"));
+    let output_handle2 = lag2_flat.accumulate_output_persistent(Some("output2"));
+    let output_handle3 = lag3_flat.accumulate_output_persistent(Some("output3"));
 
     (
         input_handle1,
@@ -1001,6 +1406,131 @@ fn test_lag_circuit() {
     );
 }
 
+// Circuit with rank:
+//
+// The interesting part here is that the input to dense_rank is replayed from the internal state of the rank operator.
+//
+// Pipeline 1:
+//
+// ---> input1 ---> rank --> output1
+//
+// Pipeline 2: adds a dense_rank:
+//
+//                      /--------> output1
+// ---> input1 ---> rank-------> dense_rank --> output2
+//
+
+struct RankValOrd3(PhantomData<()>);
+
+impl CmpFunc<Tup3<u64, u64, i64>> for RankValOrd3 {
+    fn cmp(left: &Tup3<u64, u64, i64>, right: &Tup3<u64, u64, i64>) -> Ordering {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)))
+    }
+}
+
+fn rank_circuit1(
+    circuit: &mut RootCircuit,
+) -> (
+    (),
+    ZSetHandle<u64>,
+    (),
+    OutputHandle<SpineSnapshot<OrdZSet<Tup4<u64, u64, u64, i64>>>>,
+) {
+    let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
+    input_stream1.set_persistent_id(Some("input1"));
+
+    let input_stream1_indexed = input_stream1
+        .map_index(|x| (x % 3, Tup2(*x, *x % 5)))
+        .set_persistent_id(Some("input_stream1_indexed"));
+
+    let rank1 = input_stream1_indexed
+        .rank_custom_order_persistent::<RankValOrd, u64, _, _, _, _>(
+            Some("rank1"),
+            |v| v.0,
+            |a, b| a.0.cmp(b),
+            |rank, t| Tup3(t.0, t.1, rank),
+        )
+        .set_persistent_id(Some("rank1"));
+
+    let rank1_flat = rank1
+        .map(|(k, t)| Tup4(*k, t.0, t.1, t.2))
+        .set_persistent_id(Some("rank1_flat"));
+
+    let output_handle1 = rank1_flat.accumulate_output_persistent(Some("output1"));
+
+    ((), input_handle1, (), output_handle1)
+}
+
+fn rank_circuit2(
+    circuit: &mut RootCircuit,
+) -> (
+    ZSetHandle<u64>,
+    (),
+    OutputHandle<SpineSnapshot<OrdZSet<Tup4<u64, u64, u64, i64>>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<Tup4<u64, u64, u64, i64>>>>,
+) {
+    let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
+    input_stream1.set_persistent_id(Some("input1"));
+
+    input_stream1.integrate_trace();
+
+    let input_stream1_indexed = input_stream1
+        .map_index(|x| (x % 3, Tup2(*x, *x % 5)))
+        .set_persistent_id(Some("input_stream1_indexed"));
+
+    let rank1 = input_stream1_indexed
+        .rank_custom_order_persistent::<RankValOrd, u64, _, _, _, _>(
+            Some("rank1"),
+            |v| v.0,
+            |a, b| a.0.cmp(b),
+            |rank, t| Tup3(t.0, t.1, rank),
+        )
+        .set_persistent_id(Some("rank1"));
+
+    let rank1_flat = rank1
+        .map(|(k, t)| Tup4(*k, t.0, t.1, t.2))
+        .set_persistent_id(Some("rank1_flat"));
+
+    let dense1 = rank1
+        .dense_rank_custom_order_persistent::<RankValOrd3, u64, _, _, _, _>(
+            Some("dense1"),
+            |v| v.0,
+            |a, b| a.0.cmp(b),
+            |rank, t| Tup3(t.0, t.1, rank),
+        )
+        .set_persistent_id(Some("dense1"));
+
+    let dense1_flat = dense1
+        .map(|(k, t)| Tup4(*k, t.0, t.1, t.2))
+        .set_persistent_id(Some("dense1_flat"));
+
+    let output_handle1 = rank1_flat.accumulate_output_persistent(Some("output1"));
+    let output_handle2 = dense1_flat.accumulate_output_persistent(Some("output2"));
+
+    (input_handle1, (), output_handle1, output_handle2)
+}
+
+#[test]
+fn test_rank_circuit() {
+    test_replay::<
+        (),
+        TestData1<u64>,
+        (),
+        (),
+        TestData1<Tup4<u64, u64, u64, i64>>,
+        TestData1<Tup4<u64, u64, u64, i64>>,
+    >(
+        Arc::new(rank_circuit1),
+        Arc::new(rank_circuit2),
+        std::iter::repeat_n((), 10).collect(),
+        sequence(0, 10),
+        sequence(10, 20),
+        std::iter::repeat_n((), 10).collect(),
+    );
+}
+
 // Circuit with rolling aggregates:
 //
 // Pipeline 1:
@@ -1018,8 +1548,8 @@ fn rolling_circuit1(
 ) -> (
     (),
     ZSetHandle<u64>,
-    OutputHandle<OrdZSet<Tup2<u64, Option<u64>>>>,
-    OutputHandle<OrdZSet<Tup2<u64, Option<u64>>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, Option<u64>>>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, Option<u64>>>>>,
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
     input_stream1.set_persistent_id(Some("input1"));
@@ -1044,7 +1574,7 @@ fn rolling_circuit1(
         .map(|(_k, v)| *v)
         .set_persistent_id(Some("rolling1_flat"));
 
-    let output_handle1 = rolling1_flat.output_persistent(Some("output1"));
+    let output_handle1 = rolling1_flat.accumulate_output_persistent(Some("output1"));
 
     let rolling2 = input_stream1_indexed
         .partitioned_rolling_aggregate_persistent(
@@ -1060,7 +1590,7 @@ fn rolling_circuit1(
         .map(|(_k, v)| *v)
         .set_persistent_id(Some("rolling2_flat"));
 
-    let output_handle2 = rolling2_flat.output_persistent(Some("output2"));
+    let output_handle2 = rolling2_flat.accumulate_output_persistent(Some("output2"));
 
     ((), input_handle1, output_handle1, output_handle2)
 }
@@ -1070,10 +1600,10 @@ fn rolling_circuit2(
 ) -> (
     ZSetHandle<u64>,
     (),
-    OutputHandle<OrdZSet<Tup2<u64, Option<u64>>>>,
+    OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, Option<u64>>>>>,
     (
-        OutputHandle<OrdZSet<Tup2<u64, Option<u64>>>>,
-        OutputHandle<OrdZSet<Tup2<u64, Option<u64>>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, Option<u64>>>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<Tup2<u64, Option<u64>>>>>,
     ),
 ) {
     let (input_stream1, input_handle1) = circuit.add_input_zset::<u64>();
@@ -1099,7 +1629,7 @@ fn rolling_circuit2(
         .map(|(_k, v)| *v)
         .set_persistent_id(Some("rolling2_flat"));
 
-    let output_handle2 = rolling2_flat.output_persistent(Some("output2"));
+    let output_handle2 = rolling2_flat.accumulate_output_persistent(Some("output2"));
 
     let rolling3 = rolling2_flat
         .map_index(|Tup2(x, y)| (*x, Tup2(*x, *y)))
@@ -1116,7 +1646,7 @@ fn rolling_circuit2(
         .map(|(_k, v)| *v)
         .set_persistent_id(Some("rolling3_flat"));
 
-    let output_handle3 = rolling3_flat.output_persistent(Some("output3"));
+    let output_handle3 = rolling3_flat.accumulate_output_persistent(Some("output3"));
 
     let rolling4 = input_stream1_indexed
         .partitioned_rolling_aggregate_persistent(
@@ -1132,7 +1662,7 @@ fn rolling_circuit2(
         .map(|(_k, v)| *v)
         .set_persistent_id(Some("rolling4_flat"));
 
-    let output_handle4 = rolling4_flat.output_persistent(Some("output4"));
+    let output_handle4 = rolling4_flat.accumulate_output_persistent(Some("output4"));
 
     (
         input_handle1,

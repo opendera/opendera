@@ -1,8 +1,9 @@
 use std::marker::PhantomData;
 
 use crate::{
-    dynamic::{DataTrait, DynUnit, Erase, Factory, WeightTrait},
     Timestamp,
+    dynamic::{DataTrait, DynUnit, Erase, Factory, WeightTrait},
+    trace::cursor::Position,
 };
 
 use super::Cursor;
@@ -83,6 +84,13 @@ where
         self.base.weight()
     }
 
+    fn weight_checked(&mut self) -> &R
+    where
+        R: WeightTrait,
+    {
+        self.base.weight_checked()
+    }
+
     fn map_values(&mut self, logic: &mut dyn FnMut(&DynUnit, &R))
     where
         T: PartialEq<()>,
@@ -108,7 +116,7 @@ where
         self.val_valid = true;
     }
 
-    fn seek_key_exact(&mut self, val: &V) -> bool {
+    fn seek_key_exact(&mut self, val: &V, _hash: Option<u64>) -> bool {
         self.seek_key(val);
         self.key_valid() && self.key().eq(val)
     }
@@ -168,5 +176,9 @@ where
 
     fn fast_forward_vals(&mut self) {
         self.val_valid = true;
+    }
+
+    fn position(&self) -> Option<Position> {
+        None
     }
 }

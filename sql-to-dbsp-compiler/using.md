@@ -18,10 +18,10 @@ CREATE VIEW Adult AS SELECT Person.name FROM Person WHERE Person.age > 18;
 
 Given this program as input, the SQL compiler generates a Rust
 function which implements the query as a function: given the input
-data, it produces the output data.
-
-The compiler can also generate a function which will incrementally maintain the
-view `Adult` when presented with changes to table `Person`:
+data, it produces the output data.  When invoked with the `-i` flag,
+the compiler will instead generate a function which will incrementally
+maintain the view `Adult` when presented with changes to table
+`Person`:
 
 ```
                                            table changes
@@ -45,6 +45,17 @@ Usage: sql-to-dbsp [options] Input file to compile
       Generate an input for each CREATE TABLE, even if the table is not used
       by any view
       Default: false
+    --anonymize
+      Produce in the output file an anonymized version of the input program
+      Default: false
+    --correlatedColumns
+      Dump information about the columns that are used in join equality
+      comparisons
+      Default: false
+    --crates
+      Followed by a program name. Generates code using multiple crates;
+      `outputFile` is interpreted as a directory.
+      Default: <empty string>
     --dataflow
       Emit the Dataflow graph of the program in the specified JSON file
     --enterprise
@@ -52,10 +63,6 @@ Usage: sql-to-dbsp [options] Input file to compile
       Default: false
     --errors
       Error output file; stderr if not specified
-      Default: <empty string>
-    --crates
-      Followed by a program name. Generates code using multiple crates;
-      `outputFile` is interpreted as a directory.
       Default: <empty string>
     --handles
       Use handles (true) or Catalog (false) in the emitted Rust code
@@ -65,11 +72,11 @@ Usage: sql-to-dbsp [options] Input file to compile
     --ignoreOrder
       Ignore ORDER BY clauses at the end
       Default: false
-    --jdbcSource
-      Connection string to a database that contains table metadata
-      Default: <empty string>
     --je, -je
       Emit error messages as a JSON array to the error output
+      Default: false
+    --jit
+      Emit a JSON representation suitable for an interpreter
       Default: false
     --jpg, -jpg
       Emit a jpg image of the circuit instead of Rust
@@ -87,9 +94,6 @@ Usage: sql-to-dbsp [options] Input file to compile
     --noRust
       Do not generate Rust output files
       Default: false
-    --nowstream
-      Implement NOW as a stream (true) or as an internal operator (false)
-      Default: false
     --outputsAreSets
       Ensure that outputs never contain duplicates
       Default: false
@@ -98,6 +102,10 @@ Usage: sql-to-dbsp [options] Input file to compile
     --png, -png
       Emit a png image of the circuit instead of Rust
       Default: false
+    --runtime
+      Followed by a path.  Path to the runtime to use.  Used in conjunction
+      with '--crates'.
+      Default: <empty string>
     --streaming
       Compiling a streaming program, where only inserts are allowed
       Default: false
@@ -107,6 +115,8 @@ Usage: sql-to-dbsp [options] Input file to compile
     --unaryPlusNoop
       Compile unary plus into a no-operation; similar to sqlite
       Default: false
+    --version
+      Print compiler version
     -O
       Optimization level (0, 1, or 2)
       Default: 2
@@ -130,6 +140,20 @@ Usage: sql-to-dbsp [options] Input file to compile
 
 Here is a description of the non-obvious command-line options:
 
+--correlatedColumns: Runs a compiler analysis over the input program which
+     detects table columns that are directly compared in equijoin comparisons.
+     This can be useful for implementing custom data generators.
+     This produces an output of the form:
+
+     [Correlated:] [table0.column1, table2.column0, table3.column4]
+     [Compared:] [table0.column2 >= 'constant']
+
+     Note that a list of columns may contain more than two
+     table.column pairs, when some columns are used in sequences of
+     joins.
+
+     "Compared" describes columns that are compared against constant values.
+
 --handles: The Rust generated code can expose the input tables and
      output views in two ways: through explicit handles, and through a
      `Catalog` object.  The catalog allows one to retrieve the handles
@@ -137,19 +161,20 @@ Here is a description of the non-obvious command-line options:
      serializer (for output handles) or a deserializer (for input
      handles) to transmit data.  The handles API gives access to typed
      stream handles, which allow data insertion and retrieval without
-     using serialization/deserialization.
+     using serialization/deserialization.  All Java tests use the
+     typed API; production pipelines use the untyped API.
 
 --ignoreOrder: `ORDER BY` clauses are not naturally incrementalizable.
      Using this flag directs the compiler to ignore `ORDER BY` clauses
-     that occur *last* in a view definition (thus giving unsorte
-     outputs).  This will not affect `ORDER BY` clauses in an `OVER`
+     that occur *last* in a view definition (the result will thus not sort
+     the views).  This flag will not affect `ORDER BY` clauses in an `OVER`
      clause, or `ORDER BY` clauses followed by `LIMIT` clauses.  The
      use of this flag is recommended with the `-i` flag that
      incrementalizes the compiler output.
 
 --lenient: Some SQL queries generate output views having multiple columns
      with the same name.  Such views can cause problems with other tools
-     that interface with the compiler outputs.  By default the compiler will
+     that interface with the compiler outputs.  By default, the compiler will
      emit an error when given such views.  For example, the following definition:
 
      `CREATE VIEW V AS SELECT T.COL2, S.COL2 from T, S`
@@ -173,31 +198,11 @@ Here is a description of the non-obvious command-line options:
      `CREATE VIEW V AS SELECT T.COL1 FROM T`
 
 -O:  sets the optimization level.  A higher values implies more optimizations.
-
--d:  Sets the lexical rules used.  SQL dialects differ in rules for
-     allowed identifiers, quoting identifiers, conversions to
-     uppercase, case sensitivity of identifiers.
+     Currently setting this to 0 inhibits some Calcite-level optimizations.
+     The default value is "2".
 
 --streaming: Equivalent to adding the following property to all program tables:
      `'appendOnly' = 'true'`.
-
---nowstream: If this property is set to 'true' it implements the NOW() function
-     in a special way, as an input table, which allows deterministic testing.
-
-     When a program uses the `NOW` function, the following input table is
-     automatically injected by the compiler:
-
-     ```sql
-     CREATE TABLE NOW(now TIMESTAMP NOT NULL LATENESS INTERVAL 0 SECONDS);
-     ```
-
-     All invocations of the `NOW()` function within the program
-     will produce the last value inserted in this table.
-
-     This table does is not populated automatically.  Instead, the
-     user is responsible for supplying the data to this table.  In
-     every step of the circuit the user has to insert a new value in
-     this table, which should be larger than the previous value.
 
 ### Example: Compiling a SQL program to Rust
 
@@ -223,7 +228,7 @@ $ cat ../temp/src/lib.rs
 // Automatically-generated file
 
 [...boring stuff removed...]
-fn circuit(workers: usize) -> Result<(DBSPHandle, (CollectionHandle<Tup3<String, Option<i32>, Option<bool>>, Weight>, OutputHandle<OrdZSet<Tup1<String>, Weight>>, )), DbspError> {
+fn circuit(workers: usize) -> Result<(DBSPHandle, (CollectionHandle<Tup3<String, Option<i32>, Option<bool>>, Weight>, OutputHandle<SpineSnapshot<OrdZSet<Tup1<String>, Weight>>>, )), DbspError> {
 
     let (circuit, streams) = Runtime::init_circuit(workers, |circuit| {
         // CREATE TABLE `PERSON` (`NAME` VARCHAR NOT NULL, `AGE` INTEGER, `PRESENT` BOOLEAN)
@@ -299,7 +304,7 @@ fn circuit(workers: usize) -> Result<(DBSPHandle, (CollectionHandle<Tup3<String,
         serialize_table_record!(ADULT_0[1]{
             r#field["NAME"]: String
         });
-        let handleADULT = stream4.output();
+        let handleADULT = stream4.accumulate_output();
 
         Ok((handlePERSON, handleADULT, ))
     })?;
@@ -334,7 +339,7 @@ pub fn test() {
     // Second input has a count of "2"
     person.push( (SqlString::from_ref("Tom"), Some(20), Some(false)).into(), 2 );
     // Execute the circuit on these inputs
-    circuit.step().unwrap();
+    circuit.transaction().unwrap();
     // Read the produced output
     let out = adult.consolidate();
     // Print the produced output
@@ -367,14 +372,14 @@ difference between this circuit and the previous one is as follows:
 
 - For the non-incremental circuit, every time we supply an input
   value, the table `PERSONS` is cleared and filled with the supplied
-  value.  The `circuit.step()` function computes the contents of the
+  value.  The `circuit.transaction()` function computes the contents of the
   output view `ADULTS`.  Reading the output handle gives us the entire
   contents of this view.
 
 - For the incremental circuit, the `PERSONS` table is initially empty.
   Every time we supply an input it is *added* to the table.  (Input
   encoding formats such as [`JSON`](../formats/json) can also specify
-  *deletions* from the table.)  The `circuit.step()` function computes
+  *deletions* from the table.)  The `circuit.transaction()` function computes
   the *changes* to the output view `ADULTS`.  Reading the output
   handle gives us the latest *changes* to the contents of this view.
   Formats such as CSV cannot represent deletions, so they may be
@@ -388,6 +393,7 @@ We exercise this circuit by inserting data using a CSV format:
 #[test]
 pub fn test() {
     use dbsp_adapters::{CircuitCatalog, RecordFormat};
+    use use feldera_types::format::csv::CsvParserConfig;
 
     let (mut circuit, catalog) = circuit(2)
         .expect("Failed to build circuit");
@@ -395,21 +401,22 @@ pub fn test() {
         .input_collection_handle(&SqlIdentifier::from("PERSON"))
         .expect("Failed to get input collection handle");
     let mut persons_stream = persons
+        .handle
         .configure_deserializer(RecordFormat::Csv(Default::default())
         .expect("Failed to configure deserializer");
     persons_stream
-        .insert(b"Bob,12,true")
+        .insert(b"Bob,12,true", &None)
         .expect("Failed to insert data");
     persons_stream
-        .insert(b"Tom,20,false")
+        .insert(b"Tom,20,false", &None)
         .expect("Failed to insert data");
     persons_stream
-        .insert(b"Tom,20,false")
+        .insert(b"Tom,20,false", &None)
         .expect("Failed to insert data");  // Insert twice
     persons_stream.flush();
     // Execute the circuit on these inputs
     circuit
-        .step()
+        .transaction()
         .unwrap();
 
     let adult = &catalog
@@ -418,9 +425,15 @@ pub fn test() {
         .delta_handle;
 
     // Read the produced output
-    let out = adult.consolidate();
-    // Print the produced output
-    println!("{:?}", out);
+    let reader = adult.concat().consolidate();
+    let mut cursor = reader
+        .cursor(RecordFormat::Csv(CsvParserConfig::default()))
+        .unwrap();
+    while cursor.key_valid() {
+        let mut w = cursor.weight();
+        println!("{}: {}", cursor.key_to_json().unwrap(), w);
+        cursor.step_key();
+    }
 }
 ```
 

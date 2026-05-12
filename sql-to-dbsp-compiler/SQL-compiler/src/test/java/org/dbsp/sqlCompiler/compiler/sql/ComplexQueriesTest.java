@@ -4,7 +4,7 @@ import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateWithWaterlineOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
-import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
+import org.dbsp.sqlCompiler.compiler.frontend.TableData;
 import org.dbsp.sqlCompiler.compiler.sql.tools.BaseSQLTests;
 import org.dbsp.sqlCompiler.compiler.sql.tools.Change;
 import org.dbsp.sqlCompiler.compiler.sql.tools.CompilerCircuitStream;
@@ -22,7 +22,6 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPZSetExpression;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTupleBase;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDouble;
 import org.junit.Assert;
-import org.junit.Ignore;
 import org.junit.Test;
 
 public class ComplexQueriesTest extends BaseSQLTests {
@@ -62,7 +61,7 @@ public class ComplexQueriesTest extends BaseSQLTests {
                    AND b55=a31;
                 """;
         var ccs = this.getCCS(sql);
-        ccs.step("""
+        ccs.stepWeightOne("""
                 INSERT INTO t29 VALUES(1,4,'table t29 row 1');
                 INSERT INTO t29 VALUES(2,2,'table t29 row 2');
                 INSERT INTO t29 VALUES(3,9,'table t29 row 3');
@@ -107,9 +106,9 @@ public class ComplexQueriesTest extends BaseSQLTests {
                 INSERT INTO t55 VALUES(9,6,'table t55 row 9');
                 INSERT INTO t55 VALUES(10,2,'table t55 row 10');""",
                  """
-                 x29 | x31 | x51 | x55 | weight
+                 x29 | x31 | x51 | x55
                 ---------------------------------
-                 table t29 row 6 | table t31 row 9 | table t51 row 5 | table t55 row 4 | 1""");
+                 table t29 row 6| table t31 row 9| table t51 row 5| table t55 row 4""");
         InnerVisitor typeWidth = new InnerVisitor(ccs.compiler) {
             @Override
             public void postorder(DBSPTypeTupleBase type) {
@@ -247,19 +246,23 @@ public class ComplexQueriesTest extends BaseSQLTests {
             }
         };
         visitor.apply(circuit);
+        // This will compile the same program a second time, but with different flags, to
+        // match the other tests in this file, and it will also Rust-compile the result.
         this.compileRustTestCase(sql);
     }
 
-   @Test @Ignore("Cross apply not yet implemented")
+   @Test
     public void testCrossApply() {
         String query = """
-                 select d.DocumentID, ds.Status, ds.DateCreated
-                 from Documents as d
-                 cross apply
-                     (select top 1 Status, DateCreated
-                      from DocumentStatusLogs
-                      where DocumentID = d.DocumentId
-                      order by DateCreated desc) as ds
+                create table Documents(DocumentId INT, status VARCHAR, DateCreated DATE);
+                create table DocumentStatusLogs(DocumentId INT);
+                create view V AS select d.DocumentID, ds.Status, ds.DateCreated
+                from Documents as d
+                cross apply
+                    (select Status, DateCreated
+                     from DocumentStatusLogs
+                     where DocumentID = d.DocumentId
+                     order by DateCreated desc) as ds limit 1
                 """;
         this.compileRustTestCase(query);
     }
@@ -378,7 +381,7 @@ public class ComplexQueriesTest extends BaseSQLTests {
                     ON t1.cc_num = t2.cc_num);""";
         DBSPCompiler compiler = testCompiler();
         compiler.submitStatementsForCompilation(script);
-        DBSPZSetExpression[] inputs = new DBSPZSetExpression[] {
+        TableData demographics = new TableData("demographics",
                 new DBSPZSetExpression(new DBSPTupleExpression(
                         new DBSPDoubleLiteral(0.0),
                         new DBSPStringLiteral("First", true),
@@ -388,12 +391,13 @@ public class ComplexQueriesTest extends BaseSQLTests {
                         new DBSPStringLiteral("State", true),
                         new DBSPI32Literal(94043, true),
                         //new DBSPDoubleLiteral(128.0, true),
-                        DBSPLiteral.none(new DBSPTypeDouble(CalciteObject.EMPTY,true)),
+                        DBSPLiteral.none(DBSPTypeDouble.create(true)),
                         new DBSPDoubleLiteral(128.0, true),
                         new DBSPI32Literal(100000, true),
                         new DBSPStringLiteral("Job", true),
                         new DBSPStringLiteral("2020-02-20", true)
-                        )),
+                        )));
+        TableData transactions = new TableData("transactions",
                 new DBSPZSetExpression(new DBSPTupleExpression(
                         new DBSPTimestampLiteral("2020-02-20 10:00:00", false),
                         new DBSPDoubleLiteral(0.0, false),
@@ -405,9 +409,8 @@ public class ComplexQueriesTest extends BaseSQLTests {
                         new DBSPDoubleLiteral(128.0),
                         new DBSPDoubleLiteral(128.0),
                         new DBSPI32Literal(0, true)
-                ))
-        };
-        InputOutputChange ip = new InputOutputChange(new Change(inputs), new Change());
+                )));
+        InputOutputChange ip = new InputOutputChange(new Change(demographics, transactions), new Change());
         CompilerCircuitStream ccs = this.getCCS(compiler);
         ccs.addChange(ip);
     }
@@ -437,14 +440,13 @@ public class ComplexQueriesTest extends BaseSQLTests {
                 FROM transactions AS t1;""";
         DBSPCompiler compiler = testCompiler();
         compiler.submitStatementsForCompilation(script);
-        DBSPZSetExpression[] inputs = new DBSPZSetExpression[] {
+        TableData transactions = new TableData("transactions",
                 new DBSPZSetExpression(new DBSPTupleExpression(
                         new DBSPI64Literal(0, false),
                         new DBSPDoubleLiteral(10.0, true),
                         new DBSPI32Literal(1000)
-                ))
-        };
-        InputOutputChange ip = new InputOutputChange(new Change(inputs), new Change());
+                )));
+        InputOutputChange ip = new InputOutputChange(new Change(transactions), new Change());
         CompilerCircuitStream ccs = this.getCCS(compiler);
         ccs.addChange(ip);
     }

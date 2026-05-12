@@ -34,7 +34,6 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.IsNumericLiteral;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDecimal;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeRuntimeDecimal;
 import org.dbsp.util.IIndentStream;
 import org.dbsp.util.Utilities;
 
@@ -48,7 +47,7 @@ public final class DBSPDecimalLiteral extends DBSPLiteral implements IsNumericLi
 
     public DBSPDecimalLiteral(CalciteObject node, DBSPType type, @Nullable BigDecimal value) {
         super(node, type, value == null);
-        if (!type.is(DBSPTypeDecimal.class) && !type.is(DBSPTypeRuntimeDecimal.class))
+        if (!type.is(DBSPTypeDecimal.class))
             throw new InternalCompilerError("Decimal literal cannot have type " + type, this);
         this.value = value;
     }
@@ -63,6 +62,14 @@ public final class DBSPDecimalLiteral extends DBSPLiteral implements IsNumericLi
 
     public DBSPDecimalLiteral(int value, boolean mayBeNull) {
         this(DBSPTypeDecimal.getDefault().withMayBeNull(mayBeNull), BigDecimal.valueOf(value));
+    }
+
+    @Override
+    public int compare(IsNumericLiteral other) {
+        DBSPDecimalLiteral oi = other.to(DBSPDecimalLiteral.class);
+        Utilities.enforce(this.value != null);
+        Utilities.enforce(oi.value != null);
+        return this.value.compareTo(oi.value);
     }
 
     @Override
@@ -109,7 +116,7 @@ public final class DBSPDecimalLiteral extends DBSPLiteral implements IsNumericLi
                     .append(this.type)
                     .append(")null");
         else
-            return builder.append(this.value.toString());
+            return builder.append(this.wrapSome(this.value.toString()));
     }
 
     @Override

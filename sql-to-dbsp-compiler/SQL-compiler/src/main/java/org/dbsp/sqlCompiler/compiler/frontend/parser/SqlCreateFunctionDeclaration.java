@@ -1,20 +1,25 @@
 package org.dbsp.sqlCompiler.compiler.frontend.parser;
 
+import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlCreate;
 import org.apache.calcite.sql.SqlDataTypeSpec;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlSpecialOperator;
 import org.apache.calcite.sql.SqlWriter;
 import org.apache.calcite.sql.parser.SqlParserPos;
+import org.dbsp.util.Linq;
+import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
+
+import static java.util.Objects.requireNonNull;
 
 /** Our own version of CREATE FUNCTION, different from Calcite. */
 public class SqlCreateFunctionDeclaration extends SqlCreate {
@@ -24,7 +29,20 @@ public class SqlCreateFunctionDeclaration extends SqlCreate {
     @Nullable private final SqlNode body;
 
     private static final SqlSpecialOperator OPERATOR =
-            new SqlSpecialOperator("CREATE FUNCTION", SqlKind.CREATE_FUNCTION);
+            new SqlSpecialOperator("CREATE FUNCTION", SqlKind.CREATE_FUNCTION) {
+                @Override
+                public SqlCall createCall(@org.checkerframework.checker.nullness.qual.Nullable SqlLiteral functionQualifier,
+                                          SqlParserPos pos, @org.checkerframework.checker.nullness.qual.Nullable SqlNode... operands) {
+                    Utilities.enforce(operands.length == 6);
+                    return new SqlCreateFunctionDeclaration(pos,
+                            ((SqlLiteral) requireNonNull(operands[0], "replace")).booleanValue(),
+                            ((SqlLiteral) requireNonNull(operands[1], "ifNotExists")).booleanValue(),
+                            (SqlIdentifier) Objects.requireNonNull(operands[2]),
+                            (SqlNodeList) Objects.requireNonNull(operands[3]),
+                            (SqlDataTypeSpec) Objects.requireNonNull(operands[4]),
+                            operands[5]);
+                }
+            };
 
     public SqlCreateFunctionDeclaration(SqlParserPos pos, boolean replace,
                                         boolean ifNotExists, SqlIdentifier name,
@@ -76,7 +94,10 @@ public class SqlCreateFunctionDeclaration extends SqlCreate {
     }
 
     @Override public List<SqlNode> getOperandList() {
-        return Arrays.asList(this.name, this.parameters);
+        return Linq.list(
+                SqlLiteral.createBoolean(getReplace(), SqlParserPos.ZERO),
+                SqlLiteral.createBoolean(this.ifNotExists, SqlParserPos.ZERO),
+                this.name, this.parameters, this.returnType, this.body);
     }
 
     @Nullable public SqlNode getBody() { return this.body; }

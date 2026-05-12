@@ -1,18 +1,14 @@
 package org.dbsp.simulator.operators;
 
-import org.dbsp.simulator.collections.BaseCollection;
-import org.dbsp.simulator.types.WeightType;
+import org.dbsp.simulator.types.CollectionType;
 
-public abstract class UnaryOperator<Weight> extends BaseOperator<Weight> {
-    UnaryOperator(WeightType<Weight> weightType, BaseOperator<Weight> input) {
-        super(weightType, input);
+/** Operator with one single input */
+public abstract class UnaryOperator extends BaseOperator {
+    UnaryOperator(CollectionType outputType, Stream input) {
+        super(outputType, input);
     }
 
-    public BaseOperator<Weight> input() {
+    public Stream input() {
         return this.inputs[0];
-    }
-
-    public BaseCollection<Weight> getInputValue() {
-        return this.input().getOutput();
     }
 }

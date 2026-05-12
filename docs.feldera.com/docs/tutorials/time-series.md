@@ -28,9 +28,24 @@ with finite memory, making it extremely resource efficient.**
 
 :::warning
 
-Feldera does not automatically garbage collect [materialized tables and views](/sql/materialized),
-as well as tables declared with a primary key.  If such a table stores an unbounded time series,
-it will continue to consume storage without limit.
+Feldera does not automatically garbage collect [materialized tables and views](/sql/materialized).
+If such a table stores an unbounded time series, it will continue to consume storage without limit.
+In addition, if the table has a primary key (PK), Feldera will maintain a PK index for this table,
+which will only be garbage collected if at least one of the PK columns has a `LATENESS` annotation.
+
+:::
+
+:::warning
+
+Feldera implements an `INSERT` or `UPDATE` in a table with a primary
+key as a pair of `INSERT` and `DELETE` operations: a new record is
+inserted, and the old record with the same primary key (if present) is
+deleted.  For tables with `LATENESS` this may cause surprising
+effects: the `DELETE` needs to delete the previous version of the
+record, with the old timestamp; if this timestamp is behind the
+`LATENESS` threshold, the entire INSERT or UPDATE is considered late
+and is thus ignored.  This effectivelly means that "old" records in
+such a table can never be updated or deleted.
 
 :::
 
@@ -108,6 +123,9 @@ lateness value.  The statement may appear before or after the view declaration:
 CREATE VIEW v AS SELECT t.col1, t.col2 FROM t;
 LATENESS v.col1 INTERVAL 1 HOUR;
 ```
+
+`LATENESS` can only be specified for toplevel view columns; i.e., the following
+is illegal: `LATENESS v.str.col INTERVAL 1 HOUR`.
 
 ### Guidelines for writing lateness annotations
 
@@ -637,13 +655,12 @@ ON purchase.customer_id = customer.customer_id;
 
 #### Garbage collection
 
-The incremental as-of join operator stores both of its input relations.  Feldera
-currently implements GC for the left input only: if both timestamp columns
-in the `MATCH_CONDITION` have waterlines, the operator will discard old records
-below the smaller of the two waterlines.
+The incremental as-of join operator stores both of its input relations.  If both
+timestamp columns in the `MATCH_CONDITION` have waterlines, the operator will
 
-GC for the right input is on our [roadmap](https://github.com/feldera/feldera/issues/1850).
-[Let us know](https://github.com/feldera/feldera/issues/new/) if you are interested in this feature.
+* discard records below the smaller of the two waterlines from the left collection
+* discard all except the last record below the smaller of the two waterlines for each join key
+  from the right collection.
 
 ### `LAG` and `LEAD`
 
@@ -696,7 +713,7 @@ See [`NOW()`](/sql/datetime/#now) documentation for more details.
 
 Feldera implements garbage collection for temporal filters by discarding records older
 than the left window bound (e.g., records more than 7 days old in the above example).
-This optimization is sound because `NOW()` grows monotonically, and not _not_ require
+This optimization is sound because `NOW()` grows monotonically, and does _not_ require
 the timestamp column to have a waterline.
 
 

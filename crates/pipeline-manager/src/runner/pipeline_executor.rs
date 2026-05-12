@@ -2,11 +2,22 @@ use crate::config::CommonConfig;
 use crate::db::types::pipeline::PipelineId;
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
-use crate::runner::pipeline_logs::LogMessage;
+use crate::runner::pipeline_logs::LogsSender;
 use async_trait::async_trait;
 use feldera_types::config::{PipelineConfig, StorageConfig};
+use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use uuid::Uuid;
+
+pub enum ProvisionStatus {
+    /// Pipeline resources are still being provisioned.
+    Ongoing { details: serde_json::Value },
+    /// Pipeline resources are provisioned.
+    Provisioned {
+        location: String,
+        details: serde_json::Value,
+    },
+}
 
 /// Trait to be implemented by any pipeline runner.
 /// The `PipelineAutomaton` invokes these methods per pipeline.
@@ -24,7 +35,7 @@ pub trait PipelineExecutor: Sync + Send {
         common_config: CommonConfig,
         config: Self::Config,
         client: reqwest::Client,
-        logs_sender: mpsc::Sender<LogMessage>,
+        logs_sender: LogsSender,
     ) -> Self;
 
     /// Generates the storage configuration of the pipeline if storage is enabled.
@@ -38,26 +49,29 @@ pub trait PipelineExecutor: Sync + Send {
     /// while the pipeline is running). This operation is idempotent and as non-blocking as possible
     /// such that the user can stop the provisioning. After calling this once, completion should be
     /// checked using `is_provisioned()`.
+    ///
+    /// Note: `program_info` is used to discover the set of secrets to mount into the pipeline.
+    #[allow(clippy::too_many_arguments)]
     async fn provision(
         &mut self,
+        deployment_initial: RuntimeDesiredStatus,
+        bootstrap_policy: Option<BootstrapPolicy>,
+        deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
+        program_info: &serde_json::Value,
         program_binary_url: &str,
+        program_info_url: Option<&str>,
         program_version: Version,
-        suspend_info: Option<serde_json::Value>,
     ) -> Result<(), ManagerError>;
 
     /// Validates whether the compute and possibly storage resources provisioning
-    /// initiated by `provision()` is completed.
-    ///
-    /// Returns:
-    /// - `Ok(Some(deployment_location))` if completed successfully
-    /// - `Ok(None)` if still ongoing
-    /// - `Err(...)` if resources encountered an irrecoverable failure
-    async fn is_provisioned(&mut self) -> Result<Option<String>, ManagerError>;
+    /// initiated by `provision()` is completed. An error is returned only if the resources
+    /// encountered an irrecoverable failure.
+    async fn is_provisioned(&mut self) -> Result<ProvisionStatus, ManagerError>;
 
     /// Checks the healthiness of the pipeline compute and storage resources.
     /// An error is returned only if the resources encountered an irrecoverable failure.
-    async fn check(&mut self) -> Result<(), ManagerError>;
+    async fn check(&mut self) -> Result<serde_json::Value, ManagerError>;
 
     /// Scales down to zero or deallocates the compute resources, but retains storage resources.
     /// This operation is idempotent and blocks until finished.

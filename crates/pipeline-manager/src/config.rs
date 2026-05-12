@@ -1,20 +1,34 @@
 use crate::db::types::program::CompilationProfile;
 use crate::db::types::version::Version;
 use crate::db::{error::DBError, types::pipeline::PipelineId};
+use crate::has_unstable_feature;
 use actix_web::http::header;
 use anyhow::{Error as AnyError, Result as AnyResult};
 use clap::Parser;
-use log::warn;
+use openssl::asn1::Asn1Time;
+use openssl::bn::{BigNum, MsbOption};
+use openssl::hash::MessageDigest;
+use openssl::nid::Nid;
+use openssl::pkey::PKey;
+use openssl::rsa::Rsa;
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+use openssl::x509::extension::SubjectAlternativeName;
+use openssl::x509::{X509NameBuilder, X509};
 use postgres_openssl::MakeTlsConnector;
+use reqwest::Certificate;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ClientConfig, RootCertStore};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::{
     env,
-    fs::{canonicalize, create_dir_all},
+    fs::{canonicalize, create_dir_all, write},
     path::{Path, PathBuf},
     sync::Once,
     thread,
 };
+use tracing::warn;
 
 /// The default `platform_version` is formed using three compilation environment variables:
 /// - `CARGO_PKG_VERSION` set by Cargo
@@ -84,7 +98,22 @@ fn default_db_connection_string() -> String {
 
 /// Default demos directory used by the API server.
 fn default_demos_dir() -> Vec<String> {
-    vec!["demo/packaged/sql".to_string()]
+    vec!["crates/pipeline-manager/demos/sql".to_string()]
+}
+
+/// Default value for individual_tenant flag.
+fn default_individual_tenant() -> bool {
+    true
+}
+
+/// Default audience claim value for OIDC authentication.
+fn default_auth_audience() -> String {
+    "feldera-api".to_string()
+}
+
+/// Default number of monitor events that are retained for each pipeline.
+fn default_pipeline_monitor_events_retention() -> u32 {
+    720
 }
 
 /// Determines the default amount of worker threads to spawn.
@@ -131,15 +160,10 @@ fn help_create_dir(dir: &str) -> AnyResult<()> {
     Ok(())
 }
 
-/// Converts the directory path to an absolute path.
-fn help_canonicalize_dir(dir: &str) -> AnyResult<String> {
-    Ok(canonicalize(dir)
-        .map_err(|e| {
-            AnyError::msg(format!(
-                "error canonicalizing working directory path '{}': {e}",
-                dir
-            ))
-        })?
+/// Converts the directory or file path to an absolute path.
+fn help_canonicalize_path(path: &str) -> AnyResult<String> {
+    Ok(canonicalize(path)
+        .map_err(|e| AnyError::msg(format!("error canonicalizing path '{}': {e}", path)))?
         .to_string_lossy()
         .into_owned())
 }
@@ -180,6 +204,10 @@ pub struct CommonConfig {
     #[arg(long, default_value = "127.0.0.1")]
     pub bind_address: String,
 
+    /// Host (hostname or IP address) at which the API HTTP server can be reached by the others.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub api_host: String,
+
     /// Port used by the API server to both bind its HTTP server, and on which it can be reached.
     #[arg(long, default_value_t = 8080)]
     pub api_port: u16,
@@ -217,6 +245,349 @@ pub struct CommonConfig {
     /// - `1500m` -> 1 thread
     #[arg(verbatim_doc_comment, long, default_value_t = default_http_workers(), env = "FELDERA_HTTP_WORKERS", value_parser = cpu_quantity_to_workers)]
     pub http_workers: usize,
+
+    /// Enable experimental platform features.
+    ///
+    /// These features are not yet stable and may change or be removed in the future.
+    ///
+    /// Currently supported features:
+    /// - `runtime_version`: Allows to override the runtime version of a pipeline on the platform.
+    /// - `testing`
+    /// - `cluster_monitor_resources`: Cluster monitoring also monitors the resources backing the
+    ///   instance (i.e., the Kubernetes objects).
+    #[arg(verbatim_doc_comment, long, env = "FELDERA_UNSTABLE_FEATURES")]
+    pub unstable_features: Option<String>,
+
+    /// Whether to enable TLS on the HTTP servers (API server, compiler, runner, pipelines).
+    /// Iff true, is it allowed and required to set `https_tls_cert_path` and `https_tls_key_path`.
+    #[arg(long, default_value_t = false, env = "FELDERA_ENABLE_HTTPS")]
+    pub enable_https: bool,
+
+    /// Path to the TLS x509 certificate PEM file (e.g., `/path/to/tls.crt`)
+    /// that the pipeline manager should use.  The pipeline manager will connect
+    /// to servers whose keys are signed by CAs along this chain.
+    ///
+    /// If the certificate is not self-signed, this PEM file should contain the complete bundle of
+    /// the entire chain up until the root certificate authority (i.e., it should contain multiple
+    /// `-----BEGIN CERTIFICATE----- (...) -----END CERTIFICATE-----` sections, starting with the
+    /// leaf certificate and ending with the root certificate).
+    #[arg(long, env = "FELDERA_HTTPS_TLS_CERT_PATH")]
+    pub https_tls_cert_path: Option<String>,
+
+    /// Path to the TLS key PEM file corresponding to the x509 certificate (e.g.,
+    /// `/path/to/tls.key`) that the pipeline manager should use.
+    ///
+    /// Even if the certificate is not self-signed and the entire chain is provided in
+    /// `https_tls_cert_path`, this PEM file should only contain the single private key of the leaf
+    /// certificate.
+    #[arg(long, env = "FELDERA_HTTPS_TLS_KEY_PATH")]
+    pub https_tls_key_path: Option<String>,
+
+    /// Path to an additional TLS x509 certificate PEM file (e.g.,
+    /// `/path/to/tls.crt`).  The pipeline will connect to servers whose keys
+    /// are signed by CAs along this chain.
+    ///
+    /// The pipeline manager supports two separate CAs:
+    ///
+    /// * `--https-tls-cert-path` is the CA that signs the wildcard certificate
+    ///   that the pipeline manager itself, the compiler, and the runner use in
+    ///   common.  This could be a private CA or part of the public web's PKI.
+    ///   In deployments that lack a private CA, pipeline deployments also use
+    ///   the same wildcard certificate.
+    ///
+    /// * `--private-ca-cert-path` is, optionally, a private CA that is not part
+    ///   of the public web PKI and distinct from the former CA.  When it is
+    ///   present, it signs the certificates for pipeline deployments.
+    ///   Multihost pipeline deployments require a private CA to be provided
+    ///   because their DNS names are in a subdomain of the main Feldera domain,
+    ///   so the wildcard certificate that covers the pipeline manager (etc.)
+    ///   cannot cover the pipeline deployments since wildcards are for a single
+    ///   level only.
+    ///
+    /// If the certificate is not self-signed, this PEM file should contain the complete bundle of
+    /// the entire chain up until the root certificate authority (i.e., it should contain multiple
+    /// `-----BEGIN CERTIFICATE----- (...) -----END CERTIFICATE-----` sections, starting with the
+    /// leaf certificate and ending with the root certificate).
+    #[arg(long, env = "FELDERA_CA_CERT_PATH")]
+    pub private_ca_cert_path: Option<String>,
+
+    /// Number of monitor events that are retained for each pipeline.
+    #[arg(long, default_value_t = default_pipeline_monitor_events_retention(), env = "FELDERA_PIPELINE_MONITOR_EVENTS_RETENTION")]
+    pub pipeline_monitor_events_retention: u32,
+}
+
+impl CommonConfig {
+    fn ensure_testing_https_cert_key(&mut self) -> AnyResult<()> {
+        if !self.enable_https || !has_unstable_feature("testing") {
+            return Ok(());
+        }
+
+        if self.https_tls_cert_path.is_some() || self.https_tls_key_path.is_some() {
+            return Ok(());
+        }
+
+        let private_key = PKey::from_rsa(Rsa::generate(2048)?)?;
+
+        let mut name_builder = X509NameBuilder::new()?;
+        name_builder.append_entry_by_nid(Nid::COMMONNAME, "localhost")?;
+        let name = name_builder.build();
+
+        let mut certificate_builder = X509::builder()?;
+        certificate_builder.set_version(2)?;
+        let mut serial = BigNum::new()?;
+        serial.rand(128, MsbOption::MAYBE_ZERO, false)?;
+        let serial = serial.to_asn1_integer()?;
+        certificate_builder.set_serial_number(&serial)?;
+        certificate_builder.set_subject_name(&name)?;
+        certificate_builder.set_issuer_name(&name)?;
+        certificate_builder.set_pubkey(&private_key)?;
+        let not_before = Asn1Time::days_from_now(0)?;
+        let not_after = Asn1Time::days_from_now(30)?;
+        certificate_builder.set_not_before(not_before.as_ref())?;
+        certificate_builder.set_not_after(not_after.as_ref())?;
+        let san = SubjectAlternativeName::new()
+            .dns("localhost")
+            .ip("127.0.0.1")
+            .build(&certificate_builder.x509v3_context(None, None))?;
+        certificate_builder.append_extension(san)?;
+        certificate_builder.sign(&private_key, MessageDigest::sha256())?;
+
+        let cert_pem = certificate_builder.build().to_pem()?;
+        let key_pem = private_key.private_key_to_pem_pkcs8()?;
+
+        let dir = env::temp_dir().join("feldera-testing-https");
+        create_dir_all(&dir)?;
+        let cert_path = dir.join(format!("tls-{}.crt", std::process::id()));
+        let key_path = dir.join(format!("tls-{}.key", std::process::id()));
+        write(&cert_path, cert_pem)?;
+        write(&key_path, key_pem)?;
+
+        self.https_tls_cert_path = Some(cert_path.to_string_lossy().into_owned());
+        self.https_tls_key_path = Some(key_path.to_string_lossy().into_owned());
+
+        // Avoid rustls SNI warnings in testing mode by preferring
+        // DNS names over IP literals for intra-manager HTTPS requests.
+        if self.api_host == "127.0.0.1" {
+            self.api_host = "localhost".to_string();
+        }
+        if self.compiler_host == "127.0.0.1" {
+            self.compiler_host = "localhost".to_string();
+        }
+        if self.runner_host == "127.0.0.1" {
+            self.runner_host = "localhost".to_string();
+        }
+
+        Ok(())
+    }
+
+    /// Converts all paths in the `self` to absolute paths.
+    pub fn canonicalize(mut self) -> AnyResult<Self> {
+        self.ensure_testing_https_cert_key()?;
+        let _ = self.https_config();
+        if let Some(https_tls_cert_path) = self.https_tls_cert_path {
+            self.https_tls_cert_path = Some(help_canonicalize_path(&https_tls_cert_path)?);
+        }
+        if let Some(https_tls_key_path) = self.https_tls_key_path {
+            self.https_tls_key_path = Some(help_canonicalize_path(&https_tls_key_path)?);
+        }
+        if let Some(private_ca_cert_path) = self.private_ca_cert_path {
+            self.private_ca_cert_path = Some(help_canonicalize_path(&private_ca_cert_path)?);
+        }
+        Ok(self)
+    }
+
+    /// Parses the HTTPS configuration arguments.
+    /// If HTTPS is enabled, returns a pair of strings `Some((certificate path, key path))`.
+    /// Otherwise, if HTTPS is not enabled, returns `None`.
+    pub fn https_config(&self) -> Option<(String, String)> {
+        if self.enable_https
+            || self.https_tls_cert_path.is_some()
+            || self.https_tls_key_path.is_some()
+        {
+            assert!(
+                self.enable_https,
+                "--enable-https is required to pass --https-tls-cert-path or --https-tls-key-path"
+            );
+            let https_tls_cert_path = self
+                .https_tls_cert_path
+                .as_ref()
+                .expect("CLI argument --https-tls-cert-path is required");
+            let https_tls_key_path = self
+                .https_tls_key_path
+                .as_ref()
+                .expect("CLI argument --https-tls-key-path is required");
+            Some((https_tls_cert_path.clone(), https_tls_key_path.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Creates the `ServerConfig` for the HTTP servers of the API server, compiler and runner if
+    /// HTTPS is enabled. Otherwise, returns `None`.
+    pub fn https_server_config(&self) -> Option<rustls::ServerConfig> {
+        if let Some((https_tls_cert_path, https_tls_key_path)) = self.https_config() {
+            // Load in certificate (public)
+            let cert_chain = CertificateDer::pem_file_iter(https_tls_cert_path)
+                .expect("HTTPS TLS certificate should be read")
+                .flatten()
+                .collect();
+
+            // Load in key (private)
+            let key_der = PrivateKeyDer::from_pem_file(https_tls_key_path)
+                .expect("HTTPS TLS key should be read");
+
+            // Server configuration
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, key_der)
+                .expect(
+                    "server configuration should be built using the certificate and private key",
+                );
+            feldera_observability::fips::log_rustls_fips_status(
+                "HTTPS server config",
+                server_config.fips(),
+            );
+
+            Some(server_config)
+        } else {
+            None
+        }
+    }
+
+    fn ca_cert_paths(&self) -> Vec<&String> {
+        let mut paths = Vec::with_capacity(2);
+        if let Some(https_tls_cert_path) = &self.https_tls_cert_path {
+            paths.push(https_tls_cert_path);
+        }
+        if let Some(private_ca_cert_path) = &self.private_ca_cert_path {
+            paths.push(private_ca_cert_path);
+        }
+        paths
+    }
+
+    /// Creates `awc` client.
+    ///
+    /// - If HTTPS is enabled for Feldera HTTP servers, the client will only have our root HTTPS
+    ///   certificate as the only valid one. As such, it will be only able to connect to servers
+    ///   that have a certificate signed by the root certificate.
+    ///   Unfortunately, it is not possible to configure `awc` to refuse to connect over HTTP at all.
+    ///
+    /// - If HTTPS is not enabled for Feldera HTTP servers, it will return the default client which can
+    ///   connect to both HTTP and HTTPS (for any valid system certificates).
+    ///
+    /// # Why both [awc] and [reqwest]?
+    ///
+    /// The pipeline manager uses both [awc] and [reqwest]:
+    ///
+    /// - `awc` supports websockets but `reqwest` did not at the time we added
+    ///   `awc`.  (Now there is the `reqwest_websocket` crate, which can't be
+    ///   much worse than `awc` since `awc` can send mangled frames to the
+    ///   client sometimes.)
+    ///
+    /// - `awc` is conveniently coupled with `actix-web` typewise.
+    ///
+    /// but:
+    ///
+    /// - `reqwest` is `Send + Sync`.
+    ///
+    /// - `reqwest` has an HTTPS-only mode.
+    pub fn awc_client(&self) -> awc::Client {
+        if self.https_config().is_some() {
+            let mut root_cert_store = RootCertStore::empty();
+            for path in self.ca_cert_paths() {
+                let cert_chain: Vec<_> = CertificateDer::pem_file_iter(path)
+                    .expect("HTTPS TLS certificate should be read")
+                    .flatten()
+                    .collect();
+                let root_cert = cert_chain
+                    .last()
+                    .expect("At least one HTTPS TLS certificate should be present")
+                    .clone();
+                root_cert_store
+                    .add(root_cert)
+                    .expect("Root HTTPS TLS certificate should be parsed");
+            }
+            let config = ClientConfig::builder()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth();
+            feldera_observability::fips::log_rustls_fips_status(
+                "HTTPS client config",
+                config.fips(),
+            );
+            // In the `awc` implementation, the connection is kept open for endpoints that return a
+            // streaming response (e.g., `/logs`) when they are half closed. As a workaround,
+            // increase the max connections limit to 25'000. This is also the default maximum number
+            // of connections for an actix server.
+            awc::Client::builder()
+                .connector(
+                    awc::Connector::new()
+                        .rustls_0_23(Arc::new(config))
+                        .limit(25000),
+                )
+                .finish()
+        } else {
+            awc::Client::builder()
+                .connector(awc::Connector::new().limit(25000))
+                .finish()
+        }
+    }
+
+    /// Creates `reqwest` client.
+    ///
+    /// - If HTTPS is enabled for Feldera HTTP servers, the client will only have our root
+    ///   HTTPS certificate as the only valid one. As such, it will be only able to connect to
+    ///   servers that have a certificate signed by the root certificate.
+    ///   It will refuse to connect over HTTP at all.
+    ///
+    /// - If HTTPS is not enabled for Feldera HTTP servers, it will return the default client which can
+    ///   connect to both HTTP and HTTPS (for any valid system certificates).
+    ///
+    /// # Why both [awc] and [reqwest]?
+    ///
+    /// See [Self::awc_client].
+    pub async fn reqwest_client(&self) -> reqwest::Client {
+        if self.https_config().is_some() {
+            let mut builder = reqwest::ClientBuilder::new()
+                .https_only(true) // Only connect to HTTPS
+                .tls_built_in_root_certs(false); // Other TLS certificates are not used
+            for path in self.ca_cert_paths() {
+                let cert_pem = tokio::fs::read_to_string(path)
+                    .await
+                    .expect("HTTPS TLS certificate should be read");
+                let cert_chain = Certificate::from_pem_bundle(cert_pem.as_bytes())
+                    .expect("HTTPS TLS certificate should be readable");
+                let root_cert = cert_chain
+                    .last()
+                    .expect("At least one HTTPS TLS certificate should be present")
+                    .clone();
+                builder = builder.add_root_certificate(root_cert);
+            }
+            builder.build().expect("HTTPS client should be built")
+        } else {
+            reqwest::Client::new()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_config() -> Self {
+        Self {
+            bind_address: "127.0.0.1".to_string(),
+            api_host: "127.0.0.1".to_string(),
+            api_port: 8080,
+            compiler_host: "127.0.0.1".to_string(),
+            compiler_port: 8085,
+            runner_host: "127.0.0.1".to_string(),
+            runner_port: 8089,
+            platform_version: "v0".to_string(),
+            http_workers: 1,
+            unstable_features: None,
+            enable_https: false,
+            https_tls_cert_path: None,
+            https_tls_key_path: None,
+            private_ca_cert_path: None,
+            pipeline_monitor_events_retention: 720,
+        }
+    }
 }
 
 /// Embedded Postgres configuration.
@@ -233,7 +604,7 @@ impl PgEmbedConfig {
     /// Converts all directory paths in the `self` to absolute paths.
     pub fn canonicalize(mut self) -> AnyResult<Self> {
         help_create_dir(&self.pg_embed_working_directory)?;
-        self.pg_embed_working_directory = help_canonicalize_dir(&self.pg_embed_working_directory)?;
+        self.pg_embed_working_directory = help_canonicalize_path(&self.pg_embed_working_directory)?;
         Ok(self)
     }
 
@@ -265,6 +636,11 @@ pub struct DatabaseConfig {
     #[serde(default)]
     #[arg(long, env = "FELDERA_DB_TLS_DISABLE_VERIFY")]
     pub disable_tls_verify: bool,
+
+    /// Disables TLS hostname verification.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_DB_TLS_DISABLE_HOSTNAME_VERIFY")]
+    pub disable_tls_hostname_verify: bool,
 }
 
 impl DatabaseConfig {
@@ -273,6 +649,7 @@ impl DatabaseConfig {
             db_connection_string,
             db_tls_certificate_path,
             disable_tls_verify: false,
+            disable_tls_hostname_verify: false,
         }
     }
 
@@ -335,9 +712,26 @@ impl DatabaseConfig {
                     ),
                     openssl_error: Some(e),
                 })?;
+        } else {
+            builder
+                .set_default_verify_paths()
+                .map_err(|e| DBError::TlsConnection {
+                    hint: "Unable to configure default TLS paths".to_string(),
+                    openssl_error: Some(e),
+                })?;
         }
 
-        Ok(MakeTlsConnector::new(builder.build()))
+        let mut connector = MakeTlsConnector::new(builder.build());
+
+        if self.disable_tls_hostname_verify {
+            warn!("PostgreSQL TLS hostname verification is disabled. The PostgreSQL server's hostname may not match the one specified in the SSL certificate.");
+            connector.set_callback(|ctx, _| {
+                ctx.set_verify_hostname(false);
+                Ok(())
+            });
+        }
+
+        Ok(connector)
     }
 }
 
@@ -346,7 +740,7 @@ pub enum AuthProviderType {
     #[default]
     None,
     AwsCognito,
-    GoogleIdentity,
+    GenericOidc,
 }
 
 impl std::fmt::Display for AuthProviderType {
@@ -354,7 +748,7 @@ impl std::fmt::Display for AuthProviderType {
         match *self {
             AuthProviderType::None => write!(f, "none"),
             AuthProviderType::AwsCognito => write!(f, "aws-cognito"),
-            AuthProviderType::GoogleIdentity => write!(f, "google-identity"),
+            AuthProviderType::GenericOidc => write!(f, "generic-oidc"),
         }
     }
 }
@@ -367,8 +761,8 @@ pub struct ApiServerConfig {
     ///
     /// Usage depends on two environment variables to be set
     ///
-    /// AUTH_CLIENT_ID, the client-id or application
-    /// AUTH_ISSUER, the issuing service
+    /// FELDERA_AUTH_CLIENT_ID, the client-id or application
+    /// FELDERA_AUTH_ISSUER, the issuing service
     ///
     /// ** AWS Cognito provider **
     /// If the auth_provider is aws-cognito, there are two more
@@ -387,8 +781,22 @@ pub struct ApiServerConfig {
     ///
     /// We also only support implicit grants for now. We expect to
     /// support PKCE soon.
+    ///
+    /// ** Okta provider **
+    /// If the auth_provider is okta, the FELDERA_AUTH_ISSUER should be your Okta domain
+    /// including the authorization server ID (e.g., "<https://your-domain.okta.com/oauth2/default>").
+    /// The FELDERA_AUTH_CLIENT_ID should be the client ID from your Okta application configuration.
+    ///
+    /// ** Tenant Assignment **
+    /// Tenant assignment follows this priority order:
+    /// 1. 'tenant' claim in JWT (if configured by Okta admin)
+    /// 2. Issuer domain extraction (if --issuer-tenant flag is set)
+    /// 3. Individual user tenant from 'sub' claim (if --individual-tenant=true)
+    ///
+    /// Use --individual-tenant=false for enterprise deployments requiring explicit tenant assignment.
+    /// Use --issuer-tenant for simple multi-user access using organization domain as tenant.
     #[serde(default)]
-    #[arg(long, action = clap::ArgAction::Set, default_value_t=AuthProviderType::None)]
+    #[arg(long, action = clap::ArgAction::Set, env = "AUTH_PROVIDER", default_value_t=AuthProviderType::None)]
     pub auth_provider: AuthProviderType,
 
     /// [Developers only] dump OpenAPI specification to `openapi.json` file and
@@ -432,6 +840,64 @@ pub struct ApiServerConfig {
     /// and sent to our telemetry service.
     #[arg(long, default_value = "", env = "FELDERA_TELEMETRY")]
     pub telemetry: String,
+
+    /// Support data collection frequency (in seconds).
+    ///
+    /// This parameter determines how often data should be collected and stored
+    /// for support bundles, note that we only actively collect data for running pipelines.
+    ///
+    /// If set to 0, the continous collection is disabled.
+    #[arg(
+        long,
+        default_value_t = 10 * 60,
+        env = "FELDERA_SUPPORT_DATA_COLLECTION_FREQUENCY"
+    )]
+    pub support_data_collection_frequency: u64,
+
+    /// How many support data collections to keep per pipeline.
+    ///
+    /// Example: If `--support-data-collection-frequency` is 15 minutes and
+    /// `--support-data-retention` is 5, then the support bundle data will
+    /// be collected every 15 minutes and the oldest collection will be discarded when
+    /// the 6th collection is made.
+    #[arg(long, default_value_t = 3, env = "FELDERA_SUPPORT_DATA_RETENTION")]
+    pub support_data_retention: u64,
+
+    /// Use the issuer domain as tenant identifier for multi-user deployments.
+    ///
+    /// When enabled, extracts the subdomain from the JWT issuer claim as the tenant.
+    /// For example, "<https://acme-corp.okta.com/oauth2/default>" becomes "acme-corp".
+    /// Useful for simple multi-user access without requiring custom tenant claims.
+    #[serde(default)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false, env = "FELDERA_AUTH_ISSUER_TENANT")]
+    pub issuer_tenant: bool,
+
+    /// Allow individual user tenants based on the 'sub' claim.
+    ///
+    /// When true (default), users without explicit tenant or issuer-based tenant
+    /// assignment get individual tenants based on their 'sub' claim.
+    /// When false, users must have explicit tenant assignment or access is denied.
+    /// Set to false for enterprise deployments requiring explicit tenant assignment.
+    #[serde(default = "default_individual_tenant")]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true, env = "FELDERA_AUTH_INDIVIDUAL_TENANT")]
+    pub individual_tenant: bool,
+
+    /// Comma-separated list of group names that users must belong to for access.
+    /// When specified, a user must have at least one group from the authorized_groups list
+    /// present in the `groups` claim of the Access OIDC token to access the platform.
+    /// If empty, no group restrictions are applied.
+    /// Example: "feldera-users,analytics-team"
+    #[serde(default)]
+    #[arg(long, value_delimiter = ',', env = "FELDERA_AUTH_AUTHORIZED_GROUPS")]
+    pub authorized_groups: Vec<String>,
+
+    /// Expected audience claim value in OIDC Access tokens.
+    /// This value must match the 'aud' claim in JWT tokens for successful authentication.
+    /// For Okta custom authorization servers, this is typically the API identifier.
+    /// Default: "feldera-api"
+    #[serde(default = "default_auth_audience")]
+    #[arg(long, default_value = "feldera-api", env = "FELDERA_AUTH_AUDIENCE")]
+    pub auth_audience: String,
 }
 
 impl ApiServerConfig {
@@ -443,7 +909,7 @@ impl ApiServerConfig {
             }
             actix_cors::Cors::permissive()
         } else {
-            let mut cors = actix_cors::Cors::default();
+            let mut cors = actix_cors::Cors::default().block_on_origin_mismatch(true); // Retain default behavior of actix-cors 0.6.x
             if let Some(ref origins) = self.allowed_origins {
                 for origin in origins {
                     cors = cors.allowed_origin(origin);
@@ -452,8 +918,30 @@ impl ApiServerConfig {
                 cors = cors.allow_any_origin();
             }
             cors.allowed_methods(vec!["GET", "POST", "PATCH", "PUT", "DELETE"])
-                .allowed_headers(vec![header::AUTHORIZATION, header::ACCEPT])
+                .allowed_headers(vec![
+                    header::AUTHORIZATION,
+                    header::ACCEPT,
+                    header::HeaderName::from_static(crate::auth::TENANT_HEADER),
+                ])
                 .supports_credentials()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_config() -> Self {
+        Self {
+            support_data_collection_frequency: 1, // 1 second for testing
+            support_data_retention: 2,            // Keep 2 collections
+            auth_provider: crate::config::AuthProviderType::None,
+            dev_mode: false,
+            allowed_origins: None,
+            telemetry: "test".to_string(),
+            demos_dir: vec!["demos".to_string()],
+            dump_openapi: false,
+            issuer_tenant: false,
+            individual_tenant: true,
+            authorized_groups: vec![],
+            auth_audience: "feldera-api".to_string(),
         }
     }
 }
@@ -506,6 +994,38 @@ pub struct CompilerConfig {
     #[arg(long, default_value_t = default_dbsp_override_path())]
     pub dbsp_override_path: String,
 
+    /// HTTP endpoint URL for uploading compiled binaries.
+    /// If set, compiled binaries will be uploaded to this endpoint instead of being copied locally.
+    /// The binary will be uploaded as raw binary data using POST with Content-Type: application/octet-stream.
+    /// Metadata is included in the URL path as follows:
+    /// {endpoint}/binary/{pipeline_id}/{program_version}/{source_checksum}/{integrity_checksum}
+    /// Where:
+    /// - pipeline_id: The UUID of the pipeline
+    /// - program_version: The version number of the program
+    /// - source_checksum: SHA256 checksum of the source code
+    /// - integrity_checksum: SHA256 checksum of the compiled binary
+    ///
+    /// Example: --binary-upload-endpoint http://127.0.0.1:8085
+    ///          --binary-upload-endpoint https://compiler-server-0:8085
+    #[arg(long)]
+    pub binary_upload_endpoint: Option<String>,
+
+    /// Timeout in seconds for binary upload requests.
+    /// Default is 600 seconds (10 minutes).
+    #[arg(long, default_value_t = 600)]
+    pub binary_upload_timeout_secs: u64,
+
+    /// Maximum number of retry attempts for binary upload requests.
+    /// Default is 10 retries.
+    #[arg(long, default_value_t = 10)]
+    pub binary_upload_max_retries: u32,
+
+    /// Initial delay in milliseconds between retry attempts for binary upload requests.
+    /// The delay doubles after each retry (exponential backoff).
+    /// Default is 1000 milliseconds (1 second).
+    #[arg(long, default_value_t = 1000)]
+    pub binary_upload_retry_delay_ms: u64,
+
     /// Precompile Rust dependencies in the working directory.
     ///
     /// Instructs the manager to download and compile all crates needed by
@@ -527,11 +1047,11 @@ impl CompilerConfig {
     /// Convert all directory paths in the `self` to absolute paths.
     pub fn canonicalize(mut self) -> AnyResult<Self> {
         help_create_dir(&self.compiler_working_directory)?;
-        self.compiler_working_directory = help_canonicalize_dir(&self.compiler_working_directory)?;
-        self.sql_compiler_path = help_canonicalize_dir(&self.sql_compiler_path)?;
+        self.compiler_working_directory = help_canonicalize_path(&self.compiler_working_directory)?;
+        self.sql_compiler_path = help_canonicalize_path(&self.sql_compiler_path)?;
         self.compilation_cargo_lock_path =
-            help_canonicalize_dir(&self.compilation_cargo_lock_path)?;
-        self.dbsp_override_path = help_canonicalize_dir(&self.dbsp_override_path)?;
+            help_canonicalize_path(&self.compilation_cargo_lock_path)?;
+        self.dbsp_override_path = help_canonicalize_path(&self.dbsp_override_path)?;
         Ok(self)
     }
 }
@@ -550,7 +1070,7 @@ impl LocalRunnerConfig {
     /// Creates and converts all directory paths in `self` to absolute paths.
     pub fn canonicalize(mut self) -> AnyResult<Self> {
         help_create_dir(&self.runner_working_directory)?;
-        self.runner_working_directory = help_canonicalize_dir(&self.runner_working_directory)?;
+        self.runner_working_directory = help_canonicalize_path(&self.runner_working_directory)?;
         Ok(self)
     }
 
@@ -565,9 +1085,16 @@ impl LocalRunnerConfig {
             .join(format!("program_{pipeline_id}_v{version}"))
     }
 
+    /// Location to write the fetched pipeline binary to.
+    pub(crate) fn program_info_file_path(&self, pipeline_id: PipelineId) -> PathBuf {
+        self.pipeline_dir(pipeline_id).join("program_info.json")
+    }
+
     /// Location to write the pipeline config file.
-    pub(crate) fn config_file_path(&self, pipeline_id: PipelineId) -> PathBuf {
-        self.pipeline_dir(pipeline_id).join("config.yaml")
+    pub(crate) fn config_file_path(&self, pipeline_id: PipelineId, extension: &str) -> PathBuf {
+        self.pipeline_dir(pipeline_id)
+            .join("config")
+            .with_extension(extension)
     }
 
     /// Location for pipeline port file
@@ -580,6 +1107,7 @@ impl LocalRunnerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn test_cpu_quantity() {
@@ -602,5 +1130,38 @@ mod tests {
         assert!(cpu_quantity_to_workers("").is_err());
         assert!(cpu_quantity_to_workers("m500").is_err());
         assert!(cpu_quantity_to_workers("500M").is_err()); // uppercase M is invalid
+    }
+
+    #[test]
+    fn test_https_testing_mode_generates_cert_and_key() {
+        if crate::unstable_features().is_none() {
+            crate::platform_enable_unstable("testing");
+        }
+        let config = CommonConfig {
+            enable_https: true,
+            unstable_features: Some("testing".to_string()),
+            ..CommonConfig::test_config()
+        }
+        .canonicalize()
+        .unwrap();
+
+        let cert_path = config.https_tls_cert_path.as_ref().unwrap();
+        let key_path = config.https_tls_key_path.as_ref().unwrap();
+        assert!(Path::new(&cert_path).exists());
+        assert!(Path::new(&key_path).exists());
+        assert!(config.https_config().is_some());
+        assert_eq!(config.api_host, "localhost");
+        assert_eq!(config.compiler_host, "localhost");
+        assert_eq!(config.runner_host, "localhost");
+    }
+
+    #[test]
+    fn test_https_without_testing_mode_requires_cert_and_key() {
+        let config = CommonConfig {
+            enable_https: true,
+            unstable_features: None,
+            ..CommonConfig::test_config()
+        };
+        assert!(std::panic::catch_unwind(|| config.https_config()).is_err());
     }
 }

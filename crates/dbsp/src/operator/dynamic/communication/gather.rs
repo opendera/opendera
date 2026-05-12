@@ -1,33 +1,35 @@
 use crate::{
+    Circuit, Runtime, Stream,
     circuit::{
+        GlobalNodeId, OwnershipPreference, Scope,
         circuit_builder::StreamId,
         metadata::OperatorLocation,
         operator_traits::{Operator, SinkOperator, SourceOperator},
-        OwnershipPreference, Scope,
+        runtime::{WorkerLocation, WorkerLocations},
     },
     circuit_cache_key,
-    trace::{merge_batches, Batch},
-    Circuit, Runtime, Stream,
+    operator::communication::{Mailbox, new_exchange_operators},
+    trace::{Batch, deserialize_indexed_wset, merge_batches, serialize_indexed_wset},
 };
 use arc_swap::ArcSwap;
 use crossbeam::atomic::AtomicConsume;
 use crossbeam_utils::CachePadded;
-use minitrace::trace;
 use std::{
     borrow::Cow,
     marker::PhantomData,
     mem::MaybeUninit,
     panic::Location,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 type NotifyCallback = dyn Fn() + Send + Sync + 'static;
 
 circuit_cache_key!(GatherId<C, D>((StreamId, usize) => Stream<C, D>));
-circuit_cache_key!(local GatherDataId<T>(usize => Arc<GatherData<T>>));
+circuit_cache_key!(local GatherDataId<T>(usize => Arc<GatherData<(T, bool)>>));
+circuit_cache_key!(MultihostGatherId<C, D>((GlobalNodeId, usize) => Stream<C, D>));
 
 impl<C, B> Stream<C, B>
 where
@@ -41,59 +43,139 @@ where
         // FIXME: Remove `Time = ()` restriction currently imposed by `.consolidate()`
         B: Batch<Time = ()> + Send,
     {
-        let location = Location::caller();
-
-        match Runtime::runtime() {
-            None => self.clone(),
-            Some(runtime) => {
-                let workers = runtime.num_workers();
-                assert!(receiver_worker < workers);
-
-                if workers == 1 {
-                    self.clone()
-                } else {
-                    self.circuit()
-                        .cache_get_or_insert_with(
-                            GatherId::new((self.stream_id(), receiver_worker)),
-                            move || {
-                                let current_worker = Runtime::worker_index();
-                                let gather_id = runtime.sequence_next();
-
-                                let gather = runtime
-                                    .local_store()
-                                    .entry(GatherDataId::new(gather_id))
-                                    .or_insert_with(|| Arc::new(GatherData::new(workers, location)))
-                                    .value()
-                                    .clone();
-
-                                // Safety: The current worker is unique
-                                let producer =
-                                    unsafe { GatherProducer::new(gather.clone(), current_worker) };
-
-                                if current_worker == receiver_worker {
-                                    self.circuit().add_exchange(
-                                        producer,
-                                        GatherConsumer::new(gather, factories),
-                                        self,
-                                    )
-                                } else {
-                                    self.circuit().add_exchange(
-                                        producer,
-                                        EmptyGatherConsumer::new(location, factories),
-                                        self,
-                                    )
-                                }
-                                .set_persistent_id(
-                                    self.get_persistent_id()
-                                        .map(|name| format!("{name}.gather-{receiver_worker}"))
-                                        .as_deref(),
-                                )
-                            },
-                        )
-                        .clone()
-                }
-            }
+        let workers = Runtime::num_workers();
+        assert!(receiver_worker < workers);
+        if workers == 1 {
+            return self.clone();
         }
+
+        let runtime = Runtime::runtime().unwrap();
+        if runtime.layout().is_solo() {
+            self.dyn_gather_single_host(workers, runtime, factories, receiver_worker)
+        } else {
+            self.dyn_gather_multihost(factories, receiver_worker)
+        }
+    }
+
+    #[track_caller]
+    fn dyn_gather_single_host(
+        &self,
+        workers: usize,
+        runtime: Runtime,
+        factories: &B::Factories,
+        receiver_worker: usize,
+    ) -> Stream<C, B>
+    where
+        B: Batch<Time = ()> + Send,
+    {
+        let location = Location::caller();
+        self.circuit()
+            .cache_get_or_insert_with(
+                GatherId::new((self.stream_id(), receiver_worker)),
+                move || {
+                    let current_worker = Runtime::worker_index();
+                    let gather_id = runtime.sequence_next();
+
+                    let gather = runtime
+                        .local_store()
+                        .entry(GatherDataId::new(gather_id))
+                        .or_insert_with(|| Arc::new(GatherData::new(workers, location)))
+                        .value()
+                        .clone();
+
+                    // Safety: The current worker is unique
+                    let producer = unsafe { GatherProducer::new(gather.clone(), current_worker) };
+
+                    if current_worker == receiver_worker {
+                        self.circuit().add_exchange(
+                            producer,
+                            GatherConsumer::new(gather, factories),
+                            self,
+                        )
+                    } else {
+                        self.circuit().add_exchange(
+                            producer,
+                            EmptyGatherConsumer::new(location, factories),
+                            self,
+                        )
+                    }
+                    .set_persistent_id(
+                        self.get_persistent_id()
+                            .map(|name| format!("{name}.gather-{receiver_worker}"))
+                            .as_deref(),
+                    )
+                },
+            )
+            .clone()
+    }
+
+    #[track_caller]
+    fn dyn_gather_multihost(&self, factories: &B::Factories, receiver_worker: usize) -> Stream<C, B>
+    where
+        B: Batch<Time = ()> + Send,
+    {
+        let location = Location::caller();
+        self.circuit()
+            .cache_get_or_insert_with(
+                MultihostGatherId::new((self.origin_node_id().clone(), receiver_worker)),
+                move || {
+                    let factories_clone = factories.clone();
+                    let factories_clone2 = factories.clone();
+                    let factories_clone3 = factories.clone();
+
+                    let output = self.circuit().region("gather", || {
+                        let (sender, receiver) = new_exchange_operators(
+                            Some(location),
+                            || Vec::new(),
+                            move |batch: B, batches: &mut Vec<Mailbox<B>>| {
+                                let empty = B::dyn_empty(&factories_clone3);
+                                let mut serializer_inner = None;
+                                for location in WorkerLocations::new() {
+                                    match location {
+                                        WorkerLocation::Local => {
+                                            batches.push(Mailbox::Plain(empty.clone()))
+                                        }
+                                        WorkerLocation::Remote => {
+                                            batches.push(Mailbox::Tx(serialize_indexed_wset(
+                                                &empty,
+                                                serializer_inner.get_or_insert_default(),
+                                            )))
+                                        }
+                                    }
+                                }
+                                if Runtime::runtime()
+                                    .unwrap()
+                                    .layout()
+                                    .local_workers()
+                                    .contains(&receiver_worker)
+                                {
+                                    batches[receiver_worker] = Mailbox::Plain(batch);
+                                } else {
+                                    batches[receiver_worker] = Mailbox::Tx(serialize_indexed_wset(
+                                        &batch,
+                                        serializer_inner.get_or_insert_default(),
+                                    ));
+                                }
+                            },
+                            move |data| deserialize_indexed_wset(&factories_clone, &data),
+                            |batches: &mut Vec<B>, batch: B| batches.push(batch),
+                        )
+                        .unwrap();
+
+                        self.circuit()
+                            .add_exchange(sender, receiver, self)
+                            .apply_owned_named("gather shards", move |batches| {
+                                merge_batches(&factories_clone2, batches, &None, &None)
+                            })
+                    });
+                    output.set_persistent_id(
+                        self.get_persistent_id()
+                            .map(|name| format!("{name}.gather"))
+                            .as_deref(),
+                    )
+                },
+            )
+            .clone()
     }
 }
 
@@ -230,8 +312,11 @@ unsafe impl<T: Send> Send for GatherData<T> {}
 unsafe impl<T: Send> Sync for GatherData<T> {}
 
 struct GatherProducer<T> {
-    gather: Arc<GatherData<T>>,
+    gather: Arc<GatherData<(T, bool)>>,
     worker: usize,
+
+    // Used to notify the consumer that the current worker has been flushed.
+    flushed: bool,
 }
 
 impl<T> GatherProducer<T> {
@@ -240,8 +325,12 @@ impl<T> GatherProducer<T> {
     /// # Safety
     ///
     /// `worker` must be inbounds and unique within `gather`'s channels
-    const unsafe fn new(gather: Arc<GatherData<T>>, worker: usize) -> Self {
-        Self { gather, worker }
+    const unsafe fn new(gather: Arc<GatherData<(T, bool)>>, worker: usize) -> Self {
+        Self {
+            gather,
+            worker,
+            flushed: false,
+        }
     }
 }
 
@@ -260,22 +349,26 @@ where
     fn fixedpoint(&self, _scope: Scope) -> bool {
         true
     }
+
+    fn flush(&mut self) {
+        self.flushed = true;
+    }
 }
 
 impl<T> SinkOperator<T> for GatherProducer<T>
 where
     T: Clone + Send + 'static,
 {
-    #[trace]
     async fn eval(&mut self, input: &T) {
         // Safety: `worker` is guaranteed to be a valid & unique worker index
-        unsafe { self.gather.push(self.worker, input.clone()) }
+        unsafe { self.gather.push(self.worker, (input.clone(), self.flushed)) };
+        self.flushed = false;
     }
 
-    #[trace]
     async fn eval_owned(&mut self, input: T) {
         // Safety: `worker` is guaranteed to be a valid & unique worker index
-        unsafe { self.gather.push(self.worker, input) }
+        unsafe { self.gather.push(self.worker, (input, self.flushed)) };
+        self.flushed = false;
     }
 
     fn input_preference(&self) -> OwnershipPreference {
@@ -285,14 +378,22 @@ where
 
 struct GatherConsumer<T: Batch> {
     factories: T::Factories,
-    gather: Arc<GatherData<T>>,
+    gather: Arc<GatherData<(T, bool)>>,
+
+    /// The number of workers that have flushed their outputs during the current clock cycle.
+    flush_count: usize,
+
+    /// Set after flush_count has reached the number of workers and `flush` was called.
+    flush_complete: bool,
 }
 
 impl<T: Batch> GatherConsumer<T> {
-    fn new(gather: Arc<GatherData<T>>, factories: &T::Factories) -> Self {
+    fn new(gather: Arc<GatherData<(T, bool)>>, factories: &T::Factories) -> Self {
         Self {
             gather,
             factories: factories.clone(),
+            flush_count: 0,
+            flush_complete: false,
         }
     }
 }
@@ -325,23 +426,43 @@ impl<T: Batch + 'static> Operator for GatherConsumer<T> {
     fn fixedpoint(&self, _scope: Scope) -> bool {
         true
     }
+
+    fn flush(&mut self) {
+        self.flush_complete = false;
+    }
+
+    fn is_flush_complete(&self) -> bool {
+        self.flush_complete
+    }
 }
 
 impl<T> SourceOperator<T> for GatherConsumer<T>
 where
     T: Batch<Time = ()> + 'static,
 {
-    #[trace]
     async fn eval(&mut self) -> T {
         // Safety: This is the gather thread
         debug_assert!(unsafe { self.gather.all_channels_ready() });
 
-        merge_batches(
+        let result = merge_batches(
             &self.factories,
-            (0..self.gather.workers()).map(|worker| unsafe { self.gather.pop(worker) }),
+            (0..self.gather.workers()).map(|worker| {
+                let (batch, flushed) = unsafe { self.gather.pop(worker) };
+                if flushed {
+                    self.flush_count += 1;
+                }
+                batch
+            }),
             &None,
             &None,
-        )
+        );
+
+        if self.flush_count == Runtime::num_workers() {
+            self.flush_count = 0;
+            self.flush_complete = true;
+        }
+
+        result
     }
 }
 
@@ -366,7 +487,7 @@ impl<T: Batch> EmptyGatherConsumer<T> {
 
 impl<T: Batch + 'static> Operator for EmptyGatherConsumer<T> {
     fn name(&self) -> Cow<'static, str> {
-        Cow::Borrowed("GatherConsumer")
+        Cow::Borrowed("EmptyGatherConsumer")
     }
 
     fn location(&self) -> OperatorLocation {
@@ -382,7 +503,6 @@ impl<T> SourceOperator<T> for EmptyGatherConsumer<T>
 where
     T: Batch<Time = ()> + 'static,
 {
-    #[trace]
     async fn eval(&mut self) -> T {
         T::dyn_empty(&self.factories)
     }

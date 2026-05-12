@@ -1,5 +1,5 @@
-import os
-from typing import Optional, Any, Mapping
+from typing import Any, Mapping, Optional
+
 from feldera.enums import FaultToleranceModel
 
 
@@ -70,6 +70,7 @@ class RuntimeConfig:
     def __init__(
         self,
         workers: Optional[int] = None,
+        hosts: Optional[int] = None,
         storage: Optional[Storage | bool] = None,
         tracing: Optional[bool] = False,
         tracing_endpoint_jaeger: Optional[str] = "",
@@ -79,11 +80,14 @@ class RuntimeConfig:
         clock_resolution_usecs: Optional[int] = None,
         provisioning_timeout_secs: Optional[int] = None,
         resources: Optional[Resources] = None,
-        runtime_version: Optional[str] = None,
         fault_tolerance_model: Optional[FaultToleranceModel] = None,
         checkpoint_interval_secs: Optional[int] = None,
+        dev_tweaks: Optional[dict] = None,
+        env: Optional[dict[str, str]] = None,
+        logging: Optional[str] = None,
     ):
         self.workers = workers
+        self.hosts = hosts
         self.tracing = tracing
         self.tracing_endpoint_jaeger = tracing_endpoint_jaeger
         self.cpu_profiler = cpu_profiler
@@ -91,9 +95,6 @@ class RuntimeConfig:
         self.min_batch_size_records = min_batch_size_records
         self.clock_resolution_usecs = clock_resolution_usecs
         self.provisioning_timeout_secs = provisioning_timeout_secs
-        self.runtime_version = runtime_version or os.environ.get(
-            "FELDERA_RUNTIME_VERSION"
-        )
         if fault_tolerance_model is not None:
             self.fault_tolerance = {
                 "model": str(fault_tolerance_model),
@@ -101,10 +102,16 @@ class RuntimeConfig:
             }
         if resources is not None:
             self.resources = resources.__dict__
-        if isinstance(storage, bool):
-            self.storage = storage
-        if isinstance(storage, Storage):
-            self.storage = storage.__dict__
+        if storage is not None:
+            if isinstance(storage, bool):
+                self.storage = storage
+            elif isinstance(storage, Storage):
+                self.storage = storage.__dict__
+            else:
+                raise ValueError(f"Unknown value '{storage}' for storage")
+        self.dev_tweaks = dev_tweaks
+        self.env = env
+        self.logging = logging
 
     @staticmethod
     def default() -> "RuntimeConfig":
@@ -119,3 +126,6 @@ class RuntimeConfig:
         conf = cls()
         conf.__dict__ = d
         return conf
+
+    def to_dict(self) -> dict:
+        return dict((k, v) for k, v in self.__dict__.items() if v is not None)

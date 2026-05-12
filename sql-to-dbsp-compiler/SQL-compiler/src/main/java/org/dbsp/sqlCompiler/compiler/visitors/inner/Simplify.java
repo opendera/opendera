@@ -27,14 +27,15 @@ import org.apache.calcite.util.DateString;
 import org.apache.calcite.util.TimeString;
 import org.apache.calcite.util.TimestampString;
 import org.apache.commons.lang3.StringUtils;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPUnaryOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.intern.InternInner;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.ir.IsIntervalLiteral;
 import org.dbsp.sqlCompiler.ir.IsNumericLiteral;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPApplyMethodExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPBaseTupleExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPBinaryExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPBlockExpression;
@@ -43,11 +44,11 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPCloneExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPDerefExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPFailExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPFieldExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPIfExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPIsNullExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPOpcode;
-import org.dbsp.sqlCompiler.ir.expression.DBSPRawTupleExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPSomeExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPUnaryExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPUnwrapExpression;
@@ -62,7 +63,6 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI8Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPISizeLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLiteral;
-import org.dbsp.sqlCompiler.ir.expression.literal.DBSPNullLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPStringLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimeLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimestampLiteral;
@@ -71,9 +71,12 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU16Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU32Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU64Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU8Literal;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPUSizeLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPVoidLiteral;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.IHasZero;
 import org.dbsp.sqlCompiler.ir.type.IsNumericType;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeAny;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBool;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDate;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDecimal;
@@ -83,6 +86,8 @@ import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeNull;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeString;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTime;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTimestamp;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeUSize;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeArray;
 import org.dbsp.util.Logger;
 import org.dbsp.util.Utilities;
 
@@ -103,10 +108,15 @@ public class Simplify extends ExpressionTranslator {
         super(compiler);
     }
 
+    public static DBSPExpression simplify(DBSPCompiler compiler, DBSPExpression expression) {
+        Simplify simplify = new Simplify(compiler);
+        return simplify.apply(expression).to(DBSPExpression.class);
+    }
+
     @Override
     public void startVisit(IDBSPInnerNode node) {
         super.startVisit(node);
-        Logger.INSTANCE.belowLevel(this, 1)
+        Logger.INSTANCE.belowLevel(this, 3)
                 .append("Starting Simplify on ")
                 .appendSupplier(node::toString)
                 .newline();
@@ -126,17 +136,26 @@ public class Simplify extends ExpressionTranslator {
         DBSPExpression result = source.is_null();
         if (!source.getType().mayBeNull || source.is(DBSPSomeExpression.class))
             result = new DBSPBoolLiteral(false);
-        else if (source.is(DBSPNullLiteral.class))
-            result = new DBSPBoolLiteral(true);
         else if (source.is(DBSPCloneExpression.class))
             result = source.to(DBSPCloneExpression.class).expression.is_null();
+        else if (source.isNone())
+            result = new DBSPBoolLiteral(true);
+        else if (source.is(DBSPIfExpression.class)) {
+            DBSPIfExpression ifExp = source.to(DBSPIfExpression.class);
+            Utilities.enforce(ifExp.negative != null);
+            result = new DBSPIfExpression(
+                    ifExp.getNode(),
+                    ifExp.condition,
+                    ifExp.positive.is_null(),
+                    ifExp.negative.is_null());
+        }
         this.map(expression, result);
     }
 
     @Override
     public void postorder(DBSPUnwrapExpression expression) {
         DBSPExpression source = this.getE(expression.expression);
-        DBSPExpression result = source.unwrapIfNullable();
+        DBSPExpression result = source.unwrap(expression.getNode(), expression.message);
         this.map(expression, result);
     }
 
@@ -167,8 +186,17 @@ public class Simplify extends ExpressionTranslator {
     public void postorder(DBSPCloneExpression expression) {
         DBSPExpression source = this.getE(expression.expression);
         DBSPExpression result = source.applyCloneIfNeeded();
-        if (source.is(DBSPCloneExpression.class)) {
+        if (source.is(DBSPCloneExpression.class) ||
+            source.is(DBSPApplyMethodExpression.class) ||
+            source.is(DBSPApplyExpression.class) ||
+            source.is(DBSPIfExpression.class) ||
+            source.is(DBSPCastExpression.class)
+        ) {
             result = source;
+        }
+        if (source.is(DBSPFailExpression.class)) {
+            result = new DBSPFailExpression(
+                    expression.getNode(), expression.getType(), source.to(DBSPFailExpression.class).message);
         }
         this.map(expression, result);
     }
@@ -178,6 +206,20 @@ public class Simplify extends ExpressionTranslator {
         DBSPExpression source = this.getE(expression.source);
         DBSPType type = expression.getType();
         DBSPExpression result = source.cast(expression.getNode(), type, expression.safe);
+        // (array<T>)(array<unknown>)a -> array<T>.
+        // This should not be necessary, but there is a bug in Calcite somewhere
+        if (source.is(DBSPCastExpression.class)) {
+            if (source.getType().is(DBSPTypeArray.class) && type.is(DBSPTypeArray.class)) {
+                DBSPTypeArray arr = source.getType().to(DBSPTypeArray.class);
+                if (arr.getElementType().is(DBSPTypeAny.class)) {
+                    result = source.to(DBSPCastExpression.class).source
+                            .cast(expression.getNode(), type, expression.safe);
+                }
+            }
+        } else if (source.is(DBSPFailExpression.class)) {
+            result = new DBSPFailExpression(expression.getNode(), expression.getType(),
+                    source.to(DBSPFailExpression.class).message);
+        }
         DBSPLiteral lit = source.as(DBSPLiteral.class);
         if (lit != null) {
             DBSPType litType = lit.getType();
@@ -210,9 +252,9 @@ public class Simplify extends ExpressionTranslator {
                         LocalDate.parse(str.value, dateFormatter); // executed for exception
                         result = new DBSPDateLiteral(lit.getNode(), type, new DateString(str.value));
                     } catch (DateTimeParseException ex) {
-                        this.compiler.reportWarning(expression.getSourcePosition(), "Not a DATE",
-                                " String " + Utilities.singleQuote(str.value) +
-                                        " cannot be interpreted as a date");
+                        this.compiler.reportWarning(expression.getSourcePosition(), "Suspicious argument",
+                                "String " + Utilities.singleQuote(str.value) +
+                                        " cannot be interpreted as a DATE");
                     }
                 } else if (type.is(DBSPTypeTime.class)) {
                     try {
@@ -226,7 +268,6 @@ public class Simplify extends ExpressionTranslator {
                 } else if (type.is(DBSPTypeTimestamp.class)) {
                     try {
                         TimestampString ts = new TimestampString(str.value);
-                        ts = Utilities.roundMillis(ts);
                         result = new DBSPTimestampLiteral(lit.getNode(), type, ts);
                     } catch (DateTimeParseException | IllegalArgumentException ex) {
                         this.compiler.reportWarning(expression.getSourcePosition(), "Not a TIMESTAMP",
@@ -247,16 +288,20 @@ public class Simplify extends ExpressionTranslator {
                 } else if (type.is(DBSPTypeString.class)) {
                     DBSPTypeString typeString = type.to(DBSPTypeString.class);
                     if (typeString.precision == DBSPTypeString.UNLIMITED_PRECISION) {
-                        String value = Utilities.trimRight(str.value);
-                        result = new DBSPStringLiteral(value, str.charset, type);
+                        result = new DBSPStringLiteral(str.value, str.charset, type);
                     } else {
-                        String value;
-                        if (!typeString.fixed) {
-                            value = Utilities.trimRight(str.value);
-                        } else if (str.value.length() < typeString.precision) {
-                            value = StringUtils.rightPad(str.value, typeString.precision);
+                        String value = str.value;
+                        if (typeString.fixed) {
+                            if (str.value.length() < typeString.precision) {
+                                value = StringUtils.rightPad(str.value, typeString.precision);
+                            } else {
+                                value = str.value.substring(0, typeString.precision);
+                            }
                         } else {
-                            value = str.value.substring(0, typeString.precision);
+                            // Not fixed, but limited precision; truncate if necessary
+                            if (str.value.length() > typeString.precision) {
+                                value = str.value.substring(0, typeString.precision);
+                            }
                         }
                         result = new DBSPStringLiteral(expression.getNode(), type, value, str.charset);
                     }
@@ -371,6 +416,10 @@ public class Simplify extends ExpressionTranslator {
                     if (!i.isNull()) {
                         result = new DBSPISizeLiteral(source.getNode(), type, i.value.longValue());
                     }
+                } else if (type.is(DBSPTypeUSize.class)) {
+                    if (!i.isNull() && i.value >= 0) {
+                        result = new DBSPUSizeLiteral(source.getNode(), type, i.value.longValue());
+                    }
                 }
             } else if (lit.is(DBSPDecimalLiteral.class)) {
                 DBSPDecimalLiteral dec = lit.to(DBSPDecimalLiteral.class);
@@ -400,20 +449,33 @@ public class Simplify extends ExpressionTranslator {
         DBSPExpression result = source.field(expression.fieldNo);
         if (source.is(DBSPBaseTupleExpression.class)) {
             result = source.to(DBSPBaseTupleExpression.class).get(expression.fieldNo);
+            if (source.getType().mayBeNull && !result.getType().mayBeNull)
+                result = result.some();
         } if (source.is(DBSPBlockExpression.class)) {
             DBSPBlockExpression block = source.to(DBSPBlockExpression.class);
             Utilities.enforce(block.lastExpression != null);
             result = new DBSPBlockExpression(block.contents,
-                    block.lastExpression.field(expression.fieldNo).simplify());
+                    block.lastExpression.field(expression.fieldNo));
         } else if (source.is(DBSPIfExpression.class)) {
             DBSPIfExpression conditional = source.to(DBSPIfExpression.class);
+            DBSPExpression negative = conditional.negative != null ? conditional.negative.field(expression.fieldNo) : null;
             result = new DBSPIfExpression(source.getNode(), conditional.condition,
-                    conditional.positive.field(expression.fieldNo),
-                    conditional.negative != null ? conditional.negative.field(expression.fieldNo) : null);
+                    conditional.positive.field(expression.fieldNo), negative);
         } else if (source.is(DBSPCloneExpression.class)) {
             result = new DBSPFieldExpression(expression.getNode(),
                     source.to(DBSPCloneExpression.class).expression,
                     expression.fieldNo);
+        } else if (source.is(DBSPSomeExpression.class)) {
+            // Some(Tup(x, y)).1 -> y or Some(y)
+            DBSPSomeExpression some = source.to(DBSPSomeExpression.class);
+            if (some.expression.is(DBSPBaseTupleExpression.class)) {
+                result = some.expression.to(DBSPBaseTupleExpression.class).get(expression.fieldNo);
+                if (!result.getType().mayBeNull)
+                    result = result.some();
+            }
+        } else if (source.is(DBSPFailExpression.class)) {
+            result = new DBSPFailExpression(expression.getNode(), expression.getType(),
+                    source.to(DBSPFailExpression.class).message);
         }
         this.map(expression, result);
     }
@@ -424,6 +486,10 @@ public class Simplify extends ExpressionTranslator {
         DBSPExpression result = source.deref();
         if (source.is(DBSPBorrowExpression.class))
             result = source.to(DBSPBorrowExpression.class).expression;
+        else if (source.is(DBSPFailExpression.class)) {
+            result = new DBSPFailExpression(expression.getNode(), expression.getType(),
+                    source.to(DBSPFailExpression.class).message);
+        }
         this.map(expression, result);
     }
 
@@ -433,6 +499,9 @@ public class Simplify extends ExpressionTranslator {
         DBSPExpression result = source.borrow(expression.mut);
         if (source.is(DBSPDerefExpression.class)) {
             result = source.to(DBSPDerefExpression.class).expression;
+        } else if (source.is(DBSPFailExpression.class)) {
+            result = new DBSPFailExpression(expression.getNode(), expression.getType(),
+                    source.to(DBSPFailExpression.class).message);
         }
         this.map(expression, result);
     }
@@ -451,7 +520,7 @@ public class Simplify extends ExpressionTranslator {
                 } else {
                     result = negative;
                     if (result == null)
-                        result = new DBSPRawTupleExpression();
+                        result = new DBSPVoidLiteral();
                 }
             }
         } else if (negative != null &&
@@ -459,6 +528,22 @@ public class Simplify extends ExpressionTranslator {
                 negative.isCompileTimeConstant() &&
                 positive.equivalent(negative)) {
             result = positive;
+        } else if (negative != null &&
+                // if (condition) then { true } else { false } == condition
+                positive.getType().sameType(condition.getType()) &&
+                positive.is(DBSPBoolLiteral.class) &&
+                positive.to(DBSPBoolLiteral.class).hasValue(true) &&
+                negative.is(DBSPBoolLiteral.class) &&
+                negative.to(DBSPBoolLiteral.class).hasValue(false)) {
+            result = condition;
+        } else if (negative != null &&
+                // if (condition) then { false } else { true } == !condition
+                positive.getType().sameType(condition.getType()) &&
+                positive.is(DBSPBoolLiteral.class) &&
+                positive.to(DBSPBoolLiteral.class).hasValue(false) &&
+                negative.is(DBSPBoolLiteral.class) &&
+                negative.to(DBSPBoolLiteral.class).hasValue(true)) {
+            result = condition.not();
         } else if (condition != expression.condition ||
                 positive != expression.positive ||
                 negative != expression.negative) {
@@ -467,12 +552,31 @@ public class Simplify extends ExpressionTranslator {
         this.map(expression, result);
     }
 
+    // Push a unary expression in both branches of a conditional
+    private DBSPExpression pushIntoConditional(
+            DBSPExpression newSource, DBSPUnaryExpression originalExpression, DBSPExpression currentResult) {
+        if (newSource.is(DBSPIfExpression.class)) {
+            DBSPIfExpression ifExp = newSource.to(DBSPIfExpression.class);
+            Utilities.enforce(ifExp.negative != null);
+            return new DBSPIfExpression(
+                    ifExp.getNode(),
+                    ifExp.condition,
+                    originalExpression.replaceSource(ifExp.positive),
+                    originalExpression.replaceSource(ifExp.negative));
+        }
+        return currentResult;
+    }
+
+    @SuppressWarnings("ReplaceNullCheck")
     @Override
     public void postorder(DBSPUnaryExpression expression) {
         DBSPExpression source = this.getE(expression.source);
         DBSPExpression result = new DBSPUnaryExpression(
                 expression.getNode(), expression.type, expression.opcode, source);
-        if (expression.opcode == DBSPOpcode.NEG) {
+        if (source.is(DBSPFailExpression.class)) {
+            result = new DBSPFailExpression(expression.getNode(), expression.getType(),
+                    source.to(DBSPFailExpression.class).message);
+        } else if (expression.opcode == DBSPOpcode.NEG) {
             if (source.is(DBSPLiteral.class)) {
                 DBSPLiteral lit = source.to(DBSPLiteral.class);
                 if (lit.is(IsNumericLiteral.class)) {
@@ -482,6 +586,8 @@ public class Simplify extends ExpressionTranslator {
                         // leave unchanged
                     }
                 }
+            } else {
+                result = this.pushIntoConditional(source, expression, result);
             }
         } else if (expression.opcode == DBSPOpcode.WRAP_BOOL) {
             // wrap_bool(cast_to_bn_b(expression)) => expression
@@ -491,6 +597,12 @@ public class Simplify extends ExpressionTranslator {
                     !cast.source.getType().mayBeNull) {
                     result = cast.source;
                 }
+            } else if (source.is(DBSPBoolLiteral.class)) {
+                DBSPBoolLiteral b = source.to(DBSPBoolLiteral.class);
+                boolean r = b.value != null && b.value;
+                result = new DBSPBoolLiteral(expression.getNode(), expression.getType(), r);
+            } else {
+                result = this.pushIntoConditional(source, expression, result);
             }
         } else if (expression.opcode == DBSPOpcode.NOT) {
             if (source.is(DBSPBoolLiteral.class)) {
@@ -499,15 +611,65 @@ public class Simplify extends ExpressionTranslator {
                     result = b;
                 else
                     result = new DBSPBoolLiteral(expression.getNode(), expression.getType(), !b.value);
-            } else if (source.is(DBSPUnaryOperator.class)) {
+            } else if (source.is(DBSPUnaryExpression.class)) {
                 // !!e = e, true in ternary logic too
                 DBSPUnaryExpression unarySource = source.to(DBSPUnaryExpression.class);
                 if (unarySource.opcode == DBSPOpcode.NOT) {
                     result = unarySource.source;
                 }
+            } else {
+                result = this.pushIntoConditional(source, expression, result);
+            }
+        } else if (expression.opcode == DBSPOpcode.IS_FALSE) {
+            if (source.is(DBSPBoolLiteral.class)) {
+                DBSPBoolLiteral b = source.to(DBSPBoolLiteral.class);
+                boolean r;
+                if (b.value == null)
+                    r = false;
+                else
+                    r = !b.value;
+                result = new DBSPBoolLiteral(expression.getNode(), expression.getType(), r);
+            } else {
+                result = this.pushIntoConditional(source, expression, result);
+            }
+        } else if (expression.opcode == DBSPOpcode.IS_TRUE) {
+            if (source.is(DBSPBoolLiteral.class)) {
+                DBSPBoolLiteral b = source.to(DBSPBoolLiteral.class);
+                boolean r;
+                if (b.value == null)
+                    r = false;
+                else
+                    r = b.value;
+                result = new DBSPBoolLiteral(expression.getNode(), expression.getType(), r);
+            } else {
+                result = this.pushIntoConditional(source, expression, result);
+            }
+        } else if (expression.opcode == DBSPOpcode.IS_NOT_FALSE) {
+            if (source.is(DBSPBoolLiteral.class)) {
+                DBSPBoolLiteral b = source.to(DBSPBoolLiteral.class);
+                boolean r;
+                if (b.value == null)
+                    r = true;
+                else
+                    r = !b.value;
+                result = new DBSPBoolLiteral(expression.getNode(), expression.getType(), r);
+            } else {
+                result = this.pushIntoConditional(source, expression, result);
+            }
+        } else if (expression.opcode == DBSPOpcode.IS_NOT_TRUE) {
+            if (source.is(DBSPBoolLiteral.class)) {
+                DBSPBoolLiteral b = source.to(DBSPBoolLiteral.class);
+                boolean r;
+                if (b.value == null)
+                    r = true;
+                else
+                    r = b.value;
+                result = new DBSPBoolLiteral(expression.getNode(), expression.getType(), r);
+            } else {
+                result = this.pushIntoConditional(source, expression, result);
             }
         }
-        this.map(expression, result.cast(expression.getNode(), expression.getType(), false));
+        this.map(expression, result.cast(expression.getNode(), expression.getType(), DBSPCastExpression.CastType.SqlUnsafe));
     }
 
     @Override
@@ -525,7 +687,7 @@ public class Simplify extends ExpressionTranslator {
         if (opcode == DBSPOpcode.MAP_INDEX ||
                 opcode == DBSPOpcode.SQL_INDEX ||
                 opcode == DBSPOpcode.RUST_INDEX) {
-            if (expression.left.is(DBSPCloneExpression.class)) {
+            if (left.is(DBSPCloneExpression.class)) {
                 result = new DBSPBinaryExpression(
                         expression.getNode(), expression.type, expression.opcode,
                         left.to(DBSPCloneExpression.class).expression, right);
@@ -551,6 +713,13 @@ public class Simplify extends ExpressionTranslator {
                             result = right;
                         }
                     }
+                } else if (left instanceof DBSPUnaryExpression unaryLeft &&
+                        right instanceof DBSPUnaryExpression unaryRight &&
+                        unaryLeft.opcode == DBSPOpcode.WRAP_BOOL &&
+                        unaryRight.opcode == DBSPOpcode.WRAP_BOOL) {
+                    // (bool) a && (bool) b => (bool)(a && b)
+                    result = new DBSPBinaryExpression(expression.getNode(), unaryLeft.source.getType(),
+                            DBSPOpcode.AND, unaryLeft.source, unaryRight.source).wrapBoolIfNeeded();
                 }
             } else if (opcode == DBSPOpcode.OR) {
                 if (left.is(DBSPBoolLiteral.class)) {
@@ -572,7 +741,7 @@ public class Simplify extends ExpressionTranslator {
                         }
                     }
                 }
-            } else if (opcode == DBSPOpcode.ADD || opcode == DBSPOpcode.TS_ADD) {
+            } else if (opcode == DBSPOpcode.ADD) {
                 if (left.is(DBSPLiteral.class)) {
                     DBSPLiteral leftLit = left.to(DBSPLiteral.class);
                     IHasZero iLeftType = leftType.as(IHasZero.class);
@@ -600,7 +769,7 @@ public class Simplify extends ExpressionTranslator {
                         }
                     }
                 }
-            } else if (opcode == DBSPOpcode.SUB || opcode == DBSPOpcode.TS_SUB) {
+            } else if (opcode == DBSPOpcode.SUB) {
                 if (left.is(DBSPLiteral.class)) {
                     DBSPLiteral leftLit = left.to(DBSPLiteral.class);
                     if (leftLit.isNull()) {
@@ -623,13 +792,13 @@ public class Simplify extends ExpressionTranslator {
                         }
                     }
                 }
-            }  else if (opcode == DBSPOpcode.MUL || opcode == DBSPOpcode.INTERVAL_MUL) {
+            }  else if (opcode == DBSPOpcode.MUL || opcode == DBSPOpcode.MUL_INTERVAL) {
                 if (left.is(DBSPLiteral.class) && leftType.is(IsNumericType.class)) {
                     DBSPLiteral leftLit = left.to(DBSPLiteral.class);
                     IsNumericType iLeftType = leftType.to(IsNumericType.class);
                     if (iLeftType.isOne(leftLit)) {
                         // This works even for null
-                        result = right.cast(expression.getNode(), expression.getType(), false);
+                        result = right.cast(expression.getNode(), expression.getType(), DBSPCastExpression.CastType.SqlUnsafe);
                     } else if (iLeftType.isZero(leftLit) && !rightMayBeNull) {
                         // This is not true for null values
                         result = left;
@@ -661,7 +830,7 @@ public class Simplify extends ExpressionTranslator {
                                 .to(DBSPExpression.class);
                     }
                 }
-            } else if (opcode == DBSPOpcode.DIV || opcode == DBSPOpcode.INTERVAL_DIV) {
+            } else if (opcode == DBSPOpcode.DIV || opcode == DBSPOpcode.DIV_INTERVAL) {
                 if (right.is(DBSPLiteral.class)) {
                     DBSPLiteral rightLit = right.to(DBSPLiteral.class);
                     IsNumericType iRightType = rightType.to(IsNumericType.class);
@@ -690,10 +859,69 @@ public class Simplify extends ExpressionTranslator {
                         );
                     }
                 }
+            } else if (opcode == DBSPOpcode.EQ || opcode == DBSPOpcode.NEQ) {
+                if (left.is(DBSPLiteral.class) && right.is(DBSPLiteral.class) && leftType.sameType(rightType)) {
+                    DBSPLiteral rightLit = right.to(DBSPLiteral.class);
+                    DBSPLiteral leftLit = left.to(DBSPLiteral.class);
+                    if (leftLit.isNull() || rightLit.isNull()) {
+                        Utilities.enforce(expression.type.mayBeNull);
+                        result = expression.type.none();
+                    } else {
+                        boolean same = leftLit.sameValue(rightLit);
+                        //noinspection SimplifiableConditionalExpression
+                        result = new DBSPBoolLiteral(expression.getNode(), expression.type,
+                                opcode == DBSPOpcode.NEQ ? !same : same);
+                    }
+                }
+            } else if (opcode == DBSPOpcode.GT || opcode == DBSPOpcode.GTE ||
+                    opcode == DBSPOpcode.LTE || opcode == DBSPOpcode.LT) {
+                if (left.is(DBSPLiteral.class) && right.is(DBSPLiteral.class) && leftType.sameType(rightType)) {
+                    DBSPLiteral rightLit = right.to(DBSPLiteral.class);
+                    DBSPLiteral leftLit = left.to(DBSPLiteral.class);
+                    if (leftLit.isNull() || rightLit.isNull()) {
+                        Utilities.enforce(expression.type.mayBeNull);
+                        result = expression.type.none();
+                    } else {
+                        if (leftLit.is(IsNumericLiteral.class)) {
+                            int compare = leftLit.to(IsNumericLiteral.class).compare(rightLit.to(IsNumericLiteral.class));
+                            boolean r = switch (opcode) {
+                                case GT -> compare > 0;
+                                case LT -> compare < 0;
+                                case GTE -> compare >= 0;
+                                case LTE -> compare <= 0;
+                                default -> throw new InternalCompilerError("Unexpected comparison " + opcode);
+                            };
+                            result = new DBSPBoolLiteral(expression.getNode(), expression.type, r);
+                        }
+                    }
+                }
+            } else if (opcode == DBSPOpcode.IS_DISTINCT) {
+                if (left.is(DBSPLiteral.class) && right.is(DBSPLiteral.class) && leftType.sameType(rightType)) {
+                    DBSPLiteral rightLit = right.to(DBSPLiteral.class);
+                    DBSPLiteral leftLit = left.to(DBSPLiteral.class);
+                    boolean same = leftLit.sameValue(rightLit);
+                    result = new DBSPBoolLiteral(expression.getNode(), expression.type, !same);
+                }
             }
         } catch (ArithmeticException unused) {
             // ignore, defer to runtime
         }
-        this.map(expression, result.cast(expression.getNode(), expression.getType(), false));
+        this.map(expression, result.cast(expression.getNode(), expression.getType(), DBSPCastExpression.CastType.SqlUnsafe));
+    }
+
+    @Override
+    protected void map(DBSPExpression expression, DBSPExpression result) {
+        if (!expression.sameFields(result)) {
+            Logger.INSTANCE.belowLevel(this, 1)
+                    .append("Simplified ")
+                    .appendSupplier(expression::toString)
+                    .append(" to ")
+                    .appendSupplier(result::toString)
+                    .newline();
+        }
+        Utilities.enforce(expression.getType().sameType(result.getType()),
+                () -> "Expression with type " + expression.getType() + " has type " + result.getType() +
+                        " after simplification");
+        super.map(expression, result);
     }
 }

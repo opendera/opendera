@@ -7,34 +7,36 @@ use std::hash::Hasher;
 use std::num::NonZeroU32;
 use std::ops::{Range, RangeInclusive};
 use std::sync::{Arc, LazyLock};
-use std::thread::Thread;
+use std::thread;
 use std::time::Duration as StdDuration;
 
-use anyhow::{anyhow, bail, Result as AnyResult};
+use anyhow::{Result as AnyResult, anyhow, bail};
 use async_channel::Receiver as AsyncReceiver;
 use chrono::format::{Item, StrftimeItems};
-use chrono::{DateTime, Days, Duration, NaiveDate, NaiveTime, Timelike};
+use chrono::{DateTime, Days, Duration, NaiveDate, NaiveTime, Timelike, Utc};
+use crossbeam::sync::{Parker, Unparker};
+use feldera_fxp::{DynamicDecimal, UniformDecimal, pow10};
 use feldera_types::config::FtModel;
 use governor::clock::DefaultClock;
 use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Jitter, Quota, RateLimiter};
-use num_traits::{clamp, Bounded, ToPrimitive};
+use num_traits::{Bounded, ToPrimitive, clamp};
 use rand::distributions::{Alphanumeric, Uniform};
 use rand::rngs::SmallRng;
-use rand::{thread_rng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, thread_rng};
 use rand_distr::{Distribution, Zipf};
 use range_set::RangeSet;
 use serde::{Deserialize, Serialize};
-use serde_json::{to_writer, Map, Value};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use serde_json::{Map, Value, to_writer};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::{sync::mpsc::UnboundedSender, time::Instant as TokioInstant};
 
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::format::{InputBuffer, Parser};
+use feldera_adapterlib::format::{BufferSize, InputBuffer, Parser, StagedInputBuffer};
 use feldera_adapterlib::transport::{
     InputCommandReceiver, InputConsumer, InputEndpoint, InputReader, InputReaderCommand, Resume,
-    TransportInputEndpoint,
+    TransportInputEndpoint, Watermark, parse_resume_info,
 };
 use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier, SqlType};
 use feldera_types::transport::datagen::{
@@ -83,6 +85,61 @@ fn range_as_f64(
             "Range values must be floating point numbers for field {:?}",
             field.sql_name()
         )),
+    }
+}
+
+fn decimal_max_range(field: &Field) -> AnyResult<(DynamicDecimal, DynamicDecimal)> {
+    let precision = field
+        .columntype
+        .precision
+        .unwrap_or(FELDERA_MAX_DECIMAL_PRECISION as i64) as u32;
+    if precision > FELDERA_MAX_DECIMAL_PRECISION {
+        return Err(anyhow!(
+            "Invalid precision for field {:?}, max precision is {}",
+            field.name,
+            FELDERA_MAX_DECIMAL_PRECISION
+        ));
+    }
+
+    let scale = field.columntype.scale.unwrap_or(0) as u32;
+    if scale > FELDERA_MAX_DECIMAL_SCALE {
+        return Err(anyhow!(
+            "Invalid scale for field {:?}, max scale is {}",
+            field.name,
+            FELDERA_MAX_DECIMAL_SCALE
+        ));
+    }
+    if scale > precision {
+        return Err(anyhow!(
+            "Invalid scale for field {:?}, scale must be less or equal than precision",
+            field.name
+        ));
+    }
+
+    Ok((decimal_min(precision, scale), decimal_max(precision, scale)))
+}
+
+fn range_as_decimal(
+    name: &SqlIdentifier,
+    range: &Option<(Value, Value)>,
+) -> AnyResult<Option<(DynamicDecimal, DynamicDecimal)>> {
+    match range {
+        None => Ok(None),
+        Some((a, b)) => {
+            let a = serde_json::from_value::<DynamicDecimal>(a.clone()).map_err(|_| {
+                anyhow!(
+                    "Invalid range, min is not a valid decimal for field {:?}",
+                    name
+                )
+            })?;
+            let b = serde_json::from_value::<DynamicDecimal>(b.clone()).map_err(|_| {
+                anyhow!(
+                    "Invalid range, max is not a valid decimal for field {:?}",
+                    name
+                )
+            })?;
+            Ok(Some((a, b)))
+        }
     }
 }
 
@@ -291,6 +348,32 @@ fn parse_range_for_datetime(
     }
 }
 
+/// This is our max precision for decimals.
+const FELDERA_MAX_DECIMAL_PRECISION: u32 = 38;
+
+/// This is our max scale for decimals.
+///
+/// Note that in feldera `scale` is the number of digits to the right of the decimal point.
+const FELDERA_MAX_DECIMAL_SCALE: u32 = 38;
+
+/// Given a precision and scale calculate the maximum DynamicDecimal value for it.
+/// For example, the number `3.1415` has a precision of `5` and a scale of `4`.
+fn decimal_max(p: u32, s: u32) -> DynamicDecimal {
+    assert!(p > 0);
+    assert!(p <= FELDERA_MAX_DECIMAL_PRECISION);
+    assert!(s <= FELDERA_MAX_DECIMAL_SCALE);
+    assert!(p >= s);
+
+    // (10^p - 1) / 10^s
+    let nines = pow10(p as usize) - 1;
+    DynamicDecimal::new(nines, s as u8)
+}
+
+/// Given a precision and scale calculate the minimum Decimal value for it.
+fn decimal_min(p: u32, s: u32) -> DynamicDecimal {
+    -decimal_max(p, s)
+}
+
 pub struct GeneratorEndpoint {
     config: DatagenInputConfig,
 }
@@ -313,19 +396,21 @@ impl TransportInputEndpoint for GeneratorEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         schema: Relation,
+        seek: Option<Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(InputGenerator::new(
             consumer,
             parser,
             self.config.clone(),
             schema,
+            seek,
         )?))
     }
 }
 
 struct InputGenerator {
     command_sender: UnboundedSender<InputReaderCommand>,
-    datagen_thread: Thread,
+    datagen_unparker: Unparker,
 }
 
 impl InputGenerator {
@@ -334,6 +419,7 @@ impl InputGenerator {
         parser: Box<dyn Parser>,
         mut config: DatagenInputConfig,
         schema: Relation,
+        seek: Option<Value>,
     ) -> AnyResult<Self> {
         let (command_sender, command_receiver) = unbounded_channel();
 
@@ -357,18 +443,29 @@ impl InputGenerator {
             plan.fields = normalized_plan_names;
         }
 
-        let join_handle = std::thread::spawn(move || {
-            if let Err(error) =
-                Self::datagen_thread(command_receiver, consumer.clone(), parser, config, schema)
-            {
-                consumer.error(true, error);
-            }
-        });
-        let datagen_thread = join_handle.thread().clone();
+        let datagen_parker = Parker::new();
+        let datagen_unparker = datagen_parker.unparker().clone();
+
+        thread::Builder::new()
+            .name("datagen".to_string())
+            .spawn(move || {
+                if let Err(error) = Self::datagen_thread(
+                    command_receiver,
+                    consumer.clone(),
+                    parser,
+                    config,
+                    schema,
+                    seek,
+                    datagen_parker,
+                ) {
+                    consumer.error(true, error, None);
+                }
+            })
+            .expect("failed to spawn datagen thread");
 
         Ok(Self {
             command_sender,
-            datagen_thread,
+            datagen_unparker,
         })
     }
 
@@ -378,6 +475,8 @@ impl InputGenerator {
         parser: Box<dyn Parser>,
         config: DatagenInputConfig,
         schema: Relation,
+        seek: Option<Value>,
+        parker: Parker,
     ) -> AnyResult<()> {
         let rate_limiters = Arc::new(
             config
@@ -393,7 +492,7 @@ impl InputGenerator {
 
         // Generate initial seed.  If we start from a checkpoint, we'll change
         // it to use the seed from that checkpoint.
-        let mut seed = config.seed.unwrap_or(thread_rng().gen());
+        let mut seed = config.seed.unwrap_or(thread_rng().r#gen());
 
         // Long-running tasks with high CPU usage don't work well on cooperative runtimes,
         // so we use a separate blocking task if we think this will happen for our workload.
@@ -414,6 +513,7 @@ impl InputGenerator {
             let consumer = consumer.clone();
             let parser = parser.fork();
             let rate_limiters = rate_limiters.clone();
+            let hash_enabled = consumer.hasher().is_some();
 
             let task = Self::worker_thread(
                 work_receiver,
@@ -423,12 +523,16 @@ impl InputGenerator {
                 consumer,
                 parser,
                 rate_limiters,
-                std::thread::current(),
+                parker.unparker().clone(),
+                hash_enabled,
             );
             if needs_blocking_tasks {
-                std::thread::spawn(move || {
-                    TOKIO.block_on(task);
-                });
+                thread::Builder::new()
+                    .name("datagen-tokio-wrapper".to_string())
+                    .spawn(move || {
+                        TOKIO.block_on(task);
+                    })
+                    .expect("failed to spawn datagen tokio wrapper thread");
             } else {
                 TOKIO.spawn(task);
             }
@@ -439,7 +543,8 @@ impl InputGenerator {
         let mut command_receiver = InputCommandReceiver::<RawMetadata, ()>::new(command_receiver);
 
         // Tracks work that needs to be sent to a worker for execution.
-        let mut unassigned = if let Some(metadata) = command_receiver.blocking_recv_seek()? {
+        let mut unassigned = if let Some(metadata) = seek {
+            let metadata = parse_resume_info::<RawMetadata>(&metadata)?;
             seed = metadata.seed;
             range_sets_from_vecs(metadata.todo)
         } else {
@@ -462,7 +567,6 @@ impl InputGenerator {
             seed = metadata.seed;
             let mut rows = metadata.rows;
             unassigned = metadata.todo;
-            let mut num_records = 0;
             let mut hasher = Xxh3Default::new();
 
             fn complete_replay(
@@ -470,79 +574,102 @@ impl InputGenerator {
                 in_flight: &mut [RowRangeSet],
                 consumer: &dyn InputConsumer,
                 hasher: &mut Xxh3Default,
-            ) {
+            ) -> BufferSize {
                 let Completion {
                     batch,
                     mut buffer,
-                    num_bytes,
+                    hash_data,
+                    timestamp: _timestamp,
                 } = completion;
                 in_flight[batch.plan_idx].remove_range(batch.rows.start..=batch.rows.end - 1);
-                consumer.buffered(buffer.len(), num_bytes);
-                buffer.hash(hasher);
+                let size = buffer.len();
+                consumer.buffered(size);
+                hasher.write(&hash_data);
                 buffer.flush();
+                size
             }
 
+            let mut total = BufferSize::empty();
             while let Some(work) = assign_work(&mut rows, &mut in_flight, &config, seed, false) {
-                num_records += work.batch.rows.len();
                 let _ = work_sender.send_blocking(work);
                 while let Ok(completion) = completion_receiver.try_recv() {
-                    complete_replay(completion, &mut in_flight, &*consumer, &mut hasher);
+                    total += complete_replay(completion, &mut in_flight, &*consumer, &mut hasher);
                 }
             }
             while !in_flight.iter().all(|set| set.is_empty()) {
                 let Some(completion) = completion_receiver.blocking_recv() else {
                     unreachable!()
                 };
-                complete_replay(completion, &mut in_flight, &*consumer, &mut hasher);
+                total += complete_replay(completion, &mut in_flight, &*consumer, &mut hasher);
             }
-            consumer.replayed(num_records, hasher.finish());
+            consumer.replayed(total, hasher.finish());
         }
 
         let mut running = false;
         let mut eoi = false;
         let mut completed = VecDeque::new();
+        let mut transaction_size = 0;
         loop {
             match command_receiver.try_recv()? {
-                Some(command @ InputReaderCommand::Seek(_))
-                | Some(command @ InputReaderCommand::Replay { .. }) => {
+                Some(command @ InputReaderCommand::Replay { .. }) => {
                     unreachable!("{command:?} must be at the beginning of the command stream")
                 }
                 Some(InputReaderCommand::Extend) => running = true,
                 Some(InputReaderCommand::Pause) => running = false,
                 Some(InputReaderCommand::Queue { .. }) => {
-                    let mut num_records = 0;
+                    let mut total = BufferSize::empty();
                     let mut hasher = consumer.hasher();
                     let n = consumer.max_batch_size();
                     let mut consumed = vec![RowRangeSet::new(); config.plan.len()];
-                    while num_records < n {
+                    let mut watermarks = Vec::new();
+
+                    // Did we start a transaction for this particular `Queue`
+                    // command?  (We will not both start and commit a
+                    // transaction for a single `Queue` command, because one
+                    // goal of supporting transactions for datagen is to test
+                    // the transactions mechanism, which degenerates into a
+                    // no-op if we do both without another step in between.)
+                    let mut started_transaction = false;
+
+                    while total.records < n {
                         let Some(Completion {
                             batch: Batch { plan_idx, rows },
                             mut buffer,
-                            num_bytes: _,
+                            hash_data,
+                            timestamp,
                         }) = completed.pop_front()
                         else {
                             break;
                         };
-                        let mut taken = buffer.take_some(n - num_records);
-                        let flushed = taken.len();
-                        if flushed > 0 {
-                            num_records += flushed;
-                            if let Some(hasher) = hasher.as_mut() {
-                                taken.hash(hasher);
-                            }
-                            consumed[plan_idx].insert_range(rows.start..=rows.start + flushed - 1);
-                            taken.flush();
-                        }
-                        if !buffer.is_empty() {
+                        let flushed = buffer.len();
+                        if total.records > 0 && total.records + flushed.records > n {
                             completed.push_front(Completion {
-                                batch: Batch {
-                                    plan_idx,
-                                    rows: rows.start + flushed..rows.end,
-                                },
+                                batch: Batch { plan_idx, rows },
                                 buffer,
-                                num_bytes: 0,
+                                hash_data,
+                                timestamp,
                             });
                             break;
+                        }
+                        watermarks.push(Watermark::new(timestamp, None));
+
+                        if flushed.records > 0 {
+                            if let Some(goal) = config.transaction_size
+                                && goal > 0
+                            {
+                                if transaction_size == 0 {
+                                    consumer.start_transaction(None);
+                                    started_transaction = true;
+                                }
+                                transaction_size += flushed.records;
+                            }
+
+                            total += flushed;
+                            if let Some(hasher) = hasher.as_mut() {
+                                hasher.write(&hash_data);
+                            }
+                            consumed[plan_idx].insert_range(rows.start..=rows.end - 1);
+                            buffer.flush();
                         }
                     }
                     let mut metadata_todo = unassigned.clone();
@@ -562,9 +689,19 @@ impl InputGenerator {
                         seed,
                     }
                     .into();
-                    let resume =
-                        Resume::new_metadata_only(serde_json::to_value(metadata).unwrap(), hasher);
-                    consumer.extended(num_records, Some(resume));
+                    let resume = Resume::new_metadata_only(
+                        serde_json::to_value(metadata).unwrap(),
+                        hasher.map(|h| h.finish()),
+                    );
+                    if !started_transaction
+                        && let Some(goal) = config.transaction_size
+                        && goal > 0
+                        && transaction_size >= goal
+                    {
+                        consumer.commit_transaction();
+                        transaction_size = 0;
+                    }
+                    consumer.extended(total, Some(resume), watermarks);
                 }
                 Some(InputReaderCommand::Disconnect) => break,
                 None => (),
@@ -573,7 +710,7 @@ impl InputGenerator {
             while let Ok(completion) = completion_receiver.try_recv() {
                 let batch = &completion.batch;
                 in_flight[batch.plan_idx].remove_range(batch.rows.start..=batch.rows.end - 1);
-                consumer.buffered(completion.buffer.len(), completion.num_bytes);
+                consumer.buffered(completion.buffer.len());
                 completed.push_back(completion);
             }
 
@@ -583,12 +720,16 @@ impl InputGenerator {
                 {
                     let _ = work_sender.send_blocking(work);
                 } else if in_flight.iter().all(|set| set.is_empty()) {
+                    if transaction_size > 0 {
+                        consumer.commit_transaction();
+                        transaction_size = 0;
+                    }
                     eoi = true;
                     running = false;
                     consumer.eoi();
                 }
             } else {
-                std::thread::park();
+                parker.park();
             }
         }
 
@@ -604,16 +745,18 @@ impl InputGenerator {
         consumer: Box<dyn InputConsumer>,
         mut parser: Box<dyn Parser>,
         rate_limiters: Arc<Vec<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>>,
-        datagen_thread: Thread,
+        datagen_unparker: Unparker,
+        hash_enabled: bool,
     ) {
         let mut buffer = Vec::new();
         let mut buffer_start = 0;
         static START_ARR: &[u8; 1] = b"[";
         static END_ARR: &[u8; 1] = b"]";
         static REC_DELIM: &[u8; 1] = b",";
+        let max_batch_size = consumer.max_batch_size();
 
         while let Ok(work) = work_receiver.recv().await {
-            datagen_thread.unpark();
+            datagen_unparker.unpark();
 
             let Work {
                 batch: Batch { plan_idx, rows },
@@ -621,13 +764,17 @@ impl InputGenerator {
                 seed,
             } = work;
             let plan = &config.plan[plan_idx];
-            let batch_size: usize = min(plan.rate.unwrap_or(u32::MAX) as usize, 10_000);
+            let batch_size: usize = min(
+                min(plan.rate.unwrap_or(u32::MAX) as usize, 10_000),
+                max_batch_size,
+            );
             let schema = schema.clone();
             let mut generator = RecordGenerator::new(seed, plan, &schema);
 
             // Count how long we took to so far to create a batch
             // If we end up taking too long we send a batch earlier even if we don't reach `batch_size`
-            const BATCH_CREATION_TIMEOUT: StdDuration = StdDuration::from_secs(1);
+            // The batches are sent twice as often as we are polling for pipeline telemetry (1000 ms) to avoid a jagged throughput graph
+            const BATCH_CREATION_TIMEOUT: StdDuration = StdDuration::from_millis(500);
             let mut batch_creation_duration = TokioInstant::now();
 
             // Number of generated records.
@@ -651,24 +798,28 @@ impl InputGenerator {
                             || batch_creation_duration.elapsed() > BATCH_CREATION_TIMEOUT
                         {
                             buffer.extend(END_ARR);
-                            let num_bytes = buffer.len();
-                            let (buffer, errors) = parser.parse(&buffer);
+
+                            let timestamp = Utc::now();
+                            let (parsed, errors) = parser.parse(&buffer, None);
                             consumer.parse_errors(errors);
+                            let (buffer, hash_data) =
+                                stage_and_hash_buffer(&*parser, parsed, hash_enabled);
                             let _ = completion_sender.send(Completion {
                                 batch: Batch {
                                     plan_idx,
                                     rows: buffer_start..idx + 1,
                                 },
                                 buffer,
-                                num_bytes,
+                                hash_data,
+                                timestamp,
                             });
-                            datagen_thread.unpark();
+                            datagen_unparker.unpark();
                             n_records = 0;
                             batch_creation_duration = TokioInstant::now();
                         }
                     }
                     Err(e) => {
-                        consumer.error(true, e);
+                        consumer.error(true, e, None);
                         return;
                     }
                 }
@@ -681,18 +832,21 @@ impl InputGenerator {
             }
             if n_records > 0 {
                 buffer.extend(END_ARR);
-                let num_bytes = buffer.len();
-                let (buffer, errors) = parser.parse(&buffer);
+                let timestamp = Utc::now();
+
+                let (parsed, errors) = parser.parse(&buffer, None);
                 consumer.parse_errors(errors);
+                let (buffer, hash_data) = stage_and_hash_buffer(&*parser, parsed, hash_enabled);
                 let _ = completion_sender.send(Completion {
                     batch: Batch {
                         plan_idx,
                         rows: buffer_start..rows.end,
                     },
                     buffer,
-                    num_bytes,
+                    hash_data,
+                    timestamp,
                 });
-                datagen_thread.unpark();
+                datagen_unparker.unpark();
             }
         }
     }
@@ -707,12 +861,53 @@ struct Work {
 struct Completion {
     batch: Batch,
     buffer: Option<Box<dyn InputBuffer>>,
-    num_bytes: usize,
+    hash_data: Vec<u8>,
+    timestamp: DateTime<Utc>,
 }
 
 struct Batch {
     plan_idx: usize,
     rows: Range<usize>,
+}
+
+#[derive(Default)]
+struct HashBytesRecorder(Vec<u8>);
+
+impl HashBytesRecorder {
+    fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl Hasher for HashBytesRecorder {
+    fn finish(&self) -> u64 {
+        0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+}
+
+fn stage_and_hash_buffer(
+    parser: &dyn Parser,
+    buffer: Option<Box<dyn InputBuffer>>,
+    hash_enabled: bool,
+) -> (Option<Box<dyn InputBuffer>>, Vec<u8>) {
+    let Some(buffer) = buffer else {
+        return (None, Vec::new());
+    };
+
+    let mut hash_data = Vec::new();
+    if hash_enabled {
+        let mut recorder = HashBytesRecorder::default();
+        buffer.hash(&mut recorder);
+        hash_data = recorder.into_inner();
+    }
+
+    let len = buffer.len();
+    let staged = StagedInputBuffer::new(parser.stage(vec![buffer]), len);
+    (Some(Box::new(staged)), hash_data)
 }
 
 type RowRangeSet = RangeSet<[RangeInclusive<usize>; 4]>;
@@ -798,9 +993,13 @@ fn assign_work(
 }
 
 impl InputReader for InputGenerator {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         let _ = self.command_sender.send(command);
-        self.datagen_thread.unpark();
+        self.datagen_unparker.unpark();
     }
 
     fn is_closed(&self) -> bool {
@@ -848,9 +1047,13 @@ impl<'a> RecordGenerator<'a> {
             | SqlType::SmallInt
             | SqlType::Int
             | SqlType::BigInt
+            | SqlType::UTinyInt
+            | SqlType::USmallInt
+            | SqlType::UInt
+            | SqlType::UBigInt
             | SqlType::Real
-            | SqlType::Double
-            | SqlType::Decimal => Value::Number(serde_json::Number::from(0)),
+            | SqlType::Double => Value::Number(serde_json::Number::from(0)),
+            SqlType::Decimal => Value::String("0".to_string()),
             SqlType::Binary | SqlType::Varbinary => Value::Array(Vec::new()),
             SqlType::Char
             | SqlType::Varchar
@@ -913,9 +1116,13 @@ impl<'a> RecordGenerator<'a> {
             SqlType::SmallInt => self.generate_integer::<i16>(field, settings, incr, rng, obj),
             SqlType::Int => self.generate_integer::<i32>(field, settings, incr, rng, obj),
             SqlType::BigInt => self.generate_integer::<i64>(field, settings, incr, rng, obj),
+            SqlType::UTinyInt => self.generate_integer::<u8>(field, settings, incr, rng, obj),
+            SqlType::USmallInt => self.generate_integer::<u16>(field, settings, incr, rng, obj),
+            SqlType::UInt => self.generate_integer::<u32>(field, settings, incr, rng, obj),
+            SqlType::UBigInt => self.generate_integer::<u64>(field, settings, incr, rng, obj),
             SqlType::Real => self.generate_real::<f64>(field, settings, incr, rng, obj),
             SqlType::Double => self.generate_real::<f64>(field, settings, incr, rng, obj),
-            SqlType::Decimal => self.generate_real::<f64>(field, settings, incr, rng, obj),
+            SqlType::Decimal => self.generate_decimal(field, settings, incr, rng, obj),
             SqlType::Binary | SqlType::Varbinary => {
                 let mut field = field.clone();
                 let mut columntype = Box::new(ColumnType::tinyint(false));
@@ -1391,6 +1598,7 @@ impl<'a> RecordGenerator<'a> {
         rng: &mut SmallRng,
         obj: &mut Value,
     ) -> AnyResult<()> {
+        use fake::Dummy;
         use fake::faker::address::raw::*;
         use fake::faker::barcode::raw::*;
         use fake::faker::company::raw::*;
@@ -1404,7 +1612,6 @@ impl<'a> RecordGenerator<'a> {
         use fake::faker::name::raw::*;
         use fake::faker::phone_number::raw::*;
         use fake::locales::*;
-        use fake::Dummy;
 
         if let Value::String(str) = obj {
             str.clear();
@@ -1628,23 +1835,27 @@ impl<'a> RecordGenerator<'a> {
         rng: &mut SmallRng,
         obj: &mut Value,
     ) -> AnyResult<()> {
-        let min = N::min_value().to_i64().unwrap_or(i64::MIN);
+        let min = if field.columntype.scale.is_none() {
+            N::min_value().to_i64().unwrap_or(i64::MIN)
+        } else {
+            u8::MIN as i64
+        };
         let max = if field.columntype.scale.is_none() {
             N::max_value().to_i64().unwrap_or(i64::MAX)
         } else {
-            // We don't have a SQL type for u8 but we need one for the value type of the binary array
-            // so by setting scale on tinyint we currently indicate that we're dealing with a u8
+            // We need this for binary array;
+            // by setting scale on tinyint we currently indicate that we're dealing with a u8
             // rather than an i8
             u8::MAX as i64
         };
         let range = range_as_i64(&field.name, &settings.range)?;
-        if let Some((a, b)) = range {
-            if a > b {
-                return Err(anyhow!(
-                    "Invalid range, min > max for field {:?}",
-                    field.name
-                ));
-            }
+        if let Some((a, b)) = range
+            && a > b
+        {
+            return Err(anyhow!(
+                "Invalid range, min > max for field {:?}",
+                field.name
+            ));
         }
         let scale = settings.scale;
 
@@ -1726,13 +1937,13 @@ impl<'a> RecordGenerator<'a> {
         let max = N::max_value().to_f64().unwrap_or(f64::MAX);
         let range = range_as_f64(&field.name, &settings.range)?;
 
-        if let Some((a, b)) = range {
-            if a > b {
-                return Err(anyhow!(
-                    "Invalid range, min > max for field {:?}",
-                    field.name
-                ));
-            }
+        if let Some((a, b)) = range
+            && a > b
+        {
+            return Err(anyhow!(
+                "Invalid range, min > max for field {:?}",
+                field.name
+            ));
         }
         if let Some(nl) = Self::maybe_null(field, settings, rng) {
             *obj = nl;
@@ -1808,6 +2019,127 @@ impl<'a> RecordGenerator<'a> {
         Ok(())
     }
 
+    fn generate_decimal(
+        &self,
+        field: &Field,
+        settings: &RngFieldSettings,
+        incr: usize,
+        rng: &mut SmallRng,
+        obj: &mut Value,
+    ) -> AnyResult<()> {
+        let (min, max) = decimal_max_range(field)?;
+        let range = range_as_decimal(&field.name, &settings.range)?;
+        if let Some((a, b)) = range
+            && a > b
+        {
+            return Err(anyhow!(
+                "Invalid range, min > max for field {:?}",
+                field.name
+            ));
+        }
+        if let Some(nl) = Self::maybe_null(field, settings, rng) {
+            *obj = nl;
+            return Ok(());
+        }
+        let scale = DynamicDecimal::from(settings.scale);
+        let incr_dec = DynamicDecimal::from(incr);
+
+        match (&settings.strategy, &settings.values, &range) {
+            (DatagenStrategy::Increment, None, None) => {
+                let val = (incr_dec * scale) % max;
+                *obj = Value::String(val.to_string());
+            }
+            (DatagenStrategy::Increment, None, Some((a, b))) => {
+                let range = *b - *a;
+                let val_in_range = (incr_dec * scale) % range;
+                let val = *a + val_in_range;
+                debug_assert!(val >= *a && val < *b);
+                *obj = Value::String(val.to_string());
+            }
+            (DatagenStrategy::Increment, Some(values), _) => {
+                *obj = values[incr % values.len()].clone();
+            }
+            (DatagenStrategy::Uniform, None, None) => {
+                let dist =
+                    UniformDecimal::new(min.significand(), max.significand(), settings.scale as u8);
+                let val = dist.sample(rng);
+                *obj = Value::String(val.to_string());
+            }
+            (DatagenStrategy::Uniform, None, Some((a, b))) => {
+                let dist =
+                    UniformDecimal::new(a.significand(), b.significand(), settings.scale as u8);
+                let val = dist.sample(rng);
+                *obj = Value::String(val.to_string());
+            }
+            (DatagenStrategy::Uniform, Some(values), _) => {
+                let dist = Uniform::from(0..values.len());
+                *obj = values[rng.sample(dist)].clone();
+            }
+            (DatagenStrategy::Zipf, None, None) => {
+                let max_int = u64::try_from(max).map_err(|_| {
+                    anyhow!(
+                        "Unable to convert value to u64 for use with Zipf in field: `{}`",
+                        field.name
+                    )
+                })?;
+                let zipf = Zipf::new(max_int, settings.e as f64).map_err(|e| {
+                    anyhow!(
+                        "Unable to create Zipf distribution for field: `{}`: {}",
+                        field.name,
+                        e
+                    )
+                })?;
+                let val_in_range = rng.sample(zipf) as i64 - 1;
+                *obj = Value::String(val_in_range.to_string());
+            }
+            (DatagenStrategy::Zipf, None, Some((a, b))) => {
+                let range = *b - *a;
+                let range_int = u64::try_from(range).map_err(|_| {
+                    anyhow!(
+                        "Unable to convert value to u64 for use with Zipf in field: `{}`",
+                        field.name
+                    )
+                })?;
+                let zipf = Zipf::new(range_int, settings.e as f64).map_err(|e| {
+                    anyhow!(
+                        "Unable to create Zipf distribution for field: `{}`: {}",
+                        field.name,
+                        e
+                    )
+                })?;
+                let val_in_range = rng.sample(zipf) - 1.0;
+                let val_as_decimal = *a
+                    + DynamicDecimal::try_from(val_in_range).map_err(|_| {
+                        anyhow!(
+                            "Unable to convert value to decimal from Zipf in field: `{}`",
+                            field.name
+                        )
+                    })?;
+                *obj = Value::String(val_as_decimal.to_string());
+            }
+            (DatagenStrategy::Zipf, Some(values), _) => {
+                let zipf = Zipf::new(values.len() as u64, settings.e as f64).map_err(|e| {
+                    anyhow!(
+                        "Unable to create Zipf distribution for field: `{}`: {}",
+                        field.name,
+                        e
+                    )
+                })?;
+                let idx = rng.sample(zipf) as usize - 1;
+                *obj = values[idx].clone();
+            }
+            (m, _, _) => {
+                return Err(anyhow!(
+                    "Invalid strategy `{m:?}` for field: `{:?}` with type {:?}",
+                    field.name,
+                    field.columntype.typ
+                ));
+            }
+        };
+
+        Ok(())
+    }
+
     fn generate_boolean(
         &self,
         field: &Field,
@@ -1829,12 +2161,12 @@ impl<'a> RecordGenerator<'a> {
                 values[rand::random::<usize>() % values.len()].clone()
             }
             (DatagenStrategy::Zipf, None) => {
-                let zipf = Zipf::new(2, settings.e as f64).unwrap();
+                let zipf = Zipf::new(2, settings.e as f64)?;
                 let x = rng.sample(zipf) as usize;
                 Value::Bool(x == 1)
             }
             (DatagenStrategy::Zipf, Some(values)) => {
-                let zipf = Zipf::new(values.len() as u64, settings.e as f64).unwrap();
+                let zipf = Zipf::new(values.len() as u64, settings.e as f64)?;
                 let idx = rng.sample(zipf) as usize - 1;
                 values[idx].clone()
             }
@@ -1859,13 +2191,13 @@ impl<'a> RecordGenerator<'a> {
         obj: &mut Value,
     ) -> AnyResult<()> {
         let range = parse_range_for_uuid(&field.name, &settings.range)?;
-        if let Some((a, b)) = range {
-            if a > b {
-                return Err(anyhow!(
-                    "Invalid range, min > max for field {:?}",
-                    field.name
-                ));
-            }
+        if let Some((a, b)) = range
+            && a > b
+        {
+            return Err(anyhow!(
+                "Invalid range, min > max for field {:?}",
+                field.name
+            ));
         }
         let scale = settings.scale;
 
@@ -1948,5 +2280,59 @@ impl<'a> RecordGenerator<'a> {
         r?;
 
         Ok(self.json_obj.as_ref().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FELDERA_MAX_DECIMAL_PRECISION, FELDERA_MAX_DECIMAL_SCALE, decimal_max, decimal_min,
+    };
+    use feldera_fxp::{DynamicDecimal, UniformDecimal};
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
+    /// Verify we can generate all feldera min/max decimals without panicking.
+    #[test]
+    fn rust_decimal_min_max_no_panics() {
+        for p in 1..=FELDERA_MAX_DECIMAL_PRECISION {
+            for s in 0..=FELDERA_MAX_DECIMAL_SCALE {
+                if p >= s {
+                    let _max_val = decimal_max(p, s);
+                    let _min_val = decimal_min(p, s);
+                    //eprintln!("p: {}, s: {} min {} max {}", p, s, min_val, max_val);
+                }
+            }
+        }
+    }
+
+    /// Verify we get something sane for rust decimal modulo.
+    #[test]
+    fn rust_decimal_rem_check() {
+        let a = DynamicDecimal::from(19);
+        let b = DynamicDecimal::from(10);
+        assert_eq!(a % b, DynamicDecimal::from(9));
+
+        let a = DynamicDecimal::try_from(19.1).unwrap();
+        let b = DynamicDecimal::from(10);
+        assert_eq!(a % b, DynamicDecimal::try_from(9.1f64).unwrap());
+    }
+
+    #[test]
+    fn uniform() {
+        let dist = UniformDecimal::new(-1000, 1000, 2);
+        let mut rng = SmallRng::seed_from_u64(0);
+        let mut big = false;
+        let mut small = false;
+        for _i in 0..100 {
+            let d = dist.sample(&mut rng);
+            if d < DynamicDecimal::new(1, 0) {
+                small = true;
+            } else if d > DynamicDecimal::new(5, 0) {
+                big = true;
+            }
+            assert!(d >= DynamicDecimal::new(-10, 0) && d <= DynamicDecimal::new(10, 0));
+        }
+        assert!(small && big);
     }
 }

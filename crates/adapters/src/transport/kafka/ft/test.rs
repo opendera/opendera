@@ -1,59 +1,70 @@
-use crate::format::{Splitter, Sponge};
+use crate::format::{Splitter, SpongeSplitter};
+use crate::test::data::TestStructMetadata;
 use crate::test::kafka::BufferConsumer;
 use crate::test::{
-    generate_test_batches, mock_input_pipeline, wait, wait_for_output_ordered,
-    wait_for_output_unordered,
+    generate_test_batches, mock_input_pipeline, wait, wait_for_output_count,
+    wait_for_output_ordered, wait_for_output_unordered,
 };
-use crate::transport::kafka::ft::input::Metadata;
+use crate::transport::kafka::ft::input::{BACKPRESSURE, Metadata};
 use crate::transport::{input_transport_config_to_endpoint, output_transport_config_to_endpoint};
 use crate::{
+    Controller, InputConsumer, ParseError,
     test::{
+        TestStruct,
         kafka::{KafkaResources, TestProducer},
-        test_circuit, TestStruct,
+        test_circuit,
     },
-    Controller, InputConsumer, ParseError, PipelineConfig,
 };
 use crate::{InputBuffer, InputReader, Parser, TransportInputEndpoint};
 use anyhow::Error as AnyError;
 use crossbeam::sync::{Parker, Unparker};
-use csv::ReaderBuilder as CsvReaderBuilder;
-use feldera_adapterlib::transport::Resume;
+use csv::{ReaderBuilder as CsvReaderBuilder, WriterBuilder as CsvWriterBuilder};
+use dbsp::operator::StagedBuffers;
+use feldera_adapterlib::ConnectorMetadata;
+use feldera_adapterlib::format::{BufferSize, flatten_nested};
+use feldera_adapterlib::transport::{Resume, Watermark};
+use feldera_macros::IsNone;
+use feldera_sqllib::{ByteArray, SqlString, Variant};
+use feldera_types::adapter_stats::ConnectorHealth;
 use feldera_types::config::{
-    default_max_batch_size, default_max_queued_records, ConnectorConfig, FormatConfig, FtModel,
-    InputEndpointConfig, OutputBufferConfig, TransportConfig,
+    ConnectorConfig, FormatConfig, FtModel, InputEndpointConfig, TransportConfig,
 };
-use feldera_types::program_schema::Relation;
+use feldera_types::deserialize_table_record;
+use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
+use feldera_types::secret_resolver::default_secrets_directory;
 use feldera_types::transport::kafka::{
-    default_group_join_timeout_secs, default_redpanda_server, KafkaInputConfig, KafkaLogLevel,
-    KafkaStartFromConfig,
+    KafkaInputConfig, KafkaLogLevel, KafkaStartFromConfig, default_redpanda_server,
 };
 use parquet::data_type::AsBytes;
 use proptest::prelude::*;
+use rand::thread_rng;
 use rdkafka::message::{BorrowedMessage, Header, Headers};
-use rdkafka::Message;
+use rdkafka::producer::BaseRecord;
+use rdkafka::{Message, Timestamp};
 use rmpv::Value as RmpValue;
-use serde_json::Value as JsonValue;
-use serde_yaml::Mapping;
+use serde_json::{Value as JsonValue, json};
+use size_of::SizeOf;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::create_dir;
 use std::hash::Hasher;
+use std::iter::repeat_with;
 use std::ops::Range;
 use std::sync::atomic::AtomicUsize;
 use std::thread::sleep;
 use std::{
     mem,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 fn init_test_logger() {
     let _ = tracing_subscriber::registry()
@@ -73,29 +84,34 @@ fn test_kafka_output_errors() {
 
     info!("test_kafka_output_errors: Test invalid Kafka broker address");
 
-    let config_str = r#"
-name: test
-workers: 4
-inputs:
-outputs:
-    test_output:
-        stream: test_output1
-        transport:
-            name: kafka_output
-            config:
-                bootstrap.servers: localhost:11111
-                topic: ft_end_to_end_test_output_topic
-                start_from: earliest
-        format:
-            name: csv
-"#;
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      "inputs": null,
+      "outputs": {
+        "test_output": {
+          "stream": "test_output1",
+          "transport": {
+            "name": "kafka_output",
+            "config": {
+              "bootstrap.servers": "localhost:11111",
+              "topic": "ft_end_to_end_test_output_topic",
+              "start_from": "earliest"
+            }
+          },
+          "format": {
+            "name": "csv"
+          }
+        }
+      }
+    }))
+    .unwrap();
 
     info!("test_kafka_output_errors: Creating circuit");
 
     info!("test_kafka_output_errors: Starting controller");
-    let config: PipelineConfig = serde_yaml::from_str(config_str).unwrap();
 
-    match Controller::with_config(
+    match Controller::with_test_config(
         |workers| {
             Ok(test_circuit::<TestStruct>(
                 workers,
@@ -104,7 +120,7 @@ outputs:
             ))
         },
         &config,
-        Box::new(|e| panic!("error: {e}")),
+        Box::new(|e, _| panic!("error: {e}")),
     ) {
         Ok(_) => panic!("expected an error"),
         Err(e) => info!("test_kafka_output_errors: error: {e}"),
@@ -113,25 +129,27 @@ outputs:
 
 fn create_reader(
     topic: &str,
+    resume_info: Option<JsonValue>,
+    synchronize_partitions: bool,
 ) -> (
     Box<dyn TransportInputEndpoint>,
     DummyInputReceiver,
     Box<dyn InputReader>,
 ) {
-    let config_str = format!(
-        r#"
-name: kafka_input
-config:
-    topic: {topic}
-    log_level: debug
-    start_from: earliest
-"#
-    );
+    let config = serde_json::from_value(json!({
+      "name": "kafka_input",
+      "config": {
+        "topic": topic,
+        "log_level": "debug",
+         "start_from": "earliest",
+         "synchronize_partitions": synchronize_partitions,
+      }
+    }))
+    .unwrap();
 
-    let endpoint =
-        input_transport_config_to_endpoint(serde_yaml::from_str(&config_str).unwrap(), "")
-            .unwrap()
-            .unwrap();
+    let endpoint = input_transport_config_to_endpoint(&config, "", default_secrets_directory())
+        .unwrap()
+        .unwrap();
     assert!(endpoint.fault_tolerance() == Some(FtModel::ExactlyOnce));
 
     let receiver = DummyInputReceiver::new();
@@ -140,6 +158,7 @@ config:
             receiver.consumer(),
             Box::new(DummyParser::new(&receiver)),
             Relation::empty(),
+            resume_info,
         )
         .unwrap();
 
@@ -171,12 +190,188 @@ fn big_input() {
     test_input("big_input", &[100, 1000, 10000]);
 }
 
+#[test]
+fn test_synchronization() {
+    init_test_logger();
+
+    const TOPIC: &str = "synchronization";
+    const N_PARTITIONS: usize = 32;
+    const N_MESSAGES: usize = 4096;
+    let mut _kafka_resources = KafkaResources::create_topics(&[(TOPIC, N_PARTITIONS as i32)]);
+
+    let (_endpoint, receiver, reader) = create_reader(TOPIC, None, true);
+    reader.extend();
+
+    // This is the number of records we expect to read when we produce
+    // `N_MESSAGES` records, since we can read all the records except that we
+    // end up blocked when one of the partitions is exhausted.
+    let n = N_MESSAGES - N_PARTITIONS + 1;
+
+    // Produce N_MESSAGES messages into random partitions[*], with timestamps
+    // that match their record IDs.
+    //
+    // [*] The last N_PARTITIONS of the messages go to each of the partitions in
+    // order so that we have a sentinel at the end of each partition.  If we
+    // distributed all of them randomly then we'd end up reading an
+    // unpredictable number of messages from the consumer because (probably)
+    // we'd consume all the messages from one of the partitions and then we
+    // wouldn't be able to read any of the remaining ones.
+    let producer = TestProducer::new();
+    let now = Timestamp::now().to_millis().unwrap();
+    let mut rng = thread_rng();
+    let mut expect_lens = vec![0; N_PARTITIONS];
+    for (id, partition) in repeat_with(|| rng.gen_range(0..N_PARTITIONS))
+        .take(N_MESSAGES - N_PARTITIONS)
+        .chain(0..N_PARTITIONS)
+        .enumerate()
+    {
+        if id < n {
+            expect_lens[partition] += 1;
+        }
+
+        let mut writer = CsvWriterBuilder::new()
+            .has_headers(false)
+            .from_writer(Vec::new());
+        writer.serialize(TestStruct::for_id(id as u32)).unwrap();
+        writer.flush().unwrap();
+        let bytes = writer.into_inner().unwrap();
+
+        let record = <BaseRecord<(), [u8], ()>>::to(TOPIC)
+            .payload(&bytes)
+            .timestamp(now + id as i64)
+            .partition(partition as i32);
+        producer.producer.send(record).unwrap();
+    }
+
+    println!("waiting for connector to buffer {n} messages.");
+    receiver.expect_buffering(n);
+
+    // Tell the adapter to queue the batch and wait for it to do it, then check
+    // that the connector successfully merged all the records on the basis of
+    // timestamp.
+    println!("queuing and expecting {n} records",);
+    reader.queue(false);
+    let metadata = Metadata {
+        offsets: expect_lens.into_iter().map(|len| 0..len).collect(),
+    };
+    receiver.expect(vec![ConsumerCall::Extended {
+        num_records: n,
+        metadata: serde_json::to_value(&metadata).unwrap(),
+    }]);
+}
+
+#[test]
+fn test_synchronization_backpressure() {
+    fn produce_record(
+        producer: &TestProducer,
+        topic: &str,
+        partition: i32,
+        id: u32,
+        timestamp: i64,
+    ) {
+        let mut writer = CsvWriterBuilder::new()
+            .has_headers(false)
+            .from_writer(Vec::new());
+        writer.serialize(TestStruct::for_id(id as u32)).unwrap();
+        writer.flush().unwrap();
+        let bytes = writer.into_inner().unwrap();
+
+        let record = <BaseRecord<(), [u8], ()>>::to(topic)
+            .payload(&bytes)
+            .timestamp(timestamp)
+            .partition(partition as i32);
+        producer.producer.send(record).unwrap();
+    }
+
+    init_test_logger();
+
+    const TOPIC: &str = "synchronization_backpressure";
+    const N_PARTITIONS: usize = 2;
+    let mut _kafka_resources = KafkaResources::create_topics(&[(TOPIC, N_PARTITIONS as i32)]);
+
+    let (_endpoint, receiver, reader) = create_reader(TOPIC, None, true);
+    reader.extend();
+
+    // Produce 2500 messages into partition 0, with timestamps that match their
+    // record IDs, and 1 message into partition 1 with record ID 5000 and timestamp 2000.
+    let producer = TestProducer::new();
+    let now = Timestamp::now().to_millis().unwrap();
+    for id in 0..2500 {
+        produce_record(&producer, TOPIC, 0, id, now + id as i64);
+    }
+    produce_record(&producer, TOPIC, 1, 5000, now + 2000);
+
+    // 2002 messages should get buffered (partition 0 ids 0..=2000, partition 1
+    // record id 5000).
+    let expect = 2002;
+    println!("waiting for connector to buffer {expect} messages.");
+    receiver.expect_buffering(expect);
+
+    // Tell the adapter to queue the batch and wait for it to do it, then check
+    // that the connector successfully merged all the records on the basis of
+    // timestamp.
+    println!("queuing and expecting {expect} records",);
+    reader.queue(false);
+    let metadata = Metadata {
+        offsets: [2001, 1].into_iter().map(|len| 0..len).collect(),
+    };
+    receiver.expect(vec![ConsumerCall::Extended {
+        num_records: expect,
+        metadata: serde_json::to_value(&metadata).unwrap(),
+    }]);
+
+    // There are about 500 more records to read in partition 0, but none of them
+    // can actually be buffered because they are waiting for something to show
+    // up in partition 1.  However, they should not get stuck in backpressure
+    // because there's a 1000-record minimum for that.
+    //
+    // It's hard to wait for something not to happen, so just give it a few
+    // seconds.
+    sleep(Duration::from_secs(5));
+    let partition0 = (String::from(TOPIC), 0);
+    assert!(!BACKPRESSURE.lock().unwrap().contains(&partition0));
+
+    // Produce another 1000 messages into partition 0, with timestamps that
+    // match their record IDs.
+    for id in 2500..3500 {
+        produce_record(&producer, TOPIC, 0, id, now + id as i64);
+    }
+
+    // Now there are 1500 records to read in partition 0 but they're stuck
+    // because we still have nothing in partition 1.  This should exert backpressure.
+    wait(|| BACKPRESSURE.lock().unwrap().contains(&partition0), 10000).unwrap();
+
+    // Produce one record into partition 1 that is beyond all the records in
+    // partition 0.
+    produce_record(&producer, TOPIC, 1, 5000, now + 5000);
+
+    // 1499 messages should get buffered (partition 0 ids 2001..3500).
+    let expect = 1499;
+    println!("waiting for connector to buffer {expect} messages.");
+    receiver.expect_buffering(expect);
+
+    // Tell the adapter to queue the batch and wait for it to do it, then check
+    // that the connector successfully read all the records from partition 0.
+    println!("queuing and expecting {expect} records",);
+    reader.queue(false);
+    let metadata = Metadata {
+        offsets: [2001..3500, 1..1].into_iter().collect(),
+    };
+    receiver.expect(vec![ConsumerCall::Extended {
+        num_records: expect,
+        metadata: serde_json::to_value(&metadata).unwrap(),
+    }]);
+
+    // Backpressure was fixed.
+    assert!(!BACKPRESSURE.lock().unwrap().contains(&partition0));
+}
+
 fn test_input(topic: &str, batch_sizes: &[u32]) {
     init_test_logger();
 
     let mut _kafka_resources = KafkaResources::create_topics(&[(topic, 1)]);
 
-    let (_endpoint, receiver, reader) = create_reader(topic);
+    let (_endpoint, receiver, reader) = create_reader(topic, None, false);
     reader.extend();
 
     fn metadata(batch: &Range<u32>) -> JsonValue {
@@ -234,13 +429,15 @@ fn test_input(topic: &str, batch_sizes: &[u32]) {
         for replay in 0..n_batches - seek {
             println!();
             println!("seeking to {seek}, replaying {replay} batches, and then reading the rest");
-            let (_endpoint, receiver, reader) = create_reader(topic);
+            let resume_info = if seek > 0 {
+                println!("- seek to {seek}");
+                Some(metadata(&batches[seek - 1]))
+            } else {
+                None
+            };
+            let (_endpoint, receiver, reader) = create_reader(topic, resume_info, false);
             receiver.inner.drop_buffered.store(true, Ordering::Release);
 
-            if seek > 0 {
-                println!("- seek to {seek}");
-                reader.seek(metadata(&batches[seek - 1]));
-            }
             for batch in &batches[seek..seek + replay] {
                 println!("- replaying {batch:?}");
                 reader.replay(metadata(batch), RmpValue::Nil);
@@ -275,10 +472,7 @@ fn test_input(topic: &str, batch_sizes: &[u32]) {
 #[derive(Debug, PartialEq)]
 enum ConsumerCall {
     ParseErrors,
-    Buffered {
-        num_records: usize,
-        num_bytes: usize,
-    },
+    Buffered(BufferSize),
     Replayed {
         num_records: usize,
     },
@@ -290,6 +484,18 @@ enum ConsumerCall {
     Eoi,
 }
 
+struct DummyStagedBuffers {
+    data: Vec<String>,
+    handle: Arc<DummyInputReceiverInner>,
+}
+
+impl StagedBuffers for DummyStagedBuffers {
+    fn flush(&mut self) {
+        info!("flushing {} staged buffers", self.data.len());
+        self.handle.flushed.lock().unwrap().append(&mut self.data);
+    }
+}
+
 struct DummyParser(Arc<DummyInputReceiverInner>);
 
 impl DummyParser {
@@ -299,7 +505,11 @@ impl DummyParser {
 }
 
 impl Parser for DummyParser {
-    fn parse(&mut self, data: &[u8]) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
+    fn parse(
+        &mut self,
+        data: &[u8],
+        _metadata: Option<ConnectorMetadata>,
+    ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
         (
             Some(Box::new(DummyInputBuffer {
                 receiver: self.0.clone(),
@@ -310,11 +520,21 @@ impl Parser for DummyParser {
     }
 
     fn splitter(&self) -> Box<dyn Splitter> {
-        Box::new(Sponge)
+        Box::new(SpongeSplitter)
     }
 
     fn fork(&self) -> Box<dyn Parser> {
         Box::new(Self(self.0.clone()))
+    }
+
+    fn stage(&self, buffers: Vec<Box<dyn InputBuffer>>) -> Box<dyn StagedBuffers> {
+        Box::new(DummyStagedBuffers {
+            data: flatten_nested::<DummyInputBuffer>(buffers)
+                .into_iter()
+                .filter_map(|buffer| buffer.data)
+                .collect(),
+            handle: self.0.clone(),
+        })
     }
 }
 
@@ -331,8 +551,13 @@ impl InputBuffer for DummyInputBuffer {
         }
     }
 
-    fn len(&self) -> usize {
-        self.data.as_ref().map_or(0, |_| 1)
+    fn len(&self) -> BufferSize {
+        self.data
+            .as_ref()
+            .map_or(BufferSize::empty(), |_| BufferSize {
+                records: 1,
+                bytes: 0,
+            })
     }
 
     fn hash(&self, _hasher: &mut dyn Hasher) {}
@@ -385,7 +610,7 @@ impl DummyInputReceiver {
             }
             assert!(received < n);
 
-            if start.elapsed() >= Duration::from_secs(10) {
+            if start.elapsed() >= Duration::from_secs(60) {
                 panic!("only buffered {received} out of {n} expected");
             }
             self.parker.park_timeout(Duration::from_millis(100));
@@ -403,12 +628,9 @@ impl DummyInputReceiver {
             let mut current = self.inner.calls.lock().unwrap();
             for call in current.drain(..) {
                 match call {
-                    ConsumerCall::Buffered {
-                        num_records,
-                        num_bytes: _,
-                    } => {
-                        assert!(received + num_records <= n);
-                        received += num_records;
+                    ConsumerCall::Buffered(BufferSize { records, bytes: _ }) => {
+                        assert!(received + records <= n);
+                        received += records;
                         if received == n {
                             return;
                         }
@@ -501,11 +723,8 @@ impl InputConsumer for DummyInputConsumer {
         }
     }
 
-    fn buffered(&self, num_records: usize, num_bytes: usize) {
-        let call = ConsumerCall::Buffered {
-            num_records,
-            num_bytes,
-        };
+    fn buffered(&self, amt: BufferSize) {
+        let call = ConsumerCall::Buffered(amt);
         info!("{call:?}");
         if !self.0.drop_buffered.load(Ordering::Acquire) {
             self.0.calls.lock().unwrap().push(call);
@@ -515,20 +734,28 @@ impl InputConsumer for DummyInputConsumer {
         }
     }
 
-    fn replayed(&self, num_records: usize, _hash: u64) {
-        self.called(ConsumerCall::Replayed { num_records });
+    fn replayed(&self, amt: BufferSize, _hash: u64) {
+        self.called(ConsumerCall::Replayed {
+            num_records: amt.records,
+        });
     }
 
-    fn extended(&self, num_records: usize, resume: Option<Resume>) {
+    fn extended(&self, amt: BufferSize, resume: Option<Resume>, _watermark: Vec<Watermark>) {
         self.called(ConsumerCall::Extended {
-            num_records,
+            num_records: amt.records,
             metadata: resume
                 .map(|resume| resume.into_seek().unwrap())
                 .unwrap_or_default(),
         });
     }
 
-    fn error(&self, fatal: bool, error: AnyError) {
+    fn completion_watcher(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<feldera_types::coordination::Completion>> {
+        None
+    }
+
+    fn error(&self, fatal: bool, error: AnyError, _tag: Option<&'static str>) {
         info!("error: {error}");
         self.called(ConsumerCall::Error(fatal));
     }
@@ -538,6 +765,12 @@ impl InputConsumer for DummyInputConsumer {
     fn eoi(&self) {
         self.called(ConsumerCall::Eoi);
     }
+
+    fn start_transaction(&self, _label: Option<&str>) {}
+
+    fn commit_transaction(&self) {}
+
+    fn update_connector_health(&self, _health: ConnectorHealth) {}
 }
 
 #[test]
@@ -564,21 +797,23 @@ fn kafka_output_test(
     // Create topics.
     let _kafka_resources = KafkaResources::create_topics(&[(&output_topic, 1)]);
 
-    let config_str = format!(
-        r#"
-name: kafka_output
-config:
-    topic: {output_topic}
-"#
-    );
+    let config = serde_json::from_value(json!({
+      "name": "kafka_output",
+      "config": {
+        "topic": output_topic
+      }
+    }))
+    .unwrap();
 
     let mut endpoint =
-        output_transport_config_to_endpoint(serde_yaml::from_str(&config_str).unwrap(), "", true)
+        output_transport_config_to_endpoint(&config, "", true, default_secrets_directory())
             .unwrap()
             .unwrap();
     assert!(endpoint.is_fault_tolerant());
     endpoint
-        .connect(Box::new(|fatal, error| info!("({fatal:?}, {error:?})")))
+        .connect(Box::new(|fatal, error, tag| {
+            info!("({fatal:?}, {error:?}, {tag:?})")
+        }))
         .unwrap();
     for step in 0..5 {
         endpoint.batch_start(step).unwrap();
@@ -590,19 +825,23 @@ config:
 }
 
 fn _test() {
-    let config_str = r#"
-name: kafka_output
-config:
-    topic: my_topic
-"#;
+    let config = serde_json::from_value(json!({
+      "name": "kafka_output",
+      "config": {
+        "topic": "my_topic"
+      }
+    }))
+    .unwrap();
 
     let mut endpoint =
-        output_transport_config_to_endpoint(serde_yaml::from_str(config_str).unwrap(), "", true)
+        output_transport_config_to_endpoint(&config, "", true, default_secrets_directory())
             .unwrap()
             .unwrap();
     assert!(endpoint.is_fault_tolerant());
     endpoint
-        .connect(Box::new(|fatal, error| info!("({fatal:?}, {error:?})")))
+        .connect(Box::new(|fatal, error, tag| {
+            info!("({fatal:?}, {error:?}, {tag:?})")
+        }))
         .unwrap();
     for step in 0..5 {
         endpoint.batch_start(step).unwrap();
@@ -630,22 +869,26 @@ fn test_ft_kafka_input(data: Vec<Vec<TestStruct>>, topic1: &str, topic2: &str) {
 
     info!("proptest_kafka_input: Test: Specify invalid Kafka broker address");
 
-    let config_str = format!(
-        r#"
-stream: test_input
-transport:
-    name: kafka_input
-    config:
-        bootstrap.servers: localhost:11111
-        topics: ["{topic1}", "{topic2}"]
-        log_level: debug
-format:
-    name: csv
-"#
-    );
+    let config = serde_json::from_value(json!({
+      "stream": "test_input",
+      "transport": {
+        "name": "kafka_input",
+        "config": {
+          "bootstrap.servers": "localhost:11111",
+          "topics": [
+            topic1,
+            topic2
+          ],
+          "log_level": "debug"
+        }
+      },
+      "format": {
+        "name": "csv"
+      }
+    })).unwrap();
 
     let (reader, consumer, parser, _input_handle) = mock_input_pipeline::<TestStruct, TestStruct>(
-        serde_yaml::from_str(&config_str).unwrap(),
+        config,
         Relation::empty(),
     )
     .unwrap();
@@ -659,19 +902,24 @@ format:
 
     info!("proptest_kafka_input: Test: Specify invalid Kafka topic name");
 
-    let config_str = r#"
-stream: test_input
-transport:
-    name: kafka_input
-    config:
-        topics: ["this_topic_does_not_exist"]
-        log_level: debug
-format:
-    name: csv
-"#;
+    let config = serde_json::from_value(json!({
+      "stream": "test_input",
+      "transport": {
+        "name": "kafka_input",
+        "config": {
+          "topics": [
+            "this_topic_does_not_exist"
+          ],
+          "log_level": "debug"
+        }
+      },
+      "format": {
+        "name": "csv"
+      }
+    })).unwrap();
 
     let (reader, consumer, _input_handle) = mock_input_pipeline::<TestStruct, TestStruct>(
-        serde_yaml::from_str(config_str).unwrap(),
+        config,
         Relation::empty(),
     )
     .unwrap();
@@ -683,23 +931,24 @@ format:
         consumer.state().endpoint_error.as_ref().unwrap()
     );
 
-    let config_str = format!(
-        r#"
-stream: test_input
-transport:
-    name: kafka_input
-    config:
-        topics: [{topic1}, {topic2}]
-        log_level: debug
-format:
-    name: csv
-"#
-    );
+    let config = serde_json::from_value(json!({
+      "stream": "test_input",
+      "transport": {
+        "name": "kafka_input",
+        "config": {
+          "topics": [topic1, topic2],
+          "log_level": "debug"
+        }
+      },
+      "format": {
+        "name": "csv"
+      }
+    })).unwrap();
 
     info!("proptest_kafka_input: Building input pipeline");
 
     let (endpoint, _consumer, zset) = mock_input_pipeline::<TestStruct, TestStruct>(
-        serde_yaml::from_str(&config_str).unwrap(),
+        config,
         Relation::empty(),
     )
     .unwrap();
@@ -803,20 +1052,46 @@ proptest! {
 #[derive(Clone)]
 struct FtTestRound {
     n_records: usize,
+    expect_failure: bool,
     do_checkpoint: bool,
+    delete_topics_afterward: bool,
+    add_partition_afterward: bool,
 }
 
 impl FtTestRound {
-    fn with_checkpoint(n_records: usize) -> Self {
-        Self {
-            n_records,
-            do_checkpoint: true,
+    fn new(n_records: usize, do_checkpoint: bool) -> Self {
+        {
+            Self {
+                n_records,
+                expect_failure: false,
+                do_checkpoint,
+                delete_topics_afterward: false,
+                add_partition_afterward: false,
+            }
         }
     }
+    fn with_checkpoint(n_records: usize) -> Self {
+        Self::new(n_records, true)
+    }
     fn without_checkpoint(n_records: usize) -> Self {
+        Self::new(n_records, false)
+    }
+    fn with_deleting_topics_afterward(self) -> Self {
         Self {
-            n_records,
-            do_checkpoint: false,
+            delete_topics_afterward: true,
+            ..self
+        }
+    }
+    fn with_failure_expected(self) -> Self {
+        Self {
+            expect_failure: true,
+            ..self
+        }
+    }
+    fn with_adding_partition_afterward(self) -> Self {
+        Self {
+            add_partition_afterward: true,
+            ..self
         }
     }
 }
@@ -828,10 +1103,11 @@ impl FtTestRound {
 /// pipeline and waits for it to process the data.  If `do_checkpoint` is
 /// true, it creates a new checkpoint. Then it stops the checkpoint, checks
 /// that the output is as expected, and goes on to the next round.
-fn test_ft(topic: &str, rounds: &[FtTestRound]) {
+fn test_ft(topic: &str, rounds: &[FtTestRound], resume_earliest_if_data_expires: bool) {
     init_test_logger();
 
-    let mut _kafka_resources = KafkaResources::create_topics(&[(topic, 1)]);
+    let mut n_partitions = 1;
+    let mut kafka_resources = KafkaResources::create_topics(&[(topic, n_partitions as i32)]);
     sleep(Duration::from_secs(1));
     let producer = TestProducer::new();
     let tempdir = TempDir::new().unwrap();
@@ -847,40 +1123,49 @@ fn test_ft(topic: &str, rounds: &[FtTestRound]) {
     create_dir(&storage_dir).unwrap();
     let output_path = tempdir_path.join("output.csv");
 
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-storage_config:
-    path: {storage_dir:?}
-storage: true
-fault_tolerance: {{}}
-clock_resolution_usecs: null
-inputs:
-    test_input1:
-        stream: test_input1
-        transport:
-            name: kafka_input
-            config:
-                topic: {topic}
-                start_from: earliest
-                log_level: debug
-        format:
-            name: csv
-outputs:
-    test_output1:
-        stream: test_output1
-        transport:
-            name: file_output
-            config:
-                path: {output_path:?}
-        format:
-            name: csv
-            config:
-        "#
-    );
-
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
+    let config = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "storage_config": {
+            "path": storage_dir,
+        },
+        "storage": true,
+        "fault_tolerance": {},
+        "clock_resolution_usecs": null,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "kafka_input",
+                    "config": {
+                        "topic": topic,
+                        "start_from": "earliest",
+                        "log_level": "debug",
+                        "resume_earliest_if_data_expires": resume_earliest_if_data_expires,
+                    }
+                },
+                "format": {
+                    "name": "csv"
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": output_path
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                }
+            }
+        }
+    }))
+    .unwrap();
 
     // Number of records written to the input.
     let mut total_records = 0usize;
@@ -893,18 +1178,30 @@ outputs:
         round,
         FtTestRound {
             n_records,
+            expect_failure,
             do_checkpoint,
+            delete_topics_afterward,
+            add_partition_afterward,
         },
     ) in rounds.iter().cloned().enumerate()
     {
-        println!(
-            "--- round {round}: add {n_records} records, {} --- ",
-            if do_checkpoint {
+        print!(
+            "--- round {round}: add {n_records} records, {}",
+            if expect_failure {
+                "and expect failure on startup"
+            } else if do_checkpoint {
                 "and checkpoint"
             } else {
                 "no checkpoint"
             }
         );
+        if delete_topics_afterward {
+            print!(" and then delete and recreate the topic");
+        }
+        if add_partition_afterward {
+            print!(" and then add a partition");
+        }
+        println!();
 
         // Write records to the input topic.
         println!(
@@ -922,7 +1219,7 @@ outputs:
 
         // Start pipeline.
         println!("start pipeline");
-        let controller = Controller::with_config(
+        let controller = Controller::with_test_config(
             |circuit_config| {
                 Ok(test_circuit::<TestStruct>(
                     circuit_config,
@@ -931,20 +1228,19 @@ outputs:
                 ))
             },
             &config,
-            Box::new(|e| panic!("error: {e}")),
+            Box::new(move |e, _| panic!("error: {e}")),
         )
         .unwrap();
         controller.start();
 
         // Wait for the records that are not in the checkpoint to be
         // processed or replayed.
-        let expect_n = total_records - checkpointed_records;
         println!(
             "wait for {} records {checkpointed_records}..{total_records}",
-            expect_n
+            total_records - checkpointed_records
         );
         let mut last_n = 0;
-        wait(
+        let result = wait(
             || {
                 let n = controller
                     .status()
@@ -953,14 +1249,18 @@ outputs:
                     .unwrap()
                     .transmitted_records() as usize;
                 if n > last_n {
-                    println!("received {n} records of {expect_n}");
+                    println!("received {n} records of {total_records}");
                     last_n = n;
                 }
-                n >= expect_n
+                n >= total_records
             },
             10_000,
-        )
-        .unwrap();
+        );
+        if expect_failure {
+            result.unwrap_err();
+            return;
+        }
+        result.unwrap();
 
         // No more records should arrive, but give the controller some time
         // to send some more in case there's a bug.
@@ -974,7 +1274,7 @@ outputs:
                 .get(&0)
                 .unwrap()
                 .transmitted_records(),
-            expect_n as u64
+            total_records as u64
         );
 
         // Checkpoint, if requested.
@@ -1004,7 +1304,7 @@ outputs:
             .collect::<Vec<_>>();
         actual.sort();
 
-        assert_eq!(actual.len(), expect_n);
+        assert_eq!(actual.len(), total_records - checkpointed_records);
         for (record, expect_record) in actual
             .into_iter()
             .zip((checkpointed_records..).map(|id| TestStruct::for_id(id as u32)))
@@ -1014,6 +1314,20 @@ outputs:
 
         if do_checkpoint {
             checkpointed_records = total_records;
+        }
+        if delete_topics_afterward {
+            println!("dropping Kafka topics (to test resume behavior)");
+            drop(kafka_resources);
+            println!("recreating Kafka topic as empty");
+            kafka_resources = KafkaResources::create_topics(&[(topic, 1)]);
+        }
+        if add_partition_afterward {
+            println!(
+                "adding partition to topic (from {n_partitions} to {})",
+                n_partitions + 1
+            );
+            n_partitions += 1;
+            kafka_resources.add_partition(topic, n_partitions);
         }
         println!();
     }
@@ -1030,6 +1344,54 @@ fn ft_with_checkpoints() {
             FtTestRound::with_checkpoint(2500),
             FtTestRound::with_checkpoint(2500),
         ],
+        false,
+    );
+}
+
+/// Runs a checkpoint, deletes the topic that was read, and then restarts.  This
+/// should fail because the topic can't be read starting at the now-nonexistent
+/// offset.
+#[test]
+fn ft_with_topic_expiration() {
+    test_ft(
+        "ft_with_topic_expiration",
+        &[
+            FtTestRound::with_checkpoint(2500),
+            FtTestRound::with_checkpoint(2500).with_deleting_topics_afterward(),
+            FtTestRound::with_checkpoint(2500).with_failure_expected(),
+        ],
+        false,
+    );
+}
+
+/// Runs a checkpoint, deletes the topic that was read, and then restarts.  This
+/// should not fail, because it will restart from the beginning.
+#[test]
+fn ft_with_topic_expiration_and_resume_earliest() {
+    test_ft(
+        "ft_with_topic_expiration_and_resume_earliest",
+        &[
+            FtTestRound::with_checkpoint(2500),
+            FtTestRound::with_checkpoint(2500).with_deleting_topics_afterward(),
+            FtTestRound::with_checkpoint(2500),
+        ],
+        true,
+    );
+}
+
+/// Runs a checkpoint, deletes the topic that was read, and then restarts.  This
+/// should fail because the topic can't be read starting at the now-nonexistent
+/// offset.
+#[test]
+fn ft_with_tolerance_topic_expiration() {
+    test_ft(
+        "ft_with_tolerance_for_topic_expiration",
+        &[
+            FtTestRound::with_checkpoint(2500),
+            FtTestRound::with_checkpoint(2500).with_deleting_topics_afterward(),
+            FtTestRound::with_checkpoint(2500).with_failure_expected(),
+        ],
+        false,
     );
 }
 
@@ -1044,6 +1406,7 @@ fn ft_without_checkpoints() {
             FtTestRound::without_checkpoint(2500),
             FtTestRound::without_checkpoint(2500),
         ],
+        false,
     );
 }
 
@@ -1063,6 +1426,7 @@ fn ft_alternating() {
             FtTestRound::with_checkpoint(2500),
             FtTestRound::without_checkpoint(2500),
         ],
+        false,
     );
 }
 
@@ -1080,6 +1444,7 @@ fn ft_initially_zero_without_checkpoint() {
             FtTestRound::without_checkpoint(2500),
             FtTestRound::with_checkpoint(2500),
         ],
+        false,
     );
 }
 
@@ -1097,6 +1462,25 @@ fn ft_initially_zero_with_checkpoint() {
             FtTestRound::without_checkpoint(2500),
             FtTestRound::with_checkpoint(2500),
         ],
+        false,
+    );
+}
+
+#[test]
+fn ft_with_adding_partitions() {
+    test_ft(
+        "ft_with_adding_partitions",
+        &[
+            FtTestRound::without_checkpoint(2500),
+            FtTestRound::without_checkpoint(2500).with_adding_partition_afterward(),
+            FtTestRound::without_checkpoint(2500),
+            FtTestRound::without_checkpoint(2500).with_adding_partition_afterward(),
+            FtTestRound::without_checkpoint(2500),
+            FtTestRound::with_checkpoint(2500),
+            FtTestRound::with_checkpoint(2500).with_adding_partition_afterward(),
+            FtTestRound::with_checkpoint(2500),
+        ],
+        false,
     );
 }
 
@@ -1115,59 +1499,71 @@ fn test_offset(
 ) {
     let _kafka = KafkaResources::create_topics(&[(topic, partitions)]);
 
-    let config = InputEndpointConfig {
-        stream: Cow::from("test_input"),
-        connector_config: ConnectorConfig {
-            transport: TransportConfig::KafkaInput(KafkaInputConfig {
-                kafka_options: {
-                    let mut kafka_options = BTreeMap::new();
-                    let auto_offset_reset = match start_from {
-                        KafkaStartFromConfig::Earliest => Some("earliest"),
-                        KafkaStartFromConfig::Latest => Some("latest"),
-                        KafkaStartFromConfig::Offsets(_) => None,
-                    };
-                    if let Some(auto_offset_reset) = auto_offset_reset {
-                        kafka_options.insert("auto.offset.reset".into(), auto_offset_reset.into());
-                    }
-                    kafka_options.insert("bootstrap.servers".into(), default_redpanda_server());
-                    kafka_options.insert("group.id".into(), "test-client".into());
-                    kafka_options
-                },
-                topic: topic.into(),
-                log_level: Some(KafkaLogLevel::Debug),
-                group_join_timeout_secs: default_group_join_timeout_secs(),
-                poller_threads: None,
-                start_from: start_from.clone(),
-                region: None,
-                partitions: None,
-            }),
-            format: Some(FormatConfig {
-                name: Cow::from("csv"),
-                config: serde_yaml::Value::Mapping(Mapping::default()),
-            }),
-            index: None,
-            output_buffer_config: OutputBufferConfig::default(),
-            max_batch_size: default_max_batch_size(),
-            max_queued_records: default_max_queued_records(),
-            paused: false,
-            labels: Vec::new(),
-            start_after: None,
-        },
-    };
-
     info!("proptest_kafka_input_offset: Building input pipeline");
 
     let producer = TestProducer::new();
-    let expected = match &start_from {
-        KafkaStartFromConfig::Earliest | KafkaStartFromConfig::Latest => Some(data.as_slice()),
-        KafkaStartFromConfig::Offsets(vec) => data.get(vec[0] as usize..),
+    let (expected, send_before, mut send_after) = match &start_from {
+        KafkaStartFromConfig::Earliest => (Some(data.as_slice()), Some(data.as_slice()), None),
+        KafkaStartFromConfig::Latest => (Some(data.as_slice()), None, Some(data.as_slice())),
+        KafkaStartFromConfig::Offsets(vec) => {
+            let offset = vec[0] as usize;
+            (data.get(offset..), data.get(..offset), data.get(offset..))
+        }
+        KafkaStartFromConfig::Timestamp(_) => {
+            let half = data.len() / 2;
+            (
+                Some(&data[half..]),
+                Some(&data[..half]),
+                Some(&data[half..]),
+            )
+        }
     };
 
     // Front load data if auto.offset.reset: earliest
-    if start_from == KafkaStartFromConfig::Earliest {
-        producer.send_to_topic(data.as_slice(), topic);
+    if let Some(send_before) = send_before {
+        producer.send_to_topic(send_before, topic);
         producer.send_string("", topic);
     }
+
+    let mut kafka_options = BTreeMap::new();
+    let auto_offset_reset = match start_from {
+        KafkaStartFromConfig::Earliest => Some("earliest"),
+        KafkaStartFromConfig::Latest => Some("latest"),
+        KafkaStartFromConfig::Offsets(_) | KafkaStartFromConfig::Timestamp(_) => None,
+    };
+    if let Some(auto_offset_reset) = auto_offset_reset {
+        kafka_options.insert("auto.offset.reset".into(), auto_offset_reset.into());
+    }
+    kafka_options.insert("bootstrap.servers".into(), default_redpanda_server());
+    kafka_options.insert("group.id".into(), "test-client".into());
+
+    let config = InputEndpointConfig::new(
+        "test_input",
+        ConnectorConfig::new(
+            TransportConfig::KafkaInput(KafkaInputConfig {
+                log_level: Some(KafkaLogLevel::Debug),
+                start_from: match start_from {
+                    KafkaStartFromConfig::Timestamp(_) => {
+                        sleep(Duration::from_secs(2));
+                        let timestamp =
+                            KafkaStartFromConfig::Timestamp(Timestamp::now().to_millis().unwrap());
+                        sleep(Duration::from_secs(2));
+                        if let Some(send_after) = send_after.take() {
+                            producer.send_to_topic(send_after, topic);
+                            producer.send_string("", topic);
+                        }
+                        timestamp
+                    }
+                    other => other,
+                },
+                ..KafkaInputConfig::default(kafka_options, topic)
+            }),
+            Some(FormatConfig {
+                name: Cow::from("csv"),
+                config: json!({}),
+            }),
+        ),
+    );
 
     let (endpoint, consumer, _parser, zset) =
         mock_input_pipeline::<TestStruct, TestStruct>(config, Relation::empty()).unwrap();
@@ -1179,8 +1575,8 @@ fn test_offset(
     endpoint.extend();
 
     // If auto.offset.reset: latest, send data after starting the pipeline.
-    if start_from == KafkaStartFromConfig::Latest {
-        producer.send_to_topic(data.as_slice(), topic);
+    if let Some(send_after) = send_after {
+        producer.send_to_topic(send_after, topic);
         producer.send_string("", topic);
     }
 
@@ -1207,6 +1603,26 @@ fn test_offset(
     sleep(Duration::from_millis(1000));
     flush();
     assert_eq!(zset.state().flushed.len(), 0);
+}
+
+#[test]
+fn test_kafka_input_offset() {
+    test_offset(
+        testdata(),
+        "test_kafka_input_offset",
+        1,
+        KafkaStartFromConfig::Offsets(vec![1]),
+    );
+}
+
+#[test]
+fn test_kafka_input_timestamp() {
+    test_offset(
+        testdata2(),
+        "test_kafka_input_timestamp",
+        1,
+        KafkaStartFromConfig::Timestamp(0),
+    );
 }
 
 #[test]
@@ -1262,6 +1678,19 @@ fn testdata() -> Vec<Vec<TestStruct>> {
     ]
 }
 
+fn testdata2() -> Vec<Vec<TestStruct>> {
+    (0..50)
+        .map(|index| {
+            vec![TestStruct {
+                id: index,
+                b: index >= 25,
+                i: Some(index as i64),
+                s: index.to_string(),
+            }]
+        })
+        .collect()
+}
+
 #[test]
 fn test_kafka_input_offset_earliest() {
     test_offset(
@@ -1305,7 +1734,7 @@ fn test_kafka_input_offset_latest_2() {
 fn kafka_end_to_end_test(
     test_name: &str,
     format: &str,
-    format_config: &str,
+    format_config: JsonValue,
     message_max_bytes: usize,
     data: Vec<Vec<TestStruct>>,
 ) {
@@ -1322,50 +1751,57 @@ fn kafka_end_to_end_test(
     // consumer will observe all messages sent by the producer even if
     // the producer starts earlier (the consumer won't start until the
     // rebalancing protocol kicks in).
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-    test_input1:
-        stream: test_input1
-        transport:
-            name: kafka_input
-            config:
-                auto.offset.reset: "earliest"
-                group.instance.id: "{test_name}"
-                topics: [{input_topic}]
-                log_level: debug
-        format:
-            name: csv
-outputs:
-    test_output2:
-        stream: test_output1
-        transport:
-            name: kafka_output
-            config:
-                topic: {output_topic}
-                message.max.bytes: "{message_max_bytes}"
-        format:
-            name: {format}
-            config:
-                {format_config}
-"#
-    );
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      "inputs": {
+        "test_input1": {
+          "stream": "test_input1",
+          "transport": {
+            "name": "kafka_input",
+            "config": {
+              "auto.offset.reset": "earliest",
+              "group.instance.id": test_name,
+              "topics": [input_topic],
+              "log_level": "debug"
+            }
+          },
+          "format": {
+            "name": "csv"
+          }
+        }
+      },
+      "outputs": {
+        "test_output2": {
+          "stream": "test_output1",
+          "transport": {
+            "name": "kafka_output",
+            "config": {
+              "topic": output_topic,
+              "message.max.bytes": message_max_bytes.to_string(),
+            }
+          },
+          "format": {
+            "name": format,
+            "config": format_config,
+          }
+        }
+      }
+    }))
+    .unwrap();
 
-    info!("{test_name}: Creating circuit. Config {config_str}");
+    info!("{test_name}: Creating circuit. Config {config:?}");
 
     info!("{test_name}: Starting controller");
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
 
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     let test_name_clone = test_name.to_string();
 
-    let controller = Controller::with_config(
+    let controller = Controller::with_test_config(
         |workers| Ok(test_circuit::<TestStruct>(workers, &TestStruct::schema(), &[None])),
         &config,
-        Box::new(move |e| if running_clone.load(Ordering::Acquire) {
+        Box::new(move |e, _| if running_clone.load(Ordering::Acquire) {
             panic!("{test_name_clone}: error: {e}")
         } else {
             info!("{test_name_clone}: error during shutdown (likely caused by Kafka topics being deleted): {e}")
@@ -1406,47 +1842,47 @@ fn test_kafka_input(data: Vec<Vec<TestStruct>>, topic: &str, poller_threads: usi
 
     info!("proptest_kafka_input: Test: Specify invalid Kafka broker address");
 
-    let config_str = format!(
-        r#"
-stream: test_input
-transport:
-    name: kafka_input
-    config:
-        topic: {topic}
-        log_level: debug
-        bootstrap.servers: localhost:11111
-        auto.offset.reset: "earliest"
-format:
-    name: csv
-"#
-    );
+    let config = serde_json::from_value(json!({
+      "stream": "test_input",
+      "transport": {
+        "name": "kafka_input",
+        "config": {
+          "topic": topic,
+          "log_level": "debug",
+          "bootstrap.servers": "localhost:11111",
+          "auto.offset.reset": "earliest"
+        }
+      },
+      "format": {
+        "name": "csv"
+      }
+    }))
+    .unwrap();
 
-    match mock_input_pipeline::<TestStruct, TestStruct>(
-        serde_yaml::from_str(&config_str).unwrap(),
-        Relation::empty(),
-    ) {
+    match mock_input_pipeline::<TestStruct, TestStruct>(config, Relation::empty()) {
         Ok(_) => panic!("expected an error"),
         Err(e) => info!("proptest_kafka_input: Error: {e}"),
     };
 
     info!("proptest_kafka_input: Test: Specify invalid Kafka topic name");
 
-    let config_str = r#"
-stream: test_input
-transport:
-    name: kafka_input
-    config:
-        topic: this_topic_does_not_exist
-        log_level: debug
-        auto.offset.reset: "earliest"
-format:
-    name: csv
-"#;
+    let config = serde_json::from_value(json!({
+      "stream": "test_input",
+      "transport": {
+        "name": "kafka_input",
+        "config": {
+          "topic": "this_topic_does_not_exist",
+          "log_level": "debug",
+          "auto.offset.reset": "earliest"
+        }
+      },
+      "format": {
+        "name": "csv"
+      }
+    }))
+    .unwrap();
 
-    match mock_input_pipeline::<TestStruct, TestStruct>(
-        serde_yaml::from_str(config_str).unwrap(),
-        Relation::empty(),
-    ) {
+    match mock_input_pipeline::<TestStruct, TestStruct>(config, Relation::empty()) {
         Ok(_) => panic!("expected an error"),
         Err(e) => info!("proptest_kafka_input: Error: {e}"),
     };
@@ -1455,29 +1891,28 @@ format:
     // consumer will observe all messages sent by the producer even if
     // the producer starts earlier (the consumer won't start until the
     // rebalancing protocol kicks in).
-    let config_str = format!(
-        r#"
-stream: test_input
-transport:
-    name: kafka_input
-    config:
-        topic: {topic}
-        log_level: debug
-        poller_threads: {poller_threads}
-        auto.offset.reset: "earliest"
-format:
-    name: csv
-max_batch_size: 10000000
-"#
-    );
+    let config = serde_json::from_value(json!({
+        "stream": "test_input",
+        "transport": {
+            "name": "kafka_input",
+            "config": {
+                "topic": topic,
+                "log_level": "debug",
+                "poller_threads": poller_threads,
+                "auto.offset.reset": "earliest"
+            }
+        },
+        "format": {
+            "name": "csv"
+        },
+        "max_batch_size": 10000000
+    }))
+    .unwrap();
 
     info!("proptest_kafka_input: Building input pipeline");
 
-    let (endpoint, _consumer, _parser, zset) = mock_input_pipeline::<TestStruct, TestStruct>(
-        serde_yaml::from_str(&config_str).unwrap(),
-        Relation::empty(),
-    )
-    .unwrap();
+    let (endpoint, _consumer, _parser, zset) =
+        mock_input_pipeline::<TestStruct, TestStruct>(config, Relation::empty()).unwrap();
 
     endpoint.extend();
 
@@ -1521,45 +1956,33 @@ fn test_input_partition(
 ) {
     let _kafka = KafkaResources::create_topics(&[(topic, n_partitions)]);
 
-    let config = InputEndpointConfig {
-        stream: Cow::from("test_input"),
-        connector_config: ConnectorConfig {
-            transport: TransportConfig::KafkaInput(KafkaInputConfig {
-                kafka_options: {
-                    let mut kafka_options = BTreeMap::new();
-                    let auto_offset_reset = match start_from {
-                        KafkaStartFromConfig::Earliest => Some("earliest"),
-                        KafkaStartFromConfig::Latest => Some("latest"),
-                        KafkaStartFromConfig::Offsets(_) => None,
-                    };
-                    if let Some(auto_offset_reset) = auto_offset_reset {
-                        kafka_options.insert("auto.offset.reset".into(), auto_offset_reset.into());
-                    }
-                    kafka_options.insert("bootstrap.servers".into(), default_redpanda_server());
-                    kafka_options.insert("group.id".into(), "test-client".into());
-                    kafka_options
-                },
-                topic: topic.into(),
-                log_level: Some(KafkaLogLevel::Debug),
-                group_join_timeout_secs: default_group_join_timeout_secs(),
-                poller_threads: None,
-                start_from: start_from.clone(),
-                region: None,
-                partitions: Some(partitions.clone()),
-            }),
-            format: Some(FormatConfig {
-                name: Cow::from("csv"),
-                config: serde_yaml::Value::Mapping(Mapping::default()),
-            }),
-            index: None,
-            output_buffer_config: OutputBufferConfig::default(),
-            max_batch_size: default_max_batch_size(),
-            max_queued_records: default_max_queued_records(),
-            paused: false,
-            labels: Vec::new(),
-            start_after: None,
-        },
+    let mut kafka_options = BTreeMap::new();
+    let auto_offset_reset = match start_from {
+        KafkaStartFromConfig::Earliest => Some("earliest"),
+        KafkaStartFromConfig::Latest => Some("latest"),
+        KafkaStartFromConfig::Offsets(_) | KafkaStartFromConfig::Timestamp(_) => None,
     };
+    if let Some(auto_offset_reset) = auto_offset_reset {
+        kafka_options.insert("auto.offset.reset".into(), auto_offset_reset.into());
+    }
+    kafka_options.insert("bootstrap.servers".into(), default_redpanda_server());
+    kafka_options.insert("group.id".into(), "test-client".into());
+
+    let config = InputEndpointConfig::new(
+        "test_input",
+        ConnectorConfig::new(
+            TransportConfig::KafkaInput(KafkaInputConfig {
+                log_level: Some(KafkaLogLevel::Debug),
+                start_from: start_from.clone(),
+                partitions: Some(partitions.clone()),
+                ..KafkaInputConfig::default(kafka_options, topic)
+            }),
+            Some(FormatConfig {
+                name: Cow::from("csv"),
+                config: json!({}),
+            }),
+        ),
+    );
 
     info!("kafka_input_partition: Building input pipeline");
 
@@ -1573,6 +1996,7 @@ fn test_input_partition(
             }
             Some(new)
         }
+        KafkaStartFromConfig::Timestamp(_) => todo!(),
     };
 
     fn load_data_to_topic_partitions(
@@ -1896,56 +2320,75 @@ fn buffer_test() {
     let _kafka_resources = KafkaResources::create_topics(&[(&input_topic, 1), (&output_topic, 1)]);
 
     // Create controller.
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-    test_input1:
-        stream: test_input1
-        transport:
-            name: kafka_input
-            config:
-                auto.offset.reset: "earliest"
-                group.instance.id: "buffer_test"
-                topics: [{input_topic}]
-                log_level: debug
-        format:
-            name: csv
-outputs:
-    test_output2:
-        stream: test_output1
-        transport:
-            name: kafka_output
-            config:
-                topic: {output_topic}
-                message.max.bytes: "1000000"
-                headers:
-                    - key: header1
-                      value: "foobar"
-                    - key: header2
-                      value: [1,2,3,4,5]
-        format:
-            name: csv
-            config:
-        enable_output_buffer: true
-        max_output_buffer_size_records: {buffer_size}
-        max_output_buffer_time_millis: {buffer_timeout_ms}
-"#
-    );
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      "inputs": {
+        "test_input1": {
+          "stream": "test_input1",
+          "transport": {
+            "name": "kafka_input",
+            "config": {
+              "auto.offset.reset": "earliest",
+              "group.instance.id": "buffer_test",
+              "topics": [input_topic],
+              "log_level": "debug"
+            }
+          },
+          "format": {
+            "name": "csv"
+          }
+        }
+      },
+      "outputs": {
+        "test_output2": {
+          "stream": "test_output1",
+          "transport": {
+            "name": "kafka_output",
+            "config": {
+              "topic": output_topic,
+              "message.max.bytes": "1000000",
+              "headers": [
+                {
+                  "key": "header1",
+                  "value": "foobar"
+                },
+                {
+                  "key": "header2",
+                  "value": [
+                    1,
+                    2,
+                    3,
+                    4,
+                    5
+                  ]
+                }
+              ]
+            }
+          },
+          "format": {
+            "name": "csv",
+              "config": {}
+          },
+          "enable_output_buffer": true,
+          "max_output_buffer_size_records": buffer_size,
+          "max_output_buffer_time_millis": buffer_timeout_ms
+        }
+      }
+    }))
+    .unwrap();
 
-    info!("buffer_test: Creating circuit. Config {config_str}");
+    info!("buffer_test: Creating circuit. Config {config:?}");
 
     info!("buffer_test: Starting controller");
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
 
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
 
-    let controller = Controller::with_config(
+    let controller = Controller::with_test_config(
         |workers| Ok(test_circuit::<TestStruct>(workers, &TestStruct::schema(), &[None])),
         &config,
-        Box::new(move |e| if running_clone.load(Ordering::Acquire) {
+        Box::new(move |e, _| if running_clone.load(Ordering::Acquire) {
             panic!("buffer_test: error: {e}")
         } else {
             info!("buffer_test: error during shutdown (likely caused by Kafka topics being deleted): {e}")
@@ -1971,7 +2414,7 @@ outputs:
             }
         );
     });
-    let buffer_consumer = BufferConsumer::new(&output_topic, "csv", "", Some(cb));
+    let buffer_consumer = BufferConsumer::new(&output_topic, "csv", json!({}), Some(cb));
 
     info!("buffer_test: Sending inputs");
     let producer = TestProducer::new();
@@ -2034,21 +2477,293 @@ proptest! {
 
     #[test]
     fn proptest_kafka_end_to_end_csv_large(data in generate_test_batches(0, 30, 1000)) {
-        kafka_end_to_end_test("proptest_kafka_end_to_end_csv_large", "csv", "", 1000000, data);
+        kafka_end_to_end_test("proptest_kafka_end_to_end_csv_large", "csv", json!({}), 1000000, data);
     }
 
     #[test]
     fn proptest_kafka_end_to_end_csv_small(data in generate_test_batches(0, 30, 1000)) {
-        kafka_end_to_end_test("proptest_kafka_end_to_end_csv_small", "csv", "", 1500, data);
+        kafka_end_to_end_test("proptest_kafka_end_to_end_csv_small", "csv", json!({}), 1500, data);
     }
 
     #[test]
     fn proptest_kafka_end_to_end_json_small(data in generate_test_batches(0, 30, 1000)) {
-        kafka_end_to_end_test("proptest_kafka_end_to_end_json_small", "json", "", 2048, data);
+        kafka_end_to_end_test("proptest_kafka_end_to_end_json_small", "json", json!({}), 2048, data);
     }
 
     #[test]
     fn proptest_kafka_end_to_end_json_array_small(data in generate_test_batches(0, 30, 1000)) {
-        kafka_end_to_end_test("proptest_kafka_end_to_end_json_array_small", "json", "array: true", 5000, data);
+        kafka_end_to_end_test("proptest_kafka_end_to_end_json_array_small", "json", json!({"array": true}), 5000, data);
     }
+}
+
+#[test]
+fn test_kafka_metadata_json() {
+    init_test_logger();
+
+    let topic = "kafka_metadata_json_test_topic";
+    let _kafka_resources = KafkaResources::create_topics(&[(topic, 1)]);
+
+    let config = serde_json::from_value(json!({
+        "stream": "test_input",
+        "transport": {
+            "name": "kafka_input",
+            "config": {
+                "topic": topic,
+                "log_level": "debug",
+                "auto.offset.reset": "earliest",
+                "include_headers": true,
+                "include_topic": true,
+                "include_timestamp": true,
+                "include_partition": true,
+                "include_offset": true
+            }
+        },
+        "format": {
+            "name": "json",
+            "config": {
+                "update_format": "raw"
+            }
+        }
+    }))
+    .unwrap();
+
+    info!("test_kafka_metadata_json: Building input pipeline");
+
+    let (endpoint, _, _, zset) =
+        mock_input_pipeline::<TestStructMetadata, TestStructMetadata>(config, Relation::empty())
+            .unwrap();
+
+    endpoint.extend();
+
+    let producer = TestProducer::new();
+
+    info!("test_kafka_metadata_json: Test: Receive from a topic with a single partition");
+
+    // Send data to a topic with a single partition;
+    producer.send_message(
+        b"{\"i\": 0}",
+        topic,
+        Some(BTreeMap::from([
+            ("header1".to_string(), Some(b"foobar".to_vec())),
+            ("header2".to_string(), None),
+        ])),
+    );
+    producer.send_message(b"{\"i\": 1}", topic, None);
+
+    let flush = || {
+        endpoint.queue(false);
+    };
+
+    let expected = vec![
+        TestStructMetadata::new(
+            0,
+            Variant::Map(Arc::new(BTreeMap::from([
+                (
+                    Variant::String(SqlString::from("header1")),
+                    Variant::Binary(ByteArray::new(b"foobar")),
+                ),
+                (
+                    Variant::String(SqlString::from("header2")),
+                    Variant::SqlNull,
+                ),
+            ]))),
+            SqlString::from(topic),
+            feldera_sqllib::Timestamp::from_microseconds(0),
+            0,
+            0,
+        ),
+        TestStructMetadata::new(
+            1,
+            Variant::Map(Arc::new(BTreeMap::new())),
+            SqlString::from(topic),
+            feldera_sqllib::Timestamp::from_microseconds(0),
+            0,
+            1,
+        ),
+    ];
+
+    let mut received = wait_for_output_count(&zset, 2, flush);
+    received[0].kafka_timestamp = feldera_sqllib::Timestamp::from_microseconds(0);
+    received[1].kafka_timestamp = feldera_sqllib::Timestamp::from_microseconds(0);
+    assert_eq!(received, expected);
+}
+
+/// Used to test passing of record metadata from Kafka connector to deserializer.
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Hash,
+    SizeOf,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    IsNone,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+pub struct TestRawStructMetadata {
+    pub data: SqlString,
+    pub kafka_headers: Variant,
+    pub kafka_topic: SqlString,
+    pub kafka_timestamp: feldera_sqllib::Timestamp,
+    pub kafka_partition: i32,
+    pub kafka_offset: i64,
+}
+
+deserialize_table_record!(TestRawStructMetadata["TestRawStructMetadata", Variant, 6] {
+    (data, "data", false, SqlString, |_| None),
+    (kafka_headers, "kafka_headers", false, Variant, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().map(|metadata| metadata.index_string("kafka_headers"))),
+    (kafka_topic, "kafka_topic", false, SqlString, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| SqlString::try_from(metadata.index_string("kafka_topic")).ok())),
+    (kafka_timestamp, "kafka_timestamp", false, feldera_sqllib::Timestamp, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| feldera_sqllib::Timestamp::try_from(metadata.index_string("kafka_timestamp")).ok())),
+    (kafka_partition, "kafka_partition", false, i32, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| i32::try_from(metadata.index_string("kafka_partition")).ok())),
+    (kafka_offset, "kafka_offset", false, i64, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| i64::try_from(metadata.index_string("kafka_offset")).ok()))
+});
+
+impl TestRawStructMetadata {
+    pub fn new(
+        data: SqlString,
+        kafka_headers: Variant,
+        kafka_topic: SqlString,
+        kafka_timestamp: feldera_sqllib::Timestamp,
+        kafka_partition: i32,
+        kafka_offset: i64,
+    ) -> Self {
+        Self {
+            data,
+            kafka_headers,
+            kafka_topic,
+            kafka_timestamp,
+            kafka_partition,
+            kafka_offset,
+        }
+    }
+
+    pub fn schema() -> Vec<Field> {
+        vec![
+            Field::new("data".into(), ColumnType::varchar(false)),
+            Field::new(
+                "kafka_headers".into(),
+                ColumnType::map(
+                    false,
+                    ColumnType::varchar(false),
+                    ColumnType::varbinary(false),
+                ),
+            ),
+            Field::new("kafka_topic".into(), ColumnType::varchar(false)),
+            Field::new("kafka_timestamp".into(), ColumnType::timestamp(false)),
+            Field::new("kafka_partition".into(), ColumnType::int(false)),
+            Field::new("kafka_offset".into(), ColumnType::bigint(false)),
+        ]
+    }
+
+    pub fn relation_schema() -> Relation {
+        Relation::new(
+            SqlIdentifier::new("TestRawStructMetadata", false),
+            Self::schema(),
+            false,
+            BTreeMap::new(),
+        )
+    }
+}
+
+#[test]
+fn test_kafka_metadata_raw() {
+    init_test_logger();
+
+    let topic = "kafka_metadata_raw_test_topic";
+    let _kafka_resources = KafkaResources::create_topics(&[(topic, 1)]);
+
+    let config = serde_json::from_value(json!({
+        "stream": "test_input",
+        "transport": {
+            "name": "kafka_input",
+            "config": {
+                "topic": topic,
+                "log_level": "debug",
+                "auto.offset.reset": "earliest",
+                "include_headers": true,
+                "include_topic": true,
+                "include_timestamp": true,
+                "include_partition": true,
+                "include_offset": true
+            }
+        },
+        "format": {
+            "name": "raw",
+            "config": {
+                "mode": "blob",
+                "column_name": "data"
+            }
+        }
+    }))
+    .unwrap();
+
+    info!("test_kafka_metadata_raw: Building input pipeline");
+
+    let (endpoint, _, _, zset) =
+        mock_input_pipeline::<TestRawStructMetadata, TestRawStructMetadata>(
+            config,
+            TestRawStructMetadata::relation_schema(),
+        )
+        .unwrap();
+
+    endpoint.extend();
+
+    let producer = TestProducer::new();
+
+    info!("test_kafka_metadata_raw: Test: Receive from a topic with a single partition");
+
+    // Send data to a topic with a single partition;
+    producer.send_message(
+        b"foo",
+        topic,
+        Some(BTreeMap::from([
+            ("header1".to_string(), Some(b"foobar".to_vec())),
+            ("header2".to_string(), None),
+        ])),
+    );
+    producer.send_message(b"bar", topic, None);
+
+    let flush = || {
+        endpoint.queue(false);
+    };
+
+    let expected = vec![
+        TestRawStructMetadata::new(
+            SqlString::from("foo"),
+            Variant::Map(Arc::new(BTreeMap::from([
+                (
+                    Variant::String(SqlString::from("header1")),
+                    Variant::Binary(ByteArray::new(b"foobar")),
+                ),
+                (
+                    Variant::String(SqlString::from("header2")),
+                    Variant::SqlNull,
+                ),
+            ]))),
+            SqlString::from(topic),
+            feldera_sqllib::Timestamp::from_microseconds(0),
+            0,
+            0,
+        ),
+        TestRawStructMetadata::new(
+            SqlString::from("bar"),
+            Variant::Map(Arc::new(BTreeMap::new())),
+            SqlString::from(topic),
+            feldera_sqllib::Timestamp::from_microseconds(0),
+            0,
+            1,
+        ),
+    ];
+
+    let mut received = wait_for_output_count(&zset, 2, flush);
+    received[0].kafka_timestamp = feldera_sqllib::Timestamp::from_microseconds(0);
+    received[1].kafka_timestamp = feldera_sqllib::Timestamp::from_microseconds(0);
+    assert_eq!(received, expected);
 }

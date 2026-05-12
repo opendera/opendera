@@ -10,7 +10,9 @@ import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteRelNode;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.Expensive;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.Simplify;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
 import org.dbsp.sqlCompiler.ir.expression.DBSPBlockExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
@@ -28,6 +30,7 @@ import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
 import org.dbsp.util.IndentStreamBuilder;
 import org.dbsp.util.Linq;
+import org.dbsp.util.Maybe;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
@@ -37,7 +40,7 @@ import java.util.List;
 /** A Chain operator performs a linear chain of Map/Filter/MapIndex operations.
  * In the end it is lowered to a {@link DBSPFlatMapOperator} or
  * {@link DBSPFlatMapIndexOperator} operator, depending on the last operation. */
-public class DBSPChainOperator extends DBSPUnaryOperator {
+public class DBSPChainOperator extends DBSPUnaryOperator implements ILinear {
     public final ComputationChain chain;
 
     public DBSPChainOperator(CalciteRelNode node, ComputationChain chain, boolean isMultiset, OutputPort source) {
@@ -129,15 +132,27 @@ public class DBSPChainOperator extends DBSPUnaryOperator {
         DBSPExpression call(DBSPCompiler compiler, DBSPClosureExpression closure, DBSPExpression arg) {
             if (arg.getType().is(DBSPTypeRawTuple.class)) {
                 return closure.call(new DBSPRawTupleExpression(
-                        arg.field(0).simplify().borrow(),
-                        arg.field(1).simplify().borrow()))
+                        arg.field(0).borrow(),
+                        arg.field(1).borrow()))
                         .reduce(compiler);
             } else {
                 return closure.call(arg.borrow()).reduce(compiler);
             }
         }
 
+        public boolean containsFilter() {
+            return Linq.any(this.computations, c -> c.kind() == ComputationKind.Filter);
+        }
+
+        /** Return a function that is equivalent to the composition of the functions in the chain.
+         * If the chain contains any filters the result will have an Option type result. */
         public DBSPClosureExpression collapse(DBSPCompiler compiler) {
+            if (this.computations.size() == 1) {
+                Computation comp = this.computations.get(0);
+                if (comp.kind != ComputationKind.Filter)
+                    return comp.closure;
+            }
+
             DBSPVariablePath inputVar;
             DBSPExpression currentArg;
             if (this.inputType.is(DBSPTypeZSet.class)) {
@@ -156,12 +171,15 @@ public class DBSPChainOperator extends DBSPUnaryOperator {
             else
                 resultType = resultType.to(DBSPTypeIndexedZSet.class).getKVType();
             none = resultType.withMayBeNull(true).none();
+            boolean foundFilter = false;
+            boolean foundNonFilter = false;
             List<DBSPStatement> statements = new ArrayList<>();
             for (Computation comp: this.computations) {
                 CalciteObject node = comp.closure().getNode();
                 DBSPStatement stat;
                 switch (comp.kind) {
                     case Map, MapIndex: {
+                        foundNonFilter = true;
                         DBSPVariablePath nextVar = comp.closure.getResultType().var();
                         stat = new DBSPLetStatement(nextVar.variable,
                                 this.call(compiler, comp.closure, currentArg));
@@ -169,10 +187,14 @@ public class DBSPChainOperator extends DBSPUnaryOperator {
                         break;
                     }
                     case Filter: {
-                        stat = new DBSPExpressionStatement(
-                                new DBSPIfExpression(node, this.call(compiler, comp.closure, currentArg).not(),
-                                        new DBSPReturnExpression(node, none),
-                                        null));
+                        foundFilter = true;
+                        DBSPExpression condition = this.call(compiler, comp.closure, currentArg).not();
+                        Simplify simplify = new Simplify(compiler);
+                        condition = simplify.apply(condition).to(DBSPExpression.class);
+                        DBSPExpression cond = new DBSPIfExpression(node, condition,
+                                new DBSPReturnExpression(node, none),
+                                null).simplify();
+                        stat = new DBSPExpressionStatement(cond);
                         break;
                     }
                     default: {
@@ -181,7 +203,10 @@ public class DBSPChainOperator extends DBSPUnaryOperator {
                 }
                 statements.add(stat);
             }
-            DBSPExpression last = currentArg.some();
+            if (!foundNonFilter) {
+                currentArg = currentArg.applyCloneIfNeeded();
+            }
+            DBSPExpression last = (foundFilter) ? currentArg.some() : currentArg;
             DBSPBlockExpression block = new DBSPBlockExpression(statements, last);
             return block.closure(inputVar);
         }
@@ -219,6 +244,90 @@ public class DBSPChainOperator extends DBSPUnaryOperator {
                 builder.append(op.toString()).newline();
             builder.decrease().newline();
             return builder.toString();
+        }
+
+        /** Compose pairs of maps that can be efficiently composed, taking into advantage
+         * the fact that function composition is associative. */
+        public DBSPChainOperator.ComputationChain shrinkMaps(DBSPCompiler compiler) {
+            List<DBSPChainOperator.Computation> result = new ArrayList<>();
+            for (DBSPChainOperator.Computation comp: this.computations()) {
+                if (result.isEmpty() || comp.kind() == DBSPChainOperator.ComputationKind.Filter) {
+                    result.add(comp);
+                } else {
+                    DBSPChainOperator.Computation last = Utilities.removeLast(result);
+                    if (last.kind() == DBSPChainOperator.ComputationKind.Filter) {
+                        result.add(last);
+                        result.add(comp);
+                        continue;
+                    }
+
+                    boolean expensive = Expensive.isExpensive(compiler, last.closure());
+                    if (expensive) {
+                        result.add(last);
+                    } else {
+                        DBSPClosureExpression composed;
+                        if (last.kind() == DBSPChainOperator.ComputationKind.Map) {
+                            composed = comp.closure().applyAfter(compiler, last.closure(), Maybe.MAYBE);
+                        } else {
+                            DBSPClosureExpression lastFunction = last.closure();
+                            DBSPExpression argument = new DBSPRawTupleExpression(
+                                    lastFunction.body.field(0).borrow(),
+                                    lastFunction.body.field(1).borrow());
+                            DBSPExpression apply = comp.closure().call(argument);
+                            composed = apply.reduce(compiler)
+                                    .closure(lastFunction.parameters);
+                        }
+                        comp = new DBSPChainOperator.Computation(comp.kind(), composed);
+                    }
+                    result.add(comp);
+                }
+            }
+
+            if (result.size() == this.size())
+                return this;
+            return new DBSPChainOperator.ComputationChain(this.inputType(), result);
+        }
+
+        /** Convert Map(m1) -> Filter(f) -> Map(m2) into Filter(f \circ m1) -> Map(m2 \circ m1) if m1 is simple */
+        public ComputationChain shrinkMapFilterMap(DBSPCompiler compiler) {
+            List<DBSPChainOperator.Computation> result = new ArrayList<>();
+            if (this.size() < 3) {
+                return this;
+            }
+
+            // Find a sequence Map -> Filter -> Map/MapIndex
+            int startIndex = -1;
+            for (int i = 0; i < this.size() - 2; i++) {
+                if (this.computations().get(i).kind() == DBSPChainOperator.ComputationKind.Map &&
+                        this.computations().get(i+1).kind() == DBSPChainOperator.ComputationKind.Filter &&
+                        this.computations().get(i+2).kind() != DBSPChainOperator.ComputationKind.Filter) {
+                    DBSPClosureExpression map = this.computations().get(i).closure();
+                    if (this.computations().get(i+1).closure().shouldInlineComposition(compiler, map) &&
+                            this.computations().get(i+2).closure().shouldInlineComposition(compiler, map)) {
+                        startIndex = i;
+                        break;
+                    }
+                }
+                result.add(this.computations().get(i));
+            }
+
+            if (startIndex < 0)
+                return this;
+
+            DBSPChainOperator.Computation first = this.computations().get(startIndex);
+            DBSPChainOperator.Computation filter = this.computations().get(startIndex + 1);
+            DBSPChainOperator.Computation third = this.computations().get(startIndex + 2);
+
+            DBSPClosureExpression filterMap = filter.closure().applyAfter(compiler, first.closure(), Maybe.MAYBE);
+            DBSPClosureExpression mapMap = third.closure().applyAfter(compiler, first.closure(), Maybe.MAYBE);
+            result.add(new DBSPChainOperator.Computation(DBSPChainOperator.ComputationKind.Filter, filterMap));
+            result.add(new DBSPChainOperator.Computation(third.kind(), mapMap));
+            // Keep the subsequent unchanged
+            for (int i = startIndex + 3; i < this.size(); i++) {
+                result.add(this.computations().get(i));
+            }
+
+            return new DBSPChainOperator.ComputationChain(this.inputType(), result);
         }
     }
 

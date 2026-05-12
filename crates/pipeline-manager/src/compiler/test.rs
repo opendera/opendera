@@ -35,6 +35,7 @@ impl CompilerTest {
         let platform_version = "v0";
         let common_config = CommonConfig {
             bind_address: "127.0.0.1".to_string(),
+            api_host: "127.0.0.1".to_string(),
             api_port: 8080,
             compiler_host: "127.0.0.1".to_string(),
             compiler_port: 8085,
@@ -42,6 +43,12 @@ impl CompilerTest {
             runner_port: 8089,
             platform_version: platform_version.to_string(),
             http_workers: 1,
+            unstable_features: None,
+            enable_https: false,
+            https_tls_cert_path: None,
+            https_tls_key_path: None,
+            private_ca_cert_path: None,
+            pipeline_monitor_events_retention: 720,
         };
         let compiler_config = CompilerConfig {
             sql_compiler_path:
@@ -53,6 +60,10 @@ impl CompilerTest {
             compilation_profile: CompilationProfile::Optimized,
             precompile: false,
             compiler_working_directory: workdir.to_owned(),
+            binary_upload_endpoint: None,
+            binary_upload_timeout_secs: 600,
+            binary_upload_max_retries: 3,
+            binary_upload_retry_delay_ms: 1000,
         };
 
         // Test in-memory database
@@ -173,6 +184,8 @@ impl CompilerTest {
             .await
             .unwrap();
         attempt_end_to_end_sql_compilation(
+            0, // Use worker 0 for tests
+            1,
             &self.common_config,
             &self.compiler_config,
             self.db.clone(),

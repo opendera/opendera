@@ -28,7 +28,7 @@ import java.util.Objects;
  * For this we synthesize the following graph:
  *     |
  * {}/{c->1}------------------------
- *    | map (|x| x -> z}           |
+ *    | map (|x| x -> z)           |
  * {}/{z->1}                       |
  *    | -                          |
  * {} {z->-1}   {z->1} (constant)  |
@@ -41,7 +41,7 @@ import java.util.Objects;
  *                  |
  */
 @NonCoreIR
-public class DBSPAggregateZeroOperator extends DBSPUnaryOperator {
+public class DBSPAggregateZeroOperator extends DBSPUnaryOperator implements ILinear {
     /** Create an AggregateZero operator.
      *
      * @param node   Calcite node.

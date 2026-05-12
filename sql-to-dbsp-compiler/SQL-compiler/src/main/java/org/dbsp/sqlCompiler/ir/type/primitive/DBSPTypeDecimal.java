@@ -35,6 +35,7 @@ import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.DBSPTypeCode;
 import org.dbsp.sqlCompiler.ir.type.IsNumericType;
 import org.dbsp.sqlCompiler.compiler.errors.UnsupportedException;
+import org.dbsp.util.IIndentStream;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
@@ -92,11 +93,26 @@ public class DBSPTypeDecimal extends DBSPTypeBaseType
     String getMaxLiteral() {
         StringBuilder str = new StringBuilder();
         for (int i = 0; i < this.precision; i++) {
-            str.append("9");
-            if (i == this.scale)
+            if (i == this.precision - this.scale)
                 str.append(".");
+            str.append("9");
         }
         return str.toString();
+    }
+
+    @Override
+    public int genericArgumentCount() {
+        return 2;
+    }
+
+    @Override
+    public boolean emitGenericArguments(IIndentStream builder, boolean first) {
+        if (!first)
+            builder.append(", ");
+        builder.append(this.precision)
+                .append(", ")
+                .append(this.scale);
+        return false;
     }
 
     @Override
@@ -151,6 +167,11 @@ public class DBSPTypeDecimal extends DBSPTypeBaseType
         visitor.push(this);
         visitor.pop(this);
         visitor.postorder(this);
+    }
+
+    @Override
+    public IIndentStream toString(IIndentStream builder) {
+        return builder.append(this.toString());
     }
 
     @Override

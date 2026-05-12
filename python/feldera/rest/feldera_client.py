@@ -1,17 +1,23 @@
-import pathlib
-from typing import Any, Dict, Optional
-import logging
-import time
 import json
+import logging
+import pathlib
+import time
 from decimal import Decimal
-from typing import Generator
+from typing import Any, Dict, Generator, Mapping, Optional
+from urllib.parse import quote
 
-from feldera.rest.config import Config
-from feldera.rest.feldera_config import FelderaConfig
-from feldera.rest.errors import FelderaTimeoutError
-from feldera.rest.pipeline import Pipeline
+import requests
+
+from feldera.enums import BootstrapPolicy, PipelineFieldSelector, PipelineStatus
+from feldera.rest._helpers import determine_client_version
 from feldera.rest._httprequests import HttpRequests
-from feldera.rest._helpers import client_version
+from feldera.rest.config import Config
+from feldera.rest.errors import FelderaAPIError, FelderaTimeoutError
+from feldera.rest.feldera_config import FelderaConfig
+from feldera.rest.pipeline import Pipeline
+from feldera.rest.retry import RetryConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_no_none_keys_in_map(data):
@@ -35,44 +41,72 @@ def _prepare_boolean_input(value: bool) -> str:
 
 class FelderaClient:
     """
-    A client for the Feldera HTTP API
+    A client for the Feldera HTTP API.
 
-    A client instance is needed for every Feldera API method to know the
-    location of Feldera and its permissions.
+    The client is initialized with the configuration needed for interacting with the
+    Feldera HTTP API, which it uses in its calls. Its methods are implemented
+    by issuing one or more HTTP requests to the API, and as such can provide higher
+    level operations (e.g., support waiting for the success of asynchronous HTTP API
+    functionality).
     """
 
     def __init__(
         self,
-        url: str,
+        url: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout: Optional[float] = None,
-        requests_verify: bool = True,
+        connection_timeout: Optional[float] = None,
+        requests_verify: Optional[bool | str] = None,
+        retry_config: Optional[RetryConfig] = None,
     ) -> None:
         """
-        :param url: The url to Feldera API (ex: https://try.feldera.com)
-        :param api_key: The optional API key for Feldera
-        :param timeout: (optional) The amount of time in seconds that the client
-            will wait for a response before timing
-            out.
-        :param requests_verify: The `verify` parameter passed to the requests
-            library. `True` by default.
+        Constructs a Feldera client.
+
+        :param url: (Optional) URL to the Feldera API.
+            The default is read from the `FELDERA_HOST` environment variable;
+            if the variable is not set, the default is `"http://localhost:8080"`.
+        :param api_key: (Optional) API key to access Feldera (format: `"apikey:..."`).
+            The default is read from the `FELDERA_API_KEY` environment variable;
+            if the variable is not set, the default is `None` (no API key is provided).
+        :param timeout: (Optional) Duration in seconds that the client will wait to receive
+            a response of an HTTP request, after which it times out.
+            The default is `None` (wait indefinitely; no timeout is enforced).
+        :param connection_timeout: (Optional) Duration in seconds that the client will wait
+            to establish the connection of an HTTP request, after which it times out.
+            The default is `None` (wait indefinitely; no timeout is enforced).
+        :param requests_verify: (Optional) The `verify` parameter passed to the `requests` library,
+            which is used internally to perform HTTP requests.
+            See also: https://requests.readthedocs.io/en/latest/user/advanced/#ssl-cert-verification .
+            The default is based on the `FELDERA_HTTPS_TLS_CERT` or the `FELDERA_TLS_INSECURE` environment variable.
+            By setting `FELDERA_HTTPS_TLS_CERT` to a path, the default becomes the CA bundle it points to.
+            By setting `FELDERA_TLS_INSECURE` to `"1"`, `"true"` or `"yes"` (all case-insensitive), the default becomes
+            `False` which means to disable TLS verification by default. If both variables are set, the former takes
+            priority over the latter. If neither variable is set, the default is `True`.
+        :param retry_config: (Optional) Retry behavior for transient HTTP failures
+            (408, 502, 503, 504, timeouts). The default is `RetryConfig()` — 3 retries
+            with exponential backoff starting at 2 seconds.
         """
 
         self.config = Config(
-            url, api_key, timeout=timeout, requests_verify=requests_verify
+            url=url,
+            api_key=api_key,
+            timeout=timeout,
+            connection_timeout=connection_timeout,
+            requests_verify=requests_verify,
+            retry_config=retry_config,
         )
         self.http = HttpRequests(self.config)
 
         try:
-            config = self.get_config()
-            version = client_version()
-            if config.version != version:
-                logging.warn(
-                    f"Client is on version {version} while server is at "
-                    f"{config.version}. There could be incompatibilities."
+            client_version = determine_client_version()
+            server_config = self.get_config()
+            if client_version != server_config.version:
+                logger.warning(
+                    f"Feldera client is on version {client_version} while server is at "
+                    f"{server_config.version}. There could be incompatibilities."
                 )
         except Exception as e:
-            logging.error(f"Failed to connect to Feldera API: {e}")
+            logger.error(f"Failed to connect to Feldera API: {e}")
             raise e
 
     @staticmethod
@@ -83,49 +117,85 @@ class FelderaClient:
 
         return FelderaClient(f"http://127.0.0.1:{port}")
 
-    def get_pipeline(self, pipeline_name) -> Pipeline:
+    def get_pipeline(
+        self, pipeline_name: str, field_selector: PipelineFieldSelector
+    ) -> Pipeline:
         """
         Get a pipeline by name
 
         :param pipeline_name: The name of the pipeline
+        :param field_selector: Choose what pipeline information to refresh; see PipelineFieldSelector enum definition.
         """
 
-        resp = self.http.get(f"/pipelines/{pipeline_name}")
+        resp = self.http.get(
+            f"/pipelines/{pipeline_name}?selector={field_selector.value}"
+        )
 
         return Pipeline.from_dict(resp)
 
-    def get_runtime_config(self, pipeline_name) -> dict:
+    def get_runtime_config(self, pipeline_name) -> Mapping[str, Any]:
         """
         Get the runtime config of a pipeline by name
 
         :param pipeline_name: The name of the pipeline
         """
 
-        resp: dict = self.http.get(f"/pipelines/{pipeline_name}")
+        resp: Mapping[str, Any] = self.http.get(f"/pipelines/{pipeline_name}")
 
-        return resp.get("runtime_config")
+        runtime_config: Mapping[str, Any] | None = resp.get("runtime_config")
+        if runtime_config is None:
+            raise ValueError(f"Pipeline {pipeline_name} has no runtime config")
 
-    def pipelines(self) -> list[Pipeline]:
+        return runtime_config
+
+    def pipelines(
+        self, selector: PipelineFieldSelector = PipelineFieldSelector.STATUS
+    ) -> list[Pipeline]:
         """
         Get all pipelines
         """
 
         resp = self.http.get(
-            path="/pipelines",
+            path=f"/pipelines?selector={selector.value}",
         )
 
         return [Pipeline.from_dict(pipeline) for pipeline in resp]
 
-    def __wait_for_compilation(self, name: str):
+    def _wait_for_compilation(
+        self,
+        name: str,
+        expected_program_version: int | None = None,
+        timeout_s: float | None = None,
+        poll_interval_s: float = 1.0,
+    ) -> Pipeline:
+        """Wait for pipeline compilation -- internal use only."""
         wait = ["Pending", "CompilingSql", "SqlCompiled", "CompilingRust"]
-
+        start_time = time.monotonic()
         while True:
-            p = self.get_pipeline(name)
+            elapsed = time.monotonic() - start_time
+            if timeout_s is not None and elapsed > timeout_s:
+                raise TimeoutError(
+                    f"Timed out waiting for pipeline '{name}' to compile "
+                    f"(expected program_version >= {expected_program_version})"
+                )
+
+            p = self.get_pipeline(name, PipelineFieldSelector.STATUS)
             status = p.program_status
 
             if status == "Success":
-                return p
+                if expected_program_version is None:
+                    return self.get_pipeline(name, PipelineFieldSelector.ALL)
+
+                current_version = p.program_version or 0
+                if current_version == expected_program_version:
+                    return self.get_pipeline(name, PipelineFieldSelector.ALL)
+                else:
+                    raise RuntimeError(
+                        f"program version ({current_version}) != expected program version ({expected_program_version})"
+                    )
             elif status not in wait:
+                p = self.get_pipeline(name, PipelineFieldSelector.ALL)
+
                 # error handling for SQL compilation errors
                 if status == "SqlError":
                     sql_errors = p.program_error["sql_compilation"]["messages"]
@@ -138,17 +208,117 @@ class FelderaClient:
                             err_msg += f"Code snippet:\n{sql_error['snippet']}"
                         raise RuntimeError(err_msg)
 
-                raise RuntimeError(f"The program failed to compile: {status}")
+                error_message = f"The program failed to compile: {status}\n"
 
-            logging.debug("still compiling %s, waiting for 100 more milliseconds", name)
-            time.sleep(0.1)
+                rust_error = p.program_error.get("rust_compilation")
+                if rust_error is not None:
+                    error_message += f"Rust Error: {rust_error}\n"
 
-    def create_pipeline(self, pipeline: Pipeline) -> Pipeline:
+                system_error = p.program_error.get("system_error")
+                if system_error is not None:
+                    error_message += f"System Error: {system_error}"
+
+                raise RuntimeError(error_message)
+
+            logger.debug(
+                "still compiling %s, waiting for %.1f more seconds",
+                name,
+                poll_interval_s,
+            )
+            time.sleep(poll_interval_s)
+
+    def __wait_for_pipeline_state(
+        self,
+        pipeline_name: str,
+        state: str,
+        timeout_s: Optional[float] = None,
+        start: bool = True,
+        poll_interval_s: float = 0.5,
+    ):
+        start_time = time.monotonic()
+
+        while True:
+            if timeout_s is not None:
+                elapsed = time.monotonic() - start_time
+                if elapsed > timeout_s:
+                    raise TimeoutError(
+                        f"Timed out waiting for pipeline {pipeline_name} to "
+                        f"transition to '{state}' state"
+                    )
+
+            resp = self.get_pipeline(pipeline_name, PipelineFieldSelector.STATUS)
+            status = resp.deployment_status
+
+            if status.lower() == state.lower():
+                break
+            elif (
+                status == "Stopped"
+                and len(resp.deployment_error or {}) > 0
+                and resp.deployment_desired_status == "Stopped"
+            ):
+                err_msg = "Unable to START the pipeline:\n" if start else ""
+                raise RuntimeError(
+                    f"""{err_msg}Unable to transition the pipeline to '{state}'.
+Reason: The pipeline is in a STOPPED state due to the following error:
+{resp.deployment_error.get("message", "")}"""
+                )
+
+            logger.debug(
+                "still starting %s, waiting for %.1f more seconds",
+                pipeline_name,
+                poll_interval_s,
+            )
+            time.sleep(poll_interval_s)
+
+    def __wait_for_pipeline_state_one_of(
+        self,
+        pipeline_name: str,
+        states: list[str],
+        timeout_s: float | None = None,
+        start: bool = True,
+        poll_interval_s: float = 0.5,
+    ) -> PipelineStatus:
+        start_time = time.monotonic()
+        states = [state.lower() for state in states]
+
+        while True:
+            if timeout_s is not None:
+                elapsed = time.monotonic() - start_time
+                if elapsed > timeout_s:
+                    raise TimeoutError(
+                        f"Timed out waiting for pipeline {pipeline_name} to"
+                        f"transition to one of the states: {states}"
+                    )
+
+            resp = self.get_pipeline(pipeline_name, PipelineFieldSelector.STATUS)
+            status = resp.deployment_status
+
+            if status.lower() in states:
+                return PipelineStatus.from_str(status)
+            elif (
+                status == "Stopped"
+                and len(resp.deployment_error or {}) > 0
+                and resp.deployment_desired_status == "Stopped"
+            ):
+                err_msg = "Unable to START the pipeline:\n" if start else ""
+                raise RuntimeError(
+                    f"""{err_msg}Unable to transition the pipeline to one of the states: {states}.
+Reason: The pipeline is in a STOPPED state due to the following error:
+{resp.deployment_error.get("message", "")}"""
+                )
+            logger.debug(
+                "still starting %s, waiting for %.1f more seconds",
+                pipeline_name,
+                poll_interval_s,
+            )
+            time.sleep(poll_interval_s)
+
+    def create_pipeline(self, pipeline: Pipeline, wait: bool = True) -> Pipeline:
         """
         Create a pipeline if it doesn't exist and wait for it to compile
 
-
-        :name: The name of the pipeline
+        :param pipeline: The pipeline to create
+        :param wait: Whether to wait for the pipeline to compile. True by default
         """
 
         body = {
@@ -166,12 +336,21 @@ class FelderaClient:
             body=body,
         )
 
-        return self.__wait_for_compilation(pipeline.name)
+        if not wait:
+            return pipeline
 
-    def create_or_update_pipeline(self, pipeline: Pipeline) -> Pipeline:
+        return self._wait_for_compilation(pipeline.name)
+
+    def create_or_update_pipeline(
+        self, pipeline: Pipeline, wait: bool = True
+    ) -> Pipeline:
         """
         Create a pipeline if it doesn't exist or update a pipeline and wait for
         it to compile
+
+        :param pipeline: The pipeline to create or update
+        :param wait: Whether to wait for the pipeline to compile. True by default
+        :return: The created or updated pipeline
         """
 
         body = {
@@ -189,21 +368,53 @@ class FelderaClient:
             body=body,
         )
 
-        return self.__wait_for_compilation(pipeline.name)
+        if not wait:
+            return pipeline
 
-    def patch_pipeline(self, name: str, sql: str):
+        return self._wait_for_compilation(pipeline.name)
+
+    def patch_pipeline(
+        self,
+        name: str,
+        sql: Optional[str] = None,
+        udf_rust: Optional[str] = None,
+        udf_toml: Optional[str] = None,
+        program_config: Optional[Mapping[str, Any]] = None,
+        runtime_config: Optional[Mapping[str, Any]] = None,
+        description: Optional[str] = None,
+    ):
         """
-        Incrementally update the pipeline SQL
+        Incrementally update pipeline
 
         :param name: The name of the pipeline
-        :param sql: The SQL snippet. Replaces the existing SQL code with this
-            one.
         """
 
         self.http.patch(
             path=f"/pipelines/{name}",
-            body={"program_code": sql},
+            body={
+                "program_code": sql,
+                "udf_rust": udf_rust,
+                "udf_toml": udf_toml,
+                "program_config": program_config,
+                "runtime_config": runtime_config,
+                "description": description,
+            },
         )
+
+    def testing_force_update_platform_version(self, name: str, platform_version: str):
+        self.http.post(
+            path=f"/pipelines/{name}/testing",
+            params={"set_platform_version": platform_version},
+        )
+
+    def update_pipeline_runtime(self, name: str):
+        """
+        Recompile a pipeline with the Feldera runtime version included in the currently installed Feldera platform.
+
+        :param name: The name of the pipeline
+        """
+
+        self.http.post(path=f"/pipelines/{name}/update_runtime")
 
     def delete_pipeline(self, name: str):
         """
@@ -228,107 +439,237 @@ class FelderaClient:
 
         return resp
 
-    def start_pipeline(self, pipeline_name: str, timeout_s: Optional[float] = 300):
+    def get_pipeline_logs(self, pipeline_name: str) -> Generator[str, None, None]:
+        """
+        Get the pipeline logs
+
+        :param name: The name of the pipeline
+        :return: A generator yielding the logs, one line at a time.
+        """
+        chunk: bytes
+        with self.http.get(
+            path=f"/pipelines/{pipeline_name}/logs",
+            stream=True,
+        ) as resp:
+            for chunk in resp.iter_lines(chunk_size=50000000):
+                if chunk:
+                    yield chunk.decode("utf-8")
+
+    def activate_pipeline(
+        self, pipeline_name: str, wait: bool = True, timeout_s: Optional[float] = None
+    ) -> Optional[PipelineStatus]:
+        """
+
+        :param pipeline_name: The name of the pipeline to activate
+        :param wait: Set True to wait for the pipeline to activate. True by
+            default
+        :param timeout_s: The amount of time in seconds to wait for the
+            pipeline to activate.
+        """
+
+        self.http.post(
+            path=f"/pipelines/{pipeline_name}/activate",
+        )
+
+        if not wait:
+            return None
+
+        return self.__wait_for_pipeline_state_one_of(
+            pipeline_name, ["running", "AwaitingApproval"], timeout_s
+        )
+
+    def _inner_start_pipeline(
+        self,
+        pipeline_name: str,
+        initial: str = "running",
+        bootstrap_policy: Optional[BootstrapPolicy] = None,
+        wait: bool = True,
+        timeout_s: Optional[float] = None,
+        dismiss_error: bool = True,
+    ) -> Optional[PipelineStatus]:
         """
 
         :param pipeline_name: The name of the pipeline to start
-        :param timeout_s: The amount of time in seconds to wait for the pipeline
-            to start. 300 seconds by default.
+        :param initial: The initial state to start the pipeline in. "running"
+            by default.
+        :param wait: Set True to wait for the pipeline to start. True by default
+        :param timeout_s: The amount of time in seconds to wait for the
+            pipeline to start.
+        :param dismiss_error: Set True to dismiss any deployment error before starting;
+            set False to make it fail in that case. True by default.
         """
+        start_params = {}
 
-        if timeout_s is None:
-            timeout_s = 300
+        # Any error is dismissed separately in order to make sure we only dismiss any error
+        # BEFORE it was started, not after it has been started by this call
+        if dismiss_error:
+            self.http.post(path=f"/pipelines/{pipeline_name}/dismiss_error")
+        start_params["dismiss_error"] = "false"
+
+        start_params["initial"] = initial
+        if bootstrap_policy is not None:
+            start_params["bootstrap_policy"] = bootstrap_policy.value
 
         self.http.post(
             path=f"/pipelines/{pipeline_name}/start",
+            params=start_params,
         )
 
-        start_time = time.monotonic()
+        if not wait:
+            return None
 
-        while True:
-            if timeout_s is not None:
-                elapsed = time.monotonic() - start_time
-                if elapsed > timeout_s:
-                    raise TimeoutError(
-                        f"Timed out waiting for pipeline {pipeline_name} to start"
-                    )
+        return self.__wait_for_pipeline_state_one_of(
+            pipeline_name,
+            [initial, "AwaitingApproval"],
+            timeout_s,
+        )
 
-            resp = self.get_pipeline(pipeline_name)
-            status = resp.deployment_status
+    def start_pipeline(
+        self,
+        pipeline_name: str,
+        bootstrap_policy: Optional[BootstrapPolicy] = None,
+        wait: bool = True,
+        timeout_s: Optional[float] = None,
+        dismiss_error: bool = True,
+    ) -> Optional[PipelineStatus]:
+        """
 
-            if status == "Running":
-                break
-            elif status == "Failed":
-                raise RuntimeError(
-                    f"""Unable to START the pipeline.
-Reason: The pipeline is in a STOPPED state due to the following error:
-{resp.deployment_error.get("message", "")}"""
-                )
+        :param pipeline_name: The name of the pipeline to start
+        :param wait: Set True to wait for the pipeline to start.
+            True by default
+        :param timeout_s: The amount of time in seconds to wait for the
+            pipeline to start.
+        :param dismiss_error: Set True to dismiss any deployment error before starting;
+            set False to make it fail in that case. True by default.
+        """
 
-            logging.debug(
-                "still starting %s, waiting for 100 more milliseconds", pipeline_name
-            )
-            time.sleep(0.1)
+        return self._inner_start_pipeline(
+            pipeline_name,
+            "running",
+            bootstrap_policy,
+            wait,
+            timeout_s,
+            dismiss_error,
+        )
+
+    def start_pipeline_as_paused(
+        self,
+        pipeline_name: str,
+        bootstrap_policy: Optional[BootstrapPolicy] = None,
+        wait: bool = True,
+        timeout_s: float | None = None,
+        dismiss_error: bool = True,
+    ) -> Optional[PipelineStatus]:
+        """
+        :param pipeline_name: The name of the pipeline to start as paused.
+        :param wait: Set True to wait for the pipeline to start as pause.
+            True by default
+        :param timeout_s: The amount of time in seconds to wait for the
+            pipeline to start.
+        :param dismiss_error: Set True to dismiss any deployment error before starting;
+            set False to make it fail in that case. True by default.
+        """
+
+        return self._inner_start_pipeline(
+            pipeline_name,
+            "paused",
+            bootstrap_policy,
+            wait,
+            timeout_s,
+            dismiss_error,
+        )
+
+    def start_pipeline_as_standby(
+        self,
+        pipeline_name: str,
+        bootstrap_policy: Optional[BootstrapPolicy] = None,
+        wait: bool = True,
+        timeout_s: Optional[float] = None,
+        dismiss_error: bool = True,
+    ):
+        """
+        :param pipeline_name: The name of the pipeline to start as standby.
+        :param wait: Set True to wait for the pipeline to start as standby.
+            True by default
+        :param timeout_s: The amount of time in seconds to wait for the
+            pipeline to start.
+        :param dismiss_error: Set True to dismiss any deployment error before starting;
+            set False to make it fail in that case. True by default.
+        """
+
+        self._inner_start_pipeline(
+            pipeline_name,
+            "standby",
+            bootstrap_policy,
+            wait,
+            timeout_s,
+            dismiss_error,
+        )
+
+    def resume_pipeline(
+        self,
+        pipeline_name: str,
+        wait: bool = True,
+        timeout_s: Optional[float] = None,
+    ):
+        """
+        Resume a pipeline
+
+        :param pipeline_name: The name of the pipeline to stop
+        :param wait: Set True to wait for the pipeline to pause. True by default
+        :param timeout_s: The amount of time in seconds to wait for the pipeline
+            to pause.
+        """
+
+        self.http.post(
+            path=f"/pipelines/{pipeline_name}/resume",
+        )
+
+        if not wait:
+            return
+
+        self.__wait_for_pipeline_state(pipeline_name, "running", timeout_s)
 
     def pause_pipeline(
         self,
         pipeline_name: str,
-        error_message: str = None,
-        timeout_s: Optional[float] = 300,
+        wait: bool = True,
+        timeout_s: Optional[float] = None,
     ):
         """
-        Stop a pipeline
+        Pause a pipeline
 
         :param pipeline_name: The name of the pipeline to stop
         :param error_message: The error message to show if the pipeline is in
              STOPPED state due to a failure.
+        :param wait: Set True to wait for the pipeline to pause. True by default
         :param timeout_s: The amount of time in seconds to wait for the pipeline
-            to pause. 300 seconds by default.
+            to pause.
         """
-
-        if timeout_s is None:
-            timeout_s = 300
 
         self.http.post(
             path=f"/pipelines/{pipeline_name}/pause",
         )
 
-        if error_message is None:
-            error_message = "Unable to PAUSE the pipeline.\n"
+        if not wait:
+            return
 
-        start_time = time.monotonic()
+        self.__wait_for_pipeline_state(pipeline_name, "paused", timeout_s)
 
-        while True:
-            if timeout_s is not None:
-                elapsed = time.monotonic() - start_time
-                if elapsed > timeout_s:
-                    raise TimeoutError(
-                        f"Timed out waiting for pipeline {pipeline_name} to pause"
-                    )
-
-            resp = self.get_pipeline(pipeline_name)
-            status = resp.deployment_status
-
-            if status == "Paused":
-                break
-            elif (
-                status == "Stopped"
-                and len(resp.deployment_error or {}) > 0
-                and resp.deployment_desired_status == "Stopped"
-            ):
-                raise RuntimeError(
-                    error_message
-                    + f"""Reason: The pipeline is in a STOPPED state due to the following error:
-{resp.deployment_error.get("message", "")}"""
-                )
-
-            logging.debug(
-                "still pausing %s, waiting for 100 more milliseconds", pipeline_name
-            )
-            time.sleep(0.1)
+    def approve_pipeline(
+        self,
+        pipeline_name: str,
+    ):
+        self.http.post(
+            path=f"/pipelines/{pipeline_name}/approve",
+        )
 
     def stop_pipeline(
-        self, pipeline_name: str, force: bool, timeout_s: Optional[float] = 300
+        self,
+        pipeline_name: str,
+        force: bool,
+        wait: bool = True,
+        timeout_s: Optional[float] = None,
     ):
         """
         Stop a pipeline
@@ -336,12 +677,10 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         :param pipeline_name: The name of the pipeline to stop
         :param force: Set True to immediately scale compute resources to zero.
             Set False to automatically checkpoint before stopping.
+        :param wait: Set True to wait for the pipeline to stop. True by default
         :param timeout_s: The amount of time in seconds to wait for the pipeline
-            to stop. Default is 300 seconds.
+            to stop.
         """
-
-        if timeout_s is None:
-            timeout_s = 300
 
         params = {"force": str(force).lower()}
 
@@ -350,57 +689,166 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             params=params,
         )
 
+        if not wait:
+            return
+
         start = time.monotonic()
 
-        while time.monotonic() - start < timeout_s:
-            status = self.get_pipeline(pipeline_name).deployment_status
+        while True:
+            if timeout_s is not None and time.monotonic() - start > timeout_s:
+                raise FelderaTimeoutError(
+                    f"timeout error: pipeline '{pipeline_name}' did not stop in {timeout_s} seconds"
+                )
+
+            status = self.get_pipeline(
+                pipeline_name, PipelineFieldSelector.STATUS
+            ).deployment_status
 
             if status == "Stopped":
                 return
 
-            logging.debug(
+            logger.debug(
                 "still stopping %s, waiting for 100 more milliseconds",
                 pipeline_name,
             )
             time.sleep(0.1)
 
-        raise FelderaTimeoutError(
-            f"timeout error: pipeline '{pipeline_name}' did not stop in {timeout_s} seconds"
-        )
-
-    def clear_storage(self, pipeline_name: str, timeout_s: Optional[float] = 300):
+    def dismiss_error_pipeline(
+        self,
+        pipeline_name: str,
+    ):
         """
-        Clears the storage from the pipeline.
-        This operation cannot be canceled.
+        Dismisses the deployment error of a pipeline.
 
-        :param pipeline_name: The name of the pipeline
-        :param timeout_s: The amount of time in seconds to wait for the storage
-            to clear. Default is 300 seconds.
+        :param pipeline_name: The name of the pipeline for which to dismiss the deployment error
         """
-        if timeout_s is None:
-            timeout_s = 300
+        self.http.post(path=f"/pipelines/{pipeline_name}/dismiss_error")
 
+    def clear_storage(
+        self,
+        pipeline_name: str,
+        wait: bool = True,
+        timeout_s: float | None = None,
+        poll_interval_s: float = 0.25,
+    ):
+        """
+        Clears the storage of the pipeline.
+        Once started, this action cannot be canceled, and will delete all the pipeline storage.
+
+        :param pipeline_name: Name of the pipeline.
+        :param wait: Set `True` to wait for the pipeline storage to become cleared,
+            or set `False` to immediately return. Default is `True`.
+        :param timeout_s: Timeout waiting for storage to become cleared.
+            `None` = no timeout is enforced (default). Not used if `wait=False`.
+        :param poll_interval_s: Polling interval at which to check while waiting
+            if storage is cleared (default is every 0.25 seconds). Not used if `wait=False`.
+        """
         self.http.post(
             path=f"/pipelines/{pipeline_name}/clear",
         )
 
-        start = time.monotonic()
+        if not wait:
+            return
 
-        while time.monotonic() - start < timeout_s:
-            status = self.get_pipeline(pipeline_name).storage_status
+        start = time.monotonic()
+        while True:
+            if timeout_s is not None and time.monotonic() - start > timeout_s:
+                raise FelderaTimeoutError(
+                    f"timeout error: pipeline '{pipeline_name}' did not clear storage in {timeout_s} seconds"
+                )
+            status = self.get_pipeline(
+                pipeline_name, PipelineFieldSelector.STATUS
+            ).storage_status
 
             if status == "Cleared":
                 return
 
-            logging.debug(
-                "still clearing %s, waiting for 100 more milliseconds",
+            logger.debug(
+                "still clearing %s, waiting for %.1f more seconds",
                 pipeline_name,
+                poll_interval_s,
             )
-            time.sleep(0.1)
+            time.sleep(poll_interval_s)
 
-        raise FelderaTimeoutError(
-            f"timeout error: pipeline '{pipeline_name}' did not clear storage in {timeout_s} seconds"
+    def start_transaction(self, pipeline_name: str) -> int:
+        """
+        Start a new transaction.
+
+            Transaction ID.
+
+        :param pipeline_name: The name of the pipeline.
+        """
+
+        resp = self.http.post(
+            path=f"/pipelines/{pipeline_name}/start_transaction",
         )
+
+        return int(resp.get("transaction_id"))
+
+    def commit_transaction(
+        self,
+        pipeline_name: str,
+        transaction_id: Optional[int] = None,
+        wait: bool = True,
+        timeout_s: Optional[float] = None,
+    ):
+        """
+        Commits the currently active transaction.
+
+        :param pipeline_name: The name of the pipeline.
+
+        :param transaction_id: If provided, the function verifies that the currently active transaction matches this ID.
+            If the active transaction ID does not match, the function raises an error.
+
+        :param wait: If True, the function blocks until the transaction either commits successfully or the timeout is reached.
+            If False, the function initiates the commit and returns immediately without waiting for completion. The default value is True.
+
+        :param timeout_s: Maximum time (in seconds) to wait for the transaction to commit when `wait` is True.
+            If None, the function will wait indefinitely.
+
+        :raises RuntimeError: If there is currently no transaction in progress.
+        :raises ValueError: If the provided `transaction_id` does not match the current transaction.
+        :raises TimeoutError: If the transaction does not commit within the specified timeout (when `wait` is True).
+        :raises FelderaAPIError: If the pipeline fails to commit a transaction.
+        """
+
+        # TODO: implement this without using /stats when we have a better pipeline status reporting API.
+        stats = self.get_pipeline_stats(pipeline_name)
+        current_transaction_id = stats["global_metrics"]["transaction_id"]
+
+        if current_transaction_id == 0:
+            raise RuntimeError(
+                "Attempting to commit a transaction, but there is no transaction in progress"
+            )
+
+        if transaction_id and current_transaction_id != transaction_id:
+            raise ValueError(
+                f"Specified transaction id {transaction_id} doesn't match current active transaction id {current_transaction_id}"
+            )
+
+        transaction_id = current_transaction_id
+
+        self.http.post(
+            path=f"/pipelines/{pipeline_name}/commit_transaction",
+        )
+
+        start_time = time.monotonic()
+
+        if not wait:
+            return
+
+        while True:
+            if timeout_s is not None:
+                elapsed = time.monotonic() - start_time
+                if elapsed > timeout_s:
+                    raise TimeoutError("Timed out waiting for transaction to commit")
+
+            stats = self.get_pipeline_stats(pipeline_name)
+            if stats["global_metrics"]["transaction_id"] != transaction_id:
+                return
+
+            logging.debug("commit hasn't completed, waiting for 1 more second")
+            time.sleep(1.0)
 
     def checkpoint_pipeline(self, pipeline_name: str) -> int:
         """
@@ -460,7 +908,9 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         update_format: str = "raw",
         json_flavor: Optional[str] = None,
         serialize: bool = True,
-    ):
+        wait: bool = True,
+        wait_timeout_s: Optional[float] = None,
+    ) -> str:
         """
         Insert data into a pipeline
 
@@ -477,6 +927,11 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             "debezium_mysql", "snowflake", "kafka_connect_json_converter", "pandas"
         :param data: The data to insert
         :param serialize: If True, the data will be serialized to JSON. True by default
+        :param wait: If True, blocks until this input has been processed by the pipeline
+        :param wait_timeout_s: The timeout in seconds to wait for this set of
+            inputs to be processed by the pipeline. None by default
+
+        :returns: The completion token to this input.
         """
 
         if format not in ["json", "csv"]:
@@ -510,15 +965,15 @@ Reason: The pipeline is in a STOPPED state due to the following error:
                     _validate_no_none_keys_in_map(datum.get("insert", {}))
                     _validate_no_none_keys_in_map(datum.get("delete", {}))
             else:
-                data: dict = data
+                data: Mapping[str, Any] = data
                 _validate_no_none_keys_in_map(data.get("insert", {}))
                 _validate_no_none_keys_in_map(data.get("delete", {}))
         else:
             _validate_no_none_keys_in_map(data)
 
         # python sends `True` which isn't accepted by the backend
-        array = _prepare_boolean_input(array)
-        force = _prepare_boolean_input(force)
+        array: str = _prepare_boolean_input(array)
+        force: str = _prepare_boolean_input(force)
 
         params = {
             "force": force,
@@ -538,13 +993,95 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             content_type = "text/csv"
             data = bytes(str(data), "utf-8")
 
-        self.http.post(
-            path=f"/pipelines/{pipeline_name}/ingress/{table_name}",
+        resp = self.http.post(
+            path=f"/pipelines/{quote(pipeline_name, safe='')}/ingress/{quote(table_name, safe='')}",
             params=params,
             content_type=content_type,
             body=data,
             serialize=serialize,
         )
+
+        token = resp.get("token")
+        if token is None:
+            raise FelderaAPIError("response did not contain a completion token", resp)
+
+        if not wait:
+            return token
+
+        self.wait_for_token(pipeline_name, token, timeout_s=wait_timeout_s)
+
+        return token
+
+    def completion_token_processed(self, pipeline_name: str, token: str) -> bool:
+        """
+        Check whether the pipeline has finished processing all inputs received from the connector before
+        the token was generated.
+
+        :param pipeline_name: The name of the pipeline
+        :param token: The token to check for completion
+        :return: True if the pipeline has finished processing all inputs represented by the token, False otherwise
+        """
+
+        params = {
+            "token": token,
+        }
+
+        resp = self.http.get(
+            path=f"/pipelines/{quote(pipeline_name, safe='')}/completion_status",
+            params=params,
+        )
+
+        status: Optional[str] = resp.get("status")
+
+        if status is None:
+            raise FelderaAPIError(
+                f"got empty status when checking for completion status for token: {token}",
+                resp,
+            )
+
+        return status.lower() == "complete"
+
+    def wait_for_token(
+        self, pipeline_name: str, token: str, timeout_s: Optional[float] = None
+    ):
+        """
+        Blocks until all records represented by this completion token have
+        been processed.
+
+        :param pipeline_name: The name of the pipeline
+        :param token: The token to check for completion
+        :param timeout_s: The amount of time in seconds to wait for the pipeline
+            to process these records.
+        """
+
+        start = time.monotonic()
+        end = start + timeout_s if timeout_s else None
+        initial_backoff = 0.1
+        max_backoff = 5
+        exponent = 1.2
+        retries = 0
+
+        while True:
+            if end:
+                if time.monotonic() > end:
+                    raise FelderaTimeoutError(
+                        f"timeout error: pipeline '{pipeline_name}' did not"
+                        + f" process records represented by token {token} within"
+                        + f" {timeout_s}"
+                    )
+
+            if self.completion_token_processed(pipeline_name, token):
+                break
+
+            elapsed = time.monotonic() - start
+            logger.debug(
+                f"still waiting for inputs represented by {token} to be processed; elapsed: {elapsed}s"
+            )
+
+            retries += 1
+            backoff = min(max_backoff, initial_backoff * (exponent**retries))
+
+            time.sleep(backoff)
 
     def listen_to_pipeline(
         self,
@@ -554,6 +1091,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         backpressure: bool = True,
         array: bool = False,
         timeout: Optional[float] = None,
+        case_sensitive: bool = False,
     ):
         """
         Listen for updates to views for pipeline, yields the chunks of data
@@ -569,6 +1107,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             "json" format, the default value is False
 
         :param timeout: The amount of time in seconds to listen to the stream for
+        :param case_sensitive: True if the table name is case sensitive or a reserved keyword, False by default
         """
 
         params = {
@@ -579,21 +1118,26 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         if format == "json":
             params["array"] = _prepare_boolean_input(array)
 
-        resp = self.http.post(
-            path=f"/pipelines/{pipeline_name}/egress/{table_name}",
+        table_name = f'"{table_name}"' if case_sensitive else table_name
+
+        resp: requests.Response = self.http.post(
+            path=f"/pipelines/{quote(pipeline_name, safe='')}/egress/{quote(table_name, safe='')}",
             params=params,
             stream=True,
         )
 
         end = time.monotonic() + timeout if timeout else None
 
-        # Using the default chunk size below makes `iter_lines` extremely
-        # inefficient when dealing with long lines.
-        for chunk in resp.iter_lines(chunk_size=50000000):
-            if end and time.monotonic() > end:
-                break
-            if chunk:
-                yield json.loads(chunk, parse_float=Decimal)
+        def generator():
+            # Using the default chunk size below makes `iter_lines` extremely
+            # inefficient when dealing with long lines.
+            for chunk in resp.iter_lines(chunk_size=50000000):
+                if end and time.monotonic() > end:
+                    break
+                if chunk:
+                    yield json.loads(chunk, parse_float=Decimal)
+
+        return generator
 
     def query_as_text(
         self, pipeline_name: str, query: str
@@ -621,6 +1165,27 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         for chunk in resp.iter_lines(chunk_size=50000000):
             if chunk:
                 yield chunk.decode("utf-8")
+
+    def query_as_hash(self, pipeline_name: str, query: str) -> str:
+        """
+        Executes an ad-hoc query on the specified pipeline and returns a hash of the result.
+
+        :param pipeline_name: The name of the pipeline to query.
+        :param query: The SQL query to be executed.
+        :return: A string containing the hash of the query result.
+        """
+        params = {
+            "pipeline_name": pipeline_name,
+            "sql": query,
+            "format": "hash",
+        }
+
+        resp = self.http.get(
+            path=f"/pipelines/{pipeline_name}/query",
+            params=params,
+            stream=False,
+        )
+        return resp
 
     def query_as_parquet(self, pipeline_name: str, query: str, path: str):
         """
@@ -660,7 +1225,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 
     def query_as_json(
         self, pipeline_name: str, query: str
-    ) -> Generator[dict, None, None]:
+    ) -> Generator[Mapping[str, Any], None, None]:
         """
         Executes an ad-hoc query on the specified pipeline and returns the result as a generator that yields
         rows of the query as Python dictionaries.
@@ -682,9 +1247,29 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             stream=True,
         )
 
-        for chunk in resp.iter_lines(chunk_size=50000000):
+        for chunk in resp.iter_lines(chunk_size=1024):
             if chunk:
                 yield json.loads(chunk, parse_float=Decimal)
+
+    def input_connector_stats(
+        self, pipeline_name: str, table_name: str, connector_name: str
+    ) -> dict:
+        """
+        Get the status of the specified input connector.
+        """
+        return self.http.get(
+            path=f"/pipelines/{pipeline_name}/tables/{table_name}/connectors/{connector_name}/stats"
+        )
+
+    def output_connector_stats(
+        self, pipeline_name: str, view_name: str, connector_name: str
+    ) -> dict:
+        """
+        Get the status of the specified output connector.
+        """
+        return self.http.get(
+            path=f"/pipelines/{pipeline_name}/views/{view_name}/connectors/{connector_name}/stats"
+        )
 
     def pause_connector(self, pipeline_name, table_name, connector_name):
         """
@@ -734,9 +1319,201 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 
     def get_config(self) -> FelderaConfig:
         """
-        Get general feldera configuration.
+        Retrieves the general Feldera server configuration.
         """
 
         resp = self.http.get(path="/config")
 
         return FelderaConfig(resp)
+
+    def create_api_key(self, name: str) -> dict:
+        """
+        Create a new API key with the specified name.
+
+        The generated API key is returned in the response and cannot be retrieved
+        again later, so store it securely.
+
+        :param name: The API key name to create.
+        :returns: A dict with keys: `id` (UUID string), `name`, and `api_key`.
+        :raises FelderaAPIError: If a key with the same name already exists.
+        """
+
+        if not name:
+            raise ValueError("API key name must be a non-empty string")
+
+        return self.http.post(
+            path="/api_keys",
+            body={"name": name},
+        )
+
+    def get_pipeline_support_bundle(
+        self, pipeline_name: str, params: Optional[Dict[str, Any]] = None
+    ) -> bytes:
+        """
+        Generate a support bundle containing diagnostic information from a pipeline.
+
+        This endpoint collects various diagnostic data from the pipeline including
+        circuit profile, heap profile, metrics, logs, stats, and connector statistics,
+        and packages them into a single ZIP file for support purposes.
+
+        :param pipeline_name: The name of the pipeline
+        :param params: Optional query parameters to control data collection
+        :return: The support bundle as bytes (ZIP file)
+        :raises FelderaAPIError: If the pipeline does not exist or if there's an error
+        """
+
+        resp = self.http.get(
+            path=f"/pipelines/{pipeline_name}/support_bundle",
+            params=params,
+            stream=True,
+        )
+
+        buffer = b""
+        for chunk in resp.iter_content(chunk_size=1024):
+            if chunk:
+                buffer += chunk
+
+        return buffer
+
+    def start_samply_profile(self, pipeline_name: str, duration: int):
+        """
+        Start the profiling this pipeline with samply.
+
+        :param pipeline_name: The name of the pipeline
+        :param duration: The duration of the profile in seconds (default: 30)
+        :raises FelderaAPIError: If the pipeline does not exist or if there's an error
+        """
+
+        if duration <= 0:
+            raise ValueError("Duration must be a positive integer")
+
+        params = {"duration_secs": duration}
+
+        self.http.post(
+            path=f"/pipelines/{pipeline_name}/samply_profile",
+            params=params,
+        )
+
+    def get_samply_profile(self, pipeline_name: str) -> bytes:
+        """
+        Get the most recent available samply profile for the given pipeline.
+
+        :param pipeline_name: The name of the pipeline
+        :return: The samply profile as bytes (GZIP file)
+        :raises FelderaAPIError: If the pipeline does not exist or if there's an error
+        """
+
+        resp = self.http.get(
+            path=f"/pipelines/{pipeline_name}/samply_profile",
+            stream=True,
+        )
+
+        buffer = b""
+        for chunk in resp.iter_content(chunk_size=1024):
+            if chunk:
+                buffer += chunk
+
+        return buffer
+
+    def generate_completion_token(
+        self, pipeline_name: str, table_name: str, connector_name: str
+    ) -> str:
+        """
+        Generate a completion token that can be passed to :meth:`.FelderaClient.completion_token_processed` to
+        check whether the pipeline has finished processing all inputs received from the connector before
+        the token was generated.
+
+        :param pipeline_name: The name of the pipeline
+        :param table_name: The name of the table associated with this connector.
+        :param connector_name: The name of the connector.
+
+        :raises FelderaAPIError: If the connector cannot be found, or if the pipeline is not running.
+        """
+
+        resp = self.http.get(
+            path=f"/pipelines/{pipeline_name}/tables/{table_name}/connectors/{connector_name}/completion_token",
+        )
+
+        token: str | None = resp.get("token")
+
+        if token is None:
+            raise ValueError(
+                "got invalid response from feldera when generating completion token"
+            )
+
+        return token
+
+    def get_cluster_events(self) -> list[dict]:
+        """
+        Retrieves all cluster events (status fields only).
+
+        :returns: List of cluster events.
+        """
+        return self.http.get(path="/cluster/events")
+
+    def get_cluster_event(self, event_id: str, selector: str = "status") -> dict:
+        """
+        Retrieves a specific cluster event.
+
+        :param event_id: Identifier (UUID) of the event to retrieve, or `latest` for the latest event.
+        :param selector: (Optional) Limit the returned fields. Valid values: "all", "status" (default).
+
+        :returns: Event (fields limited based on selector).
+        """
+        # Selector of fields
+        if selector not in ["all", "status"]:
+            raise ValueError(f"invalid selector: {selector}")
+
+        # Issue request and return response
+        return self.http.get(path=f"/cluster/events/{event_id}?selector={selector}")
+
+    def rebalance_pipeline(self, pipeline_name: str):
+        self.http.post(path=f"/pipelines/{pipeline_name}/rebalance")
+
+    def get_checkpoints(self, pipeline_name: str):
+        return self.http.get(path=f"/pipelines/{pipeline_name}/checkpoints")
+
+    def get_pipeline_events(
+        self, pipeline_name: str, *, selector: str = "status"
+    ) -> list[dict]:
+        """
+        Retrieves all pipeline events (status fields only).
+
+        :param pipeline_name: Name of the pipeline.
+        :param selector: (Optional) Limit the returned fields. Valid values: "all", "status" (default).
+
+        :returns: List of pipeline events.
+        """
+        # Selector of fields
+        if selector not in ["all", "status"]:
+            raise ValueError(
+                f'invalid selector: {selector} (must be either "all" or "status")'
+            )
+
+        # Issue request and return response
+        return self.http.get(
+            path=f"/pipelines/{quote(pipeline_name, safe='')}/events?selector={selector}"
+        )
+
+    def get_pipeline_event(
+        self, pipeline_name: str, event_id: str, *, selector: str = "status"
+    ) -> dict:
+        """
+        Retrieves a specific pipeline event.
+
+        :param pipeline_name: Name of the pipeline.
+        :param event_id: Identifier (UUID) of the event to retrieve, or `latest` for the latest event.
+        :param selector: (Optional) Limit the returned fields. Valid values: "all", "status" (default).
+
+        :returns: Event (fields limited based on selector).
+        """
+        # Selector of fields
+        if selector not in ["all", "status"]:
+            raise ValueError(
+                f'invalid selector: {selector} (must be either "all" or "status")'
+            )
+
+        # Issue request and return response
+        return self.http.get(
+            path=f"/pipelines/{quote(pipeline_name, safe='')}/events/{quote(event_id, safe='')}?selector={selector}"
+        )

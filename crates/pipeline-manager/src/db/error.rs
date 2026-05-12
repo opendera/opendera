@@ -1,5 +1,8 @@
-use crate::db::types::pipeline::{PipelineDesiredStatus, PipelineId, PipelineStatus};
+use crate::cluster_monitor::{MONITOR_RETENTION_HOURS, MONITOR_RETENTION_NUM};
+use crate::db::types::monitor::{ClusterMonitorEventId, PipelineMonitorEventId};
+use crate::db::types::pipeline::PipelineId;
 use crate::db::types::program::ProgramStatus;
+use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
 use crate::db::types::storage::StorageStatus;
 use crate::db::types::tenant::TenantId;
 use crate::db::types::utils::ValidationError;
@@ -45,16 +48,6 @@ pub enum DBError {
         status: String,
         backtrace: Backtrace,
     },
-    #[serde(serialize_with = "serialize_invalid_pipeline_status")]
-    InvalidPipelineStatus {
-        status: String,
-        backtrace: Backtrace,
-    },
-    #[serde(serialize_with = "serialize_invalid_desired_pipeline_status")]
-    InvalidDesiredPipelineStatus {
-        status: String,
-        backtrace: Backtrace,
-    },
     #[serde(serialize_with = "serialize_invalid_storage_status")]
     InvalidStorageStatus {
         status: String,
@@ -77,6 +70,10 @@ pub enum DBError {
         error: ValidationError,
     },
     InvalidDeploymentConfig {
+        value: serde_json::Value,
+        error: ValidationError,
+    },
+    InvalidStorageStatusDetails {
         value: serde_json::Value,
         error: ValidationError,
     },
@@ -114,8 +111,8 @@ pub enum DBError {
     },
     // General errors
     MissingMigrations {
-        expected: u32,
-        actual: u32,
+        expected: i32,
+        actual: i32,
     },
     DuplicateName, // When a database unique name constraint is violated
     EmptyName,
@@ -160,31 +157,36 @@ pub enum DBError {
         compiler_error: String,
     },
     TransitionRequiresCompiledProgram {
-        current: PipelineStatus,
-        transition_to: PipelineStatus,
+        current: ResourcesStatus,
+        transition_to: ResourcesStatus,
     },
     InvalidProgramStatusTransition {
         current_status: ProgramStatus,
         new_status: ProgramStatus,
     },
-    InvalidDeploymentStatusTransition {
+    InvalidResourcesStatusTransition {
         storage_status: StorageStatus,
-        current_status: PipelineStatus,
-        new_status: PipelineStatus,
+        current_status: ResourcesStatus,
+        new_status: ResourcesStatus,
+    },
+    InvalidResourcesStatusRemain {
+        current_status: ResourcesStatus,
+        new_status: ResourcesStatus,
     },
     InvalidStorageStatusTransition {
         current_status: StorageStatus,
         new_status: StorageStatus,
     },
     StorageStatusImmutableUnlessStopped {
-        pipeline_status: PipelineStatus,
+        resources_status: ResourcesStatus,
+        resources_desired_status: ResourcesDesiredStatus,
         current_status: StorageStatus,
         new_status: StorageStatus,
     },
     IllegalPipelineAction {
-        pipeline_status: PipelineStatus,
-        current_desired_status: PipelineDesiredStatus,
-        new_desired_status: PipelineDesiredStatus,
+        status: ResourcesStatus,
+        current_desired_status: ResourcesDesiredStatus,
+        new_desired_status: ResourcesDesiredStatus,
         hint: String,
     },
     TlsConnection {
@@ -192,23 +194,40 @@ pub enum DBError {
         #[serde(skip)]
         openssl_error: Option<openssl::error::ErrorStack>,
     },
+    PauseWhileNotProvisioned,
+    ResumeWhileNotProvisioned,
+    InvalidResourcesStatus(String),
+    InvalidResourcesDesiredStatus(String),
+    InvalidRuntimeStatus(String),
+    InvalidRuntimeDesiredStatus(String),
+    InvalidBootstrap(String),
+    NoRuntimeStatusWhileProvisioned,
+    PreconditionViolation(String),
+    CannotStartWithUndismissedError,
+    CannotStartWhileClearingStorage,
+    DismissErrorRestrictedToFullyStopped,
+    InitialImmutableUnlessStopped,
+    BootstrapPolicyImmutableUnlessStopped,
+    InitialStandbyNotAllowed,
+    InvalidMonitorStatus(String),
+    UnknownClusterMonitorEvent {
+        event_id: ClusterMonitorEventId,
+    },
+    NoClusterMonitorEventsAvailable,
+    UnnecessaryResourcesStatusTransition {
+        current_status: ResourcesStatus,
+        new_status: ResourcesStatus,
+        current_desired_status: ResourcesDesiredStatus,
+    },
+    UnknownPipelineMonitorEvent {
+        event_id: PipelineMonitorEventId,
+    },
+    NoPipelineMonitorEventsAvailable,
 }
 
 impl DBError {
     pub fn invalid_program_status(status: String) -> Self {
         Self::InvalidProgramStatus {
-            status,
-            backtrace: Backtrace::capture(),
-        }
-    }
-    pub fn invalid_pipeline_status(status: String) -> Self {
-        Self::InvalidPipelineStatus {
-            status,
-            backtrace: Backtrace::capture(),
-        }
-    }
-    pub fn invalid_desired_pipeline_status(status: String) -> Self {
-        Self::InvalidDesiredPipelineStatus {
             status,
             backtrace: Backtrace::capture(),
         }
@@ -299,34 +318,6 @@ where
 {
     let mut ser = serializer.serialize_struct("InvalidProgramStatus", 2)?;
     ser.serialize_field("status", status)?;
-    ser.serialize_field("backtrace", &backtrace.to_string())?;
-    ser.end()
-}
-
-fn serialize_invalid_pipeline_status<S>(
-    status: &String,
-    backtrace: &Backtrace,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let mut ser = serializer.serialize_struct("InvalidPipelineStatus", 2)?;
-    ser.serialize_field("status", &status.to_string())?;
-    ser.serialize_field("backtrace", &backtrace.to_string())?;
-    ser.end()
-}
-
-fn serialize_invalid_desired_pipeline_status<S>(
-    status: &String,
-    backtrace: &Backtrace,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let mut ser = serializer.serialize_struct("InvalidDesiredPipelineStatus", 2)?;
-    ser.serialize_field("status", &status.to_string())?;
     ser.serialize_field("backtrace", &backtrace.to_string())?;
     ser.end()
 }
@@ -424,15 +415,6 @@ impl Display for DBError {
             DBError::InvalidProgramStatus { status, .. } => {
                 write!(f, "String '{status}' is not a valid program status")
             }
-            DBError::InvalidPipelineStatus { status, .. } => {
-                write!(f, "String '{status}' is not a valid deployment status")
-            }
-            DBError::InvalidDesiredPipelineStatus { status, .. } => {
-                write!(
-                    f,
-                    "String '{status}' is not a valid desired deployment status"
-                )
-            }
             DBError::InvalidStorageStatus { status, .. } => {
                 write!(f, "String '{status}' is not a valid storage status")
             }
@@ -464,6 +446,12 @@ impl Display for DBError {
                 write!(
                     f,
                     "JSON for 'deployment_config' field:\n{value:#}\n\n... is not valid due to: {error}"
+                )
+            }
+            DBError::InvalidStorageStatusDetails { value, error } => {
+                write!(
+                    f,
+                    "JSON for 'storage_status_details' field:\n{value:#}\n\n... is not valid due to: {error}"
                 )
             }
             DBError::InvalidProgramError { value, error } => {
@@ -591,14 +579,23 @@ impl Display for DBError {
                     "Cannot transition from program status '{current_status}' to '{new_status}'"
                 )
             }
-            DBError::InvalidDeploymentStatusTransition {
-                storage_status: current_storage_status,
+            DBError::InvalidResourcesStatusTransition {
+                storage_status,
                 current_status,
                 new_status,
             } => {
                 write!(
                     f,
-                    "Cannot transition from deployment status '{current_status}' (storage status: '{current_storage_status}') to '{new_status}'"
+                    "Cannot transition from deployment resources status '{current_status}' (storage status: '{storage_status}') to '{new_status}'"
+                )
+            }
+            DBError::InvalidResourcesStatusRemain {
+                current_status,
+                new_status,
+            } => {
+                write!(
+                    f,
+                    "Invalid remain as current status '{current_status}' is not equal to '{new_status}'"
                 )
             }
             DBError::InvalidStorageStatusTransition {
@@ -611,26 +608,63 @@ impl Display for DBError {
                 )
             }
             DBError::StorageStatusImmutableUnlessStopped {
-                pipeline_status,
+                resources_status,
+                resources_desired_status,
                 current_status,
                 new_status,
             } => {
                 write!(
                     f,
-                    "Cannot transition storage status from '{current_status}' to '{new_status}' with pipeline status '{pipeline_status}'. \
-                    Storage status cannot be changed unless the pipeline is stopped."
+                    "Cannot transition storage status from '{current_status}' to '{new_status}' with resources status '{resources_status}' and desired status '{resources_desired_status}'. \
+                    Storage status cannot be changed unless the pipeline is fully stopped."
                 )
             }
             DBError::IllegalPipelineAction {
-                pipeline_status,
+                status,
                 current_desired_status,
                 new_desired_status,
                 hint,
             } => {
                 write!(
                     f,
-                    "Deployment status (current: '{pipeline_status:?}', desired: '{current_desired_status:?}') cannot have desired changed to '{new_desired_status:?}'. {hint}"
+                    "Deployment resources status (current: '{status:?}', desired: '{current_desired_status:?}') cannot have desired changed to '{new_desired_status:?}'. {hint}"
                 )
+            }
+            DBError::PauseWhileNotProvisioned => {
+                write!(
+                    f,
+                    "You can only call /pause when the pipeline is not Stopped, Provisioning or Stopping."
+                )
+            }
+            DBError::ResumeWhileNotProvisioned => {
+                write!(
+                    f,
+                    "You can only call /resume when the pipeline is not Stopped, Provisioning or Stopping."
+                )
+            }
+            DBError::InvalidResourcesStatus(s) => {
+                write!(f, "Invalid resources status: '{s}'")
+            }
+            DBError::InvalidResourcesDesiredStatus(s) => {
+                write!(f, "Invalid resources desired status: '{s}'")
+            }
+            DBError::InvalidRuntimeStatus(s) => {
+                write!(f, "Invalid runtime status: '{s}'")
+            }
+            DBError::InvalidRuntimeDesiredStatus(s) => {
+                write!(f, "Invalid runtime desired status: '{s}'")
+            }
+            DBError::InvalidBootstrap(s) => {
+                write!(f, "Invalid bootstrap policy: '{s}'")
+            }
+            DBError::NoRuntimeStatusWhileProvisioned => {
+                write!(
+                    f,
+                    "Runtime status is not set while the resources status is Provisioned"
+                )
+            }
+            DBError::PreconditionViolation(s) => {
+                write!(f, "Operation precondition not met: '{s}'")
             }
             DBError::TlsConnection { hint, .. } => {
                 write!(f, "Unable to setup TLS connection to the database: {hint}")
@@ -640,6 +674,72 @@ impl Display for DBError {
                     f,
                     "Cannot delete pipeline unless its storage is cleared. Clear storage first using `/clear`."
                 )
+            }
+            DBError::CannotStartWithUndismissedError => {
+                write!(
+                    f,
+                    "Cannot process `/start?dismiss_error=false` if the `deployment_error` is set. \
+                    You can dismiss the error by calling `/start?dismiss_error=true`, or alternatively \
+                    first call `/dismiss_error`, after which `/start?dismiss_error=false` is again possible."
+                )
+            }
+            DBError::CannotStartWhileClearingStorage => {
+                write!(
+                    f,
+                    "Cannot process `/start` if the `storage_status` is `Clearing`. \
+                    Wait for the storage to become cleared before trying again."
+                )
+            }
+            DBError::DismissErrorRestrictedToFullyStopped => {
+                write!(
+                    f,
+                    "The pipeline must have both status `Stopped` and desired status `Stopped` to dismiss the `deployment_error` if it is set."
+                )
+            }
+            DBError::InitialImmutableUnlessStopped => {
+                write!(
+                    f,
+                    "Initial desired runtime status cannot be changed unless the pipeline is desired to become Stopped."
+                )
+            }
+            DBError::BootstrapPolicyImmutableUnlessStopped => {
+                write!(
+                    f,
+                    "Bootstrap policy cannot be changed unless the pipeline is desired to become Stopped."
+                )
+            }
+            DBError::InitialStandbyNotAllowed => {
+                write!(
+                    f,
+                    "Initial desired runtime status can only be set to Standby if: \
+                    (1) `runtime_config.storage.backend.name` is set to `file`, and \
+                    (2) `runtime_config.storage.backend.config.sync` is configured."
+                )
+            }
+            DBError::InvalidMonitorStatus(s) => {
+                write!(f, "Invalid monitor status: '{s}'")
+            }
+            DBError::UnknownClusterMonitorEvent { event_id } => {
+                write!(f, "Cluster monitor event with identifier '{event_id}' does not exist -- it might have been deleted as monitor events are only retained for {}h and at most {}", MONITOR_RETENTION_HOURS, MONITOR_RETENTION_NUM)
+            }
+            DBError::NoClusterMonitorEventsAvailable => {
+                write!(f, "There are not yet any cluster monitor events recorded")
+            }
+            DBError::UnnecessaryResourcesStatusTransition {
+                current_status,
+                new_status,
+                current_desired_status,
+            } => {
+                write!(
+                    f,
+                    "Unnecessary to transition from deployment resources status '{current_status}' to '{new_status}' given desired status is '{current_desired_status}'"
+                )
+            }
+            DBError::UnknownPipelineMonitorEvent { event_id } => {
+                write!(f, "Pipeline monitor event with identifier '{event_id}' does not exist -- it might have been deleted as only a limited number of events are retained")
+            }
+            DBError::NoPipelineMonitorEventsAvailable => {
+                write!(f, "There are not yet any pipeline monitor events recorded")
             }
         }
     }
@@ -654,14 +754,13 @@ impl DetailedError for DBError {
             #[cfg(feature = "postgresql_embedded")]
             Self::PgEmbedError { .. } => Cow::from("PgEmbedError"),
             Self::InvalidProgramStatus { .. } => Cow::from("InvalidProgramStatus"),
-            Self::InvalidPipelineStatus { .. } => Cow::from("InvalidPipelineStatus"),
-            Self::InvalidDesiredPipelineStatus { .. } => Cow::from("InvalidDesiredPipelineStatus"),
             Self::InvalidStorageStatus { .. } => Cow::from("InvalidStorageStatus"),
             Self::InvalidJsonData { .. } => Cow::from("InvalidJsonData"),
             Self::InvalidRuntimeConfig { .. } => Cow::from("InvalidRuntimeConfig"),
             Self::InvalidProgramConfig { .. } => Cow::from("InvalidProgramConfig"),
             Self::InvalidProgramInfo { .. } => Cow::from("InvalidProgramInfo"),
             Self::InvalidDeploymentConfig { .. } => Cow::from("InvalidDeploymentConfig"),
+            Self::InvalidStorageStatusDetails { .. } => Cow::from("InvalidStorageStatusDetails"),
             Self::InvalidProgramError { .. } => Cow::from("InvalidProgramError"),
             Self::EditRestrictedToClearedStorage { .. } => {
                 Cow::from("EditRestrictedToClearedStorage")
@@ -712,9 +811,10 @@ impl DetailedError for DBError {
             Self::InvalidProgramStatusTransition { .. } => {
                 Cow::from("InvalidProgramStatusTransition")
             }
-            Self::InvalidDeploymentStatusTransition { .. } => {
-                Cow::from("InvalidDeploymentStatusTransition")
+            Self::InvalidResourcesStatusTransition { .. } => {
+                Cow::from("InvalidResourcesStatusTransition")
             }
+            Self::InvalidResourcesStatusRemain { .. } => Cow::from("InvalidResourcesStatusRemain"),
             Self::InvalidStorageStatusTransition { .. } => {
                 Cow::from("InvalidStorageStatusTransition")
             }
@@ -724,6 +824,33 @@ impl DetailedError for DBError {
             Self::IllegalPipelineAction { .. } => Cow::from("IllegalPipelineAction"),
             Self::TlsConnection { .. } => Cow::from("TlsConnection"),
             Self::DeleteRestrictedToClearedStorage => Cow::from("DeleteRestrictedToClearedStorage"),
+            Self::PauseWhileNotProvisioned => Cow::from("PauseWhileNotProvisioned"),
+            Self::InvalidResourcesStatus(..) => Cow::from("InvalidResourcesStatus"),
+            Self::InvalidResourcesDesiredStatus(..) => Cow::from("InvalidResourcesDesiredStatus"),
+            Self::InvalidRuntimeStatus(..) => Cow::from("InvalidRuntimeStatus"),
+            Self::InvalidRuntimeDesiredStatus(..) => Cow::from("InvalidRuntimeDesiredStatus"),
+            Self::InvalidBootstrap(..) => Cow::from("InvalidBootstrap"),
+            Self::NoRuntimeStatusWhileProvisioned => Cow::from("NoRuntimeStatusWhileProvisioned"),
+            Self::PreconditionViolation(..) => Cow::from("PreconditionViolation"),
+            Self::ResumeWhileNotProvisioned => Cow::from("ResumeWhileNotProvisioned"),
+            Self::CannotStartWithUndismissedError => Cow::from("CannotStartWithUndismissedError"),
+            Self::CannotStartWhileClearingStorage => Cow::from("CannotStartWhileClearingStorage"),
+            Self::DismissErrorRestrictedToFullyStopped => {
+                Cow::from("DismissErrorRestrictedToFullyStopped")
+            }
+            Self::InitialImmutableUnlessStopped => Cow::from("InitialImmutableUnlessStopped"),
+            Self::BootstrapPolicyImmutableUnlessStopped => {
+                Cow::from("BootstrapPolicyImmutableUnlessStopped")
+            }
+            Self::InitialStandbyNotAllowed => Cow::from("InitialStandbyNotAllowed"),
+            Self::InvalidMonitorStatus(..) => Cow::from("InvalidMonitorStatus"),
+            Self::UnknownClusterMonitorEvent { .. } => Cow::from("UnknownClusterMonitorEvent"),
+            Self::NoClusterMonitorEventsAvailable => Cow::from("NoClusterMonitorEventsAvailable"),
+            Self::UnnecessaryResourcesStatusTransition { .. } => {
+                Cow::from("UnnecessaryResourcesStatusTransition")
+            }
+            Self::UnknownPipelineMonitorEvent { .. } => Cow::from("UnknownPipelineMonitorEvent"),
+            Self::NoPipelineMonitorEventsAvailable => Cow::from("NoPipelineMonitorEventsAvailable"),
         }
     }
 }
@@ -739,14 +866,13 @@ impl ResponseError for DBError {
             #[cfg(feature = "postgresql_embedded")]
             Self::PgEmbedError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidProgramStatus { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::InvalidPipelineStatus { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::InvalidDesiredPipelineStatus { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidStorageStatus { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidJsonData { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRuntimeConfig { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidProgramConfig { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidProgramInfo { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidDeploymentConfig { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidStorageStatusDetails { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidProgramError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::EditRestrictedToClearedStorage { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidErrorResponse { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -775,16 +901,44 @@ impl ResponseError for DBError {
             Self::StartFailedDueToFailedCompilation { .. } => StatusCode::BAD_REQUEST,
             Self::TransitionRequiresCompiledProgram { .. } => StatusCode::INTERNAL_SERVER_ERROR, // Runner error
             Self::InvalidProgramStatusTransition { .. } => StatusCode::INTERNAL_SERVER_ERROR, // Compiler error
-            Self::InvalidDeploymentStatusTransition { .. } => StatusCode::INTERNAL_SERVER_ERROR, // Runner error
+            Self::InvalidResourcesStatusTransition { .. } => StatusCode::INTERNAL_SERVER_ERROR, // Runner error
+            Self::InvalidResourcesStatusRemain { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::StorageStatusImmutableUnlessStopped { .. } => StatusCode::BAD_REQUEST,
             Self::IllegalPipelineAction { .. } => StatusCode::BAD_REQUEST, // User trying to set a deployment desired status which cannot be performed currently
             Self::TlsConnection { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            DBError::DeleteRestrictedToClearedStorage => StatusCode::BAD_REQUEST,
-            DBError::InvalidStorageStatusTransition { .. } => StatusCode::BAD_REQUEST,
+            Self::DeleteRestrictedToClearedStorage => StatusCode::BAD_REQUEST,
+            Self::InvalidStorageStatusTransition { .. } => StatusCode::BAD_REQUEST,
+            Self::PauseWhileNotProvisioned => StatusCode::BAD_REQUEST,
+            Self::ResumeWhileNotProvisioned => StatusCode::BAD_REQUEST,
+            Self::InvalidResourcesStatus(..) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidResourcesDesiredStatus(..) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidRuntimeStatus(..) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidRuntimeDesiredStatus(..) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidBootstrap(..) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::NoRuntimeStatusWhileProvisioned => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::PreconditionViolation(..) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::CannotStartWithUndismissedError => StatusCode::BAD_REQUEST,
+            Self::CannotStartWhileClearingStorage => StatusCode::BAD_REQUEST,
+            Self::DismissErrorRestrictedToFullyStopped => StatusCode::BAD_REQUEST,
+            Self::InitialImmutableUnlessStopped => StatusCode::BAD_REQUEST,
+            Self::BootstrapPolicyImmutableUnlessStopped => StatusCode::BAD_REQUEST,
+            Self::InitialStandbyNotAllowed => StatusCode::BAD_REQUEST,
+            Self::InvalidMonitorStatus(..) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::UnknownClusterMonitorEvent { .. } => StatusCode::NOT_FOUND,
+            Self::NoClusterMonitorEventsAvailable => StatusCode::NOT_FOUND,
+            Self::UnnecessaryResourcesStatusTransition { .. } => StatusCode::BAD_REQUEST,
+            Self::UnknownPipelineMonitorEvent { .. } => StatusCode::NOT_FOUND,
+            Self::NoPipelineMonitorEventsAvailable => StatusCode::NOT_FOUND,
         }
     }
 
     fn error_response(&self) -> HttpResponse<BoxBody> {
         HttpResponseBuilder::new(self.status_code()).json(ErrorResponse::from_error(self))
+    }
+}
+
+impl From<DBError> for ErrorResponse {
+    fn from(val: DBError) -> Self {
+        ErrorResponse::from_error_nolog(&val)
     }
 }

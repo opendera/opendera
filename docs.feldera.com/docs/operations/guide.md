@@ -2,6 +2,79 @@
 
 This guide covers issues Feldera Enterprise users and operators might run into in production, and steps to remedy them.
 
+## Pipelines with no input produce no outputs
+
+Today the progress of a pipeline is mediated by the input connectors.
+A pipeline without any input connectors will actually produce no
+outputs.  In consequence, a SQL program that contains no tables and
+which does not call the `NOW()` function will never produce an output.
+
+Unfortunately this makes it impossible to run simple SQL testing
+code such as:
+
+```sql
+CREATE MATERIALIZED VIEW V AS SELECT 1 + 2;
+```
+
+The workaround this limitation is to have at least one table in each
+SQL program; inserting a row in this table will trigger the production
+of an output.  You can use the [datagen
+connector](/connectors/sources/datagen.md) to populate this table:
+
+```sql
+CREATE TABLE T(c BOOLEAN) WITH (
+  'connectors' = '[{
+    "name": "dummy",
+    "transport": {
+      "name": "datagen",
+      "config": {
+        "plan": [{
+          "limit": 1
+        }]
+      }
+    }
+  }]'
+);
+
+CREATE MATERIALIZED VIEW V AS SELECT 1 + 2 FROM T;
+```
+
+## Diagnosing Performance Issues
+
+When investigating pipeline performance, Feldera support will typically request a
+support-bundle. The bundle can be downloaded from your installation with one of
+the following methods:
+
+* The `support-bundle` [fda command](/interface/cli):
+
+ ```bash
+ fda support-bundle affected-pipeline-name
+ ```
+* the `support_bundle` [function in the Python SDK](https://docs.feldera.com/python/examples.html#retrieve-a-support-bundle-for-a-pipeline).
+* the web-console has a button to download the bundle for a pipeline
+* or the `support_bundle` [endpoint in the REST API](/api/download-support-bundle).
+
+The support bundle has the following content:
+
+1. **Pipeline Logs**: for warnings and errors from the [logs](/api/stream-pipeline-logs) endpoint.
+
+2. **Pipeline Configuration**: the [pipeline configuration](/api/get-pipeline), including the SQL code and connector settings.
+
+3. **Pipeline Metrics**: from the [pipeline metrics](/api/get-pipeline-metrics) endpoint.
+
+4. **Endpoint Stats**: from the [stats](/api/get-pipeline-stats) endpoint.
+   The bundle collector calls this endpoint with
+   `?include_connector_errors=true` so the saved `stats.json` contains the
+   most recent per-endpoint error messages alongside the counters. These
+   error messages are persisted in the pipeline's checkpoint, so a bundle
+   taken after a restart still contains errors recorded before the restart.
+   The selector is intended for the bundle collector; regular callers
+   polling `/stats` keep getting a lightweight, count-only response.
+
+5. **Circuit Profile**: from the [circuit profile](/api/get-performance-profile) endpoint.
+
+6. **Heap Profile**: from [heap usage](/api/get-heap-profile) endpoint.
+
 ## Common Error Messages
 
 ### Delta Lake Connection Errors
@@ -20,36 +93,9 @@ ALTER TABLE my_table SET TBLPROPERTIES (
 
 **Error**: `The pipeline container has restarted. This was likely caused by an Out-Of-Memory (OOM) crash.`
 
-Feldera runs each pipeline in a separate container with configurable memory limits. Here are some knobs to
-control memory usage:
-
-1. Adjust the pipeline’s memory reservation and limit:
-   ```json
-   "resources": {
-       "memory_mb_min": 32000,
-       "memory_mb_max": 32000
-   }
-   ```
-
-2. Throttle the amount of records buffered by the connector using the [`max_queued_records`](https://docs.feldera.com/connectors/#generic-attributes) setting:
-   ```json
-   "max_queued_records": 100000
-   ```
-
-3. Ensure that storage is enabled (it's on by default):
-   ```json
-   "storage": {
-       "backend": {
-         "name": "default"
-       },
-       "min_storage_bytes": null,
-       "compression": "default",
-       "cache_mib": null
-   },
-   ```
-4. Optimize your SQL queries to avoid expensive
-   cross-products. Use functions like
-   [NOW()](https://docs.feldera.com/sql/datetime/#now) sparingly on large relations.
+Feldera runs each pipeline in a separate container with configurable memory limits.
+See [documentation on the pipeline's memory usage](memory) for a detailed breakdown
+of how memory is used and available control knobs.
 
 ### Out-of-storage Errors
 
@@ -125,14 +171,147 @@ making them eviction candidates. To raise their priority:
 
 **Solution**: Ensure the compiler-server has sufficient disk space (20Gib by default, configured via the `compilerPvcStorageSize` value in the Helm chart).
 
-## Diagnosing Performance Issues
+## Uncommon Problems
 
-When investigating pipeline performance, Feldera support will typically request:
+### Lost or accidentally deleted the Feldera Control-Plane PostgreSQL database
 
-1. **Performance Tab**: screenshots of the `Performance` tab in the UI to see memory usage, record counts, and processing times
+Feldera tracks state about pipelines inside a PostgreSQL database. If for
+some reason the state in this database is ever lost or otherwise can not be
+recovered, and the feldera instance had running pipelines at the time, a
+manual intervention may be necessary to clean-up the leftover pods.
+Its not possible to reinstantiate these leftover (orphaned) pipelines,
+therefore the Kubernetes objects backing these pipelines should be manually
+removed.
 
-2. **Pipeline Logs Tab**: for warnings and errors
+1. Identify any stale pipelines in the feldera namespace
+   (e.g., by running `kubectl get pods -n $NS`)
+2. For each pipeline delete the k8s definitions that feldera
+   created for it: Statefulset, Service, ConfigMap, Pod and PVC.
 
-3. **Circuit Profile**: from the [circuit profile](https://docs.feldera.com/api/retrieve-the-circuit-performance-profile-of-a-running-or-paused-pipeline) API.
+Here is an example script that would clean up a stale pipeline. Note: it is generally
+not enough to just delete the pod since the existing statefulset will try to re-create
+it.
 
-4. **Heap Profile**: from [heap usage](https://docs.feldera.com/api/retrieve-the-heap-profile-of-a-running-or-paused-pipeline) API.
+```bash
+NAMESPACE=feldera-ns
+POD=pipeline-019a7c1d-6a0c-7923-afd7-0125fe589356-0
+NAME=pipeline-019a7c1d-6a0c-7923-afd7-0125fe589356
+PVC=pipeline-019a7c1d-6a0c-7923-afd7-0125fe589356-storage-pipeline-019a7c1d-6a0c-7923-afd7-0125fe589356-0
+
+# Ensure you have the permissions to perform the delete operations
+kubectl auth can-i delete sts -n $NAMESPACE
+kubectl auth can-i delete service -n $NAMESPACE
+kubectl auth can-i delete configmap -n $NAMESPACE
+kubectl auth can-i delete pod -n $NAMESPACE
+kubectl auth can-i delete pvc -n $NAMESPACE
+
+# Delete the k8s objects manually
+kubectl delete sts -n $NAMESPACE $NAME
+kubectl delete service -n $NAMESPACE $NAME
+kubectl delete configmap -n $NAMESPACE $NAME
+kubectl delete pod -n $NAMESPACE $POD
+kubectl delete pvc -n $NAMESPACE $PVC
+```
+
+## Expand existing pipeline storage
+
+:::note Advanced Enterprise-only feature
+This guide is only applicable to the Feldera Enterprise Edition and is
+for advanced users as it details out-of-band steps that make certain
+assumptions on implementation details of Feldera. As a consequence,
+these steps might be subject to change in the future. They are
+written with only single-host pipelines in mind.
+:::
+
+Choosing a larger storage without preserving existing state can be done
+by clearing the storage, followed by increasing the runtime configuration's
+`resources.storage_mb_max`. However, this field cannot be edited with uncleared
+storage (i.e., while preserving existing state). Currently, Feldera does not
+have the feature to expand existing storage. It is however possible to do it
+out-of-band by directly interacting with the underlying Kubernetes PVC.
+This is only possible if its storage class allows volume expansion.
+
+This out-of-band action will result in a discrepancy between what the runtime
+configuration `resources.storage_mb_max` states and the actual size of the
+storage. Be aware that clearing storage afterward will delete the PVC that
+was changed out-of-band, thereby undoing the storage expansion.
+
+### Steps
+
+1. Note down the `<pipeline-id>` of the pipeline
+   (from the Web Console: Open pipeline -> Tab: Performance -> Pipeline ID button).
+
+   These environment variables will be used in the following steps:
+   ```
+   # TODO: change to your own situation
+   NAMESPACE=feldera
+   PIPELINE_PVC=pipeline-<pipeline-id>-storage-pipeline-<pipeline-id>-0
+   ```
+
+2. Check the PVC of the pipeline:
+   ```
+   kubectl get pvc -n $NAMESPACE $PIPELINE_PVC
+   ```
+
+   ... which for example outputs (`resources.storage_mb_max` is set to 25000 in this example):
+   ```
+   NAME            STATUS   VOLUME    CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+   pipeline-....   Bound    pvc-...   24Gi       RWO            gp3            <unset>                 21s
+   ```
+   The storage class is `gp3` in this example.
+
+3. Check the storage class:
+   ```
+   kubectl get sc gp3
+   ```
+
+   ... which for example outputs:
+   ```
+   NAME   PROVISIONER       RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+   gp3    ebs.csi.aws.com   Delete          WaitForFirstConsumer   true                   10d
+   ```
+
+   The storage class must support volume expansion (above: `ALLOWVOLUMEEXPANSION`)
+   in order to continue with the next step. If it does not, you can potentially enable
+   it for the storage class via:
+   ```
+   kubectl patch sc gp3 -p '{"allowVolumeExpansion": true}'
+   ```
+
+   ... followed by checking this is the case by doing again `kubectl get sc gp3`
+   and looking under `ALLOWVOLUMEEXPANSION`.
+
+4. Patch the PVC of the pipeline with a higher storage request
+   (in this example, increasing `25G` to `50G`):
+   ```
+   kubectl patch pvc -n $NAMESPACE $PIPELINE_PVC \
+       -p '{"spec":{"resources":{"requests":{"storage":"50G"}}}}'
+   ```
+
+   Note: it is not possible to patch `spec.resources.limits.storage`,
+   as such it will be lower than `spec.resources.requests.storage` afterward.
+   Irrespectively, on AWS it does expand the storage.
+
+5. Wait for the PVC resizing to take effect:
+   ```
+   kubectl get pvc -n $NAMESPACE $PIPELINE_PVC
+   ```
+
+   ... which for example eventually outputs (it can take seconds or minutes):
+   ```
+   NAME            STATUS   VOLUME    CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+   pipeline-....   Bound    pvc-...   47Gi       RWO            gp3            <unset>                 5m44s
+   ```
+
+   If it takes longer than expected, you can also debug
+   using `kubectl describe pvc -n $NAMESPACE $PIPELINE_PVC`
+   to find out what is going on with the PVC.
+
+   :::note
+   It depends on the storage provisioner backing the storage class whether it accepts the
+   PVC modification, and how long it takes for it to be applied. Additionally, storage
+   provisioners can limit how often you can modify a PVC in a certain time window.
+   Doing multiple expansions of the same PVC in quick succession might stop working at
+   some point, as is the case for AWS. Consult your cloud provider documentation to learn more
+   (e.g., [AWS](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-modify-volume.html#elastic-volumes-considerations)).
+   :::

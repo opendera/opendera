@@ -1,25 +1,28 @@
 package org.dbsp.simulator.collections;
 
 import org.dbsp.simulator.AggregateDescription;
+import org.dbsp.simulator.types.Weight;
 import org.dbsp.simulator.types.WeightType;
 import org.dbsp.simulator.util.IIndentStream;
 import org.dbsp.simulator.util.ToIndentableString;
+import org.dbsp.simulator.values.BooleanSqlValue;
+import org.dbsp.simulator.values.DynamicSqlValue;
+import org.dbsp.simulator.values.RuntimeFunction;
 
 import javax.annotation.Nullable;
 import java.util.*;
 import java.util.function.BiFunction;
 import java.util.function.Function;
-import java.util.function.Predicate;
 
-public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToIndentableString {
+@SuppressWarnings("unchecked")
+public class ZSet<Data extends DynamicSqlValue> extends BaseCollection implements ToIndentableString {
     /** Maps values to weights.  Invariant: weights are never zero */
     final Map<Data, Weight> data;
-    final WeightType<Weight> weightType;
 
     /** Create a Z-set by cloning the data from the specified map. */
-    public ZSet(Map<Data, Weight> data, WeightType<Weight> weightType) {
+    public ZSet(Map<Data, Weight> data, WeightType weightType) {
+        super(weightType);
         this.data = new HashMap<>();
-        this.weightType = weightType;
         for (Map.Entry<Data, Weight> datum: data.entrySet()) {
             if (!this.weightType.isZero(datum.getValue()))
                 this.data.put(datum.getKey(), datum.getValue());
@@ -37,20 +40,25 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
     }
 
     /** Create an empty Z-set */
-    public ZSet(WeightType<Weight> weightType) {
+    public ZSet(WeightType weightType) {
+        super(weightType);
         this.data = new HashMap<>();
-        this.weightType = weightType;
     }
 
-    public ZSet(Collection<Data> data, WeightType<Weight> weightType) {
+    @Override
+    public void append(BaseCollection other) {
+        this.append((ZSet<Data>) other);
+    }
+
+    public ZSet(Collection<Data> data, WeightType weightType) {
+        super(weightType);
         this.data = new HashMap<>();
-        this.weightType = weightType;
         for (Data datum: data) {
             this.data.merge(datum, this.weightType.one(), this::merger);
         }
     }
 
-    public ZSet<Data, Weight> negate() {
+    public ZSet<Data> negate() {
         Map<Data, Weight> result = new HashMap<>();
         for (Map.Entry<Data, Weight> entry: this.data.entrySet()) {
             result.put(entry.getKey(), this.weightType.negate(entry.getValue()));
@@ -58,7 +66,7 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
         return new ZSet<>(result, this.weightType);
     }
 
-    public static <Data, Weight> ZSet<Data, Weight> zero(WeightType<Weight> weightType) {
+    public static <Data extends DynamicSqlValue> ZSet<Data> zero(WeightType weightType) {
         return new ZSet<>(weightType);
     }
 
@@ -70,7 +78,7 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
         return w;
     }
 
-    public ZSet<Data, Weight> add(ZSet<Data, Weight> other) {
+    public ZSet<Data> add(ZSet<Data> other) {
         Map<Data, Weight> result = new HashMap<>(this.data);
         for (Map.Entry<Data, Weight> entry: other.data.entrySet()) {
             result.merge(entry.getKey(), entry.getValue(), this::merger);
@@ -78,10 +86,10 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
         return new ZSet<>(result, this.weightType);
     }
 
-    public <OtherData, Result> ZSet<Result, Weight> multiply(
-            ZSet<OtherData, Weight> other,
+    public <OtherData extends DynamicSqlValue, Result extends DynamicSqlValue> ZSet<Result> multiply(
+            ZSet<OtherData> other,
             BiFunction<Data, OtherData, Result> combiner) {
-        ZSet<Result, Weight> result = new ZSet<>(this.weightType);
+        ZSet<Result> result = new ZSet<>(this.weightType);
         for (Map.Entry<Data, Weight> entry: this.data.entrySet()) {
             for (Map.Entry<OtherData, Weight> otherEntry: other.data.entrySet()) {
                 Result data = combiner.apply(entry.getKey(), otherEntry.getKey());
@@ -92,7 +100,7 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
         return result;
     }
 
-    public ZSet<Data, Weight> subtract(ZSet<Data, Weight> other) {
+    public ZSet<Data> subtract(ZSet<Data> other) {
         Map<Data, Weight> result = new HashMap<>(this.data);
         for (Map.Entry<Data, Weight> entry: other.data.entrySet()) {
             result.merge(entry.getKey(), this.weightType.negate(entry.getValue()), this::merger);
@@ -100,28 +108,28 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
         return new ZSet<>(result, this.weightType);
     }
 
-    public ZSet<Data, Weight> append(Data data, Weight weight) {
+    public ZSet<Data> append(Data data, Weight weight) {
         this.data.merge(data, weight, this::merger);
         return this;
     }
 
-    public boolean equals(ZSet<Data, Weight> other) {
+    public boolean equals(ZSet<Data> other) {
         return this.subtract(other).isEmpty();
     }
 
-    public ZSet<Data, Weight> append(Data data) {
+    public ZSet<Data> append(Data data) {
         this.append(data, this.weightType.one());
         return this;
     }
 
-    public ZSet<Data, Weight> append(ZSet<Data, Weight> other) {
+    public ZSet<Data> append(ZSet<Data> other) {
         for (Map.Entry<Data, Weight> entry: other.data.entrySet()) {
             this.data.merge(entry.getKey(), entry.getValue(), this::merger);
         }
         return this;
     }
 
-    public ZSet<Data, Weight> positive(boolean set) {
+    public ZSet<Data> positive(boolean set) {
         Map<Data, Weight> result = new HashMap<>();
         for (Map.Entry<Data, Weight> entry: this.data.entrySet()) {
             Weight weight = entry.getValue();
@@ -134,11 +142,11 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
         return new ZSet<>(result, this.weightType);
     }
 
-    public ZSet<Data, Weight> distinct() {
+    public ZSet<Data> distinct() {
         return this.positive(true);
     }
 
-    public <OData> ZSet<OData, Weight> map(Function<Data, OData> tupleTransform) {
+    public <OData extends DynamicSqlValue> ZSet<OData> map(Function<Data, OData> tupleTransform) {
         Map<OData, Weight> result = new HashMap<>();
         for (Map.Entry<Data, Weight> entry: this.data.entrySet()) {
             Weight weight = entry.getValue();
@@ -148,18 +156,18 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
         return new ZSet<>(result, this.weightType);
     }
 
-    public ZSet<Data, Weight> filter(Predicate<Data> keep) {
+    public ZSet<Data> filter(RuntimeFunction<Data, BooleanSqlValue> keep) {
         Map<Data, Weight> result = new HashMap<>();
         for (Map.Entry<Data, Weight> entry: this.data.entrySet()) {
             Weight weight = entry.getValue();
-            if (keep.test(entry.getKey()))
+            if (keep.apply(entry.getKey()).isTrue())
                 result.put(entry.getKey(), weight);
         }
         return new ZSet<>(result, this.weightType);
     }
 
-    public <Key> IndexedZSet<Key, Data, Weight> index(Function<Data, Key> key) {
-        IndexedZSet<Key, Data, Weight> result = new IndexedZSet<>(this.weightType);
+    public <Key extends DynamicSqlValue> IndexedZSet<Key, Data> index(RuntimeFunction<Data, Key> key) {
+        IndexedZSet<Key, Data> result = new IndexedZSet<>(this.weightType);
         for (Map.Entry<Data, Weight> entry: this.data.entrySet()) {
             Weight weight = entry.getValue();
             Key keyValue = key.apply(entry.getKey());
@@ -186,20 +194,20 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
         return result;
     }
 
-    public ZSet<Data, Weight> union(ZSet<Data, Weight> other) {
+    public ZSet<Data> union(ZSet<Data> other) {
         return this.add(other).distinct();
     }
 
-    public ZSet<Data, Weight> union_all(ZSet<Data, Weight> other) {
+    public ZSet<Data> union_all(ZSet<Data> other) {
         return this.add(other);
     }
 
-    public ZSet<Data, Weight> except(ZSet<Data, Weight> other) {
+    public ZSet<Data> except(ZSet<Data> other) {
         return this.distinct().subtract(other.distinct()).distinct();
     }
 
     public <Result, IntermediateResult> Result aggregate(
-            AggregateDescription<Result, IntermediateResult, Data, Weight> aggregate) {
+            AggregateDescription<Result, IntermediateResult, Data> aggregate) {
         IntermediateResult result = aggregate.initialValue;
         for (Map.Entry<Data, Weight> entry : this.data.entrySet()) {
             Weight weight = entry.getValue();
@@ -215,13 +223,17 @@ public class ZSet<Data, Weight> extends BaseCollection<Weight> implements ToInde
     public IIndentStream toString(IIndentStream stream) {
         stream.append("{").increase();
         boolean first = true;
-        for (Map.Entry<Data, Weight> entry: this.data.entrySet()) {
+        List<Data> keys = new ArrayList<>(this.data.keySet());
+        keys.sort(Comparator.naturalOrder());
+
+        for (Data key: keys) {
+            Weight value = this.data.get(key);
             if (!first)
                 stream.append(",").newline();
             first = false;
-            stream.append(entry.getKey().toString())
+            stream.append(key.toString())
                     .append(" => ")
-                    .append(entry.getValue().toString());
+                    .append(value.toString());
         }
         return stream.decrease()
                 .newline()

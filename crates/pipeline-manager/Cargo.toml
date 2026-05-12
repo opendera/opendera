@@ -20,16 +20,15 @@ development = ["pg-client-config"]
 [dependencies]
 # Feldera
 feldera-types = { workspace = true }
-
-# Cryptography provider
-# Make sure this is the same rustls version used by other crates in the dependency tree.
-# See the `ensure_default_crypto_provider` function at the root of this crate.
-rustls = { workspace = true }
+feldera-cloud1-client = { workspace = true }
+feldera-ir = { workspace = true }
 
 # Logging
-log = { workspace = true }
-env_logger = { workspace = true, features = ["color"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 colored = { workspace = true }
+sentry = { workspace = true }
+feldera-observability = { workspace = true }
 
 # Error handling and asserts
 anyhow = { workspace = true, features = ["backtrace"] }
@@ -50,6 +49,7 @@ chrono = { workspace = true, features = ["clock", "serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml = { workspace = true }
+rmp-serde = { workspace = true }
 hex = { workspace = true }
 indoc = { workspace = true }
 openssl = { workspace = true }
@@ -59,6 +59,8 @@ regex = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 base64 = { workspace = true }
+zip = { workspace = true }
+semver = { workspace = true }
 
 # Command-line interaction
 clap = { workspace = true }
@@ -72,7 +74,7 @@ refinery = { workspace = true, features = ["tokio-postgres"] }
 postgres-openssl = { workspace = true }
 
 # HTTP server and client
-actix-web = { workspace = true }
+actix-web = { workspace = true, features = ["rustls-0_23"] }
 actix-http = { workspace = true }
 actix-web-static-files = { workspace = true }
 actix-files = { workspace = true }
@@ -84,10 +86,30 @@ jsonwebtoken = { workspace = true }
 static-files = { workspace = true }
 utoipa = { workspace = true, features = ["actix_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { workspace = true, features = ["actix-web"] }
-awc = { workspace = true, features = ["openssl"] }  # For: auth workflows
-reqwest = { workspace = true, features = ["json"]}
+# The `rustls-0_23-native-roots` feature is such that when you create a default awc::Client (during auth workflow),
+# it can connect to HTTPS with the system root certificates.
+#
+## Why both [awc] and [reqwest]?
+#
+# The pipeline manager uses both [awc] and [reqwest]:
+#
+# - `awc` supports websockets but `reqwest` did not at the time we added
+#   `awc`.  (Now there is the `reqwest_websocket` crate, which can't be
+#   much worse than `awc` since `awc` can send mangled frames to the
+#   client sometimes.)
+#
+# - `awc` is conveniently coupled with `actix-web` typewise.
+#
+# but:
+#
+# - `reqwest` is `Send + Sync`.
+#
+# - `reqwest` has an HTTPS-only mode.
+awc = { workspace = true, features = ["rustls-0_23", "rustls-0_23-native-roots"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots"] }
 cached = { workspace = true }
 crossbeam = { workspace = true }
+rustls = { workspace = true }
 
 # System interaction
 dirs = { workspace = true }  # For: discovering home directory
@@ -99,17 +121,21 @@ tempfile = { workspace = true }
 # They are provided such that they are included in the workspace `Cargo.lock`.
 # Keep in-sync with `src/compiler/rust_compiler.rs`.
 compare = { workspace = true }
+sha2 = { workspace = true }
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 
 [features]
 default = ["postgresql_embedded"]
 feldera-enterprise = []
+runtime-version = []
+fips = ["rustls/fips"]
 
 [build-dependencies]
 change-detection = { workspace = true }
 static-files = { workspace = true }
-vergen-gitcl = { version = "1.0.0", features = ["build", "cargo", "rustc", "si"] }
+vergen-gitcl = { workspace = true, features = ["build", "cargo", "rustc", "si"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

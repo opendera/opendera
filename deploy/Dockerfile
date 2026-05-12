@@ -13,8 +13,10 @@ RUN apt update --fix-missing && apt install \
   # pkg-config is required for cargo to find libssl
   libssl-dev pkg-config \
   cmake \
-  # rdkafka dependency needs libsasl2-dev and the CXX compiler
-  libsasl2-dev build-essential \
+  # Go is required to build aws-lc-fips-sys when rustls is built with FIPS
+  golang-go \
+  # rdkafka dependency needs libsasl2-dev zlib and a CXX compiler
+  libsasl2-dev zlib1g-dev build-essential \
   # To install rust
   curl  \
   # For running the SQL compiler
@@ -23,12 +25,17 @@ RUN apt update --fix-missing && apt install \
   locales \
   # To add the nodesource debian repository
   ca-certificates gnupg \
-  # Required by the `metrics-exporter-tcp` crate
-  protobuf-compiler \
   # Otherwise, postgresql_embedded complains when it tries to set timezeone to UTC
   tzdata \
   # Used by pipeline manager to switch runtime versions
-  git
+  git \
+  # Used to set capabilities to the samply profiler
+  libcap2-bin
+
+# Add AWS RDS bundle to trusted certificate store
+RUN curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+      -o /usr/local/share/ca-certificates/aws-global-rds-bundle.crt
+RUN update-ca-certificates
 
 # Set UTF-8 locale. Needed for the Rust compiler to handle Unicode column names.
 RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
@@ -47,11 +54,22 @@ ENV LANGUAGE=en_US:en
 # permissions when mounting volumes
 
 RUN mkdir -p feldera
-COPY --chown=ubuntu . feldera
-RUN cd feldera
+COPY --chown=ubuntu Cargo.lock feldera/Cargo.lock
+COPY --chown=ubuntu Cargo.toml feldera/Cargo.toml
+COPY --chown=ubuntu build/ feldera/build
+COPY --chown=ubuntu crates/ feldera/crates
+COPY --chown=ubuntu README.md feldera/README.md
+RUN mkdir -p feldera/sql-to-dbsp-compiler/lib
+# Copy over the rust code and sql-to-dbsp script
+COPY --chown=ubuntu sql-to-dbsp-compiler/lib feldera/sql-to-dbsp-compiler/lib
+COPY --chown=ubuntu sql-to-dbsp-compiler/temp feldera/sql-to-dbsp-compiler/temp
+COPY --chown=ubuntu sql-to-dbsp-compiler/SQL-compiler/sql-to-dbsp feldera/sql-to-dbsp-compiler/SQL-compiler/sql-to-dbsp
+# Copy over demos
+RUN mkdir -p feldera/demos/sql
+COPY --chown=ubuntu crates/pipeline-manager/demos/sql feldera/demos/sql
 
 # Install cargo and rust for this non-root user
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.87.0
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.93.1
 # The download URL for mold uses x86_64/aarch64 whereas dpkg --print-architecture says amd64/arm64
 RUN arch=`dpkg --print-architecture | sed "s/arm64/aarch64/g" | sed "s/amd64/x86_64/g"`; \
   curl -LO https://github.com/rui314/mold/releases/download/v2.40.1/mold-2.40.1-$arch-linux.tar.gz \
@@ -59,7 +77,10 @@ RUN arch=`dpkg --print-architecture | sed "s/arm64/aarch64/g" | sed "s/amd64/x86
   && mv mold-2.40.1-$arch-linux $HOME/mold \
   && rm mold-2.40.1-$arch-linux.tar.gz
 ENV PATH="$PATH:/home/ubuntu/.cargo/bin:/home/ubuntu/mold/bin"
-ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-Wl,--compress-debug-sections=zlib"
+
+# Install Samply for profiling
+RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/feldera/samply/releases/download/v0.13.2/samply-installer.sh | sh
 
 #
 # Build phase to specifically customize for the feldera OSS container
@@ -69,4 +90,4 @@ FROM base AS release
 # Run the precompile phase to speed up Rust compilations during deployment
 RUN ./feldera/build/pipeline-manager --bind-address=0.0.0.0 --sql-compiler-path=$HOME/feldera/build/sql2dbsp-jar-with-dependencies.jar --compilation-cargo-lock-path=$HOME/feldera/Cargo.lock --dbsp-override-path=$HOME/feldera --precompile
 ENV BANNER_ADDR=localhost
-ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demo/packaged/sql"]
+ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]

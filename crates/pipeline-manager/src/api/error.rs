@@ -23,6 +23,11 @@ pub enum ApiError {
     InvalidConnectorAction { action: String },
     UnableToConnect { reason: String },
     LockTimeout { value: String, timeout: Duration },
+    UnableToCreateSupportBundle { reason: String },
+    UnableToFetchCircuitProfile { reason: String },
+    ProgramInfoMissesDataflow { pipeline_name: String },
+    InvalidProgramInfo { error: String },
+    ProgramNotCompiled { pipeline_name: String },
 }
 
 impl DetailedError for ApiError {
@@ -37,6 +42,11 @@ impl DetailedError for ApiError {
             Self::InvalidConnectorAction { .. } => Cow::from("InvalidConnectorAction"),
             Self::UnableToConnect { .. } => Cow::from("UnableToConnect"),
             Self::LockTimeout { .. } => Cow::from("LockTimeout"),
+            Self::UnableToCreateSupportBundle { .. } => Cow::from("UnableToCreateSupportBundle"),
+            Self::UnableToFetchCircuitProfile { .. } => Cow::from("UnableToFetchCircuitProfile"),
+            Self::ProgramInfoMissesDataflow { .. } => Cow::from("ProgramInfoMissesDataflow"),
+            Self::InvalidProgramInfo { .. } => Cow::from("InvalidProgramInfo"),
+            Self::ProgramNotCompiled { .. } => Cow::from("ProgramNotCompiled"),
         }
     }
 }
@@ -78,6 +88,27 @@ impl Display for ApiError {
                     timeout.as_secs_f64()
                 )
             }
+            Self::UnableToCreateSupportBundle { reason } => {
+                write!(f, "Unable to create support bundle: {reason}")
+            }
+            Self::UnableToFetchCircuitProfile { reason } => {
+                write!(f, "Unable to fetch circuit profile: {reason}")
+            }
+            Self::ProgramInfoMissesDataflow { pipeline_name } => {
+                write!(
+                    f,
+                    "Dataflow graph is missing from pipeline '{pipeline_name}'. The pipeline may have been compiled before dataflow graphs were introduced."
+                )
+            }
+            Self::InvalidProgramInfo { error } => {
+                write!(f, "Invalid program info: {error}")
+            }
+            Self::ProgramNotCompiled { pipeline_name } => {
+                write!(
+                    f,
+                    "Pipeline '{pipeline_name}' has not been compiled yet. Please compile the pipeline first."
+                )
+            }
         }
     }
 }
@@ -102,6 +133,11 @@ impl ResponseError for ApiError {
             Self::InvalidConnectorAction { .. } => StatusCode::BAD_REQUEST,
             Self::UnableToConnect { .. } => StatusCode::BAD_REQUEST,
             Self::LockTimeout { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::UnableToCreateSupportBundle { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::UnableToFetchCircuitProfile { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ProgramInfoMissesDataflow { .. } => StatusCode::NOT_FOUND,
+            Self::InvalidProgramInfo { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ProgramNotCompiled { .. } => StatusCode::NOT_FOUND,
         }
     }
 

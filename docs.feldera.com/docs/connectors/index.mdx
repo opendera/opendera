@@ -90,10 +90,11 @@ The following attributes are common to all connectors:
   unique among the connectors of the table or view. This is particularly
   useful to define when wanting to refer to it, for example to
   [start or pause it at runtime](/connectors/orchestration).
-  By default, this is randomly generated.
+  By default, it will be named `unnamed-{index}`, with the zero-based index
+  within the list of connectors of its table/view.
 
 * `paused` - If set to to true the connector will not fetch or push data to the pipeline when started
-   unless [explicitly enabled through the API](/api/start-resume-or-pause-the-input-connector).
+   unless [explicitly enabled through the API](/api/control-input-connector).
    By default this is set to false.
 
 * `labels` - An optional list of text labels associated with the connector.
@@ -105,18 +106,41 @@ The following attributes are common to all connectors:
   of the specified labels have finished ingesting data.  This property is used in conjunction with the `labels` property
   to implement [automatic connector orchestration](/connectors/orchestration#automatic-connector-orchestration).
 
-* `max_queued_records` - The approximate maximum number of records to
-  keep in memory.  For an input connector, this is the maximum number
-  that the endpoint will read into memory, before the endpoint pauses
-  further reading until the pipeline has consumed some of the backlog.
-  For an output connector, this is the maximum number that the
-  endpoint will hold in memory waiting for the output endpoint to send
-  them, before the circuit pauses execution until the backlog
-  subsides.  By default, this is 1,000,000.
+* <a name="max_queued_records">`max_queued_records`</a> - The
+  approximate maximum number of records to keep in memory.  For an
+  input connector, this is the maximum number that the endpoint will
+  read into memory, before the endpoint pauses further reading until
+  the pipeline has consumed some of the backlog.  For an output
+  connector, this is the maximum number that the endpoint will hold in
+  memory waiting for the output endpoint to send them, before the
+  circuit pauses execution until the backlog subsides.  By default,
+  this is 1,000,000.
 
-* `max_batch_size` - For an input connector, the approximate maximum
-  number of records that the pipeline will process in a single
-  pipeline step.  By default, this is 10,000.
+* <a name="max_batch_size">`max_batch_size`</a> - Maximum number of records from this connector to process in a single batch.
+
+  When set, this caps how many records are taken from the connector’s input
+  buffer and pushed through the circuit at once.
+
+  This is typically configured lower than `max_queued_records` to allow the
+  connector time to restart and refill its buffer while a batch is being
+  processed.
+
+  Not all input adapters honor this limit.
+
+  If this is not set, the batch size is derived from `max_worker_batch_size`.
+
+* <a name="max_worker_batch_size">`max_worker_batch_size`</a> - Maximum number of records processed per batch, per worker thread.
+
+  When `max_batch_size` is not set, this setting is used to cap
+  the number of records that can be taken from the connector’s input
+  buffer and pushed through the circuit at once.  The effective batch size is computed as:
+  `max_worker_batch_size × workers`.
+
+  This provides an alternative to `max_batch_size` that automatically adjusts batch
+  size as the number of worker threads changes to maintain constant amount of
+  work per worker per batch.
+
+  Defaults to 10,000 records per worker.
 
 * `index` – *(Output connectors only)* The name of an index created by a SQL
   CREATE INDEX statement that defines

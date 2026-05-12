@@ -28,12 +28,13 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.dbsp.sqlCompiler.CompilerMain;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamDistinctOperator;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
+import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.util.HashString;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.backend.MerkleOuter;
@@ -78,6 +79,7 @@ import java.io.FileWriter;
 import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -88,7 +90,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Objects;
 import java.util.Set;
 
 /** Miscellaneous tests that do not fit into standard categories */
@@ -118,22 +119,22 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
         String str = circuit.toString();
         String expected = """
                 Circuit circuit {
-                    // DBSPConstantOperator s0
-                    let s0 = constant(zset!());
-                    // DBSPSourceMultisetOperator s1
+                    // DBSPSourceMultisetOperator s0
                     // CREATE TABLE `t` (`col1` INTEGER NOT NULL, `col2` DOUBLE NOT NULL, `col3` BOOLEAN NOT NULL, `col4` VARCHAR NOT NULL, `col5` INTEGER, `col6` DOUBLE)
-                    let s1 = t();
-                    // DBSPMapOperator s2
-                    let s2 = s1.map((|p0: &Tup6<i32, d, b, s, i32?, d?>|
+                    let s0 = t();
+                    // DBSPMapOperator s1
+                    let s1 = s0.map((|p0: &Tup6<i32, d, b, s, i32?, d?>|
                     Tup1::new(((*p0).2), )));
                     // CREATE VIEW `v` AS
                     // SELECT `t`.`col3`
                     // FROM `schema`.`t` AS `t`
-                    let s3 = s2;
+                    let s2 = s1;
+                    // DBSPConstantOperator s3
+                    let s3 = constant(zset!());
                     // CREATE VIEW `error_view` AS
                     // SELECT `feldera_error_table`.`table_or_view_name`, `feldera_error_table`.`message`, `feldera_error_table`.`metadata`
                     // FROM `schema`.`feldera_error_table` AS `feldera_error_table`
-                    let s4 = s0;
+                    let s4 = s3;
                 }
                 """;
         Assert.assertEquals(expected, str);
@@ -179,7 +180,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
         File file = createInputScript(sql);
         CompilerMain.execute("-TSqlToRelCompiler=2", "-TPasses=2",
                 "-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
-        Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, true);
+        BaseSQLTests.compileAndCheckRust(true);
         Logger.INSTANCE.setDebugStream(save);
         String messages = builder.toString();
         Assert.assertTrue(messages.contains("After optimizer"));
@@ -223,12 +224,12 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 DBSPTypeVoid.INSTANCE, body, Linq.list("#[test]"));
 
         PrintStream stream = new PrintStream(BaseSQLTests.TEST_FILE_PATH);
-        RustFileWriter writer = new RustFileWriter().withTest(true);
+        RustFileWriter writer = new RustFileWriter(new LateMaterializations(compiler)).withTest(true);
         writer.setOutputBuilder(new IndentStream(stream));
         writer.add(tester);
         writer.write(compiler);
         stream.close();
-        Utilities.compileAndTestRust(BaseSQLTests.RUST_DIRECTORY, false);
+        BaseSQLTests.compileAndTestRust(false);
     }
 
     @Test
@@ -256,12 +257,12 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 DBSPTypeVoid.INSTANCE, body, Linq.list("#[test]"));
 
         PrintStream outputStream = new PrintStream(BaseSQLTests.TEST_FILE_PATH, StandardCharsets.UTF_8);
-        RustFileWriter writer = new RustFileWriter().withTest(true);
+        RustFileWriter writer = new RustFileWriter(new LateMaterializations(compiler)).withTest(true);
         writer.setOutputBuilder(new IndentStream(outputStream));
         writer.add(tester);
         writer.write(compiler);
         outputStream.close();
-        Utilities.compileAndTestRust(BaseSQLTests.RUST_DIRECTORY, false);
+        BaseSQLTests.compileAndTestRust(false);
     }
 
     @Test
@@ -290,8 +291,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
         CompilerMessages messages = CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         if (messages.errorCount() > 0)
             throw new RuntimeException(messages.toString());
-        if (!BaseSQLTests.skipRust)
-            Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, true);
+        BaseSQLTests.compileAndCheckRust(true);
     }
 
     void compileFile(String file, boolean run) throws SQLException, IOException, InterruptedException {
@@ -299,35 +299,15 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 "-i", "--alltables", "-q", "--ignoreOrder", "-o", BaseSQLTests.TEST_FILE_PATH, file);
         messages.print();
         Assert.assertEquals(0, messages.errorCount());
-        if (run && !BaseSQLTests.skipRust)
-            Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, true);
+        if (run)
+            BaseSQLTests.compileAndCheckRust(true);
         // cleanup after ourselves
         createEmptyStubs();
     }
 
     @Test
-    public void testProjectFiles() throws IOException, InterruptedException, SQLException {
-        // Compiles all the programs in the tests directory
-        final String projectsDirectory = "../../demo/";
-        final File dir = new File(projectsDirectory);
-        File[] subdirs = dir.listFiles(File::isDirectory);
-        Objects.requireNonNull(subdirs);
-        for (File subdir: subdirs) {
-            if (!subdir.getName().contains("project_"))
-                continue;
-            FilenameFilter filter = (_d, name) -> !name.contains("setup") && name.endsWith(".sql");
-            String[] sqlFiles = subdir.list(filter);
-            Assert.assertNotNull(sqlFiles);
-            for (String sqlFile: sqlFiles) {
-                String path = subdir.getPath() + "/" + sqlFile;
-                this.compileFile(path, true);
-            }
-        }
-    }
-
-    @Test
     public void testUnionWarning() throws SQLException {
-        final String script = "../../demo/packaged/sql/02-sec-ops.sql";
+        final String script = "../../crates/pipeline-manager/demos/sql/02-sec-ops.sql";
         CompilerMessages messages = CompilerMain.execute(
                 "-i", "--alltables", "-q", "--ignoreOrder", "-o", BaseSQLTests.TEST_FILE_PATH, script);
         for (int i = 0; i < messages.warningCount(); i++) {
@@ -338,7 +318,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
 
     @Test
     public void testPackagedDemos() throws SQLException, IOException, InterruptedException {
-        final String projectsDirectory = "../../demo/packaged/sql";
+        final String projectsDirectory = "../../crates/pipeline-manager/demos/sql";
         final File dir = new File(projectsDirectory);
         FilenameFilter filter = (_d, name) -> !name.contains("setup") && name.endsWith(".sql");
         String[] sqlFiles = dir.list(filter);
@@ -366,9 +346,9 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
         DBSPCircuit circuit = compiler.getFinalCircuit(false);
         Assert.assertNotNull(circuit);
         DBSPTypeZSet outputType = circuit.getSingleOutputType().to(DBSPTypeZSet.class);
-        DBSPSimpleOperator source = circuit.getInput(compiler.canonicalName("T", false));
+        IInputOperator source = circuit.getInput(compiler.canonicalName("T", false));
         Assert.assertNotNull(source);
-        DBSPTypeZSet inputType = source.getType().to(DBSPTypeZSet.class);
+        DBSPTypeZSet inputType = source.getDataOutputType().to(DBSPTypeZSet.class);
         Assert.assertTrue(inputType.sameType(outputType));
         TestUtil.assertMessagesContain(compiler.messages, """
              ORDER BY clause is currently ignored
@@ -419,8 +399,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
         CompilerMessages messages = CompilerMain.execute("-q", "-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         messages.print();
         Assert.assertEquals(0, messages.exitCode);
-        if (!BaseSQLTests.skipRust)
-            Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, true);
+        BaseSQLTests.compileAndCheckRust(true);
     }
 
     @Test
@@ -446,9 +425,9 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                     // Second input has a count of "2"
                     person.push( (SqlString::from_ref("Tom"), Some(20), Some(false)).into(), 2 );
                     // Execute the circuit on these inputs
-                    circuit.step().unwrap();
+                    circuit.transaction().unwrap();
                     // Read the produced output
-                    let out = adult.consolidate();
+                    let out = adult.concat().consolidate();
                     // Print the produced output
                     println!("{:?}", out);
                 }
@@ -457,6 +436,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 #[test]
                 pub fn test() {
                     use dbsp_adapters::{CircuitCatalog, RecordFormat};
+                    use feldera_types::format::csv::CsvParserConfig;
 
                     let (mut circuit, catalog) = circuit(CircuitConfig::with_workers(2))
                         .expect("Failed to build circuit");
@@ -468,18 +448,18 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                         .configure_deserializer(RecordFormat::Csv(Default::default()))
                         .expect("Failed to configure deserializer");
                     persons_stream
-                        .insert(b"Bob,12,true")
+                        .insert(b"Bob,12,true", &None)
                         .expect("Failed to insert data");
                     persons_stream
-                        .insert(b"Tom,20,false")
+                        .insert(b"Tom,20,false", &None)
                         .expect("Failed to insert data");
                     persons_stream
-                        .insert(b"Tom,20,false")
+                        .insert(b"Tom,20,false", &None)
                         .expect("Failed to insert data");  // Insert twice
                     persons_stream.flush();
                     // Execute the circuit on these inputs
                     circuit
-                        .step()
+                        .transaction()
                         .unwrap();
 
                     let adult = &catalog
@@ -488,11 +468,16 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                         .delta_handle;
 
                     // Read the produced output
-                    let out = adult.consolidate();
-                    // Print the produced output
-                    println!("{:?}", out);
-                }
-                """;
+                    let reader = adult.concat();
+                    let mut cursor = reader
+                        .cursor(RecordFormat::Csv(CsvParserConfig::default()))
+                        .unwrap();
+                    while cursor.key_valid() {
+                        let mut w = cursor.weight();
+                        println!("{}: {}", cursor.key_to_json().unwrap(), w);
+                        cursor.step_key();
+                    }
+                }""";
         File file = createInputScript(sql);
         CompilerMessages message = CompilerMain.execute(
                 "--handles", "-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
@@ -504,7 +489,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
             fr.write(rustHandlesTest);
         }
         if (!BaseSQLTests.skipRust)
-            Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, true);
+            BaseSQLTests.compileAndTestRust(true);
 
         // Second test
         message = CompilerMain.execute(
@@ -517,7 +502,74 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
             fr.write(rustCatalogTest);
         }
         if (!BaseSQLTests.skipRust)
-            Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, true);
+            BaseSQLTests.compileAndTestRust(true);
+    }
+
+    @Test
+    public void issue4895() throws IOException, InterruptedException, SQLException {
+        String sql = """
+                create table t (x int lateness 0) with
+                 ('materialized' = 'true');
+                create materialized view V as SELECT * FROM t;""";
+        String rustCatalogTest = """
+                #[test]
+                pub fn test0() {
+                    use dbsp_adapters::{CircuitCatalog, RecordFormat};
+                    use feldera_types::format::json::JsonFlavor;
+                
+                    let mut circuitAndStreams = circuit(CircuitConfig::with_workers(2usize)).unwrap();
+                    let streams: Catalog = circuitAndStreams.1;
+                    let t = &SqlIdentifier::new("t", false);
+                    let input = streams.input_collection_handle(t).unwrap();
+                    let mut writer = input
+                        .handle
+                        .configure_deserializer(RecordFormat::Csv(Default::default()))
+                        .unwrap();
+                    writer.insert(b"1", &None).unwrap();
+                    writer.flush();
+                    writer.insert(b"2", &None).unwrap();
+                    writer.flush();
+                    writer.insert(b"3", &None).unwrap();
+                    writer.flush();
+                    circuitAndStreams.0.transaction().unwrap();
+                    // late value
+                    writer.insert(b"0", &None).unwrap();
+                    writer.flush();
+                    circuitAndStreams.0.transaction().unwrap();
+                
+                    let output = streams
+                        .output_handles(t)
+                        .unwrap()
+                        .integrate_handle
+                        .clone()
+                        .unwrap()
+                        .clone();
+                    let reader = output.concat();
+                    let mut cursor = reader
+                        .cursor(RecordFormat::Json(JsonFlavor::default()))
+                        .unwrap();
+                    let mut rows: u32 = 0;
+                    while (cursor.key_valid()) {
+                        let mut w = cursor.weight();
+                        // println!("{}: {}", cursor.key_to_json().unwrap(), w);
+                        rows = rows + 1;
+                        cursor.step_key();
+                    }
+                    // There should be only 3 rows; the last inserted one should be missing
+                    assert!(3 == rows, "Expected 3 rows, got {}", rows);
+                }""";
+        File file = createInputScript(sql);
+        CompilerMessages message = CompilerMain.execute(
+                "-i", "-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+        Assert.assertEquals(0, message.exitCode);
+        Assert.assertTrue(file.exists());
+
+        File rust = new File(BaseSQLTests.TEST_FILE_PATH);
+        try (FileWriter fr = new FileWriter(rust, true)) { // append
+            fr.write(rustCatalogTest);
+        }
+        if (!BaseSQLTests.skipRust)
+            BaseSQLTests.compileAndTestRust(true);
     }
 
     @Test
@@ -534,6 +586,18 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
         Assert.assertEquals(0, message.exitCode);
         Assert.assertTrue(file.exists());
         ImageIO.read(new File(png.getPath()));
+    }
+
+    @Test
+    public void testUDT() {
+        this.getCCS("""
+                CREATE TYPE address_typ AS (
+                   street          VARCHAR(30),
+                   city            VARCHAR(20),
+                   state           CHAR(2),
+                   postal_code     VARCHAR(6));
+                CREATE TABLE T(street VARCHAR, city VARCHAR, year INT);
+                CREATE VIEW V AS SELECT address_typ(T.street, city, 'CA', 94087) as address, T.year as year FROM T;""");
     }
 
     @Test
@@ -579,9 +643,11 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 REMOVE FROM T VALUES(3, 'Z');""").simplify(compiler);
         String set = change.getSet(0).toString();
         Assert.assertEquals("""
-                zset!(Tup2::new(Some(1), "x", ) => 1,
-                Tup2::new(Some(2), "Y", ) => -1,
-                Tup2::new(Some(3), "Z", ) => -1,)""", set);
+                TableData[name=t, data=zset!(
+                    Tup2::new(Some(1), Some("x"), ) => 1i64,
+                    Tup2::new(Some(2), Some("Y"), ) => -1i64,
+                    Tup2::new(Some(3), Some("Z"), ) => -1i64,
+                ), primaryKeys=[]]""", set);
     }
 
     @Test
@@ -635,23 +701,75 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
         Assert.assertNotNull(decoded);
     }
 
+    @Test
+    public void compileAggregationTests() throws URISyntaxException, IOException {
+        List<String> tests = TestUtil.enumerateResourceFiles();
+        for (String sqlFile: tests) {
+            if (!sqlFile.endsWith("sql")) continue;
+            if (!sqlFile.startsWith("aggregation_tests")) continue;
+            String sql = TestUtil.readStringFromResourceFile(sqlFile);
+            this.getCC(sql);
+        }
+    }
+
+    @Test
+    public void argMinDate() {
+        this.getCCS("""
+                CREATE TABLE date_tbl(
+                id INT,
+                c1 DATE NOT NULL,
+                c2 DATE);
+                
+                CREATE VIEW V0 AS SELECT
+                id, ARG_MIN(c1, c2) AS c1, ARG_MIN(c2, c1) AS c2
+                FROM date_tbl
+                GROUP BY id;
+                
+                CREATE VIEW V1 AS SELECT
+                ARG_MIN(c1, c2) AS c1, ARG_MIN(c2, c1) AS c2
+                FROM date_tbl;""");
+    }
+
+    @Test
+    public void argMinString() {
+        this.getCCS("""
+                CREATE TABLE varchar_tbl(
+                id INT,
+                c1 VARCHAR,
+                c2 VARCHAR NULL);
+                
+                CREATE VIEW atbl_charn AS SELECT
+                id,
+                CAST(c1 AS CHAR(7)) AS f_c1,
+                CAST(c2 AS CHAR(7)) AS f_c2
+                FROM varchar_tbl;
+                
+                CREATE VIEW V2 AS SELECT id, ARG_MIN(f_c1, f_c2) AS c1, ARG_MIN(f_c2, f_c1) AS c2
+                FROM atbl_charn
+                GROUP BY id;""");
+    }
+
     @Test @Ignore("To be invoked manually every time a new function is added")
-    public void generateFunctionIndex() throws IOException {
+    public void generateFunctionIndex() throws IOException, InterruptedException {
         // When invoked it generates documentation for the supported functions and operators
         // in the specified file.
         String file = "../../docs.feldera.com/docs/sql/function-index.md";
         FunctionDocumentation.generateIndex(file);
+        Utilities.runProcess(BaseSQLTests.PROJECT_DIRECTORY + "/../docs.feldera.com",
+                "yarn");
+        Utilities.runProcess(BaseSQLTests.PROJECT_DIRECTORY + "/../docs.feldera.com",
+                "yarn", "build");
     }
 
     @Test
     public void rustFmt() throws IOException, InterruptedException {
-        // Don't run this in CI we don't recompile at the point where we run the tests
-        if (System.getenv("CI") != null)
+        // Don't run this in CI
+        if (Utilities.inCI())
             return;
         // Check that the rust library is properly formatted
         Utilities.runProcess(BaseSQLTests.PROJECT_DIRECTORY + "/../crates/sqllib",
                 "cargo", "fmt", "--all", "--", "--check");
         Utilities.runProcess(BaseSQLTests.PROJECT_DIRECTORY + "/../crates/sqllib",
-                "cargo", "clippy", "--", "-D", "warnings");
+                "cargo", "clippy", "--all-targets", "--tests", "--", "-D", "warnings");
     }
 }

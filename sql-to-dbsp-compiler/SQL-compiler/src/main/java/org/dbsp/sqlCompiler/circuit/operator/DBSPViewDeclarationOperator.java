@@ -5,6 +5,8 @@ import org.dbsp.sqlCompiler.circuit.ICircuit;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.compiler.TableMetadata;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
+import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
+import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.RelAnd;
@@ -15,6 +17,7 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeStruct;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeUser;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
 import org.dbsp.util.Utilities;
 
@@ -33,7 +36,7 @@ public final class DBSPViewDeclarationOperator
             CalciteObject node, CalciteObject sourceName,
             DBSPTypeZSet outputType, DBSPTypeStruct originalRowType,
             TableMetadata metadata, ProgramIdentifier name) {
-        super(new RelAnd(), "Z " + name.name(), sourceName, outputType, originalRowType, true,
+        super(new RelAnd(), "Z", sourceName, outputType, originalRowType, true,
                 metadata, name, null);
         Utilities.enforce(metadata.getColumnCount() == originalRowType.fields.size());
         Utilities.enforce(metadata.getColumnCount() == outputType.elementType.to(DBSPTypeTuple.class).size());
@@ -91,5 +94,15 @@ public final class DBSPViewDeclarationOperator
         return new DBSPViewDeclarationOperator(CalciteObject.EMPTY, CalciteObject.EMPTY,
                 info.getZsetType(), originalRowType, metadata, viewName)
                 .addAnnotations(info.annotations(), DBSPViewDeclarationOperator.class);
+    }
+
+    @Override
+    public DBSPTypeUser getHandleType() {
+        throw new InternalCompilerError("Should not be called");
+    }
+
+    @Override
+    public DBSPSourceTableOperator withMetadata(TableMetadata metadata) {
+        throw new UnimplementedException();
     }
 }

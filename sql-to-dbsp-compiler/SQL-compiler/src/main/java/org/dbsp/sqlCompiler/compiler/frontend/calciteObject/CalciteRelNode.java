@@ -10,19 +10,40 @@ import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlWriter;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.pretty.SqlPrettyWriter;
+import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
 import org.dbsp.util.IHasId;
 import org.dbsp.util.IIndentStream;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 public abstract class CalciteRelNode extends CalciteObject implements IHasId {
     // Not clear these should be here
     public static final SqlDialect DIALECT = SqlDialect.DatabaseProduct.UNKNOWN.getDialect();
     static final RelToSqlConverter CONVERTER = new RelToSqlConverter(DIALECT);
+    final List<SourcePositionRange> positions = new ArrayList<>();
 
-    protected CalciteRelNode() {
-        super();
+    public List<SourcePositionRange> getSourcePositions() {
+        return this.positions;
     }
+
+    protected CalciteRelNode(SourcePositionRange pos) {
+        super(pos);
+        if (pos.isValid())
+            this.positions.add(pos);
+    }
+
+    public CalciteRelNode addSourcePositions(Iterable<SourcePositionRange> positions) {
+        for (var pos: positions)
+            if (pos.isValid())
+                this.positions.add(pos);
+        return this;
+    }
+
+    public abstract CalciteRelNode copy();
+
+    protected CalciteRelNode() { this(SourcePositionRange.INVALID); }
 
     @Override
     public boolean isEmpty() {
@@ -39,10 +60,14 @@ public abstract class CalciteRelNode extends CalciteObject implements IHasId {
     }
 
     public static String toSqlString(RelNode node) {
-        SqlNode sql = CONVERTER.visitRoot(node).asStatement();
-        final SqlWriter sqlWriter = new SqlPrettyWriter();
-        sql.unparse(sqlWriter, 0, 0);
-        return sqlWriter.toSqlString().toString();
+        try {
+            SqlNode sql = CONVERTER.visitRoot(node).asStatement();
+            final SqlWriter sqlWriter = new SqlPrettyWriter();
+            sql.unparse(sqlWriter, 0, 0);
+            return sqlWriter.toSqlString().toString();
+        } catch (Throwable ex) {
+            return "<could not convert representation to SQL>";
+        }
     }
 
     @Override

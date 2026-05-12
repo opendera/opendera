@@ -1,4 +1,4 @@
-use crate::db::types::pipeline::{PipelineDesiredStatus, PipelineStatus};
+use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
 use crate::db::types::utils::ValidationError;
 use actix_web::{
     body::BoxBody, http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError,
@@ -16,9 +16,13 @@ use std::{borrow::Cow, error::Error as StdError, fmt, fmt::Display, time::Durati
 pub enum RunnerError {
     // Automaton encountered an error during one of its own operations
     AutomatonMissingProgramInfo,
-    AutomatonMissingProgramBinaryUrl,
+    AutomatonCannotConstructProgramBinaryUrl {
+        error: String,
+    },
+    AutomatonMissingDeploymentId,
     AutomatonMissingDeploymentConfig,
     AutomatonMissingDeploymentLocation,
+    AutomatonMissingDeploymentInitial,
     AutomatonInvalidRuntimeConfig {
         value: serde_json::Value,
         error: ValidationError,
@@ -34,14 +38,11 @@ pub enum RunnerError {
     AutomatonFailedToSerializeDeploymentConfig {
         error: String,
     },
-    AutomatonCannotProvisionDifferentPlatformVersion {
+    AutomatonCannotProvisionUnsupportedPlatformVersion {
         pipeline_platform_version: String,
         runner_platform_version: String,
     },
     AutomatonProvisioningTimeout {
-        timeout: Duration,
-    },
-    AutomatonInitializingTimeout {
         timeout: Duration,
     },
     AutomatonSuspendingComputeTimeout {
@@ -49,8 +50,8 @@ pub enum RunnerError {
     },
     AutomatonAfterInitializationBecameRunning,
     AutomatonImpossibleDesiredStatus {
-        current_status: PipelineStatus,
-        desired_status: PipelineDesiredStatus,
+        current_status: ResourcesStatus,
+        desired_status: ResourcesDesiredStatus,
     },
 
     // The pipeline runner implementation encounters an error
@@ -76,14 +77,35 @@ pub enum RunnerError {
 
     // Interaction with the pipeline
     PipelineInteractionNotDeployed {
-        status: PipelineStatus,
-        desired_status: PipelineDesiredStatus,
+        /// Pipeline name or UUID if name is not available.
+        pipeline_name: String,
+        status: ResourcesStatus,
+        desired_status: ResourcesDesiredStatus,
+    },
+    PipelineUnavailable {
+        /// Pipeline name or UUID if name is not available.
+        pipeline_name: String,
+    },
+    PipelineMissingDeploymentLocation {
+        /// Pipeline name or UUID if name is not available.
+        pipeline_name: String,
     },
     PipelineInteractionUnreachable {
+        /// Pipeline name or UUID if name is not available.
+        pipeline_name: String,
+        request: String,
         error: String,
     },
     PipelineInteractionInvalidResponse {
+        /// Pipeline name or UUID if name is not available.
+        pipeline_name: String,
         error: String,
+    },
+
+    /// Error using OpenSSL for certificate management
+    OpenSSL {
+        /// OpenSSL errors.
+        errors: String,
     },
 }
 
@@ -91,14 +113,18 @@ impl DetailedError for RunnerError {
     fn error_code(&self) -> Cow<'static, str> {
         match self {
             RunnerError::AutomatonMissingProgramInfo => Cow::from("AutomatonMissingProgramInfo"),
-            RunnerError::AutomatonMissingProgramBinaryUrl => {
-                Cow::from("AutomatonMissingProgramBinaryUrl")
+            RunnerError::AutomatonCannotConstructProgramBinaryUrl { .. } => {
+                Cow::from("AutomatonCannotConstructProgramBinaryUrl")
             }
+            RunnerError::AutomatonMissingDeploymentId => Cow::from("AutomatonMissingDeploymentId"),
             RunnerError::AutomatonMissingDeploymentConfig => {
                 Cow::from("AutomatonMissingDeploymentConfig")
             }
             RunnerError::AutomatonMissingDeploymentLocation => {
                 Cow::from("AutomatonMissingDeploymentLocation")
+            }
+            RunnerError::AutomatonMissingDeploymentInitial => {
+                Cow::from("AutomatonMissingDeploymentInitial")
             }
             RunnerError::AutomatonInvalidRuntimeConfig { .. } => {
                 Cow::from("AutomatonInvalidRuntimeConfig")
@@ -112,14 +138,11 @@ impl DetailedError for RunnerError {
             RunnerError::AutomatonFailedToSerializeDeploymentConfig { .. } => {
                 Cow::from("AutomatonFailedToSerializeDeploymentConfig")
             }
-            RunnerError::AutomatonCannotProvisionDifferentPlatformVersion { .. } => {
-                Cow::from("AutomatonCannotProvisionDifferentPlatformVersion")
+            RunnerError::AutomatonCannotProvisionUnsupportedPlatformVersion { .. } => {
+                Cow::from("AutomatonCannotProvisionUnsupportedPlatformVersion")
             }
             RunnerError::AutomatonProvisioningTimeout { .. } => {
                 Cow::from("AutomatonProvisioningTimeout")
-            }
-            RunnerError::AutomatonInitializingTimeout { .. } => {
-                Cow::from("AutomatonInitializingTimeout")
             }
             RunnerError::AutomatonSuspendingComputeTimeout { .. } => {
                 Cow::from("AutomatonSuspendingComputeTimeout")
@@ -146,12 +169,17 @@ impl DetailedError for RunnerError {
             RunnerError::PipelineInteractionNotDeployed { .. } => {
                 Cow::from("PipelineInteractionNotDeployed")
             }
+            RunnerError::PipelineUnavailable { .. } => Cow::from("PipelineUnavailable"),
+            RunnerError::PipelineMissingDeploymentLocation { .. } => {
+                Cow::from("PipelineMissingDeploymentLocation")
+            }
             RunnerError::PipelineInteractionUnreachable { .. } => {
                 Cow::from("PipelineInteractionUnreachable")
             }
             RunnerError::PipelineInteractionInvalidResponse { .. } => {
                 Cow::from("PipelineInteractionInvalidResponse")
             }
+            RunnerError::OpenSSL { .. } => Cow::from("OpenSSL"),
         }
     }
 }
@@ -165,10 +193,13 @@ impl Display for RunnerError {
                     "Unable to provision pipeline because its program information is missing, which is necessary to construct the deployment configuration"
                 )
             }
-            Self::AutomatonMissingProgramBinaryUrl => {
+            Self::AutomatonCannotConstructProgramBinaryUrl { error } => {
+                write!(f, "Cannot construct program binary URL due to: {error}")
+            }
+            Self::AutomatonMissingDeploymentId => {
                 write!(
                     f,
-                    "Unable to provision pipeline because its program binary URL is missing"
+                    "Unable to provision pipeline because its deployment identifier is missing"
                 )
             }
             Self::AutomatonMissingDeploymentConfig => {
@@ -181,6 +212,12 @@ impl Display for RunnerError {
                 write!(
                     f,
                     "Unable to status check the pipeline because its deployment location is missing"
+                )
+            }
+            Self::AutomatonMissingDeploymentInitial => {
+                write!(
+                    f,
+                    "The deployment initial desired runtime status is missing"
                 )
             }
             Self::AutomatonInvalidRuntimeConfig { value, error } => {
@@ -213,14 +250,14 @@ impl Display for RunnerError {
                     "Failed to serialize deployment configuration due to: {error}"
                 )
             }
-            Self::AutomatonCannotProvisionDifferentPlatformVersion {
+            Self::AutomatonCannotProvisionUnsupportedPlatformVersion {
                 pipeline_platform_version,
                 runner_platform_version,
             } => {
                 write!(
                     f,
                     "Unable to provision pipeline because the pipeline platform version ({pipeline_platform_version}) \
-                    differs from the runner platform version ({runner_platform_version}) -- stop and restart the pipeline to resolve this"
+                    is not supported by the installed Feldera platform version ({runner_platform_version}) -- recompile the pipeline with the current platform version to resolve this"
                 )
             }
             Self::AutomatonProvisioningTimeout { timeout } => {
@@ -234,20 +271,6 @@ impl Display for RunnerError {
 
                     2) Your cloud environment could not provision some required resources like volumes or containers.
                        The pipeline logs might provide more insight if this is the case.
-                    ",
-                    timeout.as_secs()
-                }
-            }
-            Self::AutomatonInitializingTimeout { timeout } => {
-                writedoc! {
-                    f,
-                    "
-                    Pipeline could not be initialized within the timeout of {}s. Possible reasons:
-
-                    (1) It takes too long to initialize the internal state and connectors compared to the timeout.
-
-                    (2) Initialization encountered an unexpected issue.
-                        The pipeline logs might provide more insight if this is the case.
                     ",
                     timeout.as_secs()
                 }
@@ -304,46 +327,69 @@ impl Display for RunnerError {
                 write!(f, "Log follow request channel is closed -- this indicates that the runner crashed unexpectedly")
             }
             Self::PipelineInteractionNotDeployed {
+                pipeline_name,
                 status,
-                desired_status,
+                desired_status: _,
             } => {
-                let resolution = match (status, desired_status) {
-                    (PipelineStatus::Stopped, PipelineDesiredStatus::Stopped) => {
-                        "start the pipeline"
-                    }
-                    (_, PipelineDesiredStatus::Suspended) => {
-                        "wait for the pipeline to suspend and stop, and then start again"
-                    }
-                    (_, PipelineDesiredStatus::Running | PipelineDesiredStatus::Paused) => {
-                        "wait for the pipeline to become running or paused"
-                    }
-                    (_, PipelineDesiredStatus::Stopped) => {
-                        "wait for the pipeline to stop and start again afterwards"
-                    }
-                };
                 write!(
                     f,
-                    "Unable to interact with pipeline because the deployment status ('{status}') \
-                    is not one of the deployed statuses ('running', 'paused' or 'unavailable') \
-                    -- to resolve this: {resolution}"
+                    "Unable to interact with pipeline because the deployment status ({status}) indicates it is not (yet) fully provisioned{}",
+                    pipeline_suffix(pipeline_name)
                 )
             }
-            Self::PipelineInteractionUnreachable { error } => {
-                write!(f, "Unable to reach pipeline to interact due to: {error}")
-            }
-            Self::PipelineInteractionInvalidResponse { error } => {
+            Self::PipelineUnavailable { pipeline_name } => {
                 write!(
                     f,
-                    "During pipeline interaction an unexpected invalid response was encountered: {error}"
+                    "Unable to interact with pipeline because its status is currently 'unavailable'{}",
+                    pipeline_suffix(pipeline_name)
+                )
+            }
+            Self::PipelineMissingDeploymentLocation { pipeline_name } => {
+                write!(
+                    f,
+                    "Unable to interact with pipeline because its deployment location is missing despite it being fully provisioned{}",
+                    pipeline_suffix(pipeline_name)
+                )
+            }
+            Self::PipelineInteractionUnreachable {
+                pipeline_name,
+                request,
+                error,
+            } => {
+                write!(
+                    f,
+                    "Error sending HTTP request to pipeline: {error} Failed request: {request}{}",
+                    pipeline_suffix(pipeline_name)
+                )
+            }
+            Self::PipelineInteractionInvalidResponse {
+                pipeline_name,
+                error,
+            } => {
+                write!(
+                    f,
+                    "Encountered an unexpected invalid response when interacting with pipeline: {error}{}",
+                    pipeline_suffix(pipeline_name)
+                )
+            }
+            Self::OpenSSL { errors } => {
+                write!(
+                    f,
+                    "Error using OpenSSL for certificate management: {errors}"
                 )
             }
         }
     }
 }
 
+fn pipeline_suffix(name: &str) -> String {
+    let display_name = if name.is_empty() { "N/A" } else { name };
+    format!(" pipeline-id=N/A pipeline-name=\"{display_name}\"")
+}
+
 impl From<RunnerError> for ErrorResponse {
     fn from(val: RunnerError) -> Self {
-        ErrorResponse::from(&val)
+        ErrorResponse::from_error_nolog(&val)
     }
 }
 
@@ -353,20 +399,23 @@ impl ResponseError for RunnerError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::AutomatonMissingProgramInfo => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::AutomatonMissingProgramBinaryUrl => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::AutomatonCannotConstructProgramBinaryUrl { .. } => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            Self::AutomatonMissingDeploymentId => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonMissingDeploymentConfig => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonMissingDeploymentLocation => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::AutomatonMissingDeploymentInitial => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonInvalidRuntimeConfig { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonInvalidProgramInfo { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonInvalidDeploymentConfig { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonFailedToSerializeDeploymentConfig { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
-            Self::AutomatonCannotProvisionDifferentPlatformVersion { .. } => {
+            Self::AutomatonCannotProvisionUnsupportedPlatformVersion { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::AutomatonProvisioningTimeout { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::AutomatonInitializingTimeout { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonSuspendingComputeTimeout { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonAfterInitializationBecameRunning => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonImpossibleDesiredStatus { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -382,8 +431,11 @@ impl ResponseError for RunnerError {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::PipelineInteractionNotDeployed { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::PipelineUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::PipelineMissingDeploymentLocation { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::PipelineInteractionUnreachable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::PipelineInteractionInvalidResponse { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::OpenSSL { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 

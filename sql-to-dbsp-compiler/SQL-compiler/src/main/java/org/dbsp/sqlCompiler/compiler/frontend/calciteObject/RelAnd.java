@@ -2,6 +2,7 @@ package org.dbsp.sqlCompiler.compiler.frontend.calciteObject;
 
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.TableScan;
+import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
 import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
 import org.dbsp.util.IIndentStream;
 import org.dbsp.util.Linq;
@@ -14,6 +15,15 @@ import java.util.Set;
 /** Represents a set of {@link LastRel}, all of which are supposedly referring to table reads */
 public class RelAnd extends CalciteRelNode {
     final Set<LastRel> nodes;
+    SourcePositionRange position = SourcePositionRange.INVALID;
+
+    @Override
+    public CalciteRelNode copy() {
+        RelAnd result = new RelAnd();
+        for (var last: this.nodes)
+            result.add(last);
+        return result.addSourcePositions(this.positions);
+    }
 
     public RelAnd() {
         this.nodes = new HashSet<>();
@@ -44,6 +54,8 @@ public class RelAnd extends CalciteRelNode {
             if (inside.equals(rel))
                 return;
         this.nodes.add(rel);
+        if (rel.getPositionRange().isValid() && !this.position.isValid())
+            this.position = rel.getPositionRange();
         Utilities.enforce(rel.relNode instanceof TableScan);
     }
 

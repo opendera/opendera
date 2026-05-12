@@ -1,0 +1,280 @@
+# Run all the things we can run once we have a working docker image
+name: Platform Integration Tests
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID of the workflow run that uploaded the artifact"
+        required: true
+
+env:
+  FELDERA_SENTRY_ENABLED: 1
+  SENTRY_ENVIRONMENT: ci
+
+jobs:
+  manager-no-network:
+    if: ${{ !contains(vars.CI_SKIP_JOBS, 'manager-no-network') }}
+    name: Make sure manager runs without access to a network
+    runs-on: ubuntu-latest-amd64
+    steps:
+      - name: Login to GHCR with GITHUB_TOKEN
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Create a network
+        run: |
+          docker network create --internal --driver bridge no-internet-net
+      - name: Start pipeline-manager in background
+        run: |
+          docker run -d \
+            --pull missing \
+            --name pipeline-manager-no-internet \
+            --network no-internet-net \
+            --health-cmd='curl --fail --silent --max-time 2 http://localhost:8080/healthz || exit 1' \
+            --health-interval=10s \
+            --health-timeout=5s \
+            --health-retries=5 \
+            ${{ vars.FELDERA_IMAGE_NAME }}:sha-${{ github.sha }}
+      - name: Wait for container to become healthy (max 50s)
+        run: |
+          for i in {1..50}; do
+            status=$(docker inspect --format '{{json .State.Health}}' pipeline-manager-no-internet | jq -r .Status 2>/dev/null || echo "starting")
+            echo "Health status: $status"
+            if [ "$status" == "healthy" ]; then
+              echo "pipeline-manager is healthy"
+              exit 0
+            elif [ "$status" == "unhealthy" ]; then
+              echo "pipeline-manager not healthy"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "Timed out waiting for pipeline-manager to become healthy"
+          exit 1
+      - name: Logs & Cleanup
+        if: always()
+        run: |
+          docker logs pipeline-manager-no-internet || true
+          docker inspect pipeline-manager-no-internet || true
+          docker rm -f pipeline-manager-no-internet || true
+          docker network rm no-internet-net || true
+
+  manager-https:
+    if: ${{ !contains(vars.CI_SKIP_JOBS, 'manager-https') }}
+    name: Make sure manager runs with HTTPS
+    runs-on: ubuntu-latest-amd64
+
+    # Environment variables for OIDC authentication (if available)
+    env:
+      OIDC_TEST_ISSUER: ${{ vars.OIDC_TEST_ISSUER }}
+      OIDC_TEST_CLIENT_ID: ${{ vars.OIDC_TEST_CLIENT_ID }}
+      OIDC_TEST_CLIENT_SECRET: ${{ secrets.OIDC_TEST_CLIENT_SECRET }}
+      OIDC_TEST_USERNAME: ${{ secrets.OIDC_TEST_USERNAME }}
+      OIDC_TEST_PASSWORD: ${{ secrets.OIDC_TEST_PASSWORD }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Login to GHCR with GITHUB_TOKEN
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Start pipeline-manager in background
+        run: |
+          mkdir test-tls
+          echo -e "[x509_v3]\nsubjectAltName = @alt_names\nbasicConstraints = critical,CA:TRUE\n\n[alt_names]\nDNS.1 = localhost\nIP.1 = 127.0.0.1\n" > test-tls/x509_v3_test.ext
+          openssl req -x509 -newkey rsa:4096 -nodes -keyout test-tls/tls_test.key -out test-tls/tls_test.crt -days 365 \
+            -subj '/CN=localhost' -config test-tls/x509_v3_test.ext -extensions x509_v3
+          chmod 644 test-tls/tls_test.key
+          docker run -d \
+            --pull missing \
+            --name pipeline-manager-https \
+            --health-cmd='curl --fail --silent --max-time 2 --cacert /home/ubuntu/test-tls/tls_test.crt https://localhost:8080/healthz || exit 1' \
+            --health-interval=10s \
+            --health-timeout=5s \
+            --health-retries=5 \
+            --mount type=bind,src=./test-tls,dst=/home/ubuntu/test-tls,readonly \
+            -p 8080:8080 \
+            -e AUTH_PROVIDER="${{ vars.OIDC_TEST_ISSUER && 'generic-oidc' || 'none' }}" \
+            -e FELDERA_AUTH_CLIENT_ID="${{ vars.OIDC_TEST_CLIENT_ID }}" \
+            -e FELDERA_AUTH_ISSUER="${{ vars.OIDC_TEST_ISSUER }}" \
+            -e RUST_LOG=info \
+            -e RUST_BACKTRACE=1 \
+            ${{ vars.FELDERA_IMAGE_NAME }}:sha-${{ github.sha }} \
+            --enable-https \
+            --https-tls-cert-path /home/ubuntu/test-tls/tls_test.crt \
+            --https-tls-key-path /home/ubuntu/test-tls/tls_test.key
+      - name: Wait for container to become healthy (max 50s)
+        run: |
+          for i in {1..50}; do
+            status=$(docker inspect --format '{{json .State.Health}}' pipeline-manager-https | jq -r .Status 2>/dev/null || echo "starting")
+            echo "Health status: $status"
+            if [ "$status" == "healthy" ]; then
+              echo "pipeline-manager is healthy"
+              exit 0
+            elif [ "$status" == "unhealthy" ]; then
+              echo "pipeline-manager not healthy"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "Timed out waiting for pipeline-manager to become healthy"
+          exit 1
+      - name: Run platform tests
+        if: ${{ vars.CI_DRY_RUN != 'true' }}
+        run: uv run --locked pytest -n ${{ vars.PYTEST_WORKERS }} tests/platform/test_pipeline_crud.py --timeout=3600 -vv
+        working-directory: python
+        env:
+          FELDERA_HTTPS_TLS_CERT: ../test-tls/tls_test.crt
+          FELDERA_HOST: https://localhost:8080
+          PYTHONPATH: ${{ github.workspace }}/python
+          # OIDC environment variables for authentication
+          OIDC_TEST_ISSUER: ${{ vars.OIDC_TEST_ISSUER }}
+          OIDC_TEST_CLIENT_ID: ${{ vars.OIDC_TEST_CLIENT_ID }}
+          OIDC_TEST_CLIENT_SECRET: ${{ secrets.OIDC_TEST_CLIENT_SECRET }}
+          OIDC_TEST_USERNAME: ${{ secrets.OIDC_TEST_USERNAME }}
+          OIDC_TEST_PASSWORD: ${{ secrets.OIDC_TEST_PASSWORD }}
+      - name: Logs & Cleanup
+        if: always()
+        run: |
+          rm -rf test-tls
+          docker logs pipeline-manager-https || true
+          docker inspect pipeline-manager-https || true
+          docker rm -f pipeline-manager-https || true
+
+  oss-platform-tests:
+    if: ${{ !contains(vars.CI_SKIP_JOBS, 'oss-platform-tests') }}
+    name: Platform Integration Tests (OSS Docker Image)
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    strategy:
+      matrix:
+        include:
+          - runner: [k8s-runners-amd64]
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          #- runner: [k8s-runners-arm64 ]
+          #  arch: aarch64
+          #  target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+
+    # Environment variables for OIDC authentication (if available)
+    env:
+      OIDC_TEST_ISSUER: ${{ vars.OIDC_TEST_ISSUER }}
+      OIDC_TEST_CLIENT_ID: ${{ vars.OIDC_TEST_CLIENT_ID }}
+      OIDC_TEST_CLIENT_SECRET: ${{ secrets.OIDC_TEST_CLIENT_SECRET }}
+      OIDC_TEST_USERNAME: ${{ secrets.OIDC_TEST_USERNAME }}
+      OIDC_TEST_PASSWORD: ${{ secrets.OIDC_TEST_PASSWORD }}
+      FELDERA_TLS_INSECURE: true
+      FELDERA_HOST: https://localhost:8080
+
+    container:
+      image: ghcr.io/feldera/feldera-dev:sha-3613839bd73108aee58017bf75dda42f7a3d0bb4
+    services:
+      pipeline-manager:
+        image: ${{ vars.FELDERA_IMAGE_NAME }}:sha-${{ github.sha }}
+        env:
+          # Configure OIDC authentication if available, otherwise use no auth
+          AUTH_PROVIDER: ${{ vars.OIDC_TEST_ISSUER && 'generic-oidc' || 'none' }}
+          FELDERA_AUTH_CLIENT_ID: ${{ vars.OIDC_TEST_CLIENT_ID }}
+          FELDERA_AUTH_ISSUER: ${{ vars.OIDC_TEST_ISSUER }}
+          RUST_LOG: info
+          RUST_BACKTRACE: 1
+          FELDERA_ENABLE_HTTPS: true
+          # Needed by test_update_runtime.py
+          FELDERA_UNSTABLE_FEATURES: "testing"
+        options: >-
+          --health-cmd "curl --insecure --fail --request GET --url https://localhost:8080/healthz || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Show Kubernetes node
+        if: always()
+        run: |
+          echo "K8S node: ${K8S_NODE_NAME}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check OIDC configuration and connectivity
+        if: vars.OIDC_TEST_ISSUER != '' && vars.OIDC_TEST_CLIENT_ID != ''
+        run: |
+          echo "OIDC configuration detected, verifying connectivity..."
+          echo "Testing OIDC discovery endpoint: ${{ vars.OIDC_TEST_ISSUER }}"
+          ISSUER_URL="${{ vars.OIDC_TEST_ISSUER }}"
+          ISSUER_URL="${ISSUER_URL%/}" # Strip trailing slash
+          curl -f -s "${ISSUER_URL}/.well-known/openid-configuration" > /dev/null
+          echo "OIDC discovery endpoint is accessible"
+
+      - name: Validate and run packaged demos
+        if: ${{ vars.CI_DRY_RUN != 'true' }}
+        run: |
+          (cd crates/pipeline-manager/demos && uv run validate-preamble.py sql/*.sql)
+          uv run crates/pipeline-manager/demos/run.py --api-url https://localhost:8080
+        env:
+          PYTHONPATH: ${{ github.workspace }}/python
+
+      - name: Run platform tests
+        if: ${{ vars.CI_DRY_RUN != 'true' }}
+        run: uv run --locked pytest -n ${{ vars.PYTEST_WORKERS }} tests/platform --timeout=1500 -vv ${{ vars.PYTEST_EXTRA }}
+        working-directory: python
+        env:
+          PYTHONPATH: ${{ github.workspace }}/python
+          IN_CI: 1 # We use this flag to skip some kafka tests in the python code base
+
+      - name: Download fda binary
+        uses: actions/download-artifact@v8
+        with:
+          name: fda-${{ matrix.target }}
+          path: build
+
+      # Remove if https://github.com/actions/upload-artifact/issues/38 ever gets fixed
+      - name: Make fda binary executable
+        run: chmod +x ./build/fda
+
+      - name: Create API key for CLI tests
+        if: ${{ vars.CI_DRY_RUN != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          API_KEY=$(uv run --locked python - <<'PY'
+          import os
+          import uuid
+          from feldera import FelderaClient
+          from feldera.testutils_oidc import setup_token_cache
+          import contextlib
+          import io
+
+          host = os.environ.get("FELDERA_HOST", "https://localhost:8080")
+          name = f"ci-fda-cli-{os.environ.get('GITHUB_RUN_ID', 'local')}-{uuid.uuid4().hex[:8]}"
+
+          token = None
+          if os.environ.get("OIDC_TEST_ISSUER") and os.environ.get("OIDC_TEST_CLIENT_ID"):
+              # Suppress auth helper output to keep GITHUB_ENV clean
+              with contextlib.redirect_stdout(io.StringIO()):
+                  token_data = setup_token_cache()
+              if token_data is not None:
+                  token = token_data.get("access_token")
+
+          client = FelderaClient(url=host, api_key=token)
+          resp = client.create_api_key(name)
+          print(resp["api_key"])
+          PY
+          )
+          echo "FELDERA_API_KEY=$API_KEY" >> "$GITHUB_ENV"
+        working-directory: python
+        env:
+          PYTHONPATH: ${{ github.workspace }}/python
+
+      - name: Run fda CLI tests
+        if: ${{ vars.CI_DRY_RUN != 'true' }}
+        run: bash test.bash
+        working-directory: crates/fda
+        env:
+          FDA_BINARY: ${{ github.workspace }}/build/fda

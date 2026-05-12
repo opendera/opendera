@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use crate::{
+    Circuit, DBData, RootCircuit, Scope, Stream, ZWeight,
     algebra::{HasOne, OrdZSet, ZBatch},
     circuit::{
         circuit_builder::RefStreamValue,
@@ -8,7 +9,6 @@ use crate::{
     },
     dynamic::{DataTrait, DynData, DynUnit, Erase},
     trace::{Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor},
-    Circuit, DBData, RootCircuit, Scope, Stream, ZWeight,
 };
 
 use super::{MonoIndexedZSet, MonoZSet};
@@ -328,10 +328,10 @@ mod test {
     use std::cmp::max;
 
     use crate::{
+        OrdIndexedZSet, OrdZSet, Runtime, Stream, TypedBox,
         circuit::CircuitConfig,
         dynamic::DynData,
         utils::{Tup1, Tup2},
-        OrdIndexedZSet, OrdZSet, Runtime, Stream, TypedBox,
     };
 
     #[test]
@@ -363,7 +363,7 @@ mod test {
                 input_handle.push(10 * i + j - 10, 1);
             }
 
-            dbsp.step().unwrap();
+            dbsp.transaction().unwrap();
 
             let expected_output = (4..10).map(|j| Tup2(10 * i + j - 10, 1)).collect();
 
@@ -414,7 +414,7 @@ mod test {
                 input_handle.push(10 * i + j - 10, 1);
             }
 
-            dbsp.step().unwrap();
+            dbsp.transaction().unwrap();
 
             let expected_output = [4, 6, 8]
                 .iter()

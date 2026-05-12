@@ -8,9 +8,9 @@ use std::{
 };
 
 use crate::{
-    dynamic::{DataTrait, DynDataTyped, Erase, Factory, WeightTrait},
-    trace::Cursor,
     DBData,
+    dynamic::{DataTrait, DynDataTyped, Erase, Factory, WeightTrait},
+    trace::{Cursor, cursor::Position},
 };
 
 /// Relative time offset.
@@ -339,6 +339,10 @@ where
         self.cursor.weight()
     }
 
+    fn weight_checked(&mut self) -> &R {
+        self.weight()
+    }
+
     fn map_values(&mut self, logic: &mut dyn FnMut(&V, &R)) {
         self.cursor.map_values(logic)
     }
@@ -356,7 +360,7 @@ where
         unimplemented!()
     }
 
-    fn seek_key_exact(&mut self, _key: &DynDataTyped<TS>) -> bool {
+    fn seek_key_exact(&mut self, _key: &DynDataTyped<TS>, _hash: Option<u64>) -> bool {
         unimplemented!()
     }
 
@@ -410,6 +414,10 @@ where
 
     fn fast_forward_vals(&mut self) {
         self.cursor.fast_forward_vals()
+    }
+
+    fn position(&self) -> Option<Position> {
+        None
     }
 }
 

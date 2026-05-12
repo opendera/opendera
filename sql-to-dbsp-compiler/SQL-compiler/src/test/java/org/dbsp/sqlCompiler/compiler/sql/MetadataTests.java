@@ -9,20 +9,21 @@ import org.apache.calcite.jdbc.CalciteConnection;
 import org.apache.calcite.schema.SchemaPlus;
 import org.dbsp.sqlCompiler.CompilerMain;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceTableOperator;
+import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
+import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.errors.CompilerMessages;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
+import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateTableStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.DeclareViewStatement;
 import org.dbsp.sqlCompiler.compiler.sql.tools.BaseSQLTests;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
-import org.dbsp.util.HSQDBManager;
-import org.dbsp.util.NameGen;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
 import org.dbsp.util.Utilities;
-import org.hsqldb.server.ServerAcl;
 import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -30,6 +31,7 @@ import org.junit.Test;
 import javax.sql.DataSource;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -38,14 +40,25 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Arrays;
+import java.util.Iterator;
 import java.util.List;
+import java.util.stream.Collectors;
 
 /** Tests about table and view metadata */
 public class MetadataTests extends BaseSQLTests {
+    @Override
+    public CompilerOptions testOptions() {
+        CompilerOptions options = super.testOptions();
+        options.ioOptions.trimInputs = true;
+        return options;
+    }
+
     File createTempJsonFile() throws IOException {
         File file = File.createTempFile("out", ".json", new File("."));
         file.deleteOnExit();
@@ -57,6 +70,12 @@ public class MetadataTests extends BaseSQLTests {
         // Create a view named like a system view
         this.statementsFailingInCompilation("CREATE VIEW ERROR_VIEW AS SELECT 2;",
                 "'error_view' already defined");
+    }
+
+    @Test
+    public void noConnectorMetadata() {
+        this.statementsFailingInCompilation("CREATE VIEW V AS SELECT CONNECTOR_METADATA()['a'];",
+                "Calls to function 'connector_metadata' are only allowed in DEFAULT column initializers");
     }
 
     @Test
@@ -89,7 +108,7 @@ public class MetadataTests extends BaseSQLTests {
         CompilerMessages messages = CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         if (messages.errorCount() > 0)
             throw new RuntimeException(messages.toString());
-        Utilities.compileAndTestRust(BaseSQLTests.RUST_DIRECTORY, false);
+        BaseSQLTests.compileAndTestRust(false);
     }
 
     @Test
@@ -135,9 +154,21 @@ public class MetadataTests extends BaseSQLTests {
     }
 
     @Test
+    public void issue4626() throws SQLException {
+        PrintStream savedOut = System.out;
+        ByteArrayOutputStream capture = new ByteArrayOutputStream();
+        System.setOut(new PrintStream(capture));
+        var result = CompilerMain.run("--version");
+        System.setOut(savedOut);
+        Assert.assertEquals(0, result.left.exitCode);
+        String str = capture.toString();
+        Assert.assertTrue(str.contains("SQL to DBSP compiler version"));
+    }
+
+    @Test
     public void lineageTest() throws SQLException, IOException {
         // Check that the calcite property in the dataflow graph is never "null" for this program
-        final String file = "../../demo/packaged/sql/08-fine-grained-authorization.sql";
+        final String file = "../../crates/pipeline-manager/demos/sql/08-fine-grained-authorization.sql";
         File json = this.createTempJsonFile();
         CompilerMain.execute("--dataflow", json.getPath(), "--noRust", file);
         ObjectMapper mapper = Utilities.deterministicObjectMapper();
@@ -152,18 +183,74 @@ public class MetadataTests extends BaseSQLTests {
     }
 
     @Test
+    public void windowPositionTest() throws SQLException, IOException {
+        // Check that the window operator carries position information
+        String sql = """
+                CREATE TABLE T(x TIMESTAMP);
+                CREATE VIEW V AS SELECT * FROM T WHERE x < NOW() - INTERVAL 1 MINUTE;
+                """;
+        File file = createInputScript(sql);
+        File json = this.createTempJsonFile();
+        CompilerMain.execute("--dataflow", json.getPath(), "--noRust", file.getPath());
+        ObjectMapper mapper = Utilities.deterministicObjectMapper();
+        JsonNode parsed = mapper.readTree(json);
+        ObjectNode df = (ObjectNode)parsed.get("mir");
+        boolean found = false;
+        for (var prop: df.properties()) {
+            var node = prop.getValue();
+            JsonNode op = node.get("operation");
+            if (op != null && op.isTextual() && op.asText().equalsIgnoreCase("window")) {
+                found = true;
+                Assert.assertTrue(node.get("positions").isArray());
+                // At least one position exists
+                Assert.assertTrue(node.get("positions").elements().hasNext());
+            }
+        }
+        Assert.assertTrue(found);
+    }
+
+    DBSPCompiler chattyCompiler() {
+        DBSPCompiler compiler = this.testCompiler();
+        compiler.options.languageOptions.throwOnError = false;
+        compiler.options.ioOptions.quiet = false;
+        return compiler;
+    }
+
+    @Test
     public void issue3341() {
         String sql = """
                 CREATE FUNCTION F(x INTEGER NOT NULL) RETURNS INTEGER;
                 CREATE TABLE T(x INTEGER);
                 CREATE VIEW V AS SELECT F(x) FROM T;""";
-        DBSPCompiler compiler = this.testCompiler();
-        compiler.options.languageOptions.throwOnError = false;
-        compiler.options.ioOptions.quiet = false;
+        DBSPCompiler compiler = this.chattyCompiler();
         compiler.submitStatementsForCompilation(sql);
         compiler.getFinalCircuit(true);
         TestUtil.assertMessagesContain(compiler,
                 "Argument 0 is nullable, while 'f' expects a not nullable value");
+    }
+
+    @Test
+    public void testFormatWarnings() {
+        String sql = "CREATE TABLE T(d DATE);\n" +
+                "CREATE VIEW V AS SELECT FORMAT_DATE(DATE '2020-10-10', '%Y-%m');";
+        DBSPCompiler compiler = this.chattyCompiler();
+        compiler.submitStatementsForCompilation(sql);
+        compiler.getFinalCircuit(true);
+        TestUtil.assertMessagesContain(compiler,
+                "warning: Suspicious argument: String '%Y-%m' cannot be interpreted as a DATE");
+
+        compiler = this.chattyCompiler();
+        compiler.submitStatementsForCompilation("CREATE VIEW V AS SELECT PARSE_TIMESTAMP(10, '%s');");
+        compiler.getFinalCircuit(true);
+        TestUtil.assertMessagesContain(compiler, """
+                Format argument does not look like a format string.
+                    1|CREATE VIEW V AS SELECT PARSE_TIMESTAMP(10, '%s');
+                                                              ^^""");
+
+        compiler = this.chattyCompiler();
+        compiler.submitStatementsForCompilation("CREATE VIEW V AS SELECT PARSE_TIMESTAMP('10', '%s');");
+        compiler.getFinalCircuit(true);
+        TestUtil.assertMessagesContain(compiler, "Suspicious argument: Format argument does not look like a format string.");
     }
 
     @Test
@@ -242,7 +329,6 @@ public class MetadataTests extends BaseSQLTests {
 
     @Test
     public void stripProperties1() throws IOException, SQLException {
-        NameGen.reset();
         String sql = """
                 CREATE TABLE CUSTOMER (
                     cc_num BIGINT NOT NULL PRIMARY KEY, -- Credit card number
@@ -326,12 +412,60 @@ public class MetadataTests extends BaseSQLTests {
         File file = createInputScript(sql);
         CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         String rust = Utilities.readFile(Paths.get(BaseSQLTests.TEST_FILE_PATH));
-        Assert.assertFalse(rust.contains("connectors"));
+        Assert.assertFalse(rust.contains(CreateTableStatement.CONNECTORS));
     }
 
     @Test
-    public void stripProperties() throws IOException, SQLException {
-        // Test that the properties are stripped from the generated Rust
+    public void issue4896() {
+        String sql = """
+               CREATE TABLE T (COL1 INT) WITH (
+                  'connectors' = '[{
+                    "url": "localhost"
+                  }]'
+               );""";
+        DBSPCompiler compiler = this.chattyCompiler();
+        compiler.submitStatementsForCompilation(sql);
+        // Force compilation
+        compiler.getFinalCircuit(true);
+        Assert.assertTrue(compiler.messages.toString().contains(
+                "warning: Unnamed connector: Connector nr. 1 for table 't' does not have a name.\n" +
+                "It is recommended to name all connectors using the \"name\" property; " +
+                        "names will be required in the future."));
+
+        sql = """
+               CREATE TABLE T (COL1 INT) WITH (
+                  'connectors' = '[{
+                    "name": [],
+                    "url": "localhost"
+                  }]'
+               );""";
+        this.statementsFailingInCompilation(sql, """
+               Compilation error: Expected a string value for the connector "name" property
+                   3|     "name": [],
+                                  ^
+                   4|     "url": "localhost"
+               """);
+
+        sql = """
+               CREATE TABLE T (COL1 INT) WITH (
+                  'connectors' = '[{
+                    "name": "Bob",
+                    "url": "localhost"
+                  }, {
+                    "name": "Bob",
+                    "url": "localhost:8080"
+                  }]'
+               );""";
+        this.statementsFailingInCompilation(sql,"""
+               error: Compilation error: Two connectors for the same table 't' cannot have the same name: 'Bob'
+                   6|     "name": "Bob",
+                                  ^
+                   7|     "url": "localhost:8080\"""");
+    }
+
+    @Test
+    public void stripConnectors() throws IOException, SQLException {
+        // Test that the connectors are stripped from the generated Rust
         String sql = """
                CREATE TABLE T (
                   COL1 INT
@@ -350,15 +484,23 @@ public class MetadataTests extends BaseSQLTests {
         File file = createInputScript(sql);
         CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         String rust = Utilities.readFile(BaseSQLTests.TEST_FILE_PATH);
-        Assert.assertFalse(rust.contains("connectors"));
+        Assert.assertFalse(rust.contains(CreateTableStatement.CONNECTORS));
+    }
 
-        sql = """
+    @Test
+    public void issue5229() throws IOException, SQLException {
+        String sql = """
                CREATE TABLE T (COL1 INT);
-               CREATE VIEW V AS SELECT * FROM T;""";
-        file = createInputScript(sql);
-        CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
-        String rust0 = Utilities.readFile(getTestFilePath());
-        Assert.assertEquals(rust, rust0);
+               CREATE VIEW V AS SELECT col1 + col1 FROM T WHERE col1 > 10;""";
+        File file = createInputScript(sql);
+        File json = this.createTempJsonFile();
+        CompilerMain.execute("--jit", "-o", json.getPath(), file.getPath());
+        ObjectMapper mapper = Utilities.deterministicObjectMapper();
+        JsonNode parsed = mapper.readTree(json);
+        DBSPCompiler compiler = new DBSPCompiler(new CompilerOptions());
+        JsonDecoder decoder = new JsonDecoder(compiler.sqlToRelCompiler.typeFactory);
+        DBSPCircuit result = decoder.decodeOuter(parsed, DBSPCircuit.class);
+        Assert.assertNotNull(result);
     }
 
     @Test
@@ -371,8 +513,7 @@ public class MetadataTests extends BaseSQLTests {
                   'connector' = 'localhost'
                );
                CREATE VIEW V AS SELECT * FROM T;""";
-        DBSPCompiler compiler = this.testCompiler();
-        compiler.options.languageOptions.throwOnError = false;
+        DBSPCompiler compiler = this.chattyCompiler();
         compiler.submitStatementsForCompilation(ddl);
         TestUtil.assertMessagesContain(compiler, "Duplicate key");
         TestUtil.assertMessagesContain(compiler, "Previous declaration");
@@ -381,18 +522,14 @@ public class MetadataTests extends BaseSQLTests {
     @Test
     public void materializedProperty() {
         String ddl = "CREATE VIEW V WITH ('materialized' = 'true') AS SELECT 5;";
-        DBSPCompiler compiler = this.testCompiler();
-        compiler.options.languageOptions.throwOnError = false;
-        compiler.options.ioOptions.quiet = false;
+        DBSPCompiler compiler = this.chattyCompiler();
         compiler.submitStatementsForCompilation(ddl);
         TestUtil.assertMessagesContain(compiler, "please use 'CREATE MATERIALIZED VIEW' instead");
     }
 
     @Test
     public void unusedInputColumns() {
-        DBSPCompiler compiler = this.testCompiler();
-        compiler.options.languageOptions.throwOnError = false;
-        compiler.options.ioOptions.quiet = false;
+        DBSPCompiler compiler = this.chattyCompiler();
         compiler.submitStatementsForCompilation("""
                 CREATE TABLE T(used INTEGER, unused INTEGER);
                 CREATE TABLE T1(used INTEGER, unused INTEGER) with ('materialized' = 'true');
@@ -452,35 +589,86 @@ public class MetadataTests extends BaseSQLTests {
     }
 
     @Test
+    public void testValidateSkip() {
+        this.statementsFailingInCompilation("CREATE TABLE T(x INT) with ('skip_unused_columns' = '{}')",
+                "Expected a boolean value for property 'skip_unused_columns'");
+    }
+
+    @Test
+    public void issue5436() {
+        DBSPCompiler compiler = this.chattyCompiler();
+        compiler.submitStatementsForCompilation("""
+                CREATE TABLE T(used INTEGER, unused INTEGER) with ('skip_unused_columns' = 'true');
+                CREATE TABLE T1(used INTEGER, unused INTEGER) with (
+                   'connectors' = '[
+                    {
+                      "name": "unnamed",
+                      "transport": {
+                        "name": "delta_table_input",
+                        "config": {
+                          "uri": "s3://feldera-qa-data/deltalake-ingest/partitioned",
+                          "mode": "snapshot",
+                          "aws_access_key_id": "$AWS_ACCESS_KEY_ID",
+                          "aws_secret_access_key": "$AWS_SECRET_ACCESS_KEY",
+                          "aws_region": "us-west-1",
+                          "snapshot_filter": "ts >= timestamp ''2022-01-01T00:00:00''",
+                          "timestamp_column": "ts",
+                          "skip_unused_columns": true
+                        }
+                      }
+                    }]'
+                );
+                CREATE VIEW V AS SELECT used FROM ((SELECT * FROM T) UNION ALL (SELECT * FROM T1));""");
+        DBSPCircuit circuit = compiler.getFinalCircuit(false);
+        Assert.assertNotNull(circuit);
+        IInputOperator t = circuit.getInput(new ProgramIdentifier("t", false));
+        Assert.assertNotNull(t);
+        Boolean skip = t.getMetadata().skipUnusedColumns;
+        Assert.assertNotNull(skip);
+        Assert.assertTrue(skip);
+        IInputOperator t1 = circuit.getInput(new ProgramIdentifier("t1", false));
+        Assert.assertNotNull(t1);
+        skip = t1.getMetadata().skipUnusedColumns;
+        Assert.assertNotNull(skip);
+        Assert.assertTrue(skip);
+        Assert.assertTrue(compiler.messages.toString().contains(
+                "The per-connector property 'skip_unused_columns' is deprecated;"));
+    }
+
+    @Test
     public void trimUnusedInputColumns() {
         DBSPCompiler compiler = this.testCompiler();
-        compiler.options.languageOptions.throwOnError = false;
-        compiler.options.ioOptions.trimInputs = true;
         compiler.submitStatementsForCompilation("""
                 CREATE TABLE T(used INTEGER, unused INTEGER);
                 CREATE TABLE T1(used INTEGER, unused INTEGER) with ('materialized' = 'true');
                 CREATE VIEW V AS SELECT used FROM ((SELECT * FROM T) UNION ALL (SELECT * FROM T1));""");
         DBSPCircuit circuit = compiler.getFinalCircuit(false);
         Assert.assertNotNull(circuit);
-        DBSPSourceTableOperator input = circuit.getInput(new ProgramIdentifier("t", false));
+        IInputOperator input = circuit.getInput(new ProgramIdentifier("t", false));
         Assert.assertNotNull(input);
-        DBSPTypeTuple tuple = input.getOutputZSetElementType().to(DBSPTypeTuple.class);
+        DBSPTypeTuple tuple = input.getDataOutputType().to(DBSPTypeZSet.class).elementType.to(DBSPTypeTuple.class);
         // Field 'unused' has been dropped
         Assert.assertEquals(1, tuple.size());
 
         input = circuit.getInput(new ProgramIdentifier("t1", false));
         Assert.assertNotNull(input);
-        tuple = input.getOutputZSetElementType().to(DBSPTypeTuple.class);
+        tuple = input.getDataOutputType().to(DBSPTypeZSet.class).elementType.to(DBSPTypeTuple.class);
         // Field 'unused' is not dropped from materialized tables
         Assert.assertEquals(2, tuple.size());
+
+        ObjectNode json = compiler.getIOMetadataAsJson();
+        JsonNode t1 = json.get("inputs").get(1);
+        Assert.assertEquals("t1", t1.get("name").asText());
+
+        JsonNode unused = t1.get("fields").get(1);
+        Assert.assertTrue(unused.get("unused").asBoolean());
+        JsonNode used = t1.get("fields").get(0);
+        Assert.assertFalse(used.get("unused").asBoolean());
     }
 
     @Test
     public void issue3427() {
-        DBSPCompiler compiler = this.testCompiler();
-        compiler.options.languageOptions.throwOnError = false;
-        compiler.options.ioOptions.trimInputs = true;
-        compiler.options.ioOptions.quiet = false;
+        DBSPCompiler compiler = this.chattyCompiler();
         compiler.submitStatementsForCompilation("""
                 CREATE TABLE t1(c1 INTEGER);
                 CREATE VIEW v1 AS SELECT ELEMENT(ARRAY [2, 3]) FROM t1;""");
@@ -492,9 +680,7 @@ public class MetadataTests extends BaseSQLTests {
 
     @Test
     public void issue3706() {
-        DBSPCompiler compiler = this.testCompiler();
-        compiler.options.languageOptions.throwOnError = false;
-        compiler.options.ioOptions.quiet = false;
+        DBSPCompiler compiler = this.chattyCompiler();
         compiler.submitStatementsForCompilation("""
                 CREATE TABLE T(x INT, y INT);
                 CREATE VIEW V as (SELECT * FROM T) UNION ALL (SELECT y, x FROM T);
@@ -503,6 +689,7 @@ public class MetadataTests extends BaseSQLTests {
         Assert.assertNotNull(circuit);
         TestUtil.assertMessagesContain(compiler.messages, """
                 While compiling:
+                    1|CREATE TABLE T(x INT, y INT);
                     2|CREATE VIEW V as (SELECT * FROM T) UNION ALL (SELECT y, x FROM T);
                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
                 warning: Fields reordered: The input collections of a 'UNION' operation have columns with the same names, but in a different order.  This may be a mistake.
@@ -525,9 +712,9 @@ public class MetadataTests extends BaseSQLTests {
         compiler.submitStatementsForCompilation(ddl);
         DBSPCircuit circuit = getCircuit(compiler);
         TestUtil.assertMessagesContain(compiler, "PRIMARY KEY cannot be nullable");
-        DBSPSourceTableOperator t = circuit.getInput(new ProgramIdentifier("t", false));
+        IInputOperator t = circuit.getInput(new ProgramIdentifier("t", false));
         Assert.assertNotNull(t);
-        DBSPType ix = t.getOutputZSetElementType();
+        DBSPType ix = t.getDataOutputType().to(DBSPTypeIndexedZSet.class).elementType;
         Assert.assertTrue(ix.is(DBSPTypeTuple.class));
         DBSPTypeTuple tuple = ix.to(DBSPTypeTuple.class);
         // The type should not be nullable despite the declaration
@@ -545,66 +732,7 @@ public class MetadataTests extends BaseSQLTests {
                 "-q", "-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         messages.print();
         Assert.assertEquals(0, messages.errorCount());
-        Utilities.compileAndTestRust(BaseSQLTests.RUST_DIRECTORY, true);
-    }
-
-    // Test that schema for a table can be retrieved from a JDBC data source
-    @Test @Ignore("Does not find system table")
-    public void jdbcSchemaTest() throws ClassNotFoundException, SQLException {
-        // Create a table in HSQLDB
-        Class.forName("org.hsqldb.jdbcDriver");
-        String jdbcUrl = "jdbc:hsqldb:mem:db";
-        Connection connection = DriverManager.getConnection(jdbcUrl, "", "");
-        try (Statement s = connection.createStatement()) {
-            s.execute("""
-                    create table mytable(
-                    id integer not null primary key,
-                    strcol varchar(25))
-                    """);
-        }
-
-        // Create a schema that retrieves data from HSQLDB
-        DataSource mockDataSource = JdbcSchema.dataSource(jdbcUrl, "org.hsqldb.jdbcDriver", "", "");
-        Connection executorConnection = DriverManager.getConnection("jdbc:calcite:");
-        CalciteConnection calciteConnection = executorConnection.unwrap(CalciteConnection.class);
-        SchemaPlus rootSchema = calciteConnection.getRootSchema();
-        JdbcSchema hsql = JdbcSchema.create(rootSchema, "schema", mockDataSource, null, null);
-
-        CompilerOptions options = new CompilerOptions();
-        options.languageOptions.throwOnError = true;
-        DBSPCompiler compiler = new DBSPCompiler(options);
-        compiler.addSchemaSource("schema", hsql);
-        compiler.submitStatementForCompilation("CREATE VIEW V AS SELECT * FROM mytable");
-        this.getCCS(compiler);
-        ObjectNode node = compiler.getIOMetadataAsJson();
-        String json = node.toPrettyString();
-        Assert.assertTrue(json.contains("MYTABLE"));
-    }
-
-    // Test that a schema for a table can be retrieved from a JDBC data source
-    // in a separate process using a JDBC connection.
-    @Test @Ignore("Does not find system table")
-    public void jdbcSchemaTest2() throws SQLException, IOException, InterruptedException,
-            ServerAcl.AclFormatException, ClassNotFoundException {
-        HSQDBManager manager = new HSQDBManager(BaseSQLTests.RUST_DIRECTORY);
-        manager.start();
-        Connection connection = manager.getConnection();
-        try (Statement s = connection.createStatement()) {
-            s.execute("DROP TABLE mytable IF EXISTS");
-            s.execute("""
-                    create table mytable(
-                    id integer not null primary key,
-                    strcol varchar(25))
-                    """);
-        }
-
-        File script = createInputScript("CREATE VIEW V AS SELECT * FROM mytable");
-        CompilerMessages messages = CompilerMain.execute(
-                "--jdbcSource", manager.getConnectionString(), "-o", BaseSQLTests.TEST_FILE_PATH, script.getPath());
-        manager.stop();
-        if (messages.errorCount() > 0)
-            throw new RuntimeException(messages.toString());
-        Utilities.compileAndTestRust(BaseSQLTests.RUST_DIRECTORY, false);
+        BaseSQLTests.compileAndTestRust(true);
     }
 
     @Test
@@ -620,10 +748,387 @@ public class MetadataTests extends BaseSQLTests {
     }
 
     @Test
+    public void testUDA() throws IOException, InterruptedException, SQLException {
+        File file = createInputScript("""
+                CREATE LINEAR AGGREGATE I8_AVG(s TINYINT) RETURNS TINYINT;
+                CREATE TABLE T(x TINYINT);
+                CREATE VIEW V AS SELECT I8_AVG(x) FROM T;""");
+
+        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
+        script.println("""
+                use feldera_sqllib::*;
+                use crate::Tup2;
+                
+                pub type i8_avg_accumulator_type = Tup2<i32, i32>;
+                
+                pub fn i8_avg_map(val: i8) -> i8_avg_accumulator_type {
+                    Tup2::new(val as i32, 1)
+                }
+                
+                pub fn i8_avg_post(val: i8_avg_accumulator_type) -> i8 {
+                    (val.0 / val.1).try_into().unwrap()
+                }
+                """);
+        script.close();
+        CompilerMessages messages = CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+        if (messages.errorCount() > 0)
+            throw new RuntimeException(messages.toString());
+        BaseSQLTests.compileAndTestRust(false);
+
+        // Truncate file to 0 bytes
+        FileWriter writer = new FileWriter(udf);
+        writer.close();
+    }
+
+    @Test
+    public void issue5300() throws IOException, SQLException, InterruptedException {
+        File file = createInputScript("""
+                CREATE LINEAR AGGREGATE u64_sum(value INT) RETURNS INT;
+                
+                CREATE TABLE A (
+                    id VARCHAR(20) NOT NULL PRIMARY KEY,
+                    a VARCHAR(64),
+                    b VARCHAR(64),
+                    sno INT,
+                    small BIGINT,
+                    num1 INT,
+                    num2 INT
+                ) WITH ('append_only' = 'true');
+                
+                CREATE VIEW b AS
+                SELECT id, a, b, u64_sum(num1), u64_sum(num2), SUM(small), MAX(sno)
+                FROM A
+                GROUP BY id, a, b""");
+
+        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
+        script.println("""
+                use feldera_sqllib::*;
+                
+                pub type u64_sum_accumulator_type = i64;
+                
+                pub fn u64_sum_map(val: i32) -> u64_sum_accumulator_type {
+                    val.into()
+                }
+                
+                pub fn u64_sum_post(val: u64_sum_accumulator_type) -> i32 {
+                    val.try_into().unwrap()
+                }
+                """);
+        script.close();
+        CompilerMessages messages = CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+        if (messages.errorCount() > 0)
+            throw new RuntimeException(messages.toString());
+        BaseSQLTests.compileAndTestRust(false);
+
+        // Truncate file to 0 bytes
+        FileWriter writer = new FileWriter(udf);
+        writer.close();
+    }
+
+
+    @Test
+    public void testUDA2() throws IOException, InterruptedException, SQLException {
+        File file = createInputScript("""
+                CREATE LINEAR AGGREGATE I128_SUM(s BINARY(16)) RETURNS BINARY(16);
+                CREATE TABLE T(x BINARY(16), y BINARY(16) NOT NULL);
+                CREATE MATERIALIZED VIEW V AS SELECT I128_SUM(x) AS S, I128_SUM(y) AS N FROM T;""");
+
+        // Save a copy of cargo.toml
+        Path cargo = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml");
+        Path cargoBackup = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml.bak");
+        try {
+            Files.copy(cargo, cargoBackup, StandardCopyOption.REPLACE_EXISTING);
+            String cargoContents = Utilities.readFile(cargo);
+            cargoContents = cargoContents.replace("[dependencies]",
+                    """
+                            [dependencies]
+                            i256 = { version = "0.2.2", features = ["num-traits"] }
+                            num-traits = "0.2.19"
+                            """);
+            PrintWriter p = new PrintWriter(cargo.toFile(), StandardCharsets.UTF_8);
+            p.write(cargoContents);
+            p.close();
+
+            File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+            PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
+            script.println("""
+                    use i256::I256;
+                    use feldera_sqllib::*;
+                    use crate::{AddAssignByRef, AddByRef, HasZero, MulByRef, SizeOf, Tup3};
+                    use derive_more::Add;
+                    use num_traits::Zero;
+                    use rkyv::Fallible;
+                    use std::ops::AddAssign;
+                    
+                    #[derive(Add, Clone, Debug, Default, PartialOrd, Ord, Eq, PartialEq, Hash)]
+                    pub struct I256Wrapper {
+                        pub data: I256,
+                    }
+                    
+                    impl SizeOf for I256Wrapper {
+                        fn size_of_children(&self, context: &mut size_of::Context) {}
+                    }
+                    
+                    impl From<[u8; 32]> for I256Wrapper {
+                        fn from(value: [u8; 32]) -> Self {
+                            Self { data: I256::from_be_bytes(value) }
+                        }
+                    }
+                    
+                    impl From<&[u8]> for I256Wrapper {
+                        fn from(value: &[u8]) -> Self {
+                            let mut padded = [0u8; 32];
+                            // If original value is negative, pad with sign
+                            if value[0] & 0x80 != 0 {
+                                padded.fill(0xff);
+                            }
+                            let len = value.len();
+                            if len > 32 {
+                                panic!("Slice larger than target");
+                            }
+                            padded[32-len..].copy_from_slice(&value[..len]);
+                            Self { data: I256::from_be_bytes(padded) }
+                        }
+                    }
+                    
+                    impl MulByRef<Weight> for I256Wrapper {
+                        type Output = Self;
+                    
+                        fn mul_by_ref(&self, other: &Weight) -> Self::Output {
+                            println!("Mul {:?} by {}", self, other);
+                            Self {
+                                data: self.data.checked_mul_i64(*other)
+                                    .expect("Overflow during multiplication"),
+                            }
+                        }
+                    }
+                    
+                    impl HasZero for I256Wrapper {
+                        fn zero() -> Self {
+                            Self { data: I256::zero() }
+                        }
+                    
+                        fn is_zero(&self) -> bool {
+                            self.data.is_zero()
+                        }
+                    }
+                    
+                    impl AddByRef for I256Wrapper {
+                        fn add_by_ref(&self, other: &Self) -> Self {
+                            Self { data: self.data.add(other.data) }
+                        }
+                    }
+                    
+                    impl AddAssignByRef<Self> for I256Wrapper {
+                        fn add_assign_by_ref(&mut self, other: &Self) {
+                            self.data += other.data
+                        }
+                    }
+                    
+                    #[repr(C)]
+                    #[derive(Debug, Copy, Clone, PartialOrd, Ord, Eq, PartialEq)]
+                    pub struct ArchivedI256Wrapper {
+                        pub bytes: [u8; 32],
+                    }
+                    
+                    impl rkyv::Archive for I256Wrapper {
+                        type Archived = ArchivedI256Wrapper;
+                        type Resolver = ();
+                    
+                        #[inline]
+                        unsafe fn resolve(&self, pos: usize, _: Self::Resolver, out: *mut Self::Archived) {
+                            out.write(ArchivedI256Wrapper {
+                                bytes: self.data.to_be_bytes(),
+                            });
+                        }
+                    }
+                    
+                    impl<S: Fallible + ?Sized> rkyv::Serialize<S> for I256Wrapper {
+                        #[inline]
+                        fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+                            Ok(())
+                        }
+                    }
+                    
+                    impl<D: Fallible + ?Sized> rkyv::Deserialize<I256Wrapper, D> for ArchivedI256Wrapper {
+                        #[inline]
+                        fn deserialize(&self, _: &mut D) -> Result<I256Wrapper, D::Error> {
+                            Ok(I256Wrapper::from(self.bytes))
+                        }
+                    }
+                    
+                    pub type i128_sum_accumulator_type = I256Wrapper;
+                    
+                    pub fn i128_sum_map(val: ByteArray) -> i128_sum_accumulator_type {
+                        I256Wrapper::from(val.as_slice())
+                    }
+                    
+                    pub fn i128_sum_post(val: i128_sum_accumulator_type) -> ByteArray {
+                        // Check for overflow
+                        if val.data < I256::from(i128::MIN) || val.data > I256::from(i128::MAX) {
+                            panic!("Result of aggregation {} does not fit in 128 bits", val.data);
+                        }
+                        ByteArray::new(&val.data.to_be_bytes()[16..])
+                    }
+                    """);
+            script.close();
+            CompilerMessages messages = CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+            if (messages.errorCount() > 0)
+                throw new RuntimeException(messages.toString());
+            BaseSQLTests.compileAndTestRust(false);
+            // Truncate udf file to 0 bytes
+            FileWriter writer = new FileWriter(udf);
+            writer.close();
+        } finally {
+            // Restore cargo.toml
+            Files.copy(cargoBackup, cargo, StandardCopyOption.REPLACE_EXISTING);
+            Utilities.deleteFile(cargoBackup.toFile(), true);
+        }
+    }
+
+    @Test
+    public void testUDPValidation() {
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT) WITH ('connectors' = '[{
+                   "name": "0",
+                   "transport": {
+                     "name": "datagen",
+                     "config": {}
+                   },
+                   "preprocessor": [{
+                      "config": {}
+                   }]
+                }]');""", """
+                Compilation error: Preprocessor must have a field "name"
+                    7|   "preprocessor": [{
+                                          ^
+                    8|      "config": {}""");
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT) WITH ('connectors' = '[{
+                   "name": "0",
+                   "transport": {
+                     "name": "datagen",
+                     "config": {}
+                   },
+                   "preprocessor": [{
+                      "name": "Bob",
+                      "config": {}
+                   }]
+                }]');""", """
+                Compilation error: Preprocessor must have a field "message_oriented"
+                    7|   "preprocessor": [{
+                                          ^
+                    8|      "name": "Bob",""");
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT) WITH ('connectors' = '[{
+                   "name": "0",
+                   "transport": {
+                     "name": "datagen",
+                     "config": {}
+                   },
+                   "preprocessor": [{
+                      "message_oriented": "streaming",
+                      "name": "Bob",
+                      "config": {}
+                   }]
+                }]');""", """
+                Compilation error: Preprocessor field "message_oriented" must be a Boolean value
+                    8|      "message_oriented": "streaming",
+                                                ^
+                    9|      "name": "Bob",""");
+    }
+
+    @Test
+    public void testUDP() throws IOException, InterruptedException, SQLException {
+        // Test user-defined preprocessor
+        String sql = """
+                CREATE TABLE T(x INT) WITH ('connectors' = '[{
+                   "transport": {
+                      "name": "datagen",
+                      "config": {}
+                   },
+                   "preprocessor": [{
+                      "name": "example",
+                      "message_oriented": true,
+                      "config": {}
+                   }],
+                   "config": {}
+                }]');
+                CREATE MATERIALIZED VIEW V AS SELECT * FROM T;""";
+
+        // Save a copy of cargo.toml
+        Path cargo = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml");
+        Path cargoBackup = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml.bak");
+        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        try {
+            Files.copy(cargo, cargoBackup, StandardCopyOption.REPLACE_EXISTING);
+            String cargoContents = Utilities.readFile(cargo);
+            cargoContents = cargoContents.replace("[dependencies]",
+                    """
+                            [dependencies]
+                            feldera-adapterlib = { path = "../../crates/adapterlib" }
+                            """);
+            PrintWriter p = new PrintWriter(cargo.toFile(), StandardCharsets.UTF_8);
+            p.write(cargoContents);
+            p.close();
+
+            PrintWriter udfWriter = new PrintWriter(udf, StandardCharsets.UTF_8);
+            udfWriter.println("""
+                    use feldera_adapterlib::format::{ParseError, Splitter};
+                    use feldera_types::preprocess::PreprocessorConfig;
+                    use feldera_adapterlib::preprocess::{
+                        Preprocessor, PreprocessorCreateError, PreprocessorFactory,
+                    };
+
+                    pub struct ExamplePreprocessor;
+
+                    impl Preprocessor for ExamplePreprocessor {
+                        fn process(&mut self, data: &[u8]) -> (Vec<u8>, Vec<ParseError>) {
+                            (data.to_vec(), vec![])
+                        }
+
+                        fn fork(&self) -> Box<dyn Preprocessor> {
+                            Box::new(ExamplePreprocessor)
+                        }
+                    
+                        fn splitter(&self) -> Option<Box<dyn Splitter>> {
+                            None
+                        }
+                    }
+
+                    pub struct ExamplePreprocessorFactory;
+
+                    impl PreprocessorFactory for ExamplePreprocessorFactory {
+                        fn create(
+                            &self,
+                            _config: &PreprocessorConfig,
+                        ) -> Result<Box<dyn Preprocessor>, PreprocessorCreateError> {
+                            Ok(Box::new(ExamplePreprocessor))
+                        }
+                    }""");
+            udfWriter.close();
+            File file = createInputScript(sql);
+            CompilerMessages messages = CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+            if (messages.errorCount() > 0)
+                throw new RuntimeException(messages.toString());
+            BaseSQLTests.compileAndTestRust(false);
+            // Truncate udf file to 0 bytes
+            FileWriter writer = new FileWriter(udf);
+            writer.close();
+        } finally {
+            // Restore cargo.toml
+            Files.copy(cargoBackup, cargo, StandardCopyOption.REPLACE_EXISTING);
+            Utilities.deleteFile(cargoBackup.toFile(), true);
+        }
+    }
+
+    @Test
     public void testUDF() throws IOException, InterruptedException, SQLException {
         File file = createInputScript("""
-                CREATE FUNCTION contains_number(str VARCHAR NOT NULL, value INTEGER) RETURNS BOOLEAN NOT NULL;
-                CREATE VIEW V0 AS SELECT contains_number(CAST('YES: 10 NO:5 MAYBE: 2' AS VARCHAR), 5);
+                CREATE FUNCTION contains_number(str VARCHAR NOT NULL, value DECIMAL(2, 0)) RETURNS BOOLEAN NOT NULL;
+                CREATE VIEW V0 AS SELECT contains_number(CAST('YES: 10 NO:5.1 MAYBE: 2' AS VARCHAR), 5.1);
                 CREATE FUNCTION "EMPTY"() RETURNS VARCHAR;
                 CREATE VIEW V1 AS SELECT "EMPTY"();""");
 
@@ -631,7 +1136,7 @@ public class MetadataTests extends BaseSQLTests {
         PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
         script.println("""
                 use feldera_sqllib::*;
-                pub fn contains_number(str: SqlString, value: Option<i32>) -> Result<bool, Box<dyn std::error::Error>> {
+                pub fn contains_number(str: SqlString, value: Option<SqlDecimal<2, 0>>) -> Result<bool, Box<dyn std::error::Error>> {
                    match value {
                        None => Err("null value".into()),
                        Some(value) => Ok(str.str().contains(&format!("{}", value).to_string())),
@@ -644,7 +1149,7 @@ public class MetadataTests extends BaseSQLTests {
         CompilerMessages messages = CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         if (messages.errorCount() > 0)
             throw new RuntimeException(messages.toString());
-        Utilities.compileAndTestRust(BaseSQLTests.RUST_DIRECTORY, false);
+        BaseSQLTests.compileAndTestRust(false);
 
         Path protos = Paths.get(BaseSQLTests.RUST_DIRECTORY, DBSPCompiler.STUBS_FILE_NAME);
         Assert.assertTrue(protos.toFile().exists());
@@ -660,16 +1165,17 @@ public class MetadataTests extends BaseSQLTests {
 
                 use feldera_sqllib::*;
                 use crate::*;
-                pub fn contains_number(str: SqlString, value: Option<i32>) -> Result<bool, Box<dyn std::error::Error>> {
+                pub fn contains_number(str: SqlString, value: Option<SqlDecimal<2, 0>>) -> Result<bool, Box<dyn std::error::Error>> {
                     udf::contains_number(
                         str,
                         value)
                 }
+                
                 pub fn EMPTY() -> Result<Option<SqlString>, Box<dyn std::error::Error>> {
                     udf::EMPTY()
-                }""", String.join(System.lineSeparator(), str));
-        boolean success = protos.toFile().delete();
-        Assert.assertTrue(success);
+                }
+                """, String.join(System.lineSeparator(), str));
+        Utilities.deleteFile(protos.toFile(), true);
 
         // Truncate file to 0 bytes
         FileWriter writer = new FileWriter(udf);
@@ -679,13 +1185,26 @@ public class MetadataTests extends BaseSQLTests {
     @Test
     public void testDefaultColumnValueCompiler() throws IOException, InterruptedException, SQLException {
         String sql = """
-                CREATE TABLE T (COL1 INT NOT NULL DEFAULT 0, COL2 DOUBLE DEFAULT 0.0, COL3 VARCHAR DEFAULT NULL);
+                CREATE FUNCTION PLUSONE(x DOUBLE NOT NULL) RETURNS DOUBLE NOT NULL AS x + 1.0;
+                CREATE TABLE T (COL1 INT NOT NULL DEFAULT 0, COL2 DOUBLE DEFAULT PLUSONE(0.0), COL3 VARCHAR DEFAULT NULL);
                 CREATE VIEW V AS SELECT COL1 FROM T;""";
         File file = createInputScript(sql);
         CompilerMessages messages = CompilerMain.execute("-q", "-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         messages.print();
         Assert.assertEquals(0, messages.errorCount());
-        Utilities.compileAndTestRust(BaseSQLTests.RUST_DIRECTORY, false);
+        BaseSQLTests.compileAndTestRust(false);
+    }
+
+    @Test
+    public void testDefaultConnectorMetadata() throws IOException, InterruptedException, SQLException {
+        String sql = """
+                CREATE TABLE T (KAFKA_TOPIC VARCHAR DEFAULT CAST(CONNECTOR_METADATA()['kafka_topic'] AS VARCHAR));
+                CREATE VIEW V AS SELECT KAFKA_TOPIC FROM T;""";
+        File file = createInputScript(sql);
+        CompilerMessages messages = CompilerMain.execute("-q", "-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+        messages.print();
+        Assert.assertEquals(0, messages.errorCount());
+        BaseSQLTests.compileAndTestRust(false);
     }
 
     @Test
@@ -703,6 +1222,13 @@ public class MetadataTests extends BaseSQLTests {
                     --alltables
                       Generate an input for each CREATE TABLE, even if the table is not used\s
                       by any view
+                      Default: false
+                    --anonymize
+                      Produce in the output file an anonymized version of the input program
+                      Default: false
+                    --correlatedColumns
+                      Dump information about the columns that are used in join equality\s
+                      comparisons\s
                       Default: false
                     --crates
                       Followed by a program name. Generates code using multiple crates;\s
@@ -724,11 +1250,11 @@ public class MetadataTests extends BaseSQLTests {
                     --ignoreOrder
                       Ignore ORDER BY clauses at the end
                       Default: false
-                    --jdbcSource
-                      Connection string to a database that contains table metadata
-                      Default: <empty string>
                     --je, -je
                       Emit error messages as a JSON array to the error output
+                      Default: false
+                    --jit
+                      Emit a JSON representation suitable for an interpreter
                       Default: false
                     --jpg, -jpg
                       Emit a jpg image of the circuit instead of Rust
@@ -746,9 +1272,6 @@ public class MetadataTests extends BaseSQLTests {
                     --noRust
                       Do not generate Rust output files
                       Default: false
-                    --nowstream
-                      Implement NOW as a stream (true) or as an internal operator (false)
-                      Default: false
                     --outputsAreSets
                       Ensure that outputs never contain duplicates
                       Default: false
@@ -757,6 +1280,10 @@ public class MetadataTests extends BaseSQLTests {
                     --png, -png
                       Emit a png image of the circuit instead of Rust
                       Default: false
+                    --runtime
+                      Followed by a path.  Path to the runtime to use.  Used in conjunction\s
+                      with '--crates'.
+                      Default: <empty string>
                     --streaming
                       Compiling a streaming program, where only inserts are allowed
                       Default: false
@@ -766,6 +1293,8 @@ public class MetadataTests extends BaseSQLTests {
                     --unaryPlusNoop
                       Compile unary plus into a no-operation; similar to sqlite
                       Default: false
+                    --version
+                      Print compiler version
                     -O
                       Optimization level (0, 1, or 2)
                       Default: 2
@@ -865,7 +1394,7 @@ public class MetadataTests extends BaseSQLTests {
         File file = createInputScript(sql);
         File json = this.createTempJsonFile();
         CompilerMessages msg = CompilerMain.execute(
-                "--dataflow", json.getPath(), "--noRust", file.getPath());
+                "-v", "1", "--dataflow", json.getPath(), "--noRust", file.getPath());
         Assert.assertEquals(0, msg.exitCode);
         String jsonContents = Utilities.readFile(json.toPath());
         String expected = TestUtil.readStringFromResourceFile("metadataTests-generateDFRecursive.json");
@@ -966,7 +1495,7 @@ public class MetadataTests extends BaseSQLTests {
                         "precision" : 3,
                         "type" : "VARCHAR"
                       },
-                      "unused" : true
+                      "unused" : false
                     }, {
                       "name" : "col4",
                       "case_sensitive" : false,
@@ -1001,7 +1530,7 @@ public class MetadataTests extends BaseSQLTests {
                       "case_sensitive" : false,
                       "columntype" : {
                         "nullable" : true,
-                        "precision" : 0,
+                        "precision" : 6,
                         "type" : "TIMESTAMP"
                       },
                       "lateness" : "INTERVAL '5 10:10' DAY TO MINUTE",
@@ -1103,9 +1632,19 @@ public class MetadataTests extends BaseSQLTests {
         ObjectMapper mapper = new ObjectMapper();
         JsonNode jsonNode = mapper.readTree(json);
         // table t is not used in the calcite plan, so the lineage is an empty "AND" node.
-        Assert.assertEquals("source_multiset",
-                jsonNode.get("mir").get("s1").get("operation").asText());
-        JsonNode node = jsonNode.get("mir").get("s1").get("calcite").get("and");
+        // Locate table t:
+        JsonNode t = null;
+        for (Iterator<JsonNode> it = jsonNode.get("mir").elements(); it.hasNext(); ) {
+            var el = it.next();
+            if (el.get("operation").asText().equalsIgnoreCase("source_multiset") &&
+                    el.get("table").asText().equalsIgnoreCase("t")) {
+                t = el;
+                break;
+            }
+        }
+
+        Assert.assertNotNull(t);
+        JsonNode node = t.get("calcite").get("and");
         Assert.assertTrue(node.isArray());
         Assert.assertTrue(node.isEmpty());
     }
@@ -1113,27 +1652,6 @@ public class MetadataTests extends BaseSQLTests {
     @Test
     public void issue3904() throws IOException, SQLException {
         String sql = """
-                -- Tutorial: Time Series Analysis with Feldera (time-series-tutorial)
-                --
-                -- Learn to effectively work with time series data in Feldera.
-                --
-                -- This program accompanies the guide to Time Series Analysis with Feldera: https://docs.feldera.com/tutorials/time-series
-                --
-                -- Each view definition demonstrates one concept from the guide.
-                --
-                -- Example inputs:
-                -- Insert the following records in the `purchase` table and observe how
-                -- the views change in response:
-                --
-                --    INSERT INTO purchase VALUES(1, '2020-01-01 01:00:00', 10);
-                --    INSERT INTO purchase VALUES(1, '2020-01-01 02:00:00', 10);
-                --    INSERT INTO purchase VALUES(1, '2020-01-02 00:00:00', 10);
-                --    INSERT INTO purchase VALUES(1, '2020-01-02 01:00:00', 10);
-                
-                
-                -- This table uses two time-series-related annotations:
-                -- `LATENESS` - updates to this table can arrive no more than 1 hour out of order.
-                -- `append_only` - records are only inserted to this table, but never deleted.
                 CREATE TABLE purchase (
                    customer_id INT,
                    ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR,
@@ -1361,8 +1879,8 @@ public class MetadataTests extends BaseSQLTests {
                 CREATE FUNCTION str2str(i VARCHAR) RETURNS VARCHAR;
                 CREATE FUNCTION nstr2nstr(i VARCHAR NOT NULL) RETURNS VARCHAR NOT NULL;
                 
-                -- CREATE FUNCTION struct2struct(i my_struct) RETURNS my_struct;
-                -- CREATE FUNCTION nstruct2nstruct(i my_struct NOT NULL) RETURNS my_struct NOT NULL;
+                CREATE FUNCTION struct2struct(i my_struct) RETURNS my_struct;
+                CREATE FUNCTION nstruct2nstruct(i my_struct NOT NULL) RETURNS my_struct NOT NULL;
                 
                 CREATE MATERIALIZED VIEW v AS
                 SELECT
@@ -1481,5 +1999,134 @@ public class MetadataTests extends BaseSQLTests {
                 );""",
                 "FOREIGN KEY column 't.a' has type INT which does " +
                         "not match the type VARCHAR of the referenced column 's.a'");
+    }
+
+    @Test
+    public void issue4466() throws IOException, SQLException {
+        File file = createInputScript("""
+                CREATE TABLE tbl(arr1 INT ARRAY);
+                CREATE MATERIALIZED VIEW v AS SELECT
+                ARRAY_EXISTS(arr1, x -> x > 0)  AS arr
+                FROM tbl;""");
+        File json = this.createTempJsonFile();
+        CompilerMain.execute("--plan", json.getPath(), "--noRust", file.getPath());
+        String jsonContents = Utilities.readFile(json.toPath());
+        Assert.assertNotNull(jsonContents);
+    }
+
+    @Test
+    public void testSkipUnused() throws IOException, SQLException {
+        String sql = """
+                CREATE TABLE transaction(
+                    trans_date_trans_time TIMESTAMP NOT NULL,
+                    cc_num BIGINT,
+                    merchant STRING,
+                    category STRING,
+                    amt DECIMAL(38, 2),
+                    trans_num STRING,
+                    unix_time BIGINT,
+                    merch_lat DOUBLE,
+                    merch_long DOUBLE,
+                    is_fraud BIGINT
+                ) WITH (
+                  'materialized' = 'true',
+                  'connectors' = '[{
+                    "name": "zero",
+                    "transport": {
+                      "name": "delta_table_input",
+                      "config": {
+                        "uri": "s3://feldera-fraud-detection-data/transaction_train",
+                        "mode": "follow",
+                        "aws_skip_signature": "true",
+                        "timestamp_column": "trans_date_trans_time",
+                        "aws_region": "us-east-1",
+                        "skip_unused_columns": true,
+                        "version": 0
+                      }
+                    }
+                  }
+                ]');
+                
+                create view v as select trans_date_trans_time, cc_num, amt, is_fraud from transaction;""";
+        File json = this.createTempJsonFile();
+        File file = createInputScript(sql);
+        var messages = CompilerMain.execute("--dataflow", json.getPath(), "--noRust", file.getPath());
+        Assert.assertEquals(0, messages.exitCode);
+        String jsonContents1 = Utilities.readFile(json.toPath());
+        Assert.assertNotNull(jsonContents1);
+        Utilities.deleteFile(json, true);
+
+        sql = Arrays.stream(sql.split("\n"))
+                .map(s -> s.contains("skip_unused_columns") ? "" : s)
+                .collect(Collectors.joining("\n"));
+        file = createInputScript(sql);
+        messages = CompilerMain.execute("--dataflow", json.getPath(), "--noRust", file.getPath());
+        Assert.assertEquals(0, messages.exitCode);
+        var jsonContents2 = Utilities.readFile(json.toPath());
+        Utilities.deleteFile(json, false);
+        Assert.assertNotNull(jsonContents2);
+        Assert.assertNotEquals(jsonContents1, jsonContents2);
+    }
+
+    @Test
+    public void testAnonymize() throws IOException, SQLException {
+        File input = createInputScript("""
+                CREATE TYPE TYP AS ("Z" INT);
+                CREATE FUNCTION jsonstring_as_typ(l VARCHAR) RETURNS TYP;
+                CREATE TABLE T(x INT, y INT LATENESS 0, "Z" TYP ARRAY, W STRING) WITH ('connectors' = '[]');
+                CREATE VIEW V WITH ('emit_final' = 'y', 'connectors' = '[]') AS
+                SELECT jsonstring_as_typ(W), y, SUM(T.x) as sum, COUNT(T."Z"[1]) FROM T GROUP BY T.y, W;""");
+        File out = File.createTempFile("out", ".sql", new File("."));
+        out.deleteOnExit();
+        // Original program is valid
+        CompilerMessages execute = CompilerMain.execute("--noRust", "-i", input.getPath());
+        Assert.assertEquals(0, execute.exitCode);
+        // Anonymize
+        execute = CompilerMain.execute("--anonymize", "-o", out.getPath(), input.getPath());
+        Assert.assertEquals(0, execute.exitCode);
+        String result = Utilities.readFile(out.getAbsolutePath());
+        Assert.assertEquals("""
+                CREATE TYPE ID_0 AS (ID_1 INTEGER);
+                CREATE FUNCTION jsonstring_as_ID_0 (ID_3 VARCHAR) RETURNS ID_0;
+                CREATE TABLE ID_4 (ID_5 INTEGER, ID_6 INTEGER LATENESS 0, ID_1 ID_0 ARRAY, ID_7 string);
+                CREATE VIEW ID_8 WITH ('emit_final' = 'ID_6') AS
+                SELECT jsonstring_as_ID_0(ID_7), ID_6, SUM(ID_4.ID_5) AS ID_9, COUNT(ID_4.ID_1[1])
+                FROM ID_4
+                GROUP BY ID_4.ID_6, ID_7;""", result);
+        // Anonymized program is valid
+        execute = CompilerMain.execute("--noRust", "-i", out.getPath());
+        Assert.assertEquals(0, execute.exitCode);
+        Utilities.deleteFile(input, false);
+    }
+
+    @Test
+    public void testWarningsAreErrors() {
+        this.statementsFailingInCompilation("""
+            SET FELDERA_WARNINGS_ARE_ERRORS = ON;
+            CREATE TABLE T(x INT, y INT); -- unused column produces a warning
+            CREATE VIEW V AS SELECT x FROM T;""",
+                "Unused column: Column 'y' of table 't' is unused");
+    }
+
+    @Test
+    public void testSilenceWarning() {
+        var cc = this.getCC("""
+            SET FELDERA_IGNORE_WARNING_UNUSED_COLUMN = ON;
+            CREATE TABLE T(x INT, y INT); -- unused column does NOT produce a warning
+            CREATE VIEW V AS SELECT x FROM T;""");
+        Assert.assertEquals(0, cc.compiler.messages.messages.size());
+    }
+
+    @Test
+    public void issue5896() throws IOException, SQLException {
+        String sql = "CREATE VIEW v AS select cot(0)";
+        File file = createInputScript(sql);
+        File json = this.createTempJsonFile();
+        CompilerMessages msg = CompilerMain.execute(
+                "--dataflow", json.getPath(), "--noRust", file.getPath());
+        Assert.assertEquals(0, msg.exitCode);
+        ObjectMapper mapper = Utilities.deterministicObjectMapper();
+        JsonNode parsed = mapper.readTree(json);
+        Assert.assertNotNull(parsed);
     }
 }

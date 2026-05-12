@@ -8,6 +8,7 @@ import org.dbsp.sqlCompiler.ir.DBSPParameter;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.ir.aggregate.DBSPAggregateList;
 import org.dbsp.sqlCompiler.ir.aggregate.DBSPMinMax;
+import org.dbsp.sqlCompiler.ir.aggregate.MinMaxAggregate;
 import org.dbsp.sqlCompiler.ir.expression.*;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPBinaryLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPBoolLiteral;
@@ -20,8 +21,9 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI64Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI8Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPISizeLiteral;
-import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntervalMillisLiteral;
-import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntervalMonthsLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPInternedStringLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPShortIntervalLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLongIntervalLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPKeywordLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPRealLiteral;
@@ -46,8 +48,8 @@ import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeStruct;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBinary;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDecimal;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeMillisInterval;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeMonthsInterval;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeShortInterval;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeLongInterval;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeString;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeUser;
 import org.dbsp.util.JsonStream;
@@ -125,8 +127,6 @@ public class ToJsonInnerVisitor extends InnerVisitor {
 
     @Override
     public void postorder(DBSPAggregateList node) {
-        this.property("isLinear");
-        this.stream.append(node.isLinear());
         this.stream.endObject();
     }
 
@@ -236,6 +236,17 @@ public class ToJsonInnerVisitor extends InnerVisitor {
     }
 
     @Override
+    public void postorder(DBSPHandleErrorExpression node) {
+        this.property("runtimeBehavior");
+        this.stream.append(node.runtimeBehavior.toString());
+        this.property("index");
+        this.stream.append(node.index);
+        this.property("hasSourcePosition");
+        this.stream.append(node.hasSourcePosition);
+        super.postorder(node);
+    }
+
+    @Override
     public void postorder(DBSPI128Literal node) {
         if (node.value != null) {
             this.property("value");
@@ -303,7 +314,7 @@ public class ToJsonInnerVisitor extends InnerVisitor {
     }
 
     @Override
-    public void postorder(DBSPIntervalMillisLiteral node) {
+    public void postorder(DBSPShortIntervalLiteral node) {
         if (node.value != null) {
             this.property("value");
             this.stream.append(node.value.toString());
@@ -321,6 +332,11 @@ public class ToJsonInnerVisitor extends InnerVisitor {
     }
 
     @Override
+    public void postorder(DBSPInternedStringLiteral node) {
+        super.postorder(node);
+    }
+
+    @Override
     public void postorder(DBSPKeywordLiteral node) {
         this.property("keyword");
         this.stream.append(node.keyword);
@@ -331,6 +347,13 @@ public class ToJsonInnerVisitor extends InnerVisitor {
     public void postorder(DBSPMinMax node) {
         this.property("aggregation");
         this.stream.append(node.aggregation.toString());
+        super.postorder(node);
+    }
+
+    @Override
+    public void postorder(DBSPStaticExpression node) {
+        this.property("name");
+        this.stream.append(node.name);
         super.postorder(node);
     }
 
@@ -416,6 +439,8 @@ public class ToJsonInnerVisitor extends InnerVisitor {
     public void postorder(DBSPTypeBinary node) {
         this.property("precision");
         this.stream.append(node.precision);
+        this.property("fixed");
+        this.stream.append(node.fixed);
         super.postorder(node);
     }
 
@@ -447,14 +472,14 @@ public class ToJsonInnerVisitor extends InnerVisitor {
     }
 
     @Override
-    public void postorder(DBSPTypeMillisInterval node) {
+    public void postorder(DBSPTypeShortInterval node) {
         this.property("units");
         this.stream.append(node.units.toString());
         super.postorder(node);
     }
 
     @Override
-    public void postorder(DBSPTypeMonthsInterval node) {
+    public void postorder(DBSPTypeLongInterval node) {
         this.property("units");
         this.stream.append(node.units.toString());
         super.postorder(node);
@@ -487,15 +512,15 @@ public class ToJsonInnerVisitor extends InnerVisitor {
 
     @Override
     public void postorder(DBSPTypeStruct node) {
-        this.property("sanitizedName");
-        this.stream.append(node.sanitizedName);
+        this.property("hashName");
+        this.stream.append(node.hashName);
         this.property("name");
         node.name.asJson(this);
         super.postorder(node);
     }
 
     @Override
-    public void postorder(DBSPIntervalMonthsLiteral node) {
+    public void postorder(DBSPLongIntervalLiteral node) {
         if (node.value != null) {
             this.property("value");
             this.stream.append(node.value.toString());
@@ -556,9 +581,16 @@ public class ToJsonInnerVisitor extends InnerVisitor {
     }
 
     @Override
-    public void postorder(DBSPConditionalAggregateExpression node) {
+    public void postorder(DBSPConditionalIncrementExpression node) {
         this.property("opcode");
         this.stream.append(node.opcode.name());
+        super.postorder(node);
+    }
+
+    @Override
+    public void postorder(MinMaxAggregate node) {
+        this.property("operation");
+        this.stream.append(node.operation.toString());
         super.postorder(node);
     }
 
@@ -572,7 +604,7 @@ public class ToJsonInnerVisitor extends InnerVisitor {
     @Override
     public void postorder(DBSPCastExpression node) {
         this.property("safe");
-        this.stream.append(node.safe);
+        this.stream.append(node.safe.name());
         super.postorder(node);
     }
 
@@ -580,6 +612,35 @@ public class ToJsonInnerVisitor extends InnerVisitor {
     public void postorder(DBSPBinaryExpression node) {
         this.property("opcode");
         this.stream.append(node.opcode.name());
+        super.postorder(node);
+    }
+
+    @Override
+    public void postorder(DBSPTimeAddSub node) {
+        this.property("opcode");
+        this.stream.append(node.opcode.name());
+        if (node.longUnits != null) {
+            this.property("longUnits");
+            this.stream.append(node.longUnits.name());
+        }
+        if (node.shortUnits != null) {
+            this.property("shortUnits");
+            this.stream.append(node.shortUnits.name());
+        }
+        super.postorder(node);
+    }
+
+    @Override
+    public void postorder(DBSPFailExpression node) {
+        this.property("message");
+        this.stream.append(node.message);
+        super.postorder(node);
+    }
+
+    @Override
+    public void postorder(DBSPUnwrapExpression node) {
+        this.property("message");
+        this.stream.append(node.message);
         super.postorder(node);
     }
 
@@ -662,6 +723,19 @@ public class ToJsonInnerVisitor extends InnerVisitor {
         this.stream.append(node.nullsFirst);
         this.property("fieldNo");
         this.stream.append(node.fieldNo);
+        super.postorder(node);
+    }
+
+    @Override
+    public void postorder(DBSPAsymmetricFieldComparatorExpression node) {
+        this.startArrayProperty("comparisons");
+        int index = 0;
+        for (DBSPAsymmetricFieldComparatorExpression.Collation i: node.comparisons) {
+            this.propertyIndex(index);
+            index++;
+            i.asJson(this.stream);
+        }
+        this.endArrayProperty("comparisons");
         super.postorder(node);
     }
 

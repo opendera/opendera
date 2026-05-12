@@ -1,0 +1,104 @@
+package org.dbsp.sqlCompiler.compiler.frontend.parser;
+
+import org.apache.calcite.sql.SqlCall;
+import org.apache.calcite.sql.SqlCreate;
+import org.apache.calcite.sql.SqlDataTypeSpec;
+import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlLiteral;
+import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlNodeList;
+import org.apache.calcite.sql.SqlOperator;
+import org.apache.calcite.sql.SqlSpecialOperator;
+import org.apache.calcite.sql.SqlWriter;
+import org.apache.calcite.sql.parser.SqlParserPos;
+import org.checkerframework.checker.nullness.qual.Nullable;
+import org.dbsp.util.Utilities;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
+
+import static java.util.Objects.requireNonNull;
+
+/** Result produced by a CREATE AGGREGATE statement */
+public class SqlCreateAggregate extends SqlCreate {
+    private final SqlIdentifier name;
+    private final SqlNodeList parameters;
+    private final SqlDataTypeSpec returnType;
+    private final boolean linear;
+
+    private static final SqlSpecialOperator OPERATOR =
+            new SqlSpecialOperator("CREATE AGGREGATE", SqlKind.OTHER) {
+                @Override
+                public SqlCall createCall(@Nullable SqlLiteral functionQualifier, SqlParserPos pos,
+                                          @Nullable SqlNode... operands) {
+                    Utilities.enforce(operands.length == 6);
+                    return new SqlCreateAggregate(pos,
+                            ((SqlLiteral) requireNonNull(operands[0], "replace")).booleanValue(),
+                            ((SqlLiteral) requireNonNull(operands[1], "ifNotExists")).booleanValue(),
+                            ((SqlLiteral) Objects.requireNonNull(operands[2])).booleanValue(),
+                            (SqlIdentifier) Objects.requireNonNull(operands[3]),
+                            (SqlNodeList) Objects.requireNonNull(operands[4]),
+                            (SqlDataTypeSpec) Objects.requireNonNull(operands[5]));
+                }
+            };
+
+    public SqlCreateAggregate(SqlParserPos pos, boolean replace,
+                              boolean ifNotExists, boolean linear, SqlIdentifier name,
+                              SqlNodeList parameters, SqlDataTypeSpec returnType) {
+        super(OPERATOR, pos, replace, ifNotExists);
+        this.name = Objects.requireNonNull(name, "name");
+        this.parameters = Objects.requireNonNull(parameters, "parameters");
+        this.returnType = returnType;
+        this.linear = linear;
+    }
+
+    public boolean isLinear() {
+        return this.linear;
+    }
+
+    @Override public void unparse(SqlWriter writer, int leftPrec,
+                                  int rightPrec) {
+        writer.keyword(getReplace() ? "CREATE OR REPLACE" : "CREATE");
+        if (this.linear)
+            writer.keyword("LINEAR");
+        writer.keyword("AGGREGATE");
+        if (this.ifNotExists) {
+            writer.keyword("IF NOT EXISTS");
+        }
+        this.name.unparse(writer, 0, 0);
+        final SqlWriter.Frame frame = writer.startList(SqlWriter.FrameTypeEnum.SIMPLE, "(", ")");
+        for (SqlNode parameter : this.parameters) {
+            writer.sep(",");
+            parameter.unparse(writer, 0, 0);
+        }
+        writer.endList(frame);
+        writer.keyword("RETURNS");
+        this.returnType.unparse(writer, 0, 0);
+    }
+
+    @Override public SqlOperator getOperator() {
+        return OPERATOR;
+    }
+
+    public SqlNodeList getParameters() {
+        return this.parameters;
+    }
+
+    public SqlDataTypeSpec getReturnType() {
+        return this.returnType;
+    }
+
+    public SqlIdentifier getName() {
+        return this.name;
+    }
+
+    @Override public List<SqlNode> getOperandList() {
+        return Arrays.asList(
+                SqlLiteral.createBoolean(this.getReplace(), SqlParserPos.ZERO),
+                SqlLiteral.createBoolean(this.ifNotExists, SqlParserPos.ZERO),
+                SqlLiteral.createBoolean(this.linear, SqlParserPos.ZERO),
+                this.name, this.parameters, this.returnType);
+    }
+}

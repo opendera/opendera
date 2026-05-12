@@ -3,24 +3,27 @@
 //! So far, only methods/traits used in tests have been implemented.
 #![allow(clippy::type_complexity)]
 
+use crate::storage::file::FilterStats;
 use crate::{
+    DBData, DBWeight, NumEntries, Timestamp,
     dynamic::{
-        pair::DynPair, DataTrait, DowncastTrait, DynDataTyped, DynVec, DynWeightedPairs, Erase,
-        Factory, Vector, WeightTrait,
+        DataTrait, DowncastTrait, DynDataTyped, DynVec, DynWeightedPairs, Erase, Factory, Vector,
+        WeightTrait, pair::DynPair,
     },
     trace::{
         Batch, BatchFactories, BatchReader, BatchReaderFactories, Batcher, Builder, Cursor, Filter,
-        Trace,
+        GroupFilter, Trace, cursor::Position,
     },
-    DBData, DBWeight, NumEntries, Timestamp,
 };
 use dyn_clone::clone_box;
-use rand::{seq::IteratorRandom, thread_rng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, seq::IteratorRandom, thread_rng};
 use rand_chacha::ChaChaRng;
-use rkyv::{ser::Serializer, Archive, Archived, Deserialize, Fallible, Serialize};
+use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, ser::Serializer};
 use size_of::SizeOf;
+use std::any::TypeId;
+use std::sync::Arc;
 use std::{
-    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::{self, Debug},
     marker::PhantomData,
 };
@@ -163,19 +166,59 @@ where
         .collect::<Vec<_>>()
 }
 
-pub fn filter<T>(
-    mut tuples: Vec<((Box<T::Key>, Box<T::Val>, T::Time), Box<T::R>)>,
-    trace: &T,
-) -> Vec<((Box<T::Key>, Box<T::Val>, T::Time), Box<T::R>)>
-where
-    T: Trace,
-{
-    if let Some(filter) = trace.value_filter() {
-        tuples.retain(|((_k, v, _t), _r)| (filter.filter_func)(v.as_ref()));
+pub fn filter<K: DataTrait + ?Sized, V: DataTrait + ?Sized, T, R: WeightTrait + ?Sized>(
+    mut tuples: Vec<((Box<K>, Box<V>, T), Box<R>)>,
+    key_filter: &Option<Filter<K>>,
+    value_filter: &Option<GroupFilter<V>>,
+) -> Vec<((Box<K>, Box<V>, T), Box<R>)> {
+    if let Some(filter) = key_filter {
+        tuples.retain(|((k, _v, _t), _r)| (filter.filter_func())(k.as_ref()));
     }
 
-    if let Some(filter) = trace.key_filter() {
-        tuples.retain(|((k, _v, _t), _r)| (filter.filter_func)(k.as_ref()));
+    if let Some(filter) = value_filter {
+        match filter {
+            GroupFilter::Simple(filter) => {
+                tuples.retain(|((_k, v, _t), _r)| (filter.filter_func())(v.as_ref()));
+                return tuples;
+            }
+            GroupFilter::LastN(n, filter) => {
+                let mut tuples_by_key = BTreeMap::new();
+                for ((k, v, t), w) in tuples.into_iter() {
+                    tuples_by_key
+                        .entry(k)
+                        .or_insert_with(Vec::new)
+                        .push((v, t, w));
+                }
+
+                let mut result = Vec::new();
+
+                for (k, mut tuples) in tuples_by_key.into_iter() {
+                    let index = tuples
+                        .iter()
+                        .position(|(v, _t, _w)| (filter.filter_func())(v.as_ref()))
+                        .unwrap_or(tuples.len());
+                    let first_index = index.saturating_sub(*n);
+                    tuples
+                        .drain(first_index..)
+                        .for_each(|(v, t, w)| result.push(((clone_box(&*k), v, t), w)));
+                }
+
+                return result;
+            }
+            GroupFilter::TopN(n, filter, _val_factory) => {
+                tuples.retain(|((_k, v, _t), _r)| (filter.filter_func())(v.as_ref()));
+                // take the last n elements of tuples only
+                if tuples.len() > *n {
+                    tuples.drain(..tuples.len() - *n);
+                }
+                return tuples;
+            }
+            GroupFilter::BottomN(n, filter, _vals_factory) => {
+                tuples.retain(|((_k, v, _t), _r)| (filter.filter_func())(v.as_ref()));
+                tuples.truncate(*n);
+                return tuples;
+            }
+        }
     }
 
     tuples
@@ -337,12 +380,12 @@ pub fn assert_typed_batch_eq<B1, B2>(batch1: &B1, batch2: &B2)
 where
     B1: crate::typed_batch::BatchReader,
     B2: crate::typed_batch::BatchReader<
-        Time = B1::Time,
-        Key = B1::Key,
-        Val = B1::Val,
-        R = B1::R,
-        Inner = B1::Inner,
-    >,
+            Time = B1::Time,
+            Key = B1::Key,
+            Val = B1::Val,
+            R = B1::R,
+            Inner = B1::Inner,
+        >,
 {
     assert_batch_eq(batch1.inner(), batch2.inner())
 }
@@ -352,24 +395,48 @@ where
     T1: Trace,
     T2: Trace<Key = T1::Key, Val = T1::Val, Time = T1::Time, R = T1::R>,
 {
-    let tuples1 = filter(batch_to_tuples(trace1), trace1);
-    assert_eq!(
-        tuples1,
-        filter(batch_to_tuples_reverse_vals(trace1), trace1)
+    let tuples1 = filter(
+        batch_to_tuples(trace1),
+        trace1.key_filter(),
+        trace1.value_filter(),
     );
     assert_eq!(
         tuples1,
-        filter(batch_to_tuples_reverse_keys(trace1), trace1)
+        filter(
+            batch_to_tuples_reverse_vals(trace1),
+            trace1.key_filter(),
+            trace1.value_filter()
+        )
     );
     assert_eq!(
         tuples1,
-        filter(batch_to_tuples_reverse_keys_vals(trace1), trace1)
+        filter(
+            batch_to_tuples_reverse_keys(trace1),
+            trace1.key_filter(),
+            trace1.value_filter()
+        )
+    );
+    assert_eq!(
+        tuples1,
+        filter(
+            batch_to_tuples_reverse_keys_vals(trace1),
+            trace1.key_filter(),
+            trace1.value_filter()
+        )
     );
 
-    let tuples2 = filter(batch_to_tuples(trace2), trace2);
+    let tuples2 = filter(
+        batch_to_tuples(trace2),
+        trace2.key_filter(),
+        trace2.value_filter(),
+    );
     assert_eq!(
         tuples2,
-        filter(batch_to_tuples_reverse_vals(trace2), trace2)
+        filter(
+            batch_to_tuples_reverse_vals(trace2),
+            trace2.key_filter(),
+            trace2.value_filter()
+        )
     );
     assert_eq!(tuples1, tuples2);
 }
@@ -459,7 +526,7 @@ where
     #[size_of(skip)]
     key_filter: Option<Filter<K>>,
     #[size_of(skip)]
-    value_filter: Option<Filter<V>>,
+    value_filter: Option<GroupFilter<V>>,
 }
 
 unsafe impl<K, V, T, R> Send for TestBatch<K, V, T, R>
@@ -650,23 +717,12 @@ where
         source1: &Self,
         source2: &Self,
         key_filter: &Option<Filter<K>>,
-        value_filter: &Option<Filter<V>>,
+        value_filter: &Option<GroupFilter<V>>,
     ) -> Self {
         let data = source1
             .data
             .iter()
             .chain(source2.data.iter())
-            .filter(|((k, v, _t), _r)| {
-                #[allow(clippy::borrowed_box)]
-                fn include<K: ?Sized>(x: &Box<K>, filter: &Option<Filter<K>>) -> bool {
-                    match filter {
-                        Some(filter) => (filter.filter_func)(x),
-                        None => true,
-                    }
-                }
-
-                include(k, key_filter) && include(v, value_filter)
-            })
             .map(|((k, v, t), r)| {
                 (
                     (clone_box(k.as_ref()), clone_box(v.as_ref()), t.clone()),
@@ -674,7 +730,16 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        Self::from_data(&data)
+
+        let mut result = Self::from_data(&data);
+
+        if let Some(key_filter) = key_filter {
+            result.retain_keys(key_filter.clone());
+        }
+        if let Some(value_filter) = value_filter {
+            result.retain_values(value_filter.clone());
+        }
+        result
     }
 }
 
@@ -797,6 +862,8 @@ where
     result: TestBatch<K, V, T, R>,
     time_diffs: Vec<(T, Box<R>)>,
     vals: BTreeMap<Box<V>, Vec<(T, Box<R>)>>,
+    num_keys: usize,
+    num_tuples: usize,
 }
 
 impl<K, V, T, R> Builder<TestBatch<K, V, T, R>> for TestBatchBuilder<K, V, T, R>
@@ -806,29 +873,38 @@ where
     R: WeightTrait + ?Sized,
     T: Timestamp,
 {
-    fn with_capacity(factories: &TestBatchFactories<K, V, T, R>, _cap: usize) -> Self {
+    fn with_capacity(
+        factories: &TestBatchFactories<K, V, T, R>,
+        _key_capacity: usize,
+        _value_capacity: usize,
+    ) -> Self {
         Self {
             result: TestBatch::new(factories),
             time_diffs: Vec::new(),
             vals: BTreeMap::new(),
+            num_keys: 0,
+            num_tuples: 0,
         }
     }
 
     fn push_time_diff(&mut self, time: &T, weight: &R) {
         self.time_diffs.push((time.clone(), clone_box(weight)));
+        self.num_tuples += 1;
     }
 
     fn push_val(&mut self, val: &V) {
         assert!(!self.time_diffs.is_empty());
-        assert!(self
-            .vals
-            .insert(clone_box(val), std::mem::take(&mut self.time_diffs))
-            .is_none());
+        assert!(
+            self.vals
+                .insert(clone_box(val), std::mem::take(&mut self.time_diffs))
+                .is_none()
+        );
     }
 
     fn push_key(&mut self, key: &K) {
         assert!(self.time_diffs.is_empty());
         assert!(!self.vals.is_empty());
+        self.num_keys += 1;
         for (val, time_diffs) in std::mem::take(&mut self.vals) {
             for (t, r) in time_diffs {
                 match self
@@ -848,6 +924,14 @@ where
     fn done(mut self) -> TestBatch<K, V, T, R> {
         self.result.data.retain(|_, r| !r.is_zero());
         self.result
+    }
+
+    fn num_keys(&self) -> usize {
+        self.num_keys
+    }
+
+    fn num_tuples(&self) -> usize {
+        self.num_tuples
     }
 }
 
@@ -945,24 +1029,24 @@ where
     }
 
     fn key(&self) -> &K {
-        self.data[self.index].0 .0.as_ref()
+        self.data[self.index].0.0.as_ref()
     }
 
     fn val(&self) -> &V {
-        self.data[self.index].0 .1.as_ref()
+        self.data[self.index].0.1.as_ref()
     }
 
     fn map_times(&mut self, logic: &mut dyn FnMut(&T, &R)) {
-        let current_key = clone_box(self.data[self.index].0 .0.as_ref());
-        let current_val = clone_box(self.data[self.index].0 .1.as_ref());
+        let current_key = clone_box(self.data[self.index].0.0.as_ref());
+        let current_val = clone_box(self.data[self.index].0.1.as_ref());
 
         let mut index = self.index;
 
         while index < self.data.len()
-            && self.data[index].0 .0 == current_key
-            && self.data[index].0 .1 == current_val
+            && self.data[index].0.0 == current_key
+            && self.data[index].0.1 == current_val
         {
-            logic(&self.data[index].0 .2, self.data[index].1.as_ref());
+            logic(&self.data[index].0.2, self.data[index].1.as_ref());
             index += 1;
         }
     }
@@ -987,13 +1071,21 @@ where
     where
         T: PartialEq<()>,
     {
-        self.data[self.index].1.as_ref()
+        self.weight_checked()
+    }
+
+    fn weight_checked(&mut self) -> &R {
+        if TypeId::of::<T>() == TypeId::of::<()>() {
+            self.data[self.index].1.as_ref()
+        } else {
+            panic!("TestBatchCursor::weight_checked called on non-unit timestamp type");
+        }
     }
 
     fn step_key(&mut self) {
-        let current_key = clone_box(self.data[self.index].0 .0.as_ref());
+        let current_key = clone_box(self.data[self.index].0.0.as_ref());
 
-        while self.index < self.data.len() && self.data[self.index].0 .0 == current_key {
+        while self.index < self.data.len() && self.data[self.index].0.0 == current_key {
             self.index += 1;
         }
 
@@ -1005,12 +1097,12 @@ where
     }
 
     fn seek_key(&mut self, key: &K) {
-        while self.index < self.data.len() && self.data[self.index].0 .0.as_ref() < key {
+        while self.index < self.data.len() && self.data[self.index].0.0.as_ref() < key {
             self.index += 1;
         }
     }
 
-    fn seek_key_exact(&mut self, key: &K) -> bool {
+    fn seek_key_exact(&mut self, key: &K, _hash: Option<u64>) -> bool {
         self.seek_key(key);
         self.key_valid() && self.key().eq(key)
     }
@@ -1028,11 +1120,11 @@ where
     }
 
     fn step_val(&mut self) {
-        let current_key = clone_box(self.data[self.index].0 .0.as_ref());
-        let current_val = clone_box(self.data[self.index].0 .1.as_ref());
+        let current_key = clone_box(self.data[self.index].0.0.as_ref());
+        let current_val = clone_box(self.data[self.index].0.1.as_ref());
 
-        while self.index < self.data.len() && self.data[self.index].0 .1 == current_val {
-            if self.index + 1 < self.data.len() && self.data[self.index + 1].0 .0 == current_key {
+        while self.index < self.data.len() && self.data[self.index].0.1 == current_val {
+            if self.index + 1 < self.data.len() && self.data[self.index + 1].0.0 == current_key {
                 self.index += 1;
             } else {
                 self.val_valid = false;
@@ -1067,11 +1159,11 @@ where
     }
 
     fn step_val_reverse(&mut self) {
-        let current_key = clone_box(self.data[self.index].0 .0.as_ref());
-        let current_val = clone_box(self.data[self.index].0 .1.as_ref());
+        let current_key = clone_box(self.data[self.index].0.0.as_ref());
+        let current_val = clone_box(self.data[self.index].0.1.as_ref());
 
-        while self.data[self.index].0 .1 == current_val {
-            if self.index > 0 && self.data[self.index - 1].0 .0 == current_key {
+        while self.data[self.index].0.1 == current_val {
+            if self.index > 0 && self.data[self.index - 1].0.0 == current_key {
                 self.index -= 1;
             } else {
                 self.val_valid = false;
@@ -1079,11 +1171,11 @@ where
             }
         }
 
-        let current_val = clone_box(self.data[self.index].0 .1.as_ref());
+        let current_val = clone_box(self.data[self.index].0.1.as_ref());
 
         while self.index > 0
-            && self.data[self.index - 1].0 .0 == current_key
-            && self.data[self.index - 1].0 .1 == current_val
+            && self.data[self.index - 1].0.0 == current_key
+            && self.data[self.index - 1].0.1 == current_val
         {
             self.index -= 1;
         }
@@ -1103,22 +1195,26 @@ where
     }
 
     fn fast_forward_vals(&mut self) {
-        let current_key = clone_box(self.data[self.index].0 .0.as_ref());
+        let current_key = clone_box(self.data[self.index].0.0.as_ref());
 
-        while self.index + 1 < self.data.len() && self.data[self.index + 1].0 .0 == current_key {
+        while self.index + 1 < self.data.len() && self.data[self.index + 1].0.0 == current_key {
             self.index += 1;
         }
 
-        let current_val = clone_box(self.data[self.index].0 .1.as_ref());
+        let current_val = clone_box(self.data[self.index].0.1.as_ref());
 
         while self.index > 0
-            && self.data[self.index - 1].0 .0 == current_key
-            && self.data[self.index - 1].0 .1 == current_val
+            && self.data[self.index - 1].0.0 == current_key
+            && self.data[self.index - 1].0.1 == current_val
         {
             self.index -= 1;
         }
 
         self.val_valid = true;
+    }
+
+    fn position(&self) -> Option<Position> {
+        None
     }
 }
 
@@ -1169,6 +1265,10 @@ where
         self.size_of().total_bytes()
     }
 
+    fn membership_filter_stats(&self) -> FilterStats {
+        FilterStats::default()
+    }
+
     fn sample_keys<RG>(&self, _rng: &mut RG, _sample_size: usize, _sample: &mut DynVec<Self::Key>)
     where
         RG: Rng,
@@ -1184,19 +1284,23 @@ where
     R: WeightTrait + ?Sized,
     T: Timestamp,
 {
+    type Timed<T2: Timestamp> = TestBatch<K, V, T2, R>;
     type Batcher = TestBatchBatcher<K, V, T, R>;
     type Builder = TestBatchBuilder<K, V, T, R>;
 
-    /*fn from_keys(time: Self::Time, keys: Vec<(Self::Key, Self::R)>) -> Self
-    where
-        Self::Val: From<()>,
-    {
-        let tuples = keys
-            .into_iter()
-            .map(|(k, r)| ((k, <Self::Val>::from(())), r))
-            .collect::<Vec<_>>();
-        Self::from_tuples(time, tuples)
-    }*/
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        let min = self.data.keys().next()?.0.as_ref();
+        let max = self.data.keys().next_back()?.0.as_ref();
+        Some((min, max))
+    }
+
+    fn negative_weight_count(&self) -> Option<u64> {
+        None
+    }
+
+    fn touched_window_count(&self) -> crate::storage::file::TouchedWindowCount {
+        crate::storage::file::TouchedWindowCount::default()
+    }
 }
 
 impl<K, V, T, R> Trace for TestBatch<K, V, T, R>
@@ -1207,7 +1311,6 @@ where
     T: Timestamp,
 {
     type Batch = Self;
-    type Metrics = ();
 
     fn new(_factories: &Self::Factories) -> Self {
         Self {
@@ -1232,8 +1335,14 @@ where
         }
     }
 
-    fn insert(&mut self, batch: Self::Batch) {
-        self.data = Self::merge(self, &batch, &self.key_filter, &self.value_filter).data;
+    async fn insert(&mut self, batch: impl Into<Arc<Self::Batch>>) {
+        self.data = Self::merge(
+            self,
+            batch.into().as_ref(),
+            &self.key_filter,
+            &self.value_filter,
+        )
+        .data;
     }
 
     fn clear_dirty_flag(&mut self) {}
@@ -1244,27 +1353,46 @@ where
 
     fn retain_keys(&mut self, filter: Filter<Self::Key>) {
         self.data
-            .retain(|(k, _v, _t), _r| (filter.filter_func)(k.as_ref()));
+            .retain(|(k, _v, _t), _r| (filter.filter_func())(k.as_ref()));
         self.key_filter = Some(filter);
     }
 
-    fn retain_values(&mut self, filter: Filter<Self::Val>) {
-        self.data
-            .retain(|(_k, v, _t), _r| (filter.filter_func)(v.as_ref()));
-        self.value_filter = Some(filter);
+    fn retain_values(&mut self, value_filter: GroupFilter<Self::Val>) {
+        self.data = filter(
+            std::mem::take(&mut self.data).into_iter().collect(),
+            &self.key_filter,
+            &Some(value_filter.clone()),
+        )
+        .into_iter()
+        .collect();
+
+        self.value_filter = Some(value_filter);
     }
 
     fn key_filter(&self) -> &Option<Filter<Self::Key>> {
         &self.key_filter
     }
 
-    fn value_filter(&self) -> &Option<Filter<Self::Val>> {
+    fn value_filter(&self) -> &Option<GroupFilter<Self::Val>> {
         &self.value_filter
     }
 
-    fn init_operator_metrics(_global_node_id: &crate::circuit::GlobalNodeId) -> Self::Metrics {}
+    fn save(
+        &mut self,
+        _base: &feldera_storage::StoragePath,
+        _pid: &str,
+        _files: &mut Vec<std::sync::Arc<dyn feldera_storage::FileCommitter>>,
+    ) -> Result<(), crate::Error> {
+        todo!()
+    }
 
-    fn metrics(&self, _metrics: &Self::Metrics) {}
+    fn restore(
+        &mut self,
+        _base: &feldera_storage::StoragePath,
+        _pid: &str,
+    ) -> Result<(), crate::Error> {
+        todo!()
+    }
 }
 
 /// Test random sampling methods.

@@ -30,8 +30,12 @@ import net.hydromatic.sqllogictest.TestStatistics;
 import org.dbsp.sqllogictest.executors.DBSPExecutor;
 import org.dbsp.sqllogictest.executors.DbspJdbcExecutor;
 import org.dbsp.util.Linq;
+import org.dbsp.util.Utilities;
 
 import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -73,7 +77,7 @@ public class Main {
 
         String wd = System.getProperty("user.dir");
         File directory = new File(wd + "/..").getAbsoluteFile();
-        System.setProperty("user.dir", directory.getAbsolutePath());
+        System.setProperty("user.dir", directory.getCanonicalPath());
         wd = System.getProperty("user.dir");
         System.out.println("working directory is " + wd);
 
@@ -84,8 +88,24 @@ public class Main {
         main(argv);
     }
 
+    /** Executes one SLT program, to make sure everything is fine */
+    public static void quick() throws IOException, ClassNotFoundException {
+        String[] args = new String[] { "-v", "-x", "-inc", "-e", "hybrid", "-skip", "1",
+                "test/random/expr/slt_good_102.test" };
+
+        String wd = System.getProperty("user.dir");
+        File directory = new File(wd + "/..").getAbsoluteFile();
+        System.setProperty("user.dir", directory.getAbsolutePath());
+        wd = System.getProperty("user.dir");
+        System.out.println("working directory is " + wd);
+        main(args);
+    }
+
     @SuppressWarnings("SpellCheckingInspection")
     public static void main(String[] argv) throws IOException, ClassNotFoundException {
+        // Used for debugging: how many tests to skip from the first file
+        AtomicReference<Integer> skip = new AtomicReference<>();
+        skip.set(0);
         Class.forName("org.hsqldb.jdbcDriver");
         List<String> files = Linq.list(
                 // "test/random/expr/slt_good_102.test"
@@ -125,11 +145,16 @@ public class Main {
             args = a.toArray(new String[0]);
         }
         System.out.println(Arrays.toString(args));
-        System.out.println("WD: " + System.getProperty("user.dir"));
+        String wd = System.getProperty("user.dir");
+        System.out.println("WD: " + wd);
+        Path source = Path.of(wd, "..", "Cargo.lock");
+        File sourceFile = source.toFile().getCanonicalFile();
+        Path destination = Path.of(wd, "temp", "Cargo.lock");
+        File destinationFile = destination.toFile().getCanonicalFile();
+        System.out.println("Copying " + sourceFile.getPath() + " to " + destinationFile.getPath());
+        Utilities.enforce(sourceFile.exists());
+        Files.copy(sourceFile.toPath(), destinationFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
         OptionsParser parser = new OptionsParser(true, System.out, System.err);
-        // Used for debugging: how many tests to skip from the first file
-        AtomicReference<Integer> skip = new AtomicReference<>();
-        skip.set(0);
         parser.registerOption("-skip", "skipCount", "How many tests to skip (for debugging)", o -> {
             skip.set(Integer.parseInt(o));
             return true;

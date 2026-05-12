@@ -1,14 +1,17 @@
 use dyn_clone::clone_box;
+use feldera_storage::fbuf::FBuf;
 use size_of::SizeOf;
 
 use crate::circuit::checkpointer::Checkpoint;
+use crate::circuit::runtime::{WorkerLocation, WorkerLocations};
 use crate::dynamic::{DynData, DynUnit};
+use crate::operator::communication::Mailbox;
 use crate::operator::dynamic::{MonoIndexedZSet, MonoZSet};
 use crate::{
+    Circuit, NumEntries, RootCircuit, Stream,
     dynamic::DataTrait,
     operator::communication::new_exchange_operators,
     trace::{BatchReader, Cursor, Rkyv},
-    Circuit, NumEntries, RootCircuit, Runtime, Stream,
 };
 use std::{cmp::max, panic::Location};
 
@@ -82,33 +85,40 @@ where
                 }
             });
 
-            if let Some(runtime) = Runtime::runtime() {
-                let num_workers = runtime.num_workers();
-                if num_workers == 1 {
-                    return local_waterline;
+            let example = init();
+            let exchange = new_exchange_operators(
+                Some(Location::caller()),
+                init,
+                move |waterline: Box<TS>, waterlines: &mut Vec<Mailbox<Box<TS>>>| {
+                    for location in WorkerLocations::new() {
+                        match location {
+                            WorkerLocation::Local => {
+                                waterlines.push(Mailbox::Plain(clone_box(waterline.as_ref())))
+                            }
+                            WorkerLocation::Remote => waterlines.push(Mailbox::Tx(
+                                FBuf::from_slice(&waterline.checkpoint().unwrap()),
+                            )),
+                        };
+                    }
+                },
+                move |data| {
+                    let mut waterline = example.clone();
+                    waterline.restore(&data).unwrap();
+                    waterline
+                },
+                |result, waterline| {
+                    if &waterline > result {
+                        *result = waterline;
+                    }
+                },
+            );
+
+            match exchange {
+                Some((sender, receiver)) => {
+                    self.circuit()
+                        .add_exchange(sender, receiver, &local_waterline)
                 }
-
-                let (sender, receiver) = new_exchange_operators(
-                    &runtime,
-                    Runtime::worker_index(),
-                    Some(Location::caller()),
-                    init,
-                    move |waterline: Box<TS>, waterlines: &mut Vec<Box<TS>>| {
-                        for _ in 0..num_workers {
-                            waterlines.push(clone_box(waterline.as_ref()));
-                        }
-                    },
-                    |result, waterline| {
-                        if &waterline > result {
-                            *result = waterline;
-                        }
-                    },
-                );
-
-                self.circuit()
-                    .add_exchange(sender, receiver, &local_waterline)
-            } else {
-                local_waterline
+                None => local_waterline,
             }
         })
     }
@@ -156,32 +166,39 @@ where
                 },
             );
 
-            if let Some(runtime) = Runtime::runtime() {
-                let num_workers = runtime.num_workers();
-                if num_workers == 1 {
-                    return local_waterline;
+            let example = init();
+            let exchange = new_exchange_operators(
+                Some(Location::caller()),
+                init,
+                move |waterline: Box<TS>, waterlines: &mut Vec<Mailbox<Box<TS>>>| {
+                    for location in WorkerLocations::new() {
+                        match location {
+                            WorkerLocation::Local => {
+                                waterlines.push(Mailbox::Plain(clone_box(waterline.as_ref())))
+                            }
+                            WorkerLocation::Remote => waterlines.push(Mailbox::Tx(
+                                FBuf::from_slice(&waterline.checkpoint().unwrap()),
+                            )),
+                        };
+                    }
+                },
+                move |data| {
+                    let mut waterline = example.clone();
+                    waterline.restore(&data).unwrap();
+                    waterline
+                },
+                move |result, waterline| {
+                    let old_result = clone_box(result);
+                    least_upper_bound(&old_result, &waterline, result.as_mut());
+                },
+            );
+
+            match exchange {
+                Some((sender, receiver)) => {
+                    self.circuit()
+                        .add_exchange(sender, receiver, &local_waterline)
                 }
-
-                let (sender, receiver) = new_exchange_operators(
-                    &runtime,
-                    Runtime::worker_index(),
-                    Some(Location::caller()),
-                    init,
-                    move |waterline: Box<TS>, waterlines: &mut Vec<Box<TS>>| {
-                        for _ in 0..num_workers {
-                            waterlines.push(waterline.clone());
-                        }
-                    },
-                    move |result, waterline| {
-                        let old_result = clone_box(result);
-                        least_upper_bound(&old_result, &waterline, result.as_mut());
-                    },
-                );
-
-                self.circuit()
-                    .add_exchange(sender, receiver, &local_waterline)
-            } else {
-                local_waterline
+                None => local_waterline,
             }
         })
     }
@@ -190,10 +207,10 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
+        Runtime,
         dynamic::{DowncastTrait, DynData},
         typed_batch::TypedBox,
         utils::Tup2,
-        Runtime,
     };
     use std::cmp::max;
 
@@ -219,16 +236,16 @@ mod tests {
         .unwrap();
 
         input_handle.append(&mut vec![Tup2(100, 1), Tup2(110, 1), Tup2(50, 1)]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         input_handle.append(&mut vec![Tup2(90, 1), Tup2(90, 1), Tup2(50, 1)]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         input_handle.append(&mut vec![Tup2(110, 1), Tup2(120, 1), Tup2(100, 1)]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         input_handle.append(&mut vec![Tup2(130, 1), Tup2(140, 1), Tup2(0, 1)]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         dbsp.kill().unwrap();
     }
@@ -273,28 +290,28 @@ mod tests {
             Tup2(-10, Tup2(1, 1)),
             Tup2(-200, Tup2(1, 1)),
         ]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         input_handle.append(&mut vec![
             Tup2(0, Tup2(1, 1)),
             Tup2(-100, Tup2(2, 1)),
             Tup2(100, Tup2(3, 1)),
         ]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         input_handle.append(&mut vec![
             Tup2(50, Tup2(5, 1)),
             Tup2(-200, Tup2(-10, 1)),
             Tup2(99, Tup2(7, 1)),
         ]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         input_handle.append(&mut vec![
             Tup2(130, Tup2(1, 1)),
             Tup2(140, Tup2(1, 1)),
             Tup2(250, Tup2(1, 1)),
         ]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         dbsp.kill().unwrap();
     }

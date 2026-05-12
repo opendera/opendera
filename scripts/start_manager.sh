@@ -15,7 +15,7 @@ fi
 #    exit 1
 # fi
 
-cd "${SQL_COMPILER_DIR}" && ./build.sh
+#cd "${SQL_COMPILER_DIR}" && ./build.sh
 
 DEFAULT_BIND_ADDRESS="127.0.0.1"
 BIND_ADDRESS="${2:-$DEFAULT_BIND_ADDRESS}"
@@ -37,7 +37,6 @@ if [ -n "$manager_pid" ]; then
     exit 1
 fi
 
-cd "${MANAGER_DIR}" && ~/.cargo/bin/cargo build $RUST_BUILD_PROFILE
-cd "${ROOT_DIR}" && ~/.cargo/bin/cargo run --bin pipeline-manager $RUST_BUILD_PROFILE $PG_EMBED -- \
+cd "${ROOT_DIR}" && ~/.cargo/bin/cargo run -p pipeline-manager $RUST_BUILD_PROFILE $PG_EMBED -- \
     --bind-address="${BIND_ADDRESS}" \
     ${DB_CONNECTION_STRING}

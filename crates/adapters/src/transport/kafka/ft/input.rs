@@ -1,39 +1,50 @@
-use crate::transport::kafka::ft::count_partitions_in_topic;
-use crate::transport::kafka::MemoryUseReporter;
-use crate::transport::kafka::{generate_oauthbearer_token, validate_aws_msk_region};
 use crate::transport::InputCommandReceiver;
-use crate::{
-    transport::{
-        kafka::{rdkafka_loglevel_from, refine_kafka_error, DeferredLogging},
-        InputReader,
-    },
-    InputConsumer, TransportInputEndpoint,
-};
+use crate::transport::kafka::MemoryUseReporter;
+use crate::transport::kafka::ft::count_partitions_in_topic;
+use crate::transport::kafka::{generate_oauthbearer_token, validate_aws_msk_region};
 use crate::{InputBuffer, Parser};
-use anyhow::{anyhow, bail, Error as AnyError, Result as AnyResult};
+use crate::{
+    InputConsumer, TransportInputEndpoint,
+    transport::{
+        InputReader,
+        kafka::{DeferredLogging, rdkafka_loglevel_from, refine_kafka_error},
+    },
+};
+use anyhow::{Error as AnyError, Result as AnyResult, anyhow, bail};
+use chrono::{DateTime, Utc};
 use crossbeam::queue::ArrayQueue;
 use crossbeam::sync::{Parker, Unparker};
-use feldera_adapterlib::transport::{InputEndpoint, InputReaderCommand, Resume};
+use dbsp::operator::StagedBuffers;
+use feldera_adapterlib::ConnectorMetadata;
+use feldera_adapterlib::format::BufferSize;
+use feldera_adapterlib::transport::{
+    InputEndpoint, InputReaderCommand, Resume, Watermark, parse_resume_info,
+};
+use feldera_sqllib::{ByteArray, SqlString, Timestamp, Variant};
 use feldera_types::config::FtModel;
 use feldera_types::program_schema::Relation;
 use feldera_types::transport::kafka::{KafkaInputConfig, KafkaStartFromConfig};
+use itertools::Itertools;
 use rdkafka::client::OAuthToken;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::base_consumer::PartitionQueue;
-use rdkafka::message::BorrowedMessage;
+use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::{
+    ClientConfig, ClientContext, Message,
     config::FromClientConfigAndContext,
     consumer::{BaseConsumer, Consumer, ConsumerContext},
     error::{KafkaError, KafkaResult},
-    ClientConfig, ClientContext, Message,
 };
 use rdkafka::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use smallvec::{SmallVec, smallvec};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::hash::Hasher;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle, Thread};
 use std::{
     iter,
@@ -41,9 +52,9 @@ use std::{
     thread::spawn,
     time::Duration,
 };
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::span::EnteredSpan;
-use tracing::{debug, info_span};
+use tracing::{debug, info_span, warn};
 use xxhash_rust::xxh3::Xxh3Default;
 
 /// Poll timeout must be low, as it bounds the amount of time it takes to resume the connector.
@@ -69,7 +80,7 @@ impl KafkaFtInputEndpoint {
 }
 
 struct KafkaFtInputReader {
-    _inner: Arc<KafkaFtInputReaderInner>,
+    inner: Arc<KafkaFtInputReaderInner>,
     command_sender: UnboundedSender<InputReaderCommand>,
     poller_thread: Thread,
 }
@@ -155,6 +166,12 @@ impl KafkaFtHasher {
         }));
     }
 
+    fn reset(&mut self) {
+        for hasher in self.0.values_mut() {
+            hasher.reset();
+        }
+    }
+
     fn finish(&self) -> u64 {
         let mut h = Xxh3Default::new();
         for (partition, hasher) in self.0.iter() {
@@ -163,6 +180,12 @@ impl KafkaFtHasher {
         }
         h.finish()
     }
+
+    fn take(&mut self) -> u64 {
+        let hash = self.finish();
+        self.reset();
+        hash
+    }
 }
 
 struct KafkaFtInputReaderInner {
@@ -170,7 +193,57 @@ struct KafkaFtInputReaderInner {
     errors: ArrayQueue<(KafkaError, String)>,
 }
 
+/// Error returned by [KafkaFtInputReaderInner::check_offsets].
+enum OffsetError {
+    /// Error fetching watermarks for Kafka partitions.
+    FetchError(AnyError),
+
+    /// At least one provided partition offset does not exist in the partition
+    /// (probably it was expired).
+    MissingOffset(AnyError),
+}
+
+impl OffsetError {
+    /// Returns the inner [AnyError].
+    fn into_any_error(self) -> AnyError {
+        match self {
+            OffsetError::FetchError(error) => error,
+            OffsetError::MissingOffset(error) => error,
+        }
+    }
+}
+
 impl KafkaFtInputReaderInner {
+    fn check_offsets(
+        &self,
+        config: &KafkaInputConfig,
+        offsets: &[i64],
+    ) -> Result<Vec<Offset>, OffsetError> {
+        let partitions = config
+            .partitions
+            .clone()
+            .unwrap_or((0..offsets.len() as i32).collect());
+
+        for (offset, partition) in offsets.iter().copied().zip(partitions) {
+            let (low, high) = self
+                .kafka_consumer
+                .fetch_watermarks(&config.topic, partition, METADATA_TIMEOUT)
+                .map_err(|e| {
+                    OffsetError::FetchError(anyhow!(
+                        "error fetching metadata for partition '{partition}': {e}"
+                    ))
+                })?;
+
+            // Return an error if the specified offset doesn't exist.
+            if !(low..=high).contains(&offset) {
+                return Err(OffsetError::MissingOffset(anyhow!(
+                    "configuration error: provided offset '{offset}' not currently in partition '{partition}'"
+                )));
+            }
+        }
+        Ok(offsets.iter().copied().map(Offset::Offset).collect())
+    }
+
     #[allow(clippy::borrowed_box)]
     fn poller_thread(
         &self,
@@ -179,18 +252,36 @@ impl KafkaFtInputReaderInner {
         mut parser: Box<dyn Parser>,
         n_partitions: usize,
         command_receiver: UnboundedReceiver<InputReaderCommand>,
+        resume_info: Option<Metadata>,
     ) -> AnyResult<()> {
         let topic = &config.topic;
 
         // Start reading the partitions either at the resume point or at the
         // beginning.
         let mut command_receiver = InputCommandReceiver::<Metadata, ()>::new(command_receiver);
-        let initial_offsets = match command_receiver.blocking_recv_seek()? {
-            Some(metadata) => metadata
-                .parse(n_partitions)?
-                .into_iter()
-                .map(|range| Offset::Offset(range.end))
-                .collect::<Vec<_>>(),
+        let mut persisted_partitions = None;
+        let initial_offsets = match resume_info {
+            Some(metadata) => {
+                let offsets = metadata
+                    .parse(n_partitions, &mut persisted_partitions)?
+                    .into_iter()
+                    .map(|range| range.end)
+                    .collect::<Vec<_>>();
+                if config.resume_earliest_if_data_expires {
+                    match self.check_offsets(&config, &offsets) {
+                        Ok(offsets) => offsets,
+                        Err(OffsetError::FetchError(error)) => return Err(error),
+                        Err(OffsetError::MissingOffset(_error)) => {
+                            warn!(
+                                "Checkpoint for topic {topic} refers to offsets that no longer exist in the topic; as configured, the connector will resume from the earliest offsets now in the topic (checkpointed offsets were {offsets:?})"
+                            );
+                            iter::repeat_n(Offset::Beginning, n_partitions).collect()
+                        }
+                    }
+                } else {
+                    offsets.into_iter().map(Offset::Offset).collect()
+                }
+            }
             None => match &config.start_from {
                 KafkaStartFromConfig::Earliest => {
                     iter::repeat_n(Offset::Beginning, n_partitions).collect()
@@ -198,29 +289,53 @@ impl KafkaFtInputReaderInner {
                 KafkaStartFromConfig::Latest => iter::repeat_n(Offset::End, n_partitions).collect(),
                 KafkaStartFromConfig::Offsets(offsets) => {
                     if n_partitions != offsets.len() {
-                        bail!("Topic {topic} has {n_partitions} partitions but configuration specifies {} offsets.", offsets.len());
+                        bail!(
+                            "Topic {topic} has {n_partitions} partitions but configuration specifies {} offsets.",
+                            offsets.len()
+                        );
                     }
 
+                    self.check_offsets(&config, offsets)
+                        .map_err(|e| e.into_any_error())?
+                }
+                KafkaStartFromConfig::Timestamp(timestamp) => {
+                    // The partitions that we're reading.
                     let partitions = config
                         .partitions
                         .clone()
-                        .unwrap_or((0..offsets.len() as i32).collect());
+                        .unwrap_or((0..n_partitions as i32).collect());
 
-                    for (offset, partition) in offsets.iter().copied().zip(partitions) {
-                        let (low, high) = self
-                            .kafka_consumer
-                            .fetch_watermarks(topic, partition, METADATA_TIMEOUT)
-                            .map_err(|e| {
-                                anyhow!("error fetching metadata for partition '{partition}': {e}",)
-                            })?;
-
-                        // Return an error if the specified offset doesn't exist.
-                        if !(low..=high).contains(&offset) {
-                            bail!("configuration error: provided offset '{offset}' not currently in partition '{partition}'");
-                        }
+                    // Assemble a TopicPartitionList with the desired timestamp
+                    // as the "offset" for each partition.
+                    let mut timestamps = TopicPartitionList::new();
+                    for partition in partitions.iter().copied() {
+                        timestamps
+                            .add_partition_offset(topic, partition, Offset::Offset(*timestamp))
+                            .map_err(|error| self.refine_error(error).1)?;
                     }
 
-                    offsets.iter().copied().map(Offset::Offset).collect()
+                    // Translate the timestamps to offsets.
+                    let offsets = self
+                        .kafka_consumer
+                        .offsets_for_times(timestamps, METADATA_TIMEOUT)
+                        .map_err(|error| self.refine_error(error).1)?;
+
+                    // Extract the offsets from the returned value.
+                    offsets
+                        .elements()
+                        .into_iter()
+                        .zip_eq(partitions)
+                        .map(|(elem, partition)| {
+                            if elem.partition() == partition {
+                                Ok(elem.offset())
+                            } else {
+                                Err(anyhow!(
+                                    "rdkafka returned partition {} instead of expected {partition}",
+                                    elem.partition()
+                                ))
+                            }
+                        })
+                        .collect::<Result<_, AnyError>>()?
                 }
             },
         };
@@ -254,6 +369,7 @@ impl KafkaFtInputReaderInner {
         let n_threads = config.poller_threads().min(n_partitions);
         let mut threads = (0..n_threads)
             .map(|_| RecvThread {
+                topic: topic.clone(),
                 exit: exit.clone(),
                 main_thread: thread::current(),
                 parker: Parker::new(),
@@ -278,12 +394,19 @@ impl KafkaFtInputReaderInner {
                 .split_partition_queue(topic, *partition)
                 .ok_or_else(|| anyhow!("could not split queue for partition {partition}"))?;
 
+            let unparker = thread.parker.unparker().clone();
             queue.set_nonempty_callback({
-                let unparker = thread.parker.unparker().clone();
+                let unparker = unparker.clone();
                 move || unparker.unpark()
             });
 
-            let receiver = Arc::new(PartitionReceiver::new(*partition, queue, next_offset));
+            let receiver = Arc::new(PartitionReceiver::new(
+                *partition,
+                queue,
+                next_offset,
+                &config,
+                unparker,
+            ));
             receivers.insert(partition, receiver.clone());
             thread.receivers.push(receiver);
         }
@@ -301,7 +424,7 @@ impl KafkaFtInputReaderInner {
                 }
                 Err(e) => {
                     let (fatal, e) = self.refine_error(e);
-                    consumer.error(fatal, e);
+                    consumer.error(fatal, e, Some("kafka-poll"));
                     if fatal {
                         return Ok(());
                     }
@@ -329,7 +452,8 @@ impl KafkaFtInputReaderInner {
 
         // Then replay as many steps as requested.
         while let Some((metadata, ())) = command_receiver.blocking_recv_replay()? {
-            let metadata = metadata.parse(n_partitions)?;
+            let n_offsets = metadata.offsets.len();
+            let metadata = metadata.parse(n_partitions, &mut persisted_partitions)?;
             let mut incomplete_partitions = HashSet::new();
             for (offsets, (partition, receiver)) in metadata.iter().zip(receivers.iter()) {
                 if !offsets.is_empty() {
@@ -340,17 +464,19 @@ impl KafkaFtInputReaderInner {
             for thread in &threads {
                 thread.unparker.unpark();
             }
-            let mut total_records = 0;
-            let mut hasher = KafkaFtHasher::new(&partitions);
+            let mut total = BufferSize::empty();
+            let mut hasher = KafkaFtHasher::new(&partitions[..n_offsets]);
             loop {
                 // Process messages for all partitions.
                 for (partition, receiver) in receivers.iter() {
                     let max = receiver.max_offset();
-                    while let Some(mut msg) = receiver.read(max) {
-                        total_records += msg.buffer.len();
-                        hasher.add(partition, &msg.buffer);
-                        msg.buffer.flush();
-                        if msg.offset == max {
+                    while let Some((offset, (mut msg, _timestamp))) = receiver.read(max) {
+                        let amt = msg.len();
+                        total += amt;
+                        hasher.add(partition, &msg);
+                        consumer.buffered(amt);
+                        msg.flush();
+                        if offset == max {
                             incomplete_partitions.remove(partition);
                         }
                     }
@@ -363,13 +489,15 @@ impl KafkaFtInputReaderInner {
                 match self.kafka_consumer.poll(Duration::ZERO) {
                     Some(Err(e)) => {
                         let (fatal, e) = self.refine_error(e);
-                        consumer.error(fatal, e);
+                        consumer.error(fatal, e, Some("kafka-poll"));
                         if fatal {
                             return Ok(());
                         }
                     }
                     Some(Ok(message)) => {
-                        bail!("All partitions are split but the main consumer received a message anyway: {message:?}");
+                        bail!(
+                            "All partitions are split but the main consumer received a message anyway: {message:?}"
+                        );
                     }
                     None => (),
                 }
@@ -380,62 +508,127 @@ impl KafkaFtInputReaderInner {
 
                 thread::park_timeout(POLL_TIMEOUT);
             }
-            consumer.replayed(total_records, hasher.finish());
+            consumer.replayed(total, hasher.finish());
         }
 
         // We're done replaying.
 
         let mut running = false;
         let mut kafka_paused = false;
+        struct StagedBuffer {
+            buffers: Box<dyn StagedBuffers>,
+            timestamp: DateTime<Utc>,
+            amt: BufferSize,
+            hash: u64,
+            offsets: Vec<Range<i64>>,
+        }
+        struct Stager {
+            buffers: VecDeque<StagedBuffer>,
+            offsets: Vec<Range<i64>>,
+            hasher: KafkaFtHasher,
+            inputs: Vec<Box<dyn InputBuffer>>,
+            amt: BufferSize,
+            timestamp: Option<DateTime<Utc>>,
+        }
+        impl Stager {
+            fn new(receivers: &BTreeMap<&i32, Arc<PartitionReceiver>>, partitions: &[i32]) -> Self {
+                Self {
+                    buffers: VecDeque::new(),
+                    offsets: receivers
+                        .values()
+                        .map(|r| {
+                            let next_offset = r.next_offset();
+                            next_offset..next_offset
+                        })
+                        .collect(),
+                    hasher: KafkaFtHasher::new(partitions),
+                    inputs: Vec::new(),
+                    amt: BufferSize::default(),
+                    timestamp: None,
+                }
+            }
+            fn take_offsets(&mut self) -> Vec<Range<i64>> {
+                let offsets = self.offsets.clone();
+                for partition_offsets in &mut self.offsets {
+                    partition_offsets.start = partition_offsets.end;
+                }
+                offsets
+            }
+            fn take_buffer(&mut self, parser: &dyn Parser) -> StagedBuffer {
+                StagedBuffer {
+                    buffers: parser.stage(std::mem::take(&mut self.inputs)),
+                    timestamp: self.timestamp.take().unwrap_or_else(Utc::now),
+                    amt: std::mem::take(&mut self.amt),
+                    hash: self.hasher.take(),
+                    offsets: self.take_offsets(),
+                }
+            }
+            fn pop_staged_buffer(&mut self, parser: &dyn Parser) -> StagedBuffer {
+                self.buffers
+                    .pop_front()
+                    .unwrap_or_else(|| self.take_buffer(parser))
+            }
+            fn push_record(
+                &mut self,
+                consumer: &dyn InputConsumer,
+                partition: &i32,
+                offset: i64,
+                msg: Option<Box<dyn InputBuffer>>,
+                index: usize,
+            ) {
+                // Set the time when we start getting new data to be staged as ingestion timestamp.
+                if self.timestamp.is_none() {
+                    self.timestamp = Some(Utc::now());
+                }
+                let amt = msg.len();
+                consumer.buffered(amt);
+                self.amt += amt;
+                self.hasher.add(partition, &msg);
+                if let Some(buffer) = msg {
+                    self.inputs.push(buffer);
+                }
+
+                let range = &mut self.offsets[index];
+                if range.is_empty() {
+                    *range = offset..offset + 1;
+                } else {
+                    range.end = offset + 1;
+                }
+            }
+
+            fn maybe_stage(&mut self, consumer: &dyn InputConsumer, parser: &dyn Parser) {
+                if self.amt.records >= consumer.max_batch_size() {
+                    let buffer = self.take_buffer(parser);
+                    self.buffers.push_back(buffer);
+                }
+            }
+        }
+        let mut stager = Stager::new(&receivers, &partitions);
+
         loop {
             let was_running = running;
             while let Some(command) = command_receiver.try_recv()? {
                 match command {
-                    command @ InputReaderCommand::Seek(_)
-                    | command @ InputReaderCommand::Replay { .. } => {
+                    command @ InputReaderCommand::Replay { .. } => {
                         unreachable!("{command:?} must be at the beginning of the command stream")
                     }
                     InputReaderCommand::Extend => running = true,
                     InputReaderCommand::Pause => running = false,
                     InputReaderCommand::Queue { .. } => {
-                        let mut total = 0;
-                        let mut hasher = KafkaFtHasher::new(&partitions);
-                        let mut offsets = receivers
-                            .values()
-                            .map(|r| {
-                                let next_offset = r.next_offset();
-                                next_offset..next_offset
-                            })
-                            .collect::<Vec<_>>();
-                        while total < consumer.max_batch_size() {
-                            let mut empty = true;
-                            for ((partition, receiver), range) in
-                                receivers.iter().zip(offsets.iter_mut())
-                            {
-                                if let Some(mut msg) = receiver.read(i64::MAX) {
-                                    total += msg.buffer.len();
-                                    hasher.add(partition, &msg.buffer);
-                                    msg.buffer.flush();
-                                    empty = false;
-
-                                    if range.is_empty() {
-                                        *range = msg.offset..msg.offset + 1;
-                                    } else {
-                                        range.end = msg.offset + 1;
-                                    }
-                                }
-                            }
-                            if empty {
-                                break;
-                            }
-                        }
+                        let mut buffer = stager.pop_staged_buffer(&*parser);
+                        buffer.buffers.flush();
+                        let metadata = serde_json::to_value(&Metadata {
+                            offsets: buffer.offsets,
+                        })
+                        .unwrap();
                         consumer.extended(
-                            total,
+                            buffer.amt,
                             Some(Resume::Replay {
-                                hash: hasher.finish(),
-                                seek: serde_json::to_value(&Metadata { offsets }).unwrap(),
+                                hash: buffer.hash,
+                                seek: metadata.clone(),
                                 replay: rmpv::Value::Nil,
                             }),
+                            vec![Watermark::new(buffer.timestamp, Some(metadata))],
                         );
                     }
                     InputReaderCommand::Disconnect => return Ok(()),
@@ -467,6 +660,56 @@ impl KafkaFtInputReaderInner {
                 }
             }
 
+            let mut n_read = 0;
+            if running {
+                if config.synchronize_partitions {
+                    /// Returns the index(es) of the partition(s) in `receivers`
+                    /// with the earliest timestamp(s), or `None` if any of the
+                    /// receivers are out of received items.
+                    fn find_earliest(
+                        receivers: &BTreeMap<&i32, Arc<PartitionReceiver>>,
+                    ) -> Option<SmallVec<[usize; 1]>> {
+                        let mut iter = receivers.values().enumerate().map(|(index, receiver)| {
+                            receiver.peek().map(|timestamp| (index, timestamp))
+                        });
+                        let (index, mut best_timestamp) = iter.next()??;
+                        let mut best_indexes = smallvec![index];
+                        for item in iter {
+                            let (index, timestamp) = item?;
+                            if timestamp < best_timestamp {
+                                best_indexes.clear();
+                                best_indexes.push(index);
+                                best_timestamp = timestamp;
+                            } else if timestamp == best_timestamp {
+                                best_indexes.push(index);
+                            }
+                        }
+                        Some(best_indexes)
+                    }
+
+                    while n_read < partitions.len()
+                        && let Some(indexes) = find_earliest(&receivers)
+                    {
+                        n_read += indexes.len();
+                        for index in indexes {
+                            let partition = partitions[index];
+                            let (offset, (msg, _timestamp)) =
+                                receivers[&partition].read(i64::MAX).unwrap();
+                            stager.push_record(&**consumer, &partition, offset, msg, index);
+                        }
+                    }
+                } else {
+                    for (index, (partition, receiver)) in receivers.iter().enumerate() {
+                        if let Some((offset, (msg, _timestamp))) = receiver.read(i64::MAX) {
+                            stager.push_record(&**consumer, partition, offset, msg, index);
+                            n_read += 1;
+                        }
+                    }
+                };
+
+                stager.maybe_stage(&**consumer, &*parser);
+            }
+
             // Keep polling even while the consumer is paused as `BaseConsumer`
             // processes control messages (including rebalancing and errors)
             // within the polling thread.
@@ -474,13 +717,15 @@ impl KafkaFtInputReaderInner {
                 None => (),
                 Some(Err(e)) => {
                     let (fatal, e) = self.refine_error(e);
-                    consumer.error(fatal, e);
+                    consumer.error(fatal, e, Some("kafka-poll"));
                     if fatal {
                         return Ok(());
                     }
                 }
                 Some(Ok(message)) => {
-                    bail!("All partitions are split but the main consumer received a message anyway: {message:?}");
+                    bail!(
+                        "All partitions are split but the main consumer received a message anyway: {message:?}"
+                    );
                 }
             }
 
@@ -488,7 +733,7 @@ impl KafkaFtInputReaderInner {
                 let (fatal, _e) = self.refine_error(error);
                 // `reason` contains a human-readable description of the
                 // error.
-                consumer.error(fatal, anyhow!(reason));
+                consumer.error(fatal, anyhow!(reason), None);
                 if fatal {
                     return Ok(());
                 }
@@ -498,11 +743,14 @@ impl KafkaFtInputReaderInner {
                 return Ok(());
             }
             if receivers.values().all(|r| r.eof()) {
+                tracing::info!("reached end of all partitions (`enable.partition.eof` configured)");
                 consumer.eoi();
                 return Ok(());
             }
 
-            thread::park_timeout(Duration::from_secs(1));
+            if n_read == 0 {
+                thread::park_timeout(Duration::from_secs(1));
+            }
         }
     }
 
@@ -541,7 +789,13 @@ impl KafkaFtInputReader {
         config: &Arc<KafkaInputConfig>,
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
+        resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Self> {
+        let resume_info = if let Some(resume_info) = resume_info {
+            Some(parse_resume_info::<Metadata>(&resume_info)?)
+        } else {
+            None
+        };
         let _guard = span(&config.topic);
 
         // Create Kafka consumer configuration.
@@ -576,29 +830,34 @@ impl KafkaFtInputReader {
         *inner.kafka_consumer.context().endpoint.lock().unwrap() = Arc::downgrade(&inner);
 
         let (command_sender, command_receiver) = unbounded_channel();
-        let poller_handle = spawn({
-            let endpoint = inner.clone();
-            let config = config.clone();
-            move || {
-                let _guard = span(&config.topic);
-                if let Err(e) = endpoint.poller_thread(
-                    config.clone(),
-                    &consumer,
-                    parser,
-                    config
-                        .partitions
-                        .as_deref()
-                        .map(|p| p.len())
-                        .unwrap_or(partition_count),
-                    command_receiver,
-                ) {
-                    consumer.error(true, e);
+        let poller_handle = thread::Builder::new()
+            .name("kafka-input-poller".to_string())
+            .spawn({
+                let endpoint = inner.clone();
+                let config = config.clone();
+                move || {
+                    let _guard = span(&config.topic);
+                    if let Err(e) = endpoint.poller_thread(
+                        config.clone(),
+                        &consumer,
+                        parser,
+                        config
+                            .partitions
+                            .as_deref()
+                            .map(|p| p.len())
+                            .unwrap_or(partition_count),
+                        command_receiver,
+                        resume_info,
+                    ) {
+                        consumer.error(true, e, None);
+                    }
+                    tracing::info!("kafka input complete")
                 }
-            }
-        });
+            })
+            .expect("failed to spawn Kafka input poller thread");
         let poller_thread = poller_handle.thread().clone();
         Ok(KafkaFtInputReader {
-            _inner: inner,
+            inner,
             command_sender,
             poller_thread,
         })
@@ -617,22 +876,37 @@ impl TransportInputEndpoint for KafkaFtInputEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         _schema: Relation,
+        resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(KafkaFtInputReader::new(
             &self.config,
             consumer,
             parser,
+            resume_info,
         )?))
     }
 }
 
 impl InputReader for KafkaFtInputReader {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         let _ = self.command_sender.send(command);
         self.poller_thread.unpark();
     }
     fn is_closed(&self) -> bool {
         self.command_sender.is_closed()
+    }
+    fn memory(&self) -> usize {
+        self.inner
+            .kafka_consumer
+            .context()
+            .memory_use_reporter
+            .lock()
+            .unwrap()
+            .current()
     }
 }
 
@@ -649,43 +923,81 @@ pub(super) struct Metadata {
 }
 
 impl Metadata {
-    fn parse(self, n_partitions: usize) -> AnyResult<Vec<Range<i64>>> {
-        let offsets = self.offsets;
-        if offsets.len() != n_partitions {
-            bail!("topic has {n_partitions} partitions but metadata for replay has offsets for {} partitions", offsets.len());
+    fn parse(
+        self,
+        n_partitions: usize,
+        persisted_partitions: &mut Option<usize>,
+    ) -> AnyResult<Vec<Range<i64>>> {
+        // Kafka supports increasing the number of partitions in a topic, but
+        // not decreasing it.  If we are restarted with more partitions than we
+        // previously had, then we interpret checkpoints and journal entries as
+        // having empty ranges for the new partitions.  We log the discrepancy
+        // once at the beginning and once each time the number of journaled
+        // partitions increases.
+        //
+        // We disallow and fail if the number of partitions decreases, because
+        // Kafka doesn't support that either and we don't have a sensible way to
+        // recover from it (probably the lost partitions contained data and we
+        // can't recover it).
+        //
+        // We use `persisted_partitions` to ensure that the number of partitions
+        // increases monotonically.
+        let mut offsets = self.offsets;
+        let n_offsets = offsets.len();
+        if n_offsets > n_partitions {
+            bail!(
+                "metadata for replay has offsets for {n_offsets} partitions but topic has only {n_partitions} partitions; because Kafka does not allow partitions to be deleted, this implies that the topic has been deleted and recreated, which makes data loss likely"
+            );
         }
+
+        if let Some(persisted_partitions) = *persisted_partitions {
+            if n_offsets > persisted_partitions {
+                warn!("journaled partitions increased from {persisted_partitions} to {n_offsets}");
+            } else if n_offsets < persisted_partitions {
+                // Decreasing number of offsets indicates an inconsistency.
+                bail!("journaled partitions decreased from {persisted_partitions} to {n_offsets}");
+            }
+        } else if n_offsets != n_partitions {
+            warn!(
+                "topic partitions increased since the checkpoint from {n_offsets} to {n_partitions}; reading additional partitions from the start",
+            );
+        }
+        *persisted_partitions = Some(n_offsets);
+        offsets.extend((n_offsets..n_partitions).map(|_| 0..0));
         Ok(offsets)
     }
 }
 
-struct Msg {
-    offset: i64,
-    buffer: Option<Box<dyn InputBuffer>>,
-}
+/// For testing purposes, keeps track of partitions that we're not reading from
+/// because there is already too much queued.
+#[cfg(test)]
+pub static BACKPRESSURE: Mutex<BTreeSet<(String, i32)>> = Mutex::new(BTreeSet::new());
 
-impl PartialEq for Msg {
-    fn eq(&self, other: &Self) -> bool {
-        self.offset == other.offset
+#[cfg(test)]
+fn update_backpressure(topic: &str, partition: i32, has_backpressure: bool) {
+    let mut backpressure = BACKPRESSURE.lock().unwrap();
+    let member = (topic.into(), partition);
+    if has_backpressure {
+        backpressure.insert(member);
+    } else {
+        backpressure.remove(&member);
     }
 }
 
-impl Eq for Msg {}
+#[cfg(not(test))]
+fn update_backpressure(_topic: &str, _partition: i32, _has_backpressure: bool) {}
 
-impl PartialOrd for Msg {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Msg {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.offset.cmp(&other.offset)
-    }
+/// Returns true if a partition queue that holds `n_bytes` should pause for
+/// backpressure.
+fn needs_backpressure(n_bytes: usize) -> bool {
+    n_bytes >= 1_000_000
 }
 
 struct PartitionReceiver {
     partition: i32,
     queue: PartitionQueue<KafkaFtInputContext>,
+    config: KafkaInputConfig,
+    metadata_requested: bool,
 
     /// The maximum message offset that we want to receive, used as follows:
     ///
@@ -708,8 +1020,16 @@ struct PartitionReceiver {
     /// Initial value of `next_offset`.  Only used in log messages.
     initial_next_offset: i64,
 
-    /// Parsed messages and errors.
-    messages: Mutex<BTreeSet<Msg>>,
+    /// Parsed messages and errors, paired with timestamps.
+    #[allow(clippy::type_complexity)]
+    messages: Mutex<BTreeMap<i64, (Option<Box<dyn InputBuffer>>, i64)>>,
+
+    /// Number of bytes of buffers in `messages`, available without taking the
+    /// lock.
+    n_bytes: AtomicUsize,
+
+    /// Wakes up the [RecvThread] that receives into this partition.
+    unparker: Unparker,
 
     eof: AtomicBool,
     fatal_error: AtomicBool,
@@ -720,24 +1040,56 @@ impl PartitionReceiver {
         partition: i32,
         queue: PartitionQueue<KafkaFtInputContext>,
         next_offset: i64,
+        config: &KafkaInputConfig,
+        unparker: Unparker,
     ) -> Self {
+        let metadata_requested = config.metadata_requested();
+
         Self {
             partition,
             queue,
             max_offset: AtomicI64::new(i64::MIN),
             next_offset: AtomicI64::new(next_offset),
             initial_next_offset: next_offset,
-            messages: Mutex::new(BTreeSet::new()),
+            messages: Mutex::new(BTreeMap::new()),
+            n_bytes: AtomicUsize::new(0),
             eof: AtomicBool::new(false),
             fatal_error: AtomicBool::new(false),
+            config: config.clone(),
+            metadata_requested,
+            unparker,
         }
     }
-    pub fn read(&self, max: i64) -> Option<Msg> {
+
+    #[allow(clippy::type_complexity)]
+    pub fn read(&self, max: i64) -> Option<(i64, (Option<Box<dyn InputBuffer>>, i64))> {
         let mut messages = self.messages.lock().unwrap();
-        match messages.first() {
-            Some(msg) if msg.offset <= max => messages.pop_first(),
+        match messages.first_key_value() {
+            Some((offset, _)) if *offset <= max => {
+                let (offset, (buffer, timestamp)) = messages.pop_first().unwrap();
+
+                // Account the subtraction of the buffer from `self.n_bytes`.
+                // If that releases backpressure, then wake up its receiver
+                // thread.
+                let buffer_len = buffer.len().bytes;
+                let old_nbytes = self.n_bytes.fetch_sub(buffer_len, Ordering::Relaxed);
+                let new_bytes = old_nbytes - buffer_len;
+                if needs_backpressure(old_nbytes) && !needs_backpressure(new_bytes) {
+                    self.unparker.unpark();
+                }
+
+                Some((offset, (buffer, timestamp)))
+            }
             _ => None,
         }
+    }
+
+    pub fn peek(&self) -> Option<i64> {
+        self.messages
+            .lock()
+            .unwrap()
+            .first_entry()
+            .map(|entry| entry.get().1)
     }
 
     pub fn fatal_error(&self) -> bool {
@@ -760,6 +1112,60 @@ impl PartitionReceiver {
         self.next_offset.load(Ordering::Relaxed)
     }
 
+    /// Create record metadata from Kafka message containing only properties specified in the connector config.
+    fn create_metadata(&self, message: &BorrowedMessage<'_>) -> Option<ConnectorMetadata> {
+        if !self.metadata_requested {
+            return None;
+        }
+
+        let mut metadata = ConnectorMetadata::new();
+
+        if self.config.include_topic == Some(true) {
+            metadata.insert(
+                "kafka_topic",
+                Variant::String(SqlString::from(message.topic())),
+            );
+        };
+
+        if self.config.include_timestamp == Some(true) {
+            let timestamp = message.timestamp().to_millis();
+            if let Some(timestamp) = timestamp {
+                metadata.insert(
+                    "kafka_timestamp",
+                    Variant::Timestamp(Timestamp::from_milliseconds(timestamp)),
+                );
+            }
+        }
+
+        if self.config.include_partition == Some(true) {
+            metadata.insert("kafka_partition", Variant::Int(message.partition()));
+        }
+
+        if self.config.include_offset == Some(true) {
+            metadata.insert("kafka_offset", Variant::BigInt(message.offset()));
+        }
+
+        if self.config.include_headers == Some(true) {
+            let mut kafka_headers = BTreeMap::new();
+
+            if let Some(headers) = message.headers() {
+                for i in 0..headers.count() {
+                    let header = headers.get(i);
+                    let value = if let Some(value) = header.value {
+                        Variant::Binary(ByteArray::from(value))
+                    } else {
+                        Variant::SqlNull
+                    };
+                    kafka_headers.insert(Variant::String(SqlString::from(header.key)), value);
+                }
+            }
+
+            metadata.insert("kafka_headers", Variant::Map(Arc::new(kafka_headers)));
+        }
+
+        Some(metadata)
+    }
+
     fn handle_kafka_message(
         &self,
         base_consumer: &BaseConsumer<KafkaFtInputContext>,
@@ -773,7 +1179,7 @@ impl PartitionReceiver {
             }
             Err(e) => {
                 let (fatal, e) = refine_kafka_error(base_consumer.client(), e);
-                consumer.error(fatal, e);
+                consumer.error(fatal, e, Some("kafka-msg"));
                 if fatal {
                     self.fatal_error.store(true, Ordering::Relaxed);
                 }
@@ -783,17 +1189,22 @@ impl PartitionReceiver {
                 let next_offset = self.next_offset();
                 if offset >= next_offset {
                     self.next_offset.store(offset + 1, Ordering::Relaxed);
-
+                    let timestamp = message.timestamp().to_millis().unwrap_or(i64::MIN);
                     let payload = message.payload().unwrap_or(&[]);
-                    let (buffer, errors) = parser.parse(payload);
-                    let len = buffer.len();
-                    self.messages.lock().unwrap().insert(Msg { offset, buffer });
-                    consumer.buffered(len, payload.len());
+                    let metadata = self.create_metadata(&message);
+                    let (buffer, errors) = parser.parse(payload, metadata);
+                    self.n_bytes
+                        .fetch_add(buffer.len().bytes, Ordering::Relaxed);
+                    self.messages
+                        .lock()
+                        .unwrap()
+                        .insert(offset, (buffer, timestamp));
                     consumer.parse_errors(errors);
                 } else {
                     tracing::error!(
                         "Received message in partition {} at out-of-order offset {offset} (expected offset {next_offset} or greater; initial offset for this partition was {})",
-                        self.partition, self.initial_next_offset
+                        self.partition,
+                        self.initial_next_offset
                     );
                 }
             }
@@ -806,6 +1217,27 @@ impl PartitionReceiver {
         consumer: &dyn InputConsumer,
         parser: &mut dyn Parser,
     ) -> bool {
+        // Limit per-partition queuing.  This should ultimately exert
+        // backpressure on librdkafka reading from the partition (see [1]).
+        //
+        // The limit is pretty arbitrary.  It only needs to be high enough to
+        // keep up with `KafkaFtInputReaderInner::poller_thread`, which serially
+        // polls all of the partitions.
+        //
+        // For the unit tests only, we set an additional 1000-message limit
+        // because that is easier to test precisely.  Generally speaking,
+        // though, counting messages is undesirable because small messages will
+        // be dequeued quicker than we can start queuing them again.
+        //
+        // [1]: https://github.com/confluentinc/librdkafka/wiki/FAQ#what-are-partition-queues-and-why-are-some-partitions-slower-than-others
+        let backpressure = needs_backpressure(self.n_bytes.load(Ordering::Relaxed));
+        #[cfg(test)]
+        let backpressure = backpressure || self.messages.lock().unwrap().len() >= 1000;
+        update_backpressure(&self.config.topic, self.partition, backpressure);
+        if backpressure {
+            return false;
+        }
+
         let next_offset = self.next_offset();
         let max_offset = self.max_offset();
         if next_offset > max_offset {
@@ -864,6 +1296,7 @@ impl Drop for RecvThreadHandle {
 
 struct RecvThread {
     exit: Arc<AtomicBool>,
+    topic: String,
     main_thread: Thread,
     parker: Parker,
     base_consumer: Arc<BaseConsumer<KafkaFtInputContext>>,
@@ -874,6 +1307,7 @@ struct RecvThread {
 
 impl RecvThread {
     fn run(&mut self) {
+        let _guard = span(&self.topic);
         while !self.exit.load(Ordering::Relaxed) {
             let mut did_work = false;
             for receiver in &self.receivers {

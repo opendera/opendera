@@ -71,11 +71,11 @@ macro_rules! declare_trait_object_with_archived {
             }
         }
 
-        impl<$($generic),*> rkyv::Serialize<$crate::trace::Serializer> for Box<$type_alias<$($generic),*>> {
+        impl<$($generic),*> rkyv::Serialize<$crate::trace::DbspSerializer<'_>> for Box<$type_alias<$($generic),*>> {
             fn serialize(
                 &self,
-                _serializer: &mut $crate::trace::Serializer,
-            ) -> Result<Self::Resolver, <$crate::trace::Serializer as rkyv::Fallible>::Error> {
+                _serializer: &mut $crate::trace::DbspSerializer,
+            ) -> Result<Self::Resolver, <$crate::trace::DbspSerializer<'_> as rkyv::Fallible>::Error> {
                 todo!()
             }
         }
@@ -123,13 +123,13 @@ macro_rules! declare_typed_trait_object {
 
 #[cfg(test)]
 mod test {
+    use feldera_macros::IsNone;
     use rkyv::{Archive, Deserialize, Serialize};
     use size_of::SizeOf;
 
     use crate::{
-        declare_trait_object,
-        dynamic::{Data, DataTrait, DataTraitTyped, Erase, WeightTrait, WeightTraitTyped},
         DBData, DBWeight,
+        dynamic::{Data, DataTrait, DataTraitTyped, Erase, WeightTrait, WeightTraitTyped},
     };
 
     #[derive(
@@ -145,6 +145,7 @@ mod test {
         Archive,
         Serialize,
         Deserialize,
+        IsNone,
     )]
     #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
     #[archive(compare(PartialEq, PartialOrd))]

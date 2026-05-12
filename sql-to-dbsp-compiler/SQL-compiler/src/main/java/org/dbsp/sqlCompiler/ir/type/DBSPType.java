@@ -29,6 +29,7 @@ import org.dbsp.sqlCompiler.compiler.errors.UnsupportedException;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.ir.DBSPNode;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
+import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPPathExpression;
@@ -68,7 +69,19 @@ public abstract class DBSPType extends DBSPNode implements IDBSPInnerNode {
         builder.append(type);
     }
 
-    /** This is like 'equals', but it always takes a DBSPType. */
+    /** Number of generic arguments for this type's Rust implementation */
+    public int genericArgumentCount() {
+        return 0;
+    }
+
+    /** Write the generic arguments to the specified stream
+     * @param first If true, no comma is necessary prior to the first argument
+     * @return  True if the next argument is the first. */
+    public boolean emitGenericArguments(IIndentStream builder, boolean first) {
+        return first;
+    }
+
+    /** True if this type and the other type represent the same underlying type. */
     public abstract boolean sameType(DBSPType other);
 
     @SuppressWarnings("BooleanMethodIsAlwaysInverted")
@@ -122,6 +135,10 @@ public abstract class DBSPType extends DBSPNode implements IDBSPInnerNode {
         return new DBSPVariablePath(this);
     }
 
+    public DBSPVariablePath var(CalciteObject node) {
+        return new DBSPVariablePath(node, this);
+    }
+
     public DBSPPathExpression path(DBSPPath path) {
         return new DBSPPathExpression(this, path);
     }
@@ -130,11 +147,6 @@ public abstract class DBSPType extends DBSPNode implements IDBSPInnerNode {
      * compute the type that is the dereferenced type. */
     public DBSPType deref() {
         throw new InternalCompilerError("Deref of " + this);
-    }
-
-    /** The null value with this type. */
-    public DBSPExpression nullValue() {
-        return DBSPLiteral.none(this);
     }
 
     /** True if this type has a Rust 'copy' method. */
@@ -170,7 +182,7 @@ public abstract class DBSPType extends DBSPNode implements IDBSPInnerNode {
     }
 
     /** Returns a lambda which casts the current type to the specified type. */
-    public DBSPClosureExpression caster(DBSPType to, boolean safe) {
+    public DBSPClosureExpression caster(DBSPType to, DBSPCastExpression.CastType safe) {
             DBSPVariablePath var = this.ref().var();
             return var.deref()
                     .applyCloneIfNeeded()
@@ -189,7 +201,6 @@ public abstract class DBSPType extends DBSPNode implements IDBSPInnerNode {
 
     public boolean sameTypeIgnoringNullability(DBSPType type) {
         if (this.mayBeNull == type.mayBeNull)
-            // This prevents us from trying to make something nullable that can't be
             return this.sameType(type);
         return this.withMayBeNull(true).sameType(type.withMayBeNull(true));
     }
@@ -205,7 +216,7 @@ public abstract class DBSPType extends DBSPNode implements IDBSPInnerNode {
         } else if (this.is(IsBoundedType.class)) {
             return this.to(IsBoundedType.class).getMinValue();
         } else {
-            throw new UnsupportedException("Type has no minimum value", this.getNode());
+            throw new UnsupportedException("Type " + this.asSqlString() + " has no minimum value", this.getNode());
         }
     }
 

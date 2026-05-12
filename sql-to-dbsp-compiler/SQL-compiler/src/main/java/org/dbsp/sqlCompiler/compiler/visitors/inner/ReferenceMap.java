@@ -21,8 +21,9 @@ public class ReferenceMap {
         if (this.declarations.containsKey(var)) {
             IDBSPDeclaration decl = this.declarations.get(var);
             if (decl != declaration)
-                throw new InternalCompilerError("Changing declaration of " + var + " from " +
-                        decl + " to " + declaration, var);
+                throw new InternalCompilerError("Changing declaration of " + var + " from\n" +
+                        decl.getId() + " " + decl + " to\n" +
+                        declaration.getId() + " " + declaration, var);
             return;
         }
         Utilities.putNew(this.declarations, var, declaration);

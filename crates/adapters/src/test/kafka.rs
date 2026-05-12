@@ -1,34 +1,35 @@
 #![allow(clippy::type_complexity)]
 
+use crate::InputBuffer;
 use crate::catalog::InputCollectionHandle;
 use crate::format::get_input_format;
-use crate::test::{wait, MockDeZSet, MockUpdate, TestStruct, DEFAULT_TIMEOUT_MS};
-use crate::InputBuffer;
-use anyhow::{anyhow, bail, Result as AnyResult};
+use crate::test::{DEFAULT_TIMEOUT_MS, MockDeZSet, MockUpdate, TestStruct, wait};
+use anyhow::{Result as AnyResult, anyhow, bail};
 use csv::WriterBuilder as CsvWriterBuilder;
 use dbsp::circuit::NodeId;
 use feldera_types::program_schema::Relation;
 use feldera_types::transport::kafka::default_redpanda_server;
 use futures::executor::block_on;
-use rdkafka::message::BorrowedMessage;
+use rdkafka::message::{BorrowedMessage, Header, OwnedHeaders};
 use rdkafka::{
+    ClientConfig, ClientContext, Message,
     admin::{AdminClient, AdminOptions, NewPartitions, NewTopic, TopicReplication},
     client::{Client, DefaultClientContext},
     config::{FromClientConfig, RDKafkaLogLevel},
     consumer::{BaseConsumer, Consumer},
     producer::{BaseRecord, DefaultProducerContext, Producer, ThreadedProducer},
     util::Timeout,
-    ClientConfig, ClientContext, Message,
 };
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
-    thread::{sleep, JoinHandle},
+    thread::{JoinHandle, sleep},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{error, info};
@@ -60,9 +61,11 @@ fn check_topics<C: ClientContext>(consumer: &Client<C>, topics: &[(&str, i32)]) 
             bail!("{topic} has {cur_partitions} partitions, waiting for {partitions}");
         }
         if partitions > 0 {
-            consumer
-                .fetch_watermarks(topic, 0, Duration::from_secs(1))
-                .map_err(|e| anyhow!("topic {topic}: {e}"))?;
+            for partition in 0..partitions {
+                consumer
+                    .fetch_watermarks(topic, partition, Duration::from_secs(1))
+                    .map_err(|e| anyhow!("topic {topic}: {e}"))?;
+            }
         }
     }
     Ok(())
@@ -78,9 +81,14 @@ fn wait_for_completion<C: ClientContext>(admin_client: &AdminClient<C>, topics: 
     let mut backoff = 100;
     let mut n_retries = 0;
     while let Err(err) = check_topics(admin_client.inner(), topics) {
-        info!("KafkaResources::create_topics {topic_names:?}: unable to connect to newly created topics, retrying: {err}");
+        info!(
+            "KafkaResources::create_topics {topic_names:?}: unable to connect to newly created topics, retrying: {err}"
+        );
         if start.elapsed() > MAX_TOPIC_PROBE_TIMEOUT {
-            panic!("KafkaResources::create_topics {topic_names:?}: unable to connect to newly created topics, giving up after {}ms: {err}", MAX_TOPIC_PROBE_TIMEOUT.as_millis());
+            panic!(
+                "KafkaResources::create_topics {topic_names:?}: unable to connect to newly created topics, giving up after {}ms: {err}",
+                MAX_TOPIC_PROBE_TIMEOUT.as_millis()
+            );
         }
         sleep(Duration::from_millis(backoff));
         backoff = 1000.min(backoff * 2);
@@ -128,14 +136,15 @@ impl KafkaResources {
         // Now create the topics and wait for the creations to complete.
         let new_topics = topics
             .iter()
-            .filter(|&(_topic_name, partitions)| (*partitions > 0))
+            .filter(|&(_topic_name, partitions)| *partitions > 0)
             .map(|(topic_name, partitions)| {
                 NewTopic::new(topic_name, *partitions, TopicReplication::Fixed(1))
             })
             .collect::<Vec<_>>();
-        block_on(admin_client.create_topics(&new_topics, &AdminOptions::new())).unwrap();
-        wait_for_completion(&admin_client, topics);
-
+        if !new_topics.is_empty() {
+            block_on(admin_client.create_topics(&new_topics, &AdminOptions::new())).unwrap();
+            wait_for_completion(&admin_client, topics);
+        }
         Self {
             admin_client,
             topics: topics
@@ -145,12 +154,13 @@ impl KafkaResources {
         }
     }
 
-    pub fn add_partition(&self, topic: &str) {
-        block_on(
-            self.admin_client
-                .create_partitions(&[NewPartitions::new(topic, 1)], &AdminOptions::new()),
-        )
+    pub fn add_partition(&self, topic: &str, new_partition_count: usize) {
+        block_on(self.admin_client.create_partitions(
+            &[NewPartitions::new(topic, new_partition_count)],
+            &AdminOptions::new(),
+        ))
         .unwrap();
+        wait_for_completion(&self.admin_client, &[(topic, new_partition_count as i32)]);
     }
 }
 
@@ -170,7 +180,7 @@ impl Drop for KafkaResources {
 }
 
 pub struct TestProducer {
-    producer: ThreadedProducer<DefaultProducerContext>,
+    pub producer: ThreadedProducer<DefaultProducerContext>,
 }
 
 impl Default for TestProducer {
@@ -208,6 +218,28 @@ impl TestProducer {
         }
         // producer.flush(Timeout::Never).unwrap();
         // println!("Data written to '{topic}'");
+    }
+
+    // Send a serialized message with optional headers.
+    pub fn send_message(
+        &self,
+        data: &[u8],
+        topic: &str,
+        headers: Option<BTreeMap<String, Option<Vec<u8>>>>,
+    ) {
+        let mut kafka_headers = OwnedHeaders::new();
+
+        for (key, value) in headers.unwrap_or_default().iter() {
+            kafka_headers = kafka_headers.insert(Header {
+                key,
+                value: value.as_ref().map(|value| value.as_slice()),
+            });
+        }
+        let record = <BaseRecord<(), [u8], ()>>::to(topic)
+            .payload(data)
+            .headers(kafka_headers);
+        self.producer.send(record).unwrap();
+        self.producer.flush(Timeout::Never).unwrap();
     }
 
     pub fn send_to_topic_partition(&self, data: &[Vec<TestStruct>], topic: &str, partition: i32) {
@@ -264,7 +296,7 @@ impl BufferConsumer {
     pub fn new(
         topic: &str,
         format: &str,
-        format_config_yaml: &str,
+        format_config: Value,
         message_cb: Option<Box<dyn Fn(&BorrowedMessage) + Send>>,
     ) -> Self {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -281,7 +313,7 @@ impl BufferConsumer {
             .new_parser(
                 "BaseConsumer",
                 &InputCollectionHandle::new(schema, buffer.clone(), NodeId::new(0)),
-                &serde_yaml::from_str::<serde_yaml::Value>(format_config_yaml).unwrap(),
+                &format_config,
             )
             .unwrap();
 
@@ -328,7 +360,7 @@ impl BufferConsumer {
                             };
 
                             if let Some(payload) = message.payload() {
-                                parser.parse(payload).0.flush();
+                                parser.parse(payload, None).0.flush();
                             }
                         }
                     }

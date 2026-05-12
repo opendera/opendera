@@ -1,6 +1,8 @@
 package org.dbsp.sqlCompiler.compiler.errors;
 
 import org.apache.calcite.sql.SqlNode;
+import org.dbsp.util.IIndentStream;
+import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
 import java.io.BufferedReader;
@@ -48,15 +50,25 @@ public class SourceFileContents {
     public String getFragment(SourcePositionRange range, boolean decorated) {
         if (!range.isValid())
             return "";
-        int startLine = range.start.line - 1;
+        final int startLine = range.start.line - 1;
         int endLine = range.end.line - 1;
-        int startCol = range.start.column - 1;
-        int endCol = range.end.column;
-        StringBuilder result = new StringBuilder();
+        final int startCol = range.start.column - 1;
+        final int endCol = range.end.column;
+        final StringBuilder result = new StringBuilder();
         if (startLine == endLine) {
             if (startLine >= this.lines.size())
                 // This should not really happen.
                 return "";
+            if (this.lines.size() - 1 == startLine && this.lines.size() > 1) {
+                // Print one previous line to help disambiguate location
+                if (decorated) {
+                    String prevLine = this.lines.get(startLine - 1);
+                    result.append(lineNo(startLine - 1, decorated))
+                            .append(prevLine)
+                            .append(SourceFileContents.newline());
+                }
+            }
+
             String line = this.lines.get(startLine);
             if (!decorated)
                 line = line.substring(startCol, endCol);
@@ -72,13 +84,16 @@ public class SourceFileContents {
             if (this.lines.size() > startLine + 1) {
                 // Print one more line to help disambiguate location
                 if (decorated) {
-                    line = this.lines.get(startLine + 1);
+                    String nextLine = this.lines.get(startLine + 1);
                     result.append(lineNo(startLine + 1, decorated))
-                            .append(line)
+                            .append(nextLine)
                             .append(SourceFileContents.newline());
                 }
             }
         } else {
+            // Sometimes this ends on a line which does not exist in the file
+            if (endLine == this.lines.size())
+                endLine = this.lines.size() - 1;
             if (endLine - startLine < 5 || !decorated) {
                 for (int i = startLine; i <= endLine; i++) {
                     String line = this.lines.get(i);
@@ -90,8 +105,7 @@ public class SourceFileContents {
                     }
                     result.append(this.lineNo(i, decorated))
                             .append(line);
-                    if (decorated)
-                        result.append(SourceFileContents.newline());
+                    result.append(SourceFileContents.newline());
                 }
             } else {
                 result.append(this.lineNo(startLine, decorated))
@@ -128,5 +142,11 @@ public class SourceFileContents {
             this.builder.append(line)
                     .append(SourceFileContents.newline());
         }
+    }
+
+    public void writeAsJson(IIndentStream stream) {
+        stream.append("[").increase();
+        stream.joinI(",\n", this.lines, l -> Utilities.doubleQuote(l, false));
+        stream.newline().decrease().append("]");
     }
 }

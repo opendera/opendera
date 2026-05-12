@@ -1,0 +1,69 @@
+# Run all the runtiem things against our CI installations
+name: Runtime Integration Tests
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID of the workflow run that uploaded the artifact"
+        required: true
+
+jobs:
+  runtime-tests:
+    if: ${{ !contains(vars.CI_SKIP_JOBS, 'runtime-tests') }}
+    name: Runtime Integration Tests
+    strategy:
+      matrix:
+        include:
+          - runner: [k8s-runners-amd64]
+            feldera_host: ${{ vars.FELDERA_HOST_CI_AMD64 }}
+            feldera_api_key: FELDERA_API_KEY_CI_AMD64
+          - runner: [k8s-runners-arm64]
+            feldera_host: ${{ vars.FELDERA_HOST_CI_ARM64 }}
+            feldera_api_key: FELDERA_API_KEY_CI_ARM64
+    runs-on: ${{ matrix.runner }}
+    env:
+      FELDERA_HOST: ${{ matrix.feldera_host }}
+      FELDERA_API_KEY: ${{ secrets[matrix.feldera_api_key] }}
+      FELDERA_RUNTIME_VERSION: ${{ github.sha }}
+      CI_K8S_MINIO_ACCESS_KEY_ID: ${{ secrets.CI_K8S_MINIO_TEST_BUCKET_ACCESS_KEY_ID }}
+      CI_K8S_MINIO_SECRET_ACCESS_KEY: ${{ secrets.CI_K8S_MINIO_TEST_BUCKET_SECRET_ACCESS_KEY }}
+    container:
+      image: ghcr.io/feldera/feldera-dev:sha-3613839bd73108aee58017bf75dda42f7a3d0bb4
+    steps:
+      - name: Show Kubernetes node
+        if: always()
+        run: |
+          echo "K8S node: ${K8S_NODE_NAME}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Python runtime tests
+        if: ${{ vars.CI_DRY_RUN != 'true' && !contains(vars.CI_SKIP_JOBS, 'runtime-pytest') }}
+        run: uv run --locked pytest -n ${{ vars.PYTEST_WORKERS }} tests/runtime --timeout=3600 -vv ${{ vars.PYTEST_EXTRA }}
+        working-directory: python
+        env:
+          PYTHONPATH: ${{ github.workspace }}/python
+          FELDERA_TLS_INSECURE: true
+
+      - name: Python runtime_aggtest test
+        if: ${{ vars.CI_DRY_RUN != 'true' && !contains(vars.CI_SKIP_JOBS, 'runtime-aggtest') }}
+        run: uv run --locked ./tests/runtime_aggtest/run.sh
+        working-directory: python
+        env:
+          RUNTIME_AGGTEST_JOBS: ${{ vars.RUNTIME_AGGTEST_JOBS }}
+          PYTHONPATH: ${{ github.workspace }}/python
+          FELDERA_TLS_INSECURE: true
+
+      - name: Python workload tests
+        if: ${{ vars.CI_DRY_RUN != 'true' && !contains(vars.CI_SKIP_JOBS, 'runtime-workload') }}
+        run: uv run --locked pytest -n ${{ vars.PYTEST_WORKERS }} tests/workloads --timeout=3600 -vv ${{ vars.PYTEST_EXTRA }}
+        working-directory: python
+        env:
+          PYTHONPATH: ${{ github.workspace }}/python
+          FELDERA_TLS_INSECURE: true
+          KAFKA_BOOTSTRAP_SERVERS: ${{ vars.CI_KAFKA_BOOTSTRAP }}
+          SCHEMA_REGISTRY_URL: ${{ vars.CI_SCHEMA_REGISTRY }}
+          RUN_ID: 1 # we use this to run a single variant of the Kafka tests in test_kafka_avro.py

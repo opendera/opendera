@@ -1,41 +1,34 @@
 package org.dbsp.sqlCompiler.compiler.visitors.outer;
 
-import org.dbsp.sqlCompiler.circuit.operator.DBSPAsofJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPApply2Operator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPApplyOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPConcreteAsofJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPFlatMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinFilterMapOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPLeftJoinFilterMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNoopOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateWithWaterlineOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPStarJoinFilterMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
-import org.dbsp.sqlCompiler.compiler.frontend.TypeCompiler;
-import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteRelNode;
 import org.dbsp.sqlCompiler.ir.aggregate.DBSPFold;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyMethodExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPBinaryExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPBlockExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
-import org.dbsp.sqlCompiler.ir.expression.DBSPComparatorExpression;
-import org.dbsp.sqlCompiler.ir.expression.DBSPCustomOrdExpression;
-import org.dbsp.sqlCompiler.ir.expression.DBSPCustomOrdField;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPFlatmap;
 import org.dbsp.sqlCompiler.ir.expression.DBSPIfExpression;
-import org.dbsp.sqlCompiler.ir.expression.DBSPNoComparatorExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPOpcode;
-import org.dbsp.sqlCompiler.ir.expression.DBSPRawTupleExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPTupleExpression;
-import org.dbsp.sqlCompiler.ir.expression.DBSPUnwrapCustomOrdExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPVariablePath;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPStrLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPUSizeLiteral;
@@ -49,10 +42,8 @@ import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeAny;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeRawTuple;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTupleBase;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeUSize;
-import org.dbsp.sqlCompiler.ir.type.user.DBSPComparatorType;
-import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeMap;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeBTreeMap;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeVec;
-import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeWithCustomOrd;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
 import org.dbsp.util.Linq;
 import org.dbsp.util.Utilities;
@@ -113,7 +104,7 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
                     DBSPTypeUSize.INSTANCE, DBSPOpcode.ADD,
                     e.field(0),
                     new DBSPUSizeLiteral(1))
-                    .cast(flatmap.getNode(), flatmap.ordinalityIndexType, false);
+                    .cast(flatmap.getNode(), flatmap.ordinalityIndexType, DBSPCastExpression.CastType.SqlUnsafe);
         }
 
         if (flatmap.rightProjections != null) {
@@ -133,8 +124,14 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
                 if (flatmap.ordinalityIndexType != null)
                     fields.add(e0plus1);
                 DBSPExpression argument = new DBSPTupleExpression(
-                        fields, flatmap.getCollectionElementType().mayBeNull);
-                resultColumns.add(clo.call(argument.borrow()).applyCloneIfNeeded());
+                        fields,
+                        // Make nullable only if there is no ordinality
+                        flatmap.getCollectionElementType().mayBeNull &&
+                                flatmap.ordinalityIndexType == null);
+                DBSPExpression call = clo.call(argument.borrow());
+                if (compiler != null)
+                    call = call.reduce(compiler);
+                resultColumns.add(call.applyCloneIfNeeded());
             }
         } else {
             if (flatmap.ordinalityIndexType != null) {
@@ -183,14 +180,16 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
             if (flatmap.collectionKind == DBSPTypeCode.ARRAY)
                 empty = new DBSPTypeVec(collectionElementType, false).emptyVector();
             else if (flatmap.collectionKind == DBSPTypeCode.MAP) {
-                DBSPTypeTuple tup = collectionElementType.to(DBSPTypeTuple.class);
+                DBSPTypeTupleBase tup = collectionElementType.to(DBSPTypeTupleBase.class);
                 Utilities.enforce(tup.size() == 2);
-                empty = new DBSPTypeMap(tup.tupFields[0], tup.tupFields[1], false).defaultValue();
+                empty = new DBSPTypeBTreeMap(tup.tupFields[0], tup.tupFields[1], false).emptyMap();
             } else {
                 throw new InternalCompilerError("Unexpected collection type in flatmap " + flatmap.collectionKind);
             }
 
-            DBSPExpression contents = statement.getVarReference().unwrap().deref().applyClone();
+            DBSPExpression contents = statement.getVarReference()
+                    .unwrap(extractCollection.getNode(), "Collection UNNESTed should not be NULL")
+                    .deref().applyClone();
             collectionExpression = new DBSPIfExpression(flatmap.getNode(), condition, empty, contents);
         } else {
             collectionExpression = statement.getVarReference().deref().applyClone();
@@ -272,7 +271,7 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
     @Override
     public void postorder(DBSPStreamAggregateOperator node) {
         if (node.function != null) {
-            // OrderBy
+            // OrderBy implemented as an aggregate
             super.postorder(node);
             return;
         }
@@ -287,7 +286,7 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
     @Override
     public void postorder(DBSPAggregateOperator node) {
         if (node.function != null) {
-            // OrderBy
+            // OrderBy implemented as an aggregate
             super.postorder(node);
             return;
         }
@@ -299,10 +298,13 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
     }
 
     public static DBSPClosureExpression lowerJoinFilterMapFunctions(
-            DBSPCompiler compiler, DBSPJoinFilterMapOperator node) {
-        if (node.filter == null)
-            return node.getClosureFunction();
-        if (node.map == null) {
+            DBSPCompiler compiler, DBSPClosureExpression expression,
+            @Nullable DBSPClosureExpression filter, @Nullable DBSPClosureExpression map) {
+        if (filter == null) {
+            Utilities.enforce(map == null);
+            return expression;
+        }
+        if (map == null) {
             // Generate code of the form
             // let tmp = join(...);
             // if (filter(tmp)) {
@@ -310,17 +312,15 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
             // } else {
             //     None
             // }
-            DBSPClosureExpression expression = node.getClosureFunction();
-            DBSPClosureExpression filter = node.filter.to(DBSPClosureExpression.class);
             DBSPLetStatement let = new DBSPLetStatement("tmp", expression.body);
             DBSPExpression cond = filter.call(let.getVarReference().borrow()).reduce(compiler);
             DBSPExpression tmp = let.getVarReference();
-            DBSPIfExpression ifexp = new DBSPIfExpression(
-                    node.getRelNode(),
+            DBSPIfExpression ifExp = new DBSPIfExpression(
+                    expression.getNode(),
                     cond,
                     tmp.some(),
                     tmp.getType().withMayBeNull(true).none());
-            DBSPBlockExpression block = new DBSPBlockExpression(Linq.list(let), ifexp);
+            DBSPBlockExpression block = new DBSPBlockExpression(Linq.list(let), ifExp);
             return block.closure(expression.parameters);
         } else {
             // Generate code of the form
@@ -329,20 +329,18 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
             // } else {
             //    None
             // }
-            DBSPClosureExpression expression = node.getClosureFunction();
-            DBSPClosureExpression filter = node.filter.to(DBSPClosureExpression.class);
             DBSPExpression cond = filter
                     .call(expression.body.borrow())
                     .reduce(compiler);
-            DBSPExpression map = node.map.to(DBSPClosureExpression.class)
+            DBSPExpression map0 = map.to(DBSPClosureExpression.class)
                     .call(expression.body.borrow())
                     .reduce(compiler);
-            DBSPIfExpression ifexp = new DBSPIfExpression(
-                    node.getRelNode(),
+            DBSPIfExpression ifExp = new DBSPIfExpression(
+                    expression.getNode(),
                     cond,
-                    map.some(),
-                    map.getType().withMayBeNull(true).none());
-            return ifexp.closure(expression.parameters);
+                    map0.some(),
+                    map0.getType().withMayBeNull(true).none());
+            return ifExp.closure(expression.parameters);
         }
     }
 
@@ -353,10 +351,43 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
             super.postorder(node);
             return;
         }
-        DBSPExpression newFunction = lowerJoinFilterMapFunctions(this.compiler(), node);
+        DBSPExpression newFunction = lowerJoinFilterMapFunctions(this.compiler(),
+                node.getClosureFunction(), node.filter, node.map);
         DBSPSimpleOperator result = new DBSPJoinFilterMapOperator(node.getRelNode(), node.getOutputZSetType(),
                 newFunction, null, null, node.isMultiset,
-                this.mapped(node.left()), this.mapped(node.right()))
+                this.mapped(node.left()), this.mapped(node.right()), node.balanced)
+                .copyAnnotations(node);
+        this.map(node, result);
+    }
+
+    @Override
+    public void postorder(DBSPStarJoinFilterMapOperator node) {
+        if (node.filter == null) {
+            // Already lowered, or we will remove them later
+            super.postorder(node);
+            return;
+        }
+        DBSPClosureExpression newFunction = lowerJoinFilterMapFunctions(this.compiler(),
+                node.getClosureFunction(), node.filter, node.map);
+        DBSPSimpleOperator result = new DBSPStarJoinFilterMapOperator(node.getRelNode(), node.getOutputZSetType(),
+                newFunction, null, null, node.isMultiset,
+                Linq.map(node.inputs, this::mapped))
+                .copyAnnotations(node);
+        this.map(node, result);
+    }
+
+    @Override
+    public void postorder(DBSPLeftJoinFilterMapOperator node) {
+        if (node.filter == null) {
+            // Already lowered
+            super.postorder(node);
+            return;
+        }
+        DBSPExpression newFunction = lowerJoinFilterMapFunctions(this.compiler(), node.getClosureFunction(),
+                node.filter, node.map);
+        DBSPSimpleOperator result = new DBSPLeftJoinFilterMapOperator(node.getRelNode(), node.getOutputZSetType(),
+                newFunction, null, null, node.isMultiset,
+                this.mapped(node.left()), this.mapped(node.right()), node.balanced)
                 .copyAnnotations(node);
         this.map(node, result);
     }
@@ -389,106 +420,15 @@ public class LowerCircuitVisitor extends CircuitCloneVisitor {
 
     @Override
     public void postorder(DBSPPartitionedRollingAggregateWithWaterlineOperator node) {
-        if (node.aggregate == null) {
+        if (node.aggregateList == null) {
             super.postorder(node);
             return;
         }
-        DBSPFold function = node.aggregate.asFold(this.compiler());
+        DBSPFold function = node.aggregateList.asFold(this.compiler());
         DBSPSimpleOperator result = new DBSPPartitionedRollingAggregateWithWaterlineOperator(node.getRelNode(),
                 node.partitioningFunction, function, null, node.lower, node.upper,
                 node.getOutputIndexedZSetType(),
                 this.mapped(node.left()), this.mapped(node.right()));
         this.map(node, result);
-    }
-
-    @Override
-    public void postorder(DBSPAsofJoinOperator join) {
-        // Convert AsofJoinOperator to ConcreteAsofJoinOperator
-        // The new operator has two MapIndex operators in front of its
-        // inputs, producing DBSPCustomOrdExpressions.
-        // Internally the new operator also has a function which converts
-        // back to normal types.
-        CalciteRelNode node = join.getRelNode();
-        DBSPTypeTuple leftElementType = join.getLeftInputValueType()
-                .to(DBSPTypeTuple.class);
-        DBSPTypeTuple rightElementType = join.getRightInputValueType()
-                .to(DBSPTypeTuple.class);
-        DBSPType keyType = join.getKeyType();
-
-        DBSPVariablePath l = join.left().getOutputIndexedZSetType().getKVRefType().var();
-        DBSPVariablePath r = join.right().getOutputIndexedZSetType().getKVRefType().var();
-
-        DBSPTupleExpression tuple = DBSPTupleExpression.flatten(l.field(1).deref());
-        DBSPComparatorExpression leftComparator =
-                new DBSPNoComparatorExpression(node, leftElementType)
-                        .field(join.leftTimestampIndex, true);
-        DBSPComparatorType leftComparatorType = leftComparator.getComparatorType();
-        DBSPExpression wrapper = new DBSPCustomOrdExpression(node, tuple, leftComparator);
-        DBSPClosureExpression toLeftKey =
-                new DBSPRawTupleExpression(DBSPTupleExpression.flatten(l.field(0).deref()), wrapper)
-                        .closure(l);
-        DBSPMapIndexOperator leftIndex = new DBSPMapIndexOperator(
-                node, toLeftKey,
-                TypeCompiler.makeIndexedZSet(keyType, wrapper.getType()),
-                false, this.mapped(join.left()));
-        this.addOperator(leftIndex);
-
-        DBSPComparatorExpression rightComparator =
-                new DBSPNoComparatorExpression(node, rightElementType)
-                        .field(join.rightTimestampIndex, true);
-        DBSPType rightComparatorType = rightComparator.getComparatorType();
-        wrapper = new DBSPCustomOrdExpression(node,
-                DBSPTupleExpression.flatten(r.field(1).deref()), rightComparator);
-        DBSPClosureExpression toRightKey =
-                new DBSPRawTupleExpression(r.field(0).deref(), wrapper)
-                        .closure(r);
-        DBSPMapIndexOperator rightIndex = new DBSPMapIndexOperator(
-                node, toRightKey,
-                TypeCompiler.makeIndexedZSet(keyType, wrapper.getType()),
-                false, this.mapped(join.right()));
-        this.addOperator(rightIndex);
-
-        DBSPType wrappedLeftType = new DBSPTypeWithCustomOrd(node, leftElementType, leftComparatorType);
-        DBSPType wrappedRightType = new DBSPTypeWithCustomOrd(node, rightElementType, rightComparatorType);
-
-        DBSPVariablePath leftVar = wrappedLeftType.ref().var();
-        DBSPVariablePath rightVar = wrappedRightType.ref().var();
-
-        DBSPExpression leftTS = new DBSPUnwrapCustomOrdExpression(leftVar.deref())
-                .field(join.leftTimestampIndex);
-        DBSPExpression rightTS = new DBSPUnwrapCustomOrdExpression(rightVar.deref())
-                .field(join.rightTimestampIndex);
-
-        DBSPType leftTSType = leftTS.getType();
-        DBSPType rightTSType = rightTS.getType();
-        // Rust expects both timestamps to have the same type
-        boolean nullable = leftTSType.mayBeNull || rightTSType.mayBeNull;
-        DBSPType commonTSType = leftTSType.withMayBeNull(nullable);
-        Utilities.enforce(commonTSType.sameType(rightTSType.withMayBeNull(nullable)));
-
-        DBSPClosureExpression leftTimestamp = leftTS.cast(leftTS.getNode(), commonTSType, false).closure(leftVar);
-        DBSPClosureExpression rightTimestamp = rightTS.cast(rightTS.getNode(), commonTSType, false).closure(rightVar);
-
-        DBSPVariablePath k = keyType.ref().var();
-        DBSPVariablePath l0 = wrappedLeftType.ref().var();
-        // Signature of the function is (k: &K, l: &L, r: Option<&R>)
-        DBSPVariablePath r0 = wrappedRightType.ref().withMayBeNull(true).var();
-        List<DBSPExpression> lFields = new ArrayList<>();
-        for (int i = 0; i < leftElementType.size(); i++)
-            lFields.add(new DBSPUnwrapCustomOrdExpression(l0.deref()).field(i));
-        List<DBSPExpression> rFields = new ArrayList<>();
-        for (int i = 0; i < rightElementType.size(); i++)
-            rFields.add(new DBSPCustomOrdField(r0, i));
-        DBSPTupleExpression lTuple = new DBSPTupleExpression(lFields, false);
-        DBSPTupleExpression rTuple = new DBSPTupleExpression(rFields, false);
-        DBSPExpression call = join.getClosureFunction().call(k, lTuple.borrow(), rTuple.borrow())
-                .reduce(this.compiler);
-        DBSPExpression function = call.closure(k, l0, r0);
-
-        DBSPSimpleOperator result = new DBSPConcreteAsofJoinOperator(node, join.getOutputZSetType(),
-                function, leftTimestamp, rightTimestamp, join.comparator,
-                join.isMultiset, join.isLeft,
-                leftIndex.outputPort(), rightIndex.outputPort());
-        this.map(join, result);
     }
 }

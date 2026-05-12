@@ -52,8 +52,13 @@ impl Default for DateFormat {
 }
 
 /// Representation of the SQL `TIMESTAMP` type.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum TimestampFormat {
+    /// Default format:
+    /// - Parsing: accepts RFC3339 ('YYYY-MM-DDTHH:MM:SS.fffZ') as well as 'YYYY-MM-DD HH:MM:SS.fff' formats.
+    /// - Encoding: outputs 'YYYY-MM-DD HH:MM:SS.fff' format.
+    #[default]
+    Default,
     /// String formatted using the specified format:
     /// See [`chrono` documentation](https://docs.rs/chrono/0.4.31/chrono/format/strftime/)
     /// for supported formatting syntax.
@@ -66,44 +71,30 @@ pub enum TimestampFormat {
     Rfc3339,
 }
 
-impl Default for TimestampFormat {
-    fn default() -> Self {
-        Self::String("%F %T%.f")
-    }
-}
-
 /// Representation of the SQL `DECIMAL` type.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum DecimalFormat {
+    #[default]
     Numeric,
     String,
-}
-
-impl Default for DecimalFormat {
-    fn default() -> Self {
-        Self::Numeric
-    }
+    I128,
 }
 
 /// Representation of the SQL `VARIANT` type.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum VariantFormat {
     /// Serialize VARIANT to/from a JSON value.
     Json,
     /// Represent variant type as a JSON-formatted string.
+    #[default]
     JsonString,
 }
 
-impl Default for VariantFormat {
-    fn default() -> Self {
-        Self::JsonString
-    }
-}
-
 /// Representation of the SQL `BINARY` and `VARBINARY` types.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum BinaryFormat {
     /// Serialize as a sequence of bytes.
+    #[default]
     Array,
     /// Serialize as base64-encoded string.
     Base64,
@@ -113,27 +104,18 @@ pub enum BinaryFormat {
     Bytes,
     /// Serialize as a hexadecimal-encoded string, beginning with `\x`.
     PgHex,
-}
-
-impl Default for BinaryFormat {
-    fn default() -> Self {
-        Self::Array
-    }
+    /// Serialize as a hexadecimal-encoded string, beginning with `0x`.
+    CHex,
 }
 
 /// Representation of the SQL `BINARY` and `VARBINARY` types.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum UuidFormat {
     /// Serialize as string.
+    #[default]
     String,
     /// Serialize as binary.
     Binary,
-}
-
-impl Default for UuidFormat {
-    fn default() -> Self {
-        Self::String
-    }
 }
 
 /// Deserializer configuration for parsing SQL records.
@@ -252,15 +234,11 @@ impl From<JsonFlavor> for SqlSerdeConfig {
             JsonFlavor::Blockchain => {
                 SqlSerdeConfig::default().with_binary_format(BinaryFormat::Base58)
             }
+            JsonFlavor::CHex => SqlSerdeConfig::default().with_binary_format(BinaryFormat::CHex),
             JsonFlavor::ParquetConverter => Self {
                 time_format: TimeFormat::Nanos,
                 date_format: DateFormat::String("%Y-%m-%d"),
-                // TODO: This should become TimestampFormat::MillisSinceEpoch otherwise we lose the
-                // millisecond precision that parquet stores e.g., because we call to_json_value on
-                // the parquet row it calls this internally:
-                // https://docs.rs/parquet/50.0.0/src/parquet/record/api.rs.html#858
-                // the right way is probably to use serde_arrow for deserialization and serialization
-                timestamp_format: TimestampFormat::String("%Y-%m-%d %H:%M:%S %:z"), // 2023-11-04 15:33:47 +00:00
+                timestamp_format: TimestampFormat::String("%Y-%m-%d %H:%M:%S.%f %:z"), // 2023-11-04 15:33:47.123 +00:00
                 decimal_format: DecimalFormat::String,
                 variant_format: VariantFormat::JsonString,
                 binary_format: BinaryFormat::Base64,

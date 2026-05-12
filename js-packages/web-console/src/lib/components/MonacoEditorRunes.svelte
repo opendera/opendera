@@ -1,0 +1,173 @@
+<script lang="ts" module>
+  loader.config({ monaco: monacoImport, 'vs/nls': { availableLanguages: { '*': 'en' } } })
+
+  export const exportedThemes = Object.fromEntries(
+    Object.entries(import.meta.glob('/node_modules/monaco-themes/themes/*.json')).map(([k, v]) => [
+      k.toLowerCase().split('/').reverse()[0].slice(0, -'.json'.length).replaceAll(' ', '-'),
+      v
+    ])
+  )
+
+  export const nativeThemes = ['vs', 'vs-dark', 'hc-black']
+
+  export const themeNames: string[] = [...Object.keys(exportedThemes), ...nativeThemes].sort(
+    (a, b) => a.localeCompare(b)
+  )
+
+  import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker'
+  import jsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker'
+
+  self.MonacoEnvironment = {
+    getWorker(_: any, label: string) {
+      if (label === 'json') {
+        return new jsonWorker()
+      }
+      return new editorWorker()
+    }
+  }
+</script>
+
+<script lang="ts">
+  import type Monaco from 'monaco-editor'
+  import * as monacoImport from 'monaco-editor'
+  import * as monacoJson from 'monaco-editor/esm/vs/language/json/monaco.contribution.js'
+  import 'monaco-editor/esm/vs/language/json/jsonMode'
+  import { onDestroy, onMount } from 'svelte'
+  import loader from '@monaco-editor/loader'
+  import { felderaCompilerMarkerSource } from '$lib/functions/pipelines/monaco'
+  import felderaApiJsonSchemas from 'virtual:felderaApiJsonSchemas.json'
+
+  let monaco: typeof Monaco
+
+  let container: HTMLDivElement
+  let {
+    editor = $bindable(),
+    model,
+    options,
+    markers,
+    onready,
+    extras
+  }: {
+    editor?: Monaco.editor.IStandaloneCodeEditor
+    model: Monaco.editor.ITextModel
+    options?: Omit<
+      Monaco.editor.IStandaloneEditorConstructionOptions,
+      'model' | 'value' | 'language'
+    >
+    markers?: Record<string, Monaco.editor.IMarkerData[]> | undefined
+    onready: (event: Monaco.editor.IStandaloneCodeEditor) => void
+    extras?: {
+      isDarkMode?: boolean
+    }
+  } = $props()
+
+  $effect(() => {
+    if (!editor) {
+      return
+    }
+    if (model.uri === editor.getModel()?.uri) {
+      return
+    }
+    editor.setModel(model)
+  })
+
+  $effect(() => {
+    editor?.updateOptions(options ?? {})
+  })
+
+  $effect(() => {
+    markers
+    if (!monaco) {
+      return
+    }
+    if (!model) {
+      return
+    }
+    if (!markers) {
+      monaco.editor.removeAllMarkers(felderaCompilerMarkerSource)
+      return
+    }
+    setTimeout(() => {
+      Object.entries(markers).forEach(([owner, markers]) =>
+        monaco.editor.setModelMarkers(model, owner, markers)
+      )
+    })
+  })
+
+  onMount(async () => {
+    const jsonDefaults: Monaco.json.LanguageServiceDefaults = (monacoJson as any).jsonDefaults
+    if (!jsonDefaults.diagnosticsOptions.schemas?.length) {
+      jsonDefaults.setDiagnosticsOptions({
+        validate: true,
+        schemas: felderaApiJsonSchemas
+      })
+    }
+    monaco = await loader.init()
+    editor = monaco.editor.create(container, {
+      // TODO: Workaround for Windows-only cursor mis-positioning on mouse click
+      // (cursor lands progressively further off the clicked glyph along the line;
+      // a line that contains an emoji renders correctly because Monaco's
+      // monospace fast path is disabled per-line for complex characters).
+      // Suspected cause: at editor-create time the configured webfont has not
+      // finished loading, so Monaco measures `typicalHalfwidthCharacterWidth`
+      // against a fallback font; on Windows this fallback's advance width
+      // differs from the real font, on Linux it happens to match — hence the
+      // OS asymmetry. Forcing the variable-width path globally avoids the bad
+      // cached measurement at the cost of a small per-render measurement.
+      // Proper fix to try once a Windows test machine is available: drop this
+      // option and instead `await document.fonts.ready` before
+      // `monaco.editor.create`, plus call `monaco.editor.remeasureFonts()`
+      // after any subsequent webfont swap.
+      disableMonospaceOptimizations: true,
+      ...options,
+      model: null
+    })
+
+    onready(editor)
+  })
+
+  onDestroy(() => editor?.dispose())
+</script>
+
+<div
+  class="monaco-container {options?.readOnly
+    ? extras?.isDarkMode
+      ? 'monaco-readonly-dark'
+      : 'monaco-readonly'
+    : ''}"
+  bind:this={container}
+></div>
+
+<style>
+  .monaco-readonly {
+    :global(.sticky-line-content, .sticky-widget-line-numbers, .margin, .monaco-editor-background) {
+      /* @apply bg-surface-50; */
+      background-color: var(--color-surface-50);
+    }
+  }
+  .monaco-readonly-dark {
+    :global(.sticky-line-content, .sticky-widget-line-numbers, .margin, .monaco-editor-background) {
+      /* @apply bg-surface-950; */
+      background-color: var(--color-surface-950);
+    }
+  }
+
+  div.monaco-container {
+    width: 100%;
+    height: 100%;
+    padding: 0;
+    margin: 0;
+  }
+
+  div :global(.monaco-editor .monaco-inputbox .input) {
+    box-shadow: none;
+  }
+
+  div :global(.monaco-editor .monaco-inputbox .input::placeholder) {
+    line-height: normal;
+    font-family: inherit;
+    font-size: inherit;
+    padding-top: inherit;
+    padding-bottom: inherit;
+  }
+</style>

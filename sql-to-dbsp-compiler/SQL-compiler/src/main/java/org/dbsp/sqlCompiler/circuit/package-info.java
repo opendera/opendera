@@ -22,7 +22,7 @@
  */
 
 /**
- * Package that doesn't allow null values as method parameters.
+ * Core circuit data structure; includes classes for all DBSP operators.
  */
 
 @ParametersAreNonnullByDefault

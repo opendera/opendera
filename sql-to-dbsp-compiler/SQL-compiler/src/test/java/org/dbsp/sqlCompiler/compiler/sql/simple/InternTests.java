@@ -45,18 +45,18 @@ public class InternTests extends SqlIoTest {
                 CREATE TABLE T(x INT, s VARCHAR INTERNED, u VARCHAR);
                 CREATE VIEW V AS SELECT MAX(u), SUM(x), s FROM T GROUP BY s;""");
         ccs.step("INSERT INTO T VALUES(0, 'a', 'b');", """
-                 max | sum | s | weight
+                 max | sum | s| weight
                 ------------------------
-                 b   |   0 | a | 1""");
+                 b|      0 | a|  1""");
         ccs.step("INSERT INTO T VALUES(1, 'd', 'c');", """
-                 max | sum | s | weight
-                ------------------------
-                 c   |   1 | d | 1""");
+                 max | sum | s| weight
+                -----------------------
+                 c|      1 | d| 1""");
         ccs.step("INSERT INTO T VALUES(2, 'a', 'c');", """
-                 max | sum | s | weight
-                ------------------------
-                 b   |   0 | a | -1
-                 c   |   2 | a | 1""");
+                 max| sum | s| weight
+                ----------------------
+                 b|     0 | a| -1
+                 c|     2 | a| 1""");
         ccs.step("INSERT INTO T VALUES(NULL, NULL, NULL);", """
                  max | sum | s | weight
                 ------------------------
@@ -70,17 +70,17 @@ public class InternTests extends SqlIoTest {
                 CREATE TABLE S(x INT, s VARCHAR, u VARCHAR NOT NULL INTERNED);
                 CREATE VIEW V AS SELECT * FROM T UNION ALL SELECT * FROM S;""");
         ccs.step("INSERT INTO T VALUES(0, 'a', 'b');", """
-                 x | s | u | weight
-                ------------------------
-                 0 | a | b | 1""");
+                 x | s| u| weight
+                ----------------------
+                 0 | a| b| 1""");
         ccs.step("INSERT INTO T VALUES(1, 'd', 'c');", """
-                 x | s | u | weight
-                ------------------------
-                 1 | d | c | 1""");
+                 x | s| u| weight
+                ----------------------
+                 1 | d| c| 1""");
         ccs.step("INSERT INTO S VALUES(2, 'a', 'c');", """
-                 x | s | su| weight
-                ------------------------
-                 2 | a | c | 1""");
+                 x | s| su| weight
+                -----------------------
+                 2 | a| c| 1""");
     }
 
     @Test
@@ -106,10 +106,28 @@ public class InternTests extends SqlIoTest {
                 CREATE TABLE T(x VARCHAR NOT NULL INTERNED, s VARCHAR INTERNED);
                 CREATE VIEW V AS SELECT * FROM T;""");
         ccs.step("INSERT INTO T VALUES('x', 'y'), ('z', NULL);", """
-                  x | y   | weight
-                 ------------------
-                  x | y   | 1
-                  z |NULL | 1""");
+                  x| y   | weight
+                 -----------------
+                  x| y|    1
+                  z|NULL | 1""");
+    }
+
+    @Test
+    public void testLeftJoin() {
+        // Validated on Postgres by removing "INTERNED"
+        var ccs = this.getCCS("""
+            CREATE TABLE T(x VARCHAR NOT NULL INTERNED, y VARCHAR NOT NULL INTERNED);
+            CREATE TABLE S(z VARCHAR INTERNED, w VARCHAR INTERNED, a INT);
+            CREATE VIEW V AS SELECT T.x, S.a FROM T LEFT JOIN S ON T.x = S.z AND T.y = S.w;""");
+        ccs.step("""
+                INSERT INTO T VALUES('a', 'b'), ('a', 'c');
+                INSERT INTO S VALUES('a', 'b', 1), ('a', 'd', 2), ('b', 'c', 3), ('a', 'b', 4);
+                """, """
+                 x | a | weight
+                ----------------
+                 a|  1 | 1
+                 a|  4 | 1
+                 a|NULL| 1""");
     }
 
     @Test
@@ -122,15 +140,16 @@ public class InternTests extends SqlIoTest {
         DBSPExpression expr0 = ExpressionCompiler.expandTupleCast(CalciteObject.EMPTY, var, tuple);
         Assert.assertEquals("Tup2::new((t.0), (t.1), )", expr0.toString());
         DBSPExpression expr1 = ExpressionCompiler.expandTupleCast(CalciteObject.EMPTY, nVar, tuple);
-        Assert.assertEquals("Tup2::new((n.unwrap().0), (n.unwrap().1), )", expr1.toString());
+        Assert.assertEquals("Tup2::new((n.expect(\"Cast to non-nullable type applied to NULL value\").0), " +
+                "(n.expect(\"Cast to non-nullable type applied to NULL value\").1), )", expr1.toString());
         DBSPExpression expr2 = ExpressionCompiler.expandTupleCast(CalciteObject.EMPTY, var, nTuple);
         Assert.assertEquals("Some(Tup2::new((t.0), (t.1), ))", expr2.toString());
         DBSPExpression expr3 = ExpressionCompiler.expandTupleCast(CalciteObject.EMPTY, nVar, nTuple);
         Assert.assertEquals("""
-                if n.is_none() {
+                (if n.is_none() {
                     None
                 } else {
-                    Some(Tup2::new((n.unwrap().0), (n.unwrap().1), ))
-                }""", expr3.toString());
+                    Some(Tup2::new((n.expect("Cast to non-nullable type applied to NULL value").0), (n.expect("Cast to non-nullable type applied to NULL value").1), ))
+                })""", expr3.toString());
     }
 }

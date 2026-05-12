@@ -2,9 +2,8 @@ package org.dbsp.sqlCompiler.circuit.operator;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
+import org.dbsp.sqlCompiler.compiler.IColumnMetadata;
 import org.dbsp.sqlCompiler.compiler.IHasColumnsMetadata;
-import org.dbsp.sqlCompiler.compiler.IHasLateness;
-import org.dbsp.sqlCompiler.compiler.IHasWatermark;
 import org.dbsp.sqlCompiler.compiler.ViewMetadata;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
@@ -16,7 +15,6 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeStruct;
-import org.dbsp.util.Linq;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
@@ -61,17 +59,6 @@ public final class DBSPViewOperator
         return this;
     }
 
-    @Override
-    public Iterable<? extends IHasLateness> getLateness() {
-        return this.metadata.columns;
-    }
-
-    @Override
-    public Iterable<? extends IHasWatermark> getWatermarks() {
-        // Currently no watermark information in views
-        return Linq.list();
-    }
-
     @SuppressWarnings("unused")
     public static DBSPViewOperator fromJson(JsonNode node, JsonDecoder decoder) {
         ProgramIdentifier viewName = ProgramIdentifier.fromJson(Utilities.getProperty(node, "viewName"));
@@ -84,5 +71,10 @@ public final class DBSPViewOperator
         return new DBSPViewOperator(CalciteEmptyRel.INSTANCE, viewName, queryOrViewName,
                 originalRowType, metadata, info.getInput(0))
                 .addAnnotations(info.annotations(), DBSPViewOperator.class);
+    }
+
+    @Override
+    public Iterable<? extends IColumnMetadata> getColumnsMetadata() {
+        return this.metadata.columns;
     }
 }

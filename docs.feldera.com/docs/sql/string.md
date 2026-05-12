@@ -1,5 +1,8 @@
 # String Operations
 
+The default character set for all strings is
+[UTF-8](https://en.wikipedia.org/wiki/UTF-8).
+
 SQL defines two primary character types: `character varying(n)` and
 `character(n)`, where n is a positive integer.  Both of these types
 can store strings up to n characters (not bytes) in length. An attempt
@@ -13,11 +16,6 @@ simply store the shorter string.
 
 In addition, we provide the `text`, or `varchar` type, which stores
 strings of any length.
-
-Trailing spaces are removed when converting a character value to one
-of the other string types.  Note that trailing spaces are semantically
-significant in character varying and text values, and when using
-pattern matching (e.g., LIKE  and regular expressions).
 
 ## String constants (literals)
 
@@ -48,31 +46,28 @@ but:
 SELECT 'foo'      'bar'
 ```
 
-is not valid syntax.
+is not valid syntax.  Newlines are supported within string literals:
 
-## Escaped characters
+```
+SELECT 'a
+b'
+```
 
-We also accepts escaped characters withing string constants, which are
-an extension to the SQL standard.  Within an escape string, a
-backslash character (`\`) begins a C-like backslash escape sequence, in
-which the combination of backslash and following character(s)
-represent a special byte value:
+produces a multi-line string literal.
 
-|Backslash Escape Sequence|Interpretation|
-|-------------------------|--------------|
-|<code>\b</code>          | backspace    |
-|<code>\f</code>          | form feed    |
-|<code>\n</code>          | newline      |
-|<code>\r</code>          | carriage return |
-|<code>\t</code>          | tab          |
-|<code>\o, \oo, \ooo</code> | (o = 0–7) octal byte value |
-|<code>\xh, \xhh (h = 0–9, A–F)</code> | hexadecimal byte value |
-|<code>\uxxxx, \Uxxxxxxxx (x = 0–9, A–F)</code> | 16 or 32-bit hexadecimal Unicode character value |
+## Unicode characters
 
-Any other character following a backslash is taken literally. Thus, to
-include a backslash character, write two backslashes `\\`. Also, a
-single quote can be included in an escape string by writing `\'`, in
-addition to the normal way of `''`.
+A string literal prefixed with the `U&` can contain Unicode characters
+described using their numeric code: `U&'hello\0041'` includes the
+Unicode character with code U+0041, which is the uppercase letter 'A'.
+A Unicode character is described by an escape character followed by
+four hexadecimal digits.
+
+The default escape character is backslash, but it can be changed using
+the following syntax: `U&'hello!0041' UESCAPE '!'`.  The `UESCAPE`
+notation designates the escape character to use in interpreting the
+current literal, which is the exclamation sign in the previous
+example.
 
 ## Operations on string values
 
@@ -92,9 +87,9 @@ addition to the normal way of `''`.
   <tr>
     <td><a id="like"></a><code>string LIKE pattern [ESCAPE escape-character]</code> and
         <code>string NOT LIKE pattern [ESCAPE escape-character]</code></td>
-    <td>The LIKE expression returns true if the string matches the supplied pattern.
-     (As expected, the <code>NOT LIKE</code> expression returns false if LIKE returns true.</td>
-    <td>See below for details.</td>
+    <td>The LIKE expression returns true if <code>string</code> matches <code>pattern</code>.
+     (As expected, the <code>NOT LIKE</code> expression returns false if <code>LIKE</code> returns true.)</td>
+    <td>See [`LIKE`](#like) for details.</td>
   </tr>
   <tr>
     <td>
@@ -103,35 +98,35 @@ addition to the normal way of `''`.
         <code>string NOT ILIKE pattern</code>
     </td>
     <td>
-        The <code>ILIKE</code> expression returns true if the string matches the supplied pattern,
+        The <code>ILIKE</code> expression returns true if <code>string</code> matches <code>pattern</code>,
         performing a case-insensitive comparison. This means that differences in character case
         between the string and the pattern are ignored.
         (Similarly, the <code>NOT ILIKE</code> expression returns false if <code>ILIKE</code> returns true.)
     </td>
     <td>
-        See below for details.
+        See [`ILIKE`](#ilike) for details.
     </td>
   </tr>
   <tr>
     <td><a id="rlike"></a><code>string RLIKE pattern</code> and
         <code>string NOT RLIKE pattern</code></td>
-    <td>The RLIKE expression returns true if the string matches the supplied pattern.
-        The pattern is a standard Java regular expression.</td>
+    <td>The RLIKE expression returns true if <code>string</code> matches <code>pattern</code>.
+        The pattern is a standard Rust regular expression.  If the regular expression is invalid the program will crash with an error.</td>
     <td><code>'string' RLIKE 's..i.*'</code> => <code>TRUE</code></td>
   </tr>
   <tr>
     <td><a id="ascii"></a><code>ASCII ( string )</code></td>
-    <td>Returns the numeric code of the first character of the argument. In UTF8 encoding, returns the Unicode code point of the character. In other multibyte encodings, the argument must be an ASCII character.  Returns 0 if the string is empty.</td>
+    <td>Returns the numeric code of the first character of <code>string</code>. In UTF8 encoding, returns the Unicode code point of the character. In other multibyte encodings, the argument must be an ASCII character.  Returns 0 if the string is empty.</td>
     <td><code>ascii('x')</code> => <code>120</code></td>
   </tr>
   <tr>
     <td><a id="char_length"></a><code>CHAR_LENGTH(string)</code> or <code>CHARACTER_LENGTH(string)</code> or <code>LENGTH(string)</code> or <code>LEN(string)</code></td>
-    <td>Returns number of characters in the string.</td>
+    <td>Returns number of characters in <code>string</code>.</td>
     <td><code>char_length('josé')</code> => <code>4</code></td>
   </tr>
   <tr>
     <td><a id="chr"></a><code>CHR ( integer )</code></td>
-    <td>Returns a string containing the character with the given code. If the code is incorrect (e.g., negative), the result is an empty string.</td>
+    <td>Returns a string containing the character numbered <code>integer</code>. If the code is incorrect (e.g., negative), the result is an empty string.</td>
     <td><code>chr(65)</code> => <code>A</code></td>
   </tr>
   <tr>
@@ -146,35 +141,40 @@ addition to the normal way of `''`.
   </tr>
   <tr>
     <td><a id="initcap"></a><code>INITCAP ( string )</code></td>
-    <td>Converts the first letter of each word to upper case and the rest to lower case. Words are sequences of alphanumeric characters separated by non-alphanumeric characters.</td>
+    <td>Converts the first letter of each word in <code>string</code> to upper case and the rest to lower case. Words are sequences of alphanumeric characters separated by non-alphanumeric characters.</td>
     <td><code>initcap('hi THOMAS')</code> => <code>Hi Thomas</code></td>
   </tr>
   <tr>
+    <td><a id="initcap_spaces"></a><code>INITCAP_SPACES ( string )</code></td>
+    <td>Converts the first letter of each word in <code>string</code> to upper case and the rest to lower case. Words are sequences of characters separated by spaces.</td>
+    <td><code>initcap('hi THOMAS-SON')</code> => <code>Hi Thomas-son</code></td>
+  </tr>
+  <tr>
     <td><a id="left"></a><code>LEFT ( string, count )</code></td>
-    <td>Returns first <code>count</code> characters in the string.  If any argument is <code>NULL</code>, return <code>NULL</code>.</td>
+    <td>Returns first <code>count</code> characters in <code>string</code>.  If any argument is <code>NULL</code>, returns <code>NULL</code>.</td>
     <td><code>left('abcde', 2)</code> => <code>ab</code></td>
   </tr>
   <tr>
     <td><a id="lower"></a><code>LOWER ( string )</code></td>
-    <td>Converts the string to all lower case.</td>
+    <td>Converts <code>string</code> to all lower case.</td>
     <td><code>lower('TOM')</code> => <code>tom</code></td>
   </tr>
   <tr>
     <td><a id="md5"></a><code>MD5</code>(string)</td>
     <td>
-        Calculates an MD5 128-bit checksum of string and returns it as a hex <code>VARCHAR</code> value.
+        Calculates an MD5 128-bit checksum of <code>string</code> and returns it as a hex <code>VARCHAR</code> value.
         If the input is NULL, NULL is returned.
     </td>
-    <td><code>SELECT md5('Feldera')</code> => <code></code></td>
+    <td><code>SELECT md5('Feldera')</code> => <code>841afc2f65b5763600818ef42a56d7d1</code></td>
   </tr>
   <tr>
     <td><a id="overlay"></a><code>OVERLAY ( string PLACING newsubstring FROM start [ FOR remove ] )</code></td>
-    <td>Replaces the substring of string that starts at the start'th character and extends for remove characters with newsubstring. If count is omitted, it defaults to the length of newsubstring.  If 'start' is nott positive, the original string is unchanged.  If 'start' is bigger than the length of 'string', the result is the concatenation of the two strings.  If 'remove' is negative it is considered 0.</td>
+    <td>Replaces the substring of <code>string</code> that starts at the <code>start</code>'th character and extends for <code>remove</code> characters with <code>newsubstring</code>. If <code>count</code> is omitted, it defaults to the length of <code>newsubstring</code>.  If <code>start</code> is not positive, the original string is unchanged.  If <code>start</code> is bigger than the length of <code>string</code>, the result is the concatenation of the two strings.  If <code>remove</code> is negative it is considered 0.</td>
     <td><code>overlay('Txxxxas' placing 'hom' from 2 for 4)</code> => <code>Thomas</code></td>
   </tr>
   <tr>
     <td><a id="position"></a><code>POSITION(substring IN string)</code></td>
-    <td>Returns first starting index of the specified substring within string, or zero if it's not present.  First character has index 1.</td>
+    <td>Returns the first Unicode character index of <code>substring</code> within <code>string</code>, or zero if it's not present.  First character has index 1.</td>
     <td><code>position('om' in 'Thomas')</code> => <code>3</code></td>
   </tr>
   <tr>
@@ -183,12 +183,12 @@ addition to the normal way of `''`.
         specified by the pattern `pat` with the replacement string `repl`, and returns
         the resulting string. If any one of `expr`, `pat`, or `repl` is `NULL`, the return value is `NULL`.
         If `repl` is missing, it is assumed to be the empty string.  If the regular
-        expression is invalid, the original string is returned.</td>
+        expression is invalid, the program will crash at runtime with an error.</td>
     <td></td>
   </tr>
   <tr>
     <td><a id="repeat"></a><code>REPEAT ( string, count )</code></td>
-    <td>Repeats string the specified number of times.  The result is an empty string for a negative or 0 count.</td>
+    <td>Repeats <code>string</code> the specified number of times.  The result is an empty string for a negative or 0 count.</td>
     <td><code>repeat('Pg', 4)</code> => <code>PgPgPgPg</code></td>
   </tr>
   <tr>
@@ -202,27 +202,29 @@ addition to the normal way of `''`.
     <td><code>right('abcde', 2)</code> => <code>de</code></td>
   </tr>
   <tr>
-    <td><code>RLIKE(string, pattern)</code></td>
+    <td><a id="rlike-function"></a><code>RLIKE(string, pattern)</code></td>
     <td>A function equivalent to the <code>RLIKE</code> operator above.</td>
     <td><code>RLIKE('string', 's..i.*')</code> => <code>TRUE</code></td>
   </tr>
   <tr>
     <td><a id="split"></a><code>SPLIT(string [, delimiter])</code></td>
-    <td>Produce an array of strings, by splitting the first argument at each delimiter occurrence.
-        If the delimiter is empty, return an array with the original string.  If the original
-        string is empty, return an empty array.  If either argument is `NULL`, return `NULL`.
-        If delimiter is absent assume it is the string <code>','</code>.</td>
+    <td>Produce an array of strings, by splitting <code>string</code> at each occurrence of <code>delimiter</code>.
+        If <code>delimiter</code> is empty, return an array containing just <code>string</code>.  If
+        <code>string</code> is empty, return an empty array.  If either argument is NULL, return NULL.
+        If <code>delimiter</code> is absent, a single comma is used <code>','</code>.</td>
     <td><code>SPLIT('a|b|c|', '|')</code> => <code>['a', 'b', 'c', '']</code></td>
   </tr>
   <tr>
     <td><a id="split_part"></a><code>SPLIT_PART(string, delimiter, n)</code></td>
     <td>
-        This function uses 1-based indexing. It extracts the <code>n</code>'th part of the string by splitting it at each occurrence of the delimiter.
+        This function uses 1-based indexing. It extracts the <code>n</code>'th part of <code>string</code> by splitting it at each occurrence of <code>delimiter</code>.
         <ul>
-            <li><code>n = 1</code> refers to the first part of the string after splitting.</li>
+            <li><code>n = 1</code> refers to the first part of <code>string</code> after splitting.</li>
             <li><code>n = 2</code> refers to the second part, and so on.</li>
-            <li>If <code>n</code> is negative, it returns the <code>abs(n)</code>'th part from the end of the string.</li>
+            <li>If <code>n</code> is negative, it returns the <code>abs(n)</code>'th part from the end of <code>string</code>.</li>
+            <li>If <code>delimiter</code> is empty there is only one part, the entire string.</li>
             <li>If <code>n</code> is out of bounds, it returns an empty string.</li>
+            <li>If any argument is <code>NULL</code>, the result is <code>NULL</code></li>
         </ul>
     </td>
     <td>
@@ -233,25 +235,30 @@ addition to the normal way of `''`.
   </tr>
   <tr>
     <td><a id="substr"></a><code>SUBSTR (</code> string, start, <code> [ ,</code> length <code>]</code></td>
-    <td>Extracts the substring of string starting at the "start"'th character if that is specified, and stopping after "length" characters if the value is specified. If "start" is negative, it is replaced with 1.  If "count" is negative the empty string is returned.  The index of the first character is 1.</td>
+    <td>Extracts the substring of <code>string</code> starting at the <code>start</code>'th character, and stopping after <code>length</code> characters if the value is specified. If <code>start</code> is negative, the first character is chosen counting backwards from the end of <code>string</code>.  If <code>count</code> is negative the empty string is returned.  The index of the first character is 1.</td>
     <td><code>SUBSTR('Thomas', 2, 3)</code> => <code>hom</code><br></br>
         <code>SUBSTR('Thomas', 3)</code> => <code>omas</code><br></br></td>
   </tr>
   <tr>
-    <td><a id="substring"></a><code>SUBSTRING (</code> string <code>FROM</code> position <code> [ FOR</code> count<code> ] )</code></td>
-    <td>Extracts the substring of string starting at the "start"'th character if that is specified, and stopping after "count" characters if the value is specified. At least one of "start" or "count" must be provided.  If "start" is negative, it is replaced with 1.  If "count" is negative the empty string is returned.  The index of the first character is 1.</td>
+    <td><a id="substring"></a><code>SUBSTRING (</code> string <code>FROM</code> start <code> [ FOR</code> count<code> ] )</code></td>
+    <td>Extracts the substring of <code>string</code> starting at the <code>start</code>'th character, and stopping after <code>count</code> characters if the value is specified. If <code>start</code> is negative, only <code>max(count + start - 1, 0)</code> characters are returned.  If <code>count</code> is negative the empty string is returned.  The index of the first character is 1.</td>
     <td><code>SUBSTRING('Thomas' from 2 for 3)</code> => <code>hom</code><br></br>
         <code>SUBSTRING('Thomas' from 3)</code> => <code>omas</code><br></br></td>
   </tr>
   <tr>
     <td><a id="trim"></a><code>TRIM ( [ LEADING | TRAILING | BOTH ]</code> characters <code>FROM</code> string <code>)</code></td>
-    <td>Remove the specified characters from the specified ends of the string argument</td>
+    <td>Remove <code>characters</code> from the specified ends of <code>string</code></td>
     <td><code>TRIM(both 'xyz' from 'yxTomxx')</code> => <code>Tom</code><br></br><code>TRIM(leading 'xyz' from 'yxTomxx')</code> => <code>Tomxx</code></td>
   </tr>
   <tr>
     <td><a id="upper"></a><code>UPPER ( string )</code></td>
-    <td>Converts the string to all upper case.</td>
+    <td>Converts <code>string</code> to all upper case.</td>
     <td><code>upper('tom')</code> => <code>TOM</code></td>
+  </tr>
+  <tr>
+    <td><a id="xxhash"></a><code>XXHASH ( string, seed )</code></td>
+    <td>Computes the hash of the specified string with the specified seed.</td>
+    <td><code>xxhash('abc', 10)</code> => <code>6026019377950218999</code></td>
   </tr>
 </table>
 
@@ -261,9 +268,9 @@ string `LIKE` pattern [`ESCAPE` escape-character]
 
 string `NOT LIKE` pattern [`ESCAPE` escape-character]
 
-If pattern does not contain percent signs or underscores, then the
+If <code>pattern</code> does not contain percent signs or underscores, then the
 pattern only represents the string itself; in that case `LIKE` acts
-like the equals operator. An underscore (`_`) in pattern stands for
+like the equals operator. An underscore (`_`) in <code>pattern</code> stands for
 (matches) any single character; a percent sign (`%`) matches any
 sequence of zero or more characters.
 
@@ -283,7 +290,7 @@ must start and end with a percent sign.
 To match a literal underscore or percent sign without matching other
 characters, the respective character in pattern must be preceded by
 the escape character. The default escape character is the backslash
-but a different one can be selected by using the ESCAPE clause. To
+but a different one can be selected by using the <code>ESCAPE</code> clause. To
 match the escape character itself, write two escape characters.  The
 escape character cannot be one of the special pattern characters `_`
 or `%`.
@@ -310,7 +317,12 @@ string `ILIKE` pattern
 
 string `NOT ILIKE` pattern
 
-The `ILIKE` expression performs a case-insensitive pattern match. If the pattern does not contain percent signs or underscores, then the pattern represents the string itself, and `ILIKE` acts like the equals operator, ignoring character case. An underscore (`_`) in the pattern matches any single character, while a percent sign (`%`) matches any sequence of zero or more characters.
+The `ILIKE` expression performs a case-insensitive pattern match. If
+<code>pattern</code> does not contain percent signs or underscores,
+then the pattern represents the string itself, and `ILIKE` acts like
+the equals operator, ignoring character case. An underscore (`_`) in
+<code>pattern</code> matches any single character, while a percent
+sign (`%`) matches any sequence of zero or more characters.
 
 Some examples:
 
@@ -328,21 +340,20 @@ SELECT 'ABC'     NOT ILIKE '_b_'   false
 ```
 When either argument or `ILIKE`, `NOT ILIKE` is `NULL`, the result is `NULL`.
 
-## POSIX regular expressions
+## Regular expressions
 
 Regular expressions are matched using the `RLIKE` function.  If either
-argument of `RLIKE` is `NULL`, the result is also `NULL`.
+argument of `RLIKE` is `NULL`, the result is also `NULL`.  The
+implementation is based on the Rust
+[`Regex`](https://docs.rs/regex/latest/regex/) library.  The full
+syntax supported is described in the [Rust
+documentation](https://docs.rs/regex/latest/regex/#syntax).
 
-The description below is from the [Postgres
+The description below uses fragments from the [Postgres
 documentation](https://www.postgresql.org/docs/15/functions-matching.html#FUNCTIONS-POSIX-REGEXP),
 where credit is given to Henry Spencer.
 
-POSIX regular expressions provide a more powerful means for pattern
-matching than the `LIKE` and `SIMILAR TO` operators.  Many Unix tools
-such as `egrep`, `sed`, or `awk` use a pattern matching language that
-is similar to the one described here.
-
-Currently our compiler does *not* support `SIMILAR TO` regular
+Currently, Feldera does *not* support `SIMILAR TO` regular
 expressions.
 
 A regular expression is a character sequence that is an abbreviated
@@ -412,23 +423,20 @@ below.
 
 The possible quantifiers and their meanings are shown the Table below.
 
-|Quantifier|Matches|
-|----------|-------|
-|`*`  | a sequence of 0 or more matches of the atom|
-|`+`    | a sequence of 1 or more matches of the atom|
-|`?`    | a sequence of 0 or 1 matches of the atom|
-|`{`m`}`  | a sequence of exactly m matches of the atom|
-|`{`m`,}` | a sequence of m or more matches of the atom|
-|`{`m`,`n`}`| a sequence of m through n (inclusive) matches of the atom; m cannot exceed n|
-
-<!--
-|`*?`   | non-greedy version of *|
-|`+?`   | non-greedy version of +|
-|`??`   | non-greedy version of ?|
-|`{`m`}?` | non-greedy version of {m}|
-|`{`m`,}?`| non-greedy version of {m,}|
-|`{`m`,`n`}?` | non-greedy version of {m,n}|
--->
+| Quantifier   | Matches                                                                      |
+|--------------|------------------------------------------------------------------------------|
+| `*`          | a sequence of 0 or more matches of the atom                                  |
+| `+`          | a sequence of 1 or more matches of the atom                                  |
+| `?`          | a sequence of 0 or 1 matches of the atom                                     |
+| `{`m`}`      | a sequence of exactly m matches of the atom                                  |
+| `{`m`,}`     | a sequence of m or more matches of the atom                                  |
+| `{`m`,`n`}`  | a sequence of m through n (inclusive) matches of the atom; m cannot exceed n |
+| `*?`         | non-greedy version of *                                                      |
+| `+?`         | non-greedy version of +                                                      |
+| `??`         | non-greedy version of ?                                                      |
+| `{`m`}?`     | non-greedy version of `{m}`                                                  |
+| `{`m`,}?`    | non-greedy version of `{m,}`                                                 |
+| `{`m`,`n`}?` | non-greedy version of `{m,n}`                                                |
 
 A constraint matches an empty string, but matches only when specific
 conditions are met. A constraint can be used where an atom could be
@@ -436,18 +444,10 @@ used, except it cannot be followed by a quantifier. The simple
 constraints are shown in the Table below; some more constraints are
 described later.
 
-|Constraint|    Description|
-|----------|---------------|
-|`^`       |    matches at the beginning of the string |
-|`$`       |    matches at the end of the string       |
-
-<!--
-|(?=re)    |    positive lookahead matches at any point where a substring matching re begins (AREs only)
-|(?!re)    |    negative lookahead matches at any point where no substring matching re begins (AREs only)
-|(?<=re)   |    positive lookbehind matches at any point where a substring matching re ends (AREs only)
-|(?<!re)   |    negative lookbehind matches at any point where no substring matching re ends (AREs only)
--->
-
+| Constraint  | Description                            |
+|-------------|----------------------------------------|
+| `^`         | matches at the beginning of the string |
+| `$`         | matches at the end of the string       |
 
 ### Bracket Expressions
 
@@ -475,32 +475,32 @@ Within a bracket expression, the name of a character class enclosed in
 class. A character class cannot be used as an endpoint of a range. The
 POSIX standard defines these character class names:
 
-|Class| Description                          |
-|-----|--------------------------------------|
-|`alnum`| letters and numeric digits           |
-|`alpha`| letters                              |
-|`blank`| space and tab                        |
-|`cntrl`| control characters                   |
-|`digit`| numeric digits                       |
-|`graph`| printable characters except space    |
-|`lower`| lower-case letters                   |
-|`print`| printable characters including space |
-|`punct`| punctuation                          |
-|`space`| any white space                      |
-|`upper`| upper-case letters                   |
-|`xdigit`| hexadecimal digits                   |
+| Class    | Description                           |
+|----------|---------------------------------------|
+| `alnum`  | letters and numeric digits            |
+| `alpha`  | letters                               |
+| `blank`  | space and tab                         |
+| `cntrl`  | control characters                    |
+| `digit`  | numeric digits                        |
+| `graph`  | printable characters except space     |
+| `lower`  | lower-case letters                    |
+| `print`  | printable characters including space  |
+| `punct`  | punctuation                           |
+| `space`  | any white space                       |
+| `upper`  | upper-case letters                    |
+| `xdigit` | hexadecimal digits                    |
 
 Class-shorthand escapes provide shorthands for certain commonly-used
 character classes. They are shown in the table below.
 
-|Escape|        Description|
-|------|-------------------|
-|`\d`    |matches any digit, like [[:digit:]] |
-|`\s`    |matches any whitespace character, like [[:space:]] |
-|`\w`    |matches any word character, like [[:word:]] |
-|`\D`    |matches any non-digit, like [^[:digit:]] |
-|`\S`    |matches any non-whitespace character, like [^[:space:]] |
-|`\W`    |matches any non-word character, like [^[:word:]] |
+| Escape  | Description                                             |
+|---------|---------------------------------------------------------|
+| `\d`    | matches any digit, like [[:digit:]]                     |
+| `\s`    | matches any whitespace character, like [[:space:]]      |
+| `\w`    | matches any word character, like [[:word:]]             |
+| `\D`    | matches any non-digit, like [^[:digit:]]                |
+| `\S`    | matches any non-whitespace character, like [^[:space:]] |
+| `\W`    | matches any non-word character, like [^[:word:]]        |
 
 The behavior of these standard character classes is generally
 consistent across platforms for characters in the 7-bit ASCII set.
@@ -512,7 +512,7 @@ regular-expression function or operator.
 
 Escapes are special sequences beginning with `\` followed by an
 alphanumeric character.  Escapes come in several varieties: character
-entry, class shorthands, constraint escapes, and back references. A
+entry, class shorthands, and constraint escapes. A
 `\` followed by an alphanumeric character but not constituting a valid
 escape is illegal.
 
@@ -520,53 +520,24 @@ Character-entry escapes exist to make it easier to specify
 non-printing and other inconvenient characters in REs. They are shown
 in the Table below.
 
-|Escape|        Description|
-|------|-------------------|
-|`\a`     |alert (bell) character, as in C|
-|`\b`     |backspace, as in C |
-|`\B`     |synonym for backslash (\) to help reduce the need for backslash doubling|
-|`\c`X    |(where X is any character) the character whose low-order 5 bits are the same as those of X, and whose other bits are all zero|
-|`\e`     |the character whose collating-sequence name is ESC, or failing that, the character with octal value 033 |
-|`\f`     |form feed, as in C |
-|`\n`     |newline, as in C |
-|`\r`     |carriage return, as in C |
-|`\t`     |horizontal tab, as in C |
-|`\u`wxyz |(where wxyz is exactly four hexadecimal digits) the character whose hexadecimal value is 0xwxyz |
-|`\v`     |vertical tab, as in C|
-|`\x`hhh  |(where hhh is any sequence of hexadecimal digits) the character whose hexadecimal value is 0xhhh (a single character no matter how many hexadecimal digits are used)|
-|`\0`     |the character whose value is 0 (the null byte)|
-|`\`xy    |(where xy is exactly two octal digits, and is not a back reference) the character whose octal value is 0xy|
-|`\`xyz   |(where xyz is exactly three octal digits, and is not a back reference) the character whose octal value is 0xyz|
-
-Hexadecimal digits are 0-9, a-f, and A-F. Octal digits are 0-7.
+| Escape   | Description                                                                                     |
+|----------|-------------------------------------------------------------------------------------------------|
+| `\n`     | newline, as in C                                                                                |
+| `\r`     | carriage return, as in C                                                                        |
+| `\t`     | horizontal tab, as in C                                                                         |
+| `\u`wxyz | (where wxyz is exactly four hexadecimal digits) the character whose hexadecimal value is 0xwxyz |
+| `\x`hh   | (where hh is a pair of hexadecimal digits) the character whose hexadecimal value is 0xhh        |
+| `\0`     | the character whose value is 0 (the null byte)                                                  |
 
 A constraint escape is a constraint, matching the empty string if
 specific conditions are met, written as an escape. They are shown in
 the Table below.
 
-|Escape|Description|
-|------|-----------|
-|`\A`     |matches only at the beginning of the string (see Section 9.7.3.5 for how this differs from ^)|
-|`\m`     |matches only at the beginning of a word|
-|`\M`     |matches only at the end of a word|
-|`\y`     |matches only at the beginning or end of a word|
-|`\Y`     |matches only at a point that is not the beginning or end of a word|
-|`\Z`     |matches only at the end of the string|
-
-A back reference `(\`n`)` matches the same string matched by the
-previous parenthesized subexpression specified by the number n (see
-the Table below). For example, `([bc])\1` matches `bb` or `cc` but not
-`bc` or `cb`. The subexpression must entirely precede the back
-reference in the RE. Subexpressions are numbered in the order of their
-leading parentheses. Non-capturing parentheses do not define
-subexpressions. The back reference considers only the string
-characters matched by the referenced subexpression, not any
-constraints contained in it. For example, `(^\d)\1` will match `22`.
-
-|Escape|        Description|
-|------|-------------------|
-|`\`m     |(where m is a nonzero digit) a back reference to the m'th subexpression|
-|`\`mnn   |(where m is a nonzero digit, and nn is some more digits, and the decimal value mnn is not greater than the number of closing capturing parentheses seen so far) a back reference to the mnn'th subexpression|
+| Escape  | Description                                 |
+|---------|---------------------------------------------|
+| `\A`    | matches only at the beginning of the string |
+| `\b`    | matches word boundaries                     |
+| `\B`    | not a word boundary                         |
 
 ### Capture groups
 
@@ -608,7 +579,8 @@ If `repl` is missing, it is assumed to be the empty string.
 Replaces occurrences in the string `expr` that match the regular
 expression specified by the pattern `pat` with the replacement string
 `repl`, and returns the resulting string.  If any of `expr`, `pat`, or
-`repl` is `NULL`, the return value is `NULL`.
+`repl` is `NULL`, the return value is `NULL`.  If the pattern cannot
+be parsed as a valid regular expression the program will crash at runtime.
 
 #### Replacement string syntax
 
@@ -647,4 +619,3 @@ Bruce Springsteen
 
 Note that using `$2` instead of `$first` or `$1` instead of `$last`
 would produce the same result.
-

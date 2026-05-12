@@ -1,46 +1,28 @@
-use crate::controller::{ControllerInner, EndpointId};
-use crate::format::InputBuffer;
 use crate::transport::{
     InputEndpoint, InputQueue, InputReaderCommand, IntegratedInputEndpoint, NonFtInputReaderCommand,
 };
-use crate::{
-    ControllerError, InputConsumer, InputReader, PipelineState, RecordFormat,
-    TransportInputEndpoint,
-};
-use anyhow::{anyhow, Error as AnyError, Result as AnyResult};
+use crate::{ControllerError, InputConsumer, InputReader, PipelineState, RecordFormat};
+use anyhow::{Result as AnyResult, anyhow};
 use dbsp::circuit::tokio::TOKIO;
-use dbsp::InputHandle;
-
 use feldera_adapterlib::catalog::{DeCollectionStream, InputCollectionHandle};
 use feldera_adapterlib::format::ParseError;
-use feldera_types::config::{FtModel, InputEndpointConfig};
+use feldera_types::config::FtModel;
 use feldera_types::format::json::JsonFlavor;
-use feldera_types::program_schema::{ColumnType, Field, Relation, SqlType};
+use feldera_types::program_schema::Relation;
 use feldera_types::transport::postgres::PostgresReaderConfig;
 
+use super::tls::make_tls_connector;
 use chrono::{TimeZone, Utc};
-use futures::{pin_mut, TryFutureExt};
-use futures_util::{StreamExt, TryStreamExt};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
-use std::fmt::format;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use serde_json::{Value, json};
+use std::sync::Arc;
+use std::thread;
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio::sync::watch::{channel, Receiver, Sender};
-use tokio::time::sleep;
-use tokio_postgres::tls::NoTlsStream;
-use tokio_postgres::types::{FromSql, Type};
-use tokio_postgres::{Client, Connection, NoTls, Socket};
-use tokio_util::time;
-use tracing::{debug, error, info, trace};
-use tracing_subscriber::fmt::fmt;
-use url::Url;
-use utoipa::ToSchema;
+use tokio::sync::watch::{Receiver, Sender, channel};
+use tokio_postgres::types::Type;
+use tokio_postgres::{Client, NoTls};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 /// Integrated input connector that reads from a delta table.
@@ -73,6 +55,7 @@ impl IntegratedInputEndpoint for PostgresInputEndpoint {
     fn open(
         self: Box<Self>,
         input_handle: &InputCollectionHandle,
+        _resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(PostgresInputReader::new(
             &self.inner,
@@ -104,13 +87,16 @@ impl PostgresInputReader {
             .configure_deserializer(RecordFormat::Json(JsonFlavor::Datagen))?;
         let schema = input_handle.schema.clone();
 
-        std::thread::spawn(move || {
-            TOKIO.block_on(async {
-                let _ = endpoint_clone
-                    .worker_task(input_stream, schema, receiver_clone, init_status_sender)
-                    .await;
+        thread::Builder::new()
+            .name("postgres-input-tokio-wrapper".to_string())
+            .spawn(move || {
+                TOKIO.block_on(async {
+                    let _ = endpoint_clone
+                        .worker_task(input_stream, schema, receiver_clone, init_status_sender)
+                        .await;
+                })
             })
-        });
+            .expect("failed to create Postgres input connector tokio wrapper thread");
 
         init_status_receiver.blocking_recv().ok_or_else(|| {
             ControllerError::input_transport_error(
@@ -128,6 +114,10 @@ impl PostgresInputReader {
 }
 
 impl InputReader for PostgresInputReader {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         match command.as_nonft().unwrap() {
             NonFtInputReaderCommand::Queue => self.inner.queue.queue(),
@@ -203,14 +193,7 @@ impl PostgresInputEndpointInner {
                 let _ = init_status_sender.send(Err(e)).await;
                 return;
             }
-            Ok((client, connection)) => {
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        eprintln!("connection error: {}", e);
-                    }
-                });
-                client
-            }
+            Ok(client) => client,
         };
 
         let _r = init_status_sender.send(Ok(())).await;
@@ -240,6 +223,10 @@ impl PostgresInputEndpointInner {
         let mut last_event_number = 0;
         let mut bytes = 0;
         let mut errors = Vec::new();
+
+        // Set the ingestion timestamp to the time we start reading the next batch.
+        let mut timestamp = Utc::now();
+
         for row in rows {
             let columns = row.columns();
             let mut dynamic_values = serde_json::Map::new();
@@ -397,7 +384,7 @@ impl PostgresInputEndpointInner {
             }
             let value = json!(dynamic_values).to_string();
             debug!("postgres about to insert {value}");
-            let ret = input_stream.insert(value.as_ref());
+            let ret = input_stream.insert(value.as_ref(), &None);
             if let Err(ret) = ret {
                 errors.push(ParseError::text_event_error(
                     "Failed to deserialize table record from PostgreSQL",
@@ -409,43 +396,77 @@ impl PostgresInputEndpointInner {
             }
             bytes += value.len();
             if bytes >= 1024 * 1024 * 2 {
-                self.queue.push((input_stream.take_all(), errors), bytes);
+                self.queue
+                    .push((input_stream.take_all(), errors), timestamp);
+                timestamp = Utc::now();
                 bytes = 0;
                 errors = Vec::new();
             }
         }
 
-        self.queue.push((input_stream.take_all(), errors), bytes);
+        self.queue
+            .push((input_stream.take_all(), errors), timestamp);
         self.consumer.eoi();
     }
 
-    /// Open existing postgres connection.
-    async fn connect_to_postgres(
-        &self,
-    ) -> Result<(Client, Connection<Socket, NoTlsStream>), ControllerError> {
+    /// Open a postgres connection, optionally with TLS.
+    async fn connect_to_postgres(&self) -> Result<Client, ControllerError> {
         debug!(
             "postgres {}: opening connection to '{}'",
             &self.endpoint_name, &self.config.uri
         );
 
-        let (client, connection) = tokio_postgres::connect(self.config.uri.as_str(), NoTls)
-            .await
-            .map_err(|e| {
-                ControllerError::invalid_transport_configuration(
-                    &self.endpoint_name,
-                    &format!(
-                        "Unable to connect to postgres instance '{}': {e}",
-                        self.config.uri
-                    ),
-                )
-            })?;
+        let endpoint_name = self.endpoint_name.clone();
+        let connector = make_tls_connector(&self.config.tls, &self.endpoint_name).map_err(|e| {
+            ControllerError::invalid_transport_configuration(
+                &self.endpoint_name,
+                &format!("failed to configure TLS: {e}"),
+            )
+        })?;
+
+        let make_conn_err = |e: tokio_postgres::Error| {
+            ControllerError::invalid_transport_configuration(
+                &endpoint_name,
+                &format!(
+                    "Unable to connect to postgres instance '{}': {e}",
+                    self.config.uri
+                ),
+            )
+        };
+
+        fn spawn_pg_connection_monitor(
+            name: String,
+            conn: impl Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+        ) {
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    error!("postgres {name}: connection error: {e}");
+                }
+            });
+        }
+
+        let client = if let Some(connector) = connector {
+            debug!("postgres {endpoint_name}: CA certificate provided, connecting with TLS");
+            let (client, connection) = tokio_postgres::connect(self.config.uri.as_str(), connector)
+                .await
+                .map_err(make_conn_err)?;
+            spawn_pg_connection_monitor(endpoint_name.clone(), connection);
+            client
+        } else {
+            debug!("postgres {endpoint_name}: no CA certificates provided, connecting without TLS");
+            let (client, connection) = tokio_postgres::connect(self.config.uri.as_str(), NoTls)
+                .await
+                .map_err(make_conn_err)?;
+            spawn_pg_connection_monitor(endpoint_name.clone(), connection);
+            client
+        };
 
         info!(
             "postgres {}: opened connection to '{}'",
             &self.endpoint_name, &self.config.uri,
         );
 
-        Ok((client, connection))
+        Ok(client)
     }
 }
 

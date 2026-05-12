@@ -1,15 +1,15 @@
 use crate::{
+    Circuit, DBData, DBWeight, Stream,
     circuit::metadata::MetaItem,
-    dynamic::{DowncastTrait, DynData, Erase},
+    dynamic::{DowncastTrait, DynData, Erase, WithFactory},
     operator::TraceBound,
     trace::{BatchReaderFactories, Filter},
     typed_batch::{Batch, DynBatch, DynBatchReader, Spine, TypedBatch, TypedBox},
-    Circuit, DBData, DBWeight, Stream,
 };
 use dyn_clone::clone_box;
 use size_of::SizeOf;
 
-use super::dynamic::trace::ValSpine;
+use super::dynamic::trace::TimedSpine;
 
 impl<C, K, V, R, B> Stream<C, TypedBatch<K, V, R, B>>
 where
@@ -26,7 +26,7 @@ where
     /// This operator labels each untimed batch in the stream with the current
     /// timestamp and adds it to a trace.
     #[track_caller]
-    pub fn trace(&self) -> Stream<C, TypedBatch<K, V, R, ValSpine<B, C>>> {
+    pub fn trace(&self) -> Stream<C, TypedBatch<K, V, R, TimedSpine<B, C>>> {
         let trace_factories = BatchReaderFactories::new::<K, V, R>();
         let batch_factories = BatchReaderFactories::new::<K, V, R>();
         self.inner()
@@ -52,7 +52,7 @@ where
         &self,
         lower_key_bound: TraceBound<B::Key>,
         lower_val_bound: TraceBound<B::Val>,
-    ) -> Stream<C, TypedBatch<K, V, R, ValSpine<B, C>>> {
+    ) -> Stream<C, TypedBatch<K, V, R, TimedSpine<B, C>>> {
         let trace_factories = BatchReaderFactories::new::<K, V, R>();
         let batch_factories = BatchReaderFactories::new::<K, V, R>();
 
@@ -136,7 +136,7 @@ where
     ///   value represents the lowest upper bound of all partially ordered
     ///   timestamps in `self` or some other stream, computed with the help of
     ///   the [`waterline`](`Stream::waterline`) operator and adjusted by some
-    ///   contstant offsets, dictated, e.g., by window sizes used in the queries
+    ///   constant offsets, dictated, e.g., by window sizes used in the queries
     ///   and the maximal out-of-ordedness of data in the input streams.
     ///
     /// * `retain_key_func` - given the value received from the `bounds_stream`
@@ -219,6 +219,61 @@ where
                 }))
                 .with_metadata(metadata)
             }),
+        );
+    }
+
+    #[track_caller]
+    pub fn integrate_trace_retain_values_last_n<TS, RV>(
+        &self,
+        bounds_stream: &Stream<C, TypedBox<TS, DynData>>,
+        retain_value_func: RV,
+        n: usize,
+    ) where
+        TS: DBData + Erase<DynData>,
+        RV: Fn(&B::Val, &TS) -> bool + Clone + Send + Sync + 'static,
+    {
+        self.inner().dyn_integrate_trace_retain_values_last_n(
+            &bounds_stream.inner_data(),
+            Box::new(move |ts: &DynData| {
+                let metadata = MetaItem::String(format!("{ts:?}"));
+                let ts = clone_box(ts);
+                let retain_val_func = retain_value_func.clone();
+                Filter::new(Box::new(move |v: &B::DynV| {
+                    retain_val_func(unsafe { v.downcast::<B::Val>() }, unsafe {
+                        ts.as_ref().downcast::<TS>()
+                    })
+                }))
+                .with_metadata(metadata)
+            }),
+            n,
+        );
+    }
+
+    #[track_caller]
+    pub fn integrate_trace_retain_values_top_n<TS, RV>(
+        &self,
+        bounds_stream: &Stream<C, TypedBox<TS, DynData>>,
+        retain_value_func: RV,
+        n: usize,
+    ) where
+        TS: DBData + Erase<DynData>,
+        RV: Fn(&B::Val, &TS) -> bool + Clone + Send + Sync + 'static,
+    {
+        self.inner().dyn_integrate_trace_retain_values_top_n(
+            WithFactory::<B::Val>::FACTORY,
+            &bounds_stream.inner_data(),
+            Box::new(move |ts: &DynData| {
+                let metadata = MetaItem::String(format!("{ts:?}"));
+                let ts = clone_box(ts);
+                let retain_val_func = retain_value_func.clone();
+                Filter::new(Box::new(move |v: &B::DynV| {
+                    retain_val_func(unsafe { v.downcast::<B::Val>() }, unsafe {
+                        ts.as_ref().downcast::<TS>()
+                    })
+                }))
+                .with_metadata(metadata)
+            }),
+            n,
         );
     }
 

@@ -1,20 +1,19 @@
 use crate::{
+    Circuit, DBData, Stream, ZWeight,
     algebra::{IndexedZSet, IndexedZSetReader, MulByRef, ZSet, ZSetReader},
     circuit::{
+        Scope,
         circuit_builder::StreamId,
         operator_traits::{BinaryOperator, Operator},
-        Scope,
     },
     circuit_cache_key,
     dynamic::{DynPair, DynUnit, Erase},
     trace::{Batch, BatchReaderFactories, Builder, Cursor},
     utils::Tup2,
-    Circuit, DBData, Stream, ZWeight,
 };
-use minitrace::trace;
 use std::{
     borrow::Cow,
-    cmp::{min, Ordering},
+    cmp::{Ordering, min},
     marker::PhantomData,
     ops::Deref,
 };
@@ -121,7 +120,6 @@ where
     Keys: IndexedZSetReader<Key = Pairs::Key, Val = DynUnit>,
     Out: ZSet<Key = DynPair<Pairs::Key, Pairs::Val>>,
 {
-    #[trace]
     async fn eval(&mut self, pairs: &Pairs, keys: &Keys) -> Out {
         let mut pair_cursor = pairs.cursor();
         let mut key_cursor = keys.cursor();
@@ -129,8 +127,11 @@ where
         let mut item = self.output_factories.key_factory().default_box();
 
         // Choose capacity heuristically.
-        let mut builder =
-            Out::Builder::with_capacity(&self.output_factories, min(pairs.len(), keys.len()));
+        let mut builder = Out::Builder::with_capacity(
+            &self.output_factories,
+            min(pairs.key_count(), keys.key_count()),
+            min(pairs.len(), keys.len()),
+        );
 
         // While both keys are valid
         while key_cursor.key_valid() && pair_cursor.key_valid() {
@@ -166,7 +167,7 @@ where
         builder.done()
     }
 
-    // #[trace] fn eval_owned(&mut self, pairs: Pairs, keys: Keys) -> Out {
+    // fn eval_owned(&mut self, pairs: Pairs, keys: Keys) -> Out {
     //     // Choose capacity heuristically.
     //     let mut builder = Out::Builder::with_capacity((), min(pairs.len(),
     // keys.len()));
@@ -212,7 +213,7 @@ where
     //     builder.done()
     // }
 
-    // #[trace] fn eval_owned_and_ref(&mut self, pairs: Pairs, keys: &Keys) -> Out {
+    // fn eval_owned_and_ref(&mut self, pairs: Pairs, keys: &Keys) -> Out {
     //     // Choose capacity heuristically.
     //     let mut builder = Out::Builder::with_capacity((), min(pairs.len(),
     // keys.len()));

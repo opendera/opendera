@@ -2,15 +2,13 @@ use anyhow::Result as AnyResult;
 use chrono::Datelike;
 use clap::Parser;
 use dbsp::circuit::CircuitConfig;
+use dbsp::typed_batch::IndexedZSetReader;
 use dbsp::utils::Tup2;
 use dbsp::{
-    circuit::Layout, utils::Tup3, DBSPHandle, OrdIndexedZSet, OutputHandle, RootCircuit, Runtime,
-    ZSetHandle,
+    DBSPHandle, OrdIndexedZSet, OutputHandle, RootCircuit, Runtime, ZSetHandle, circuit::Layout,
+    utils::Tup3,
 };
-use futures::{
-    future::{self, Ready},
-    prelude::*,
-};
+use futures::{future, prelude::*};
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
@@ -18,7 +16,7 @@ use std::{
 use tarpc::{
     context,
     serde_transport::tcp::listen,
-    server::{self, incoming::Incoming, Channel},
+    server::{self, Channel, incoming::Incoming},
     tokio_serde::formats::Bincode,
 };
 
@@ -49,8 +47,9 @@ fn build_circuit(
     });
     let monthly_totals = subset
         .map_index(|r| {
+            let date = chrono::NaiveDate::from_epoch_days(r.date).unwrap();
             (
-                Tup3(r.location.clone(), r.date.year(), r.date.month() as u8),
+                Tup3(r.location.clone(), date.year(), date.month() as u8),
                 r.daily_vaccinations.unwrap_or(0),
             )
         })
@@ -110,29 +109,37 @@ impl Server {
     }
 }
 impl Circuit for Server {
-    type InitFut = Ready<()>;
-    fn init(self, _: context::Context, layout: Layout) -> Self::InitFut {
-        self.replace(layout);
-        future::ready(())
+    async fn init(self, _: context::Context, layout: Layout) {
+        self.replace(layout)
     }
-    type RunFut = Ready<Vec<(String, VaxMonthly, i64)>>;
-    fn run(self, _: context::Context, mut records: Vec<Tup2<Record, i64>>) -> Self::RunFut {
+    async fn run(
+        self,
+        _: context::Context,
+        mut records: Vec<Tup2<Record, i64>>,
+    ) -> Vec<(String, VaxMonthly, i64)> {
         self.inner()
             .as_ref()
             .unwrap()
             .input_handle
             .append(&mut records);
-        self.inner().as_mut().unwrap().circuit.step().unwrap();
-        future::ready(
-            self.inner()
-                .as_ref()
-                .unwrap()
-                .output_handle
-                .consolidate()
-                .iter()
-                .collect(),
-        )
+        self.inner()
+            .as_mut()
+            .unwrap()
+            .circuit
+            .transaction()
+            .unwrap();
+        self.inner()
+            .as_ref()
+            .unwrap()
+            .output_handle
+            .consolidate()
+            .iter()
+            .collect()
     }
+}
+
+async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
+    tokio::spawn(fut);
 }
 
 #[tokio::main]
@@ -147,7 +154,7 @@ async fn main() -> AnyResult<()> {
         .filter_map(|r| future::ready(r.ok()))
         .map(server::BaseChannel::with_defaults)
         .max_channels_per_key(1, |t| t.transport().peer_addr().unwrap().ip())
-        .map(|channel| channel.execute(server.clone().serve()))
+        .map(|channel| channel.execute(server.clone().serve()).for_each(spawn))
         .buffer_unordered(10)
         .for_each(|_| async {})
         .await;

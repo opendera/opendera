@@ -1,6 +1,8 @@
 package org.dbsp.sqlCompiler.compiler.sql.suites;
 
+import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinFilterMapOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinOperator;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
@@ -18,6 +20,15 @@ import org.junit.Test;
 import java.io.IOException;
 
 public class TpchTest extends BaseSQLTests {
+    @Override
+    public CompilerOptions testOptions() {
+        CompilerOptions result = super.testOptions();
+        result.languageOptions.incrementalize = true;
+        result.languageOptions.optimizationLevel = 2;
+        result.languageOptions.ignoreOrderBy = true;
+        return result;
+    }
+
     String getQuery(int query) throws IOException {
         String tpch = TestUtil.readStringFromResourceFile("tpch.sql");
         // Convert all other views to local, which will cause them to be removed
@@ -29,11 +40,7 @@ public class TpchTest extends BaseSQLTests {
     @Test
     public void compileTpch() throws IOException {
         String tpch = TestUtil.readStringFromResourceFile("tpch.sql");
-        CompilerOptions options = this.testOptions();
-        options.languageOptions.incrementalize = true;
-        options.languageOptions.optimizationLevel = 2;
-        DBSPCompiler compiler = new DBSPCompiler(options);
-        options.languageOptions.ignoreOrderBy = true;
+        DBSPCompiler compiler = this.testCompiler();
         compiler.submitStatementsForCompilation(tpch);
         CompilerCircuitStream ccs = this.getCCS(compiler);
         ccs.showErrors();
@@ -41,11 +48,7 @@ public class TpchTest extends BaseSQLTests {
 
     CompilerCircuit compileQuery(int query) throws IOException {
         String tpch = this.getQuery(query);
-        CompilerOptions options = this.testOptions();
-        options.languageOptions.incrementalize = true;
-        options.languageOptions.optimizationLevel = 2;
-        DBSPCompiler compiler = new DBSPCompiler(options);
-        options.languageOptions.ignoreOrderBy = true;
+        DBSPCompiler compiler = this.testCompiler();
         compiler.submitStatementsForCompilation(tpch);
         CompilerCircuit cc = new CompilerCircuit(compiler);
         cc.showErrors();
@@ -89,6 +92,60 @@ public class TpchTest extends BaseSQLTests {
             @Override
             public void postorder(DBSPJoinFilterMapOperator join) {
                 Assert.fail();
+            }
+        });
+    }
+
+    @Test
+    public void compileTpch21() throws IOException {
+        var cc = this.compileQuery(21);
+        cc.visit(new CircuitVisitor(cc.compiler) {
+            void someKey(DBSPJoinBaseOperator operator) {
+                // Check that the keys are not Tup0<>
+                Assert.assertNotEquals(0, operator.left().getOutputIndexedZSetType()
+                        .keyType.to(DBSPTypeTupleBase.class).size());
+            }
+
+            @Override
+            public void postorder(DBSPJoinOperator operator) {
+                this.someKey(operator);
+            }
+
+            @Override
+            public void postorder(DBSPJoinIndexOperator operator) {
+                this.someKey(operator);
+            }
+
+            @Override
+            public void postorder(DBSPJoinFilterMapOperator operator) {
+                this.someKey(operator);
+            }
+        });
+    }
+
+    @Test
+    public void compileTpch2() throws IOException {
+        var cc = this.compileQuery(2);
+        cc.visit(new CircuitVisitor(cc.compiler) {
+            void someKey(DBSPJoinBaseOperator operator) {
+                // Check that the keys are not Tup0<>
+                Assert.assertNotEquals(0, operator.left().getOutputIndexedZSetType()
+                        .keyType.to(DBSPTypeTupleBase.class).size());
+            }
+
+            @Override
+            public void postorder(DBSPJoinOperator operator) {
+                this.someKey(operator);
+            }
+
+            @Override
+            public void postorder(DBSPJoinIndexOperator operator) {
+                this.someKey(operator);
+            }
+
+            @Override
+            public void postorder(DBSPJoinFilterMapOperator operator) {
+                this.someKey(operator);
             }
         });
     }

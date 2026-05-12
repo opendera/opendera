@@ -34,6 +34,7 @@ const installation = {
             items: [
                 'get-started/enterprise/quickstart',
                 'get-started/enterprise/helm-guide',
+                'get-started/enterprise/helm-chart-reference',
                 {
                     type: 'category',
                     label: 'Kubernetes guides',
@@ -57,7 +58,20 @@ const installation = {
                         },
                     ]
                 },
-                'get-started/enterprise/authentication',
+                {
+                    type: 'category',
+                    label: 'Authentication',
+                    link: {
+                        type: 'doc',
+                        id: 'get-started/enterprise/authentication/index',
+                    },
+                    items: [
+                        'get-started/enterprise/authentication/aws-cognito',
+                        'get-started/enterprise/authentication/okta-sso',
+                    ]
+                },
+                'get-started/enterprise/https',
+                'get-started/enterprise/parallel-compilation',
             ]
         }
     ]
@@ -141,7 +155,17 @@ const guides = {
                 'use_cases/otel/grafana'
             ]
         },
-        'tutorials/rest_api/index',
+        {
+            type: 'category',
+            label: 'Rest API',
+            link: {
+                type: 'doc',
+                id: 'tutorials/rest_api/index'
+            },
+            items: [
+                'tutorials/rest_api/cluster-monitoring'
+            ]
+        },
         'tutorials/monitoring/index'
     ]
 };
@@ -204,6 +228,7 @@ const sql = {
                 'sql/string',
                 'sql/table',
                 'sql/uuid',
+                'sql/unsupported-operations'
             ]
         },
         'sql/materialized',
@@ -268,6 +293,11 @@ const connectors = {
                 },
                 {
                     type: 'doc',
+                    id: 'connectors/sources/nats',
+                    label: 'NATS'
+                },
+                {
+                    type: 'doc',
                     id: 'connectors/sources/debezium',
                     label: 'Debezium'
                 },
@@ -285,6 +315,11 @@ const connectors = {
                     type: 'doc',
                     id: 'connectors/sources/datagen',
                     label: 'Data Generator'
+                },
+                {
+                    type: 'doc',
+                    id: 'connectors/sources/file',
+                    label: 'File'
                 }
             ]
         },
@@ -330,6 +365,16 @@ const connectors = {
                     type: 'doc',
                     id: 'connectors/sinks/snowflake',
                     label: 'Snowflake (experimental)'
+                },
+                {
+                    type: 'doc',
+                    id: 'connectors/sinks/file',
+                    label: 'File'
+                },
+                {
+                    type: 'doc',
+                    id: 'connectors/sinks/iceberg',
+                    label: 'Iceberg (experimental)'
                 }
             ]
         }
@@ -353,6 +398,16 @@ const formats = {
     ]
 };
 
+const fault_tolerance = {
+    type: 'category',
+    label: 'Fault Tolerance & DR',
+    items: [
+        "pipelines/fault-tolerance-overview",
+        "pipelines/fault-tolerance",
+        "pipelines/checkpoint-sync",
+    ],
+}
+
 // Pipelines section
 const pipelines = {
     type: 'category',
@@ -366,13 +421,29 @@ const pipelines = {
         sql,
         connectors,
         formats,
+        fault_tolerance,
+        {
+            type: 'doc',
+            label: "Reference: Pipeline Lifecycle",
+            id: "pipelines/lifecycle",
+        },
         {
             type: 'doc',
             label: "Settings",
             id: "pipelines/configuration",
         },
-        "pipelines/fault-tolerance",
-        "pipelines/checkpoint-sync"
+        {
+            type: 'doc',
+            label: "Modifying a Pipeline",
+            id: "pipelines/modifying",
+        },
+        "pipelines/transactions",
+        "pipelines/latency",
+        {
+            type: 'doc',
+            label: "Sidecar Containers",
+            id: "pipelines/sidecar",
+        },
     ]
 };
 
@@ -402,6 +473,10 @@ const operations = {
     label: 'Feldera Operations',
     items: [
         'operations/guide',
+        'operations/memory',
+        'operations/metrics',
+        'operations/json-logging',
+        'operations/visualizing-profiles',
     ]
 };
 

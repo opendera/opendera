@@ -1,18 +1,18 @@
 use crate::transport::kafka::{
-    build_headers, generate_oauthbearer_token, kafka_send, rdkafka_loglevel_from,
-    validate_aws_msk_region, DeferredLogging, MemoryUseReporter, PemToLocation,
+    DeferredLogging, MemoryUseReporter, PemToLocation, build_headers, generate_oauthbearer_token,
+    kafka_send, rdkafka_loglevel_from, validate_aws_msk_region,
 };
 use crate::{AsyncErrorCallback, OutputEndpoint};
-use anyhow::{anyhow, bail, Error as AnyError, Result as AnyResult};
+use anyhow::{Error as AnyError, Result as AnyResult, anyhow, bail};
 use feldera_types::transport::kafka::KafkaOutputConfig;
 use rdkafka::client::OAuthToken;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::{
+    ClientConfig, ClientContext,
     config::FromClientConfigAndContext,
     error::KafkaError,
     producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer},
     types::RDKafkaErrorCode,
-    ClientConfig, ClientContext,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -81,6 +81,7 @@ impl ClientContext for KafkaOutputContext {
             cb(
                 fatal,
                 anyhow!("Kafka producer error: {error}; Reason: {reason}"),
+                Some("kafka_nonft_producer"),
             );
         }
     }
@@ -103,10 +104,14 @@ impl ProducerContext for KafkaOutputContext {
         delivery_result: &DeliveryResult<'_>,
         _delivery_opaque: Self::DeliveryOpaque,
     ) {
-        if let Err((error, _message)) = delivery_result {
-            if let Some(cb) = self.async_error_callback.read().unwrap().as_ref() {
-                cb(false, AnyError::new(error.clone()));
-            }
+        if let Err((error, _message)) = delivery_result
+            && let Some(cb) = self.async_error_callback.read().unwrap().as_ref()
+        {
+            cb(
+                false,
+                AnyError::new(error.clone()),
+                Some("kafka_nonft_delivery"),
+            );
         }
     }
 }
@@ -151,11 +156,15 @@ impl KafkaOutputEndpoint {
             .map(|s| s.parse::<usize>().unwrap_or(DEFAULT_MAX_MESSAGE_SIZE))
             .unwrap_or(DEFAULT_MAX_MESSAGE_SIZE);
         if message_max_bytes <= MAX_MESSAGE_OVERHEAD {
-            bail!("Invalid setting 'message.max.bytes={message_max_bytes}'. 'message.max.bytes' must be greated than {MAX_MESSAGE_OVERHEAD}");
+            bail!(
+                "Invalid setting 'message.max.bytes={message_max_bytes}'. 'message.max.bytes' must be greated than {MAX_MESSAGE_OVERHEAD}"
+            );
         }
 
         let max_message_size = message_max_bytes - MAX_MESSAGE_OVERHEAD;
-        debug!("Configured max message size: {max_message_size} ('message.max.bytes={message_max_bytes}')");
+        debug!(
+            "Configured max message size: {max_message_size} ('message.max.bytes={message_max_bytes}')"
+        );
 
         // Create Kafka producer.
         let kafka_producer = ThreadedProducer::from_config_and_context(&client_config, context)
@@ -245,15 +254,24 @@ impl OutputEndpoint for KafkaOutputEndpoint {
     fn is_fault_tolerant(&self) -> bool {
         false
     }
+
+    fn memory(&self) -> usize {
+        self.kafka_producer
+            .context()
+            .memory_use_reporter
+            .lock()
+            .unwrap()
+            .current()
+    }
 }
 
 #[cfg(test)]
 mod test {
     use crate::{
-        test::{init_test_logger, test_circuit, TestStruct},
         Controller,
+        test::{TestStruct, init_test_logger, test_circuit},
     };
-    use feldera_types::config::PipelineConfig;
+    use serde_json::json;
     use tracing::info;
 
     #[test]
@@ -262,28 +280,33 @@ mod test {
 
         info!("test_kafka_output_errors: Test invalid Kafka broker address");
 
-        let config_str = r#"
-name: test
-workers: 4
-inputs:
-outputs:
-    test_output:
-        stream: test_output1
-        transport:
-            name: kafka_output
-            config:
-                bootstrap.servers: localhost:11111
-                topic: end_to_end_test_output_topic
-        format:
-            name: csv
-"#;
+        let config = serde_json::from_value(json!({
+            "name": "test",
+            "workers": 4,
+            "inputs": {},
+            "outputs": {
+                "test_output": {
+                    "stream": "test_output1",
+                    "transport": {
+                        "name": "kafka_output",
+                        "config": {
+                            "bootstrap.servers": "localhost:11111",
+                            "topic": "end_to_end_test_output_topic"
+                        }
+                    },
+                    "format": {
+                        "name": "csv"
+                    }
+                }
+            }
+        }))
+        .unwrap();
 
         info!("test_kafka_output_errors: Creating circuit");
 
         info!("test_kafka_output_errors: Starting controller");
-        let config: PipelineConfig = serde_yaml::from_str(config_str).unwrap();
 
-        match Controller::with_config(
+        match Controller::with_test_config(
             |workers| {
                 Ok(test_circuit::<TestStruct>(
                     workers,
@@ -292,7 +315,7 @@ outputs:
                 ))
             },
             &config,
-            Box::new(|e| panic!("error: {e}")),
+            Box::new(|e, _| panic!("error: {e}")),
         ) {
             Ok(_) => panic!("expected an error"),
             Err(e) => info!("test_kafka_output_errors: error: {e}"),

@@ -6,13 +6,13 @@ use std::{
 };
 
 use crate::{
-    declare_trait_object, declare_typed_trait_object,
+    DBData, NumEntries, declare_trait_object, declare_typed_trait_object,
     dynamic::{
-        rkyv::SerializeDyn, ArchiveTrait, AsAny, Clonable, ClonableTrait, Comparable,
-        DeserializableDyn, DowncastTrait,
+        ArchiveTrait, AsAny, Clonable, ClonableTrait, Comparable, DeserializableDyn, DowncastTrait,
+        rkyv::SerializeDyn,
     },
     hash::default_hash,
-    DBData, NumEntries,
+    utils::SupportsRoaring,
 };
 
 /// Defines the minimal set of operations that must be supported by
@@ -20,7 +20,16 @@ use crate::{
 ///
 /// This trait is object safe and can be invoked via dynamic dispatch.
 pub trait Data:
-    Comparable + Clonable + SerializeDyn + DeserializableDyn + Send + Sync + Debug + AsAny + SizeOf
+    Comparable
+    + Clonable
+    + SerializeDyn
+    + DeserializableDyn
+    + Send
+    + Sync
+    + Debug
+    + AsAny
+    + SizeOf
+    + SupportsRoaring
 {
     /// Compute a hash of the object using default hasher and seed.
     fn default_hash(&self) -> u64;

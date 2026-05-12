@@ -3,7 +3,6 @@ package org.dbsp.sqlCompiler.circuit.operator;
 import com.fasterxml.jackson.databind.JsonNode;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
-import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteEmptyRel;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteRelNode;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
@@ -16,6 +15,7 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPEqualityComparatorExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPPathExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeUSize;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
 import org.dbsp.util.Utilities;
 
@@ -26,19 +26,20 @@ import java.util.Objects;
 /** Apply a topK operation to each of the groups in an indexed collection.
  * This always sorts the elements of each group.
  * To sort the entire collection just group by (). */
-public final class DBSPIndexedTopKOperator extends DBSPUnaryOperator {
+public final class DBSPIndexedTopKOperator extends DBSPUnaryOperator implements IContainsIntegrator, IIncremental {
     /** These values correspond to the SQL keywords
-     * ROW, RANK, and DENSE RANK.  See e.g.:
-     * https://learn.microsoft.com/en-us/sql/t-sql/functions/ranking-functions-transact-sql
-     */
-    @SuppressWarnings("JavadocLinkAsPlainText")
-    public enum TopKNumbering {
+     * ROW, RANK, and DENSE RANK. */
+    public enum Numbering {
         ROW_NUMBER,
         RANK,
-        DENSE_RANK
+        DENSE_RANK;
+
+        public boolean mayHaveDuplicates() {
+            return this != ROW_NUMBER;
+        }
     }
 
-    public final TopKNumbering numbering;
+    public final Numbering numbering;
     /** Limit K used by TopK.  Expected to be a constant */
     public final DBSPExpression limit;
     /** Closure which produces the output tuple.  The signature is
@@ -59,31 +60,33 @@ public final class DBSPIndexedTopKOperator extends DBSPUnaryOperator {
     }
 
     /**
-     * Create an IndexedTopK operator.  This operator is incremental only.
+     * Create an {@link DBSPIndexedTopKOperator} operator.  This operator is incremental only.
      * For a non-incremental version it should be sandwiched between a D-I.
      * @param node            CalciteObject which produced this operator.
      * @param numbering       How items in each group are numbered.
      * @param comparator      A {@link DBSPComparatorExpression} used to sort items in each group
      *                        (later could be a {@link DBSPPathExpression} too).
      * @param limit           Max number of records output in each group.
+     * @param equalityComparator Another representation of the comparator; see above.
      * @param outputProducer  Optional function with signature (rank, tuple) which produces the output.
      * @param source          Input operator.
      */
-    public DBSPIndexedTopKOperator(CalciteRelNode node, TopKNumbering numbering,
+    public DBSPIndexedTopKOperator(CalciteRelNode node, Numbering numbering,
                                    DBSPExpression comparator, DBSPExpression limit,
                                    DBSPEqualityComparatorExpression equalityComparator,
                                    DBSPClosureExpression outputProducer, OutputPort source) {
         super(node, "topK", comparator,
-                outputType(source.getOutputIndexedZSetType(), outputProducer), source.isMultiset(), source, true);
+                outputType(source.getOutputIndexedZSetType(), outputProducer),
+                numbering.mayHaveDuplicates(), source);
         Utilities.enforce(comparator.is(DBSPComparatorExpression.class) ||
                 comparator.is(DBSPPathExpression.class));
         this.limit = limit;
         this.numbering = numbering;
         this.outputProducer = outputProducer;
         this.equalityComparator = equalityComparator;
-        if (!this.outputType.is(DBSPTypeIndexedZSet.class))
-            throw new InternalCompilerError("Expected the input to be an IndexedZSet type",
-                    source.outputType());
+        Utilities.enforce(this.limit.getType().is(DBSPTypeUSize.class));
+        Utilities.enforce(this.outputType.is(DBSPTypeIndexedZSet.class),
+                () -> "Expected the input to be an IndexedZSet type" + source.outputType());
     }
 
     @Override
@@ -136,7 +139,7 @@ public final class DBSPIndexedTopKOperator extends DBSPUnaryOperator {
     public static DBSPIndexedTopKOperator fromJson(JsonNode node, JsonDecoder decoder) {
         CommonInfo info = commonInfoFromJson(node, decoder);
         DBSPExpression limit = fromJsonInner(node, "limit", decoder, DBSPExpression.class);
-        TopKNumbering numbering = TopKNumbering.valueOf(Utilities.getStringProperty(node, "numbering"));
+        Numbering numbering = Numbering.valueOf(Utilities.getStringProperty(node, "numbering"));
         DBSPClosureExpression outputProducer = fromJsonInner(node, "outputProducer", decoder, DBSPClosureExpression.class);
         DBSPEqualityComparatorExpression equalityComparator =
                 fromJsonInner(node, "equalityComparator", decoder, DBSPEqualityComparatorExpression.class);

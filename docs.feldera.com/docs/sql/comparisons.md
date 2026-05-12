@@ -70,12 +70,22 @@ but always return a Boolean value (sometimes nullable):
     <td>result is not nullable</td>
   </tr>
   <tr>
-    <td><a id="between"></a><code>BETWEEN ... AND ...</code></td>
+    <td><a id="between"></a><code>BETWEEN [ASYMMETRIC] ... AND ...</code></td>
     <td><code>x BETWEEN a AND b</code> is the same as <code>a &lt;= x AND x &lt;= b</code></td>
     <td>inclusive at both endpoints</td>
   </tr>
   <tr>
-    <td><a id="notbetween"></a><code>NOT BETWEEN ... AND ...</code></td>
+    <td><a id="notbetween"></a><code>NOT BETWEEN [ASYMMETRIC] ... AND ...</code></td>
+    <td>The <code>NOT</code> of the previous operator</td>
+    <td>not inclusive at either endpoints</td>
+  </tr>
+  <tr>
+    <td><a id="symmetric-between"></a><code>BETWEEN SYMMETRIC ... AND ...</code></td>
+    <td><code>x BETWEEN a AND b</code> is the same as <code>(a &lt;= x AND x &lt;= b) OR (b &lt;= x AND x &lt;= a)</code></td>
+    <td>inclusive at both endpoints; order of endpoints does not matter</td>
+  </tr>
+  <tr>
+    <td><a id="symmetric-notbetween"></a><code>NOT BETWEEN SYMMETRIC ... AND ...</code></td>
     <td>The <code>NOT</code> of the previous operator</td>
     <td>not inclusive at either endpoint</td>
   </tr>
@@ -85,29 +95,9 @@ but always return a Boolean value (sometimes nullable):
     <td></td>
   </tr>
   <tr>
-    <td><code>&lt;OP&gt; ANY _set_or_subquery_</code></td>
-    <td>check if any of the values in a set compares properly</td>
-    <td>Example: 10 &lt;= ANY (VALUES 10, 20, 30) is true</td>
-  </tr>
-  <tr>
-    <td><code>&lt;OP&gt; SOME _set_or_subquery_</code></td>
-    <td>A synonym for `ANY`</td>
-    <td>Example: 10 &lt;= SOME (VALUES 10, 20, 30) is true</td>
-  </tr>
-  <tr>
-    <td><code>&lt;OP&gt; ALL _set_or_subquery_</code></td>
-    <td>check if all the values in a set compare properly</td>
-    <td>Example: 10 &lt;= ALL (VALUES 10, 20, 30) is true</td>
-  </tr>
-  <tr>
     <td><a id="exists"></a><code>EXISTS query</code></td>
     <td>check whether query results have at least one row</td>
     <td></td>
-  </tr>
-  <tr>
-    <td><a id="unique"></a><code>UNIQUE query</code></td>
-    <td>check whether the result of a query contains no duplicates</td>
-    <td>ignores <code>NULL</code> values</td>
   </tr>
 </table>
 
@@ -140,15 +130,27 @@ with `NULL` values are compared smaller than any other value.
   </tr>
   <tr>
     <td><a id="greatest"></a><code>GREATEST( expr [, expr ]* )</code></td>
-    <td>The largest of a number of expressions.</td>
+    <td>The largest of a number of expressions; if any argument is <code>NULL</code>, the result is <code>NULL</code>.</td>
+  </tr>
+  <tr>
+    <td><a id="greatest_ignore_nulls"></a><code>GREATEST_IGNORE_NULLS( expr [, expr ]* )</code></td>
+    <td>The largest of a number of expressions; only if all arguments are <code>NULL</code>, the result is <code>NULL</code>; otherwise <code>NULL</code> values are ignored.</td>
   </tr>
   <tr>
     <td><a id="if"></a><code>IF( condition, ifTrue, ifFalse )</code></td>
     <td>Returns ifTrue if the condition evaluates to 'true', returns ifFalse otherwise.</td>
   </tr>
   <tr>
+    <td><a id="ifnull"></a><code>IFNULL( left, right )</code></td>
+    <td>Equivalent to <code>COALESCE(left, right)</code>.</td>
+  </tr>
+  <tr>
     <td><a id="least"></a><code>LEAST( expr [, expr ]* )</code></td>
-    <td>The smallest of a number of expressions.</td>
+    <td>The smallest of a number of expressions; if any argument is <code>NULL</code>, the result is <code>NULL</code>.</td>
+  </tr>
+  <tr>
+    <td><a id="least_ignore_nulls"></a><code>LEAST_IGNORE_NULLS( expr [, expr ]* )</code></td>
+    <td>The smallest of a number of expressions; only if all arguments are <code>NULL</code>, the result is <code>NULL</code>; otherwise <code>NULL</code> values are ignored.</td>
   </tr>
   <tr>
     <td><a id="nullif"></a><code>NULLIF(value0, value1)</code></td>

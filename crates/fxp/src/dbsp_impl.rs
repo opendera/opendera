@@ -1,12 +1,44 @@
+use dbsp::NumEntries;
 use dbsp::algebra::{HasOne, HasZero, MulByRef, OptionWeightType};
+use dbsp::utils::{IsNone, SupportsRoaring};
 use feldera_types::serde_with_context::{
-    serde_config::DecimalFormat, DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
+    DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, serde_config::DecimalFormat,
 };
 use serde::{Deserializer, Serialize, Serializer};
 use smallstr::SmallString;
-use std::fmt::{Display, Write};
+use std::fmt::Write;
 
 use crate::{DynamicDecimal, Fixed, FixedInteger};
+
+impl<const P: usize, const S: usize> NumEntries for Fixed<P, S> {
+    const CONST_NUM_ENTRIES: Option<usize> = Some(1);
+
+    fn num_entries_shallow(&self) -> usize {
+        1
+    }
+
+    fn num_entries_deep(&self) -> usize {
+        1
+    }
+}
+
+impl<const P: usize, const S: usize> IsNone for Fixed<P, S> {
+    type Inner = Self;
+
+    fn is_none(&self) -> bool {
+        false
+    }
+
+    fn unwrap_or_self(&self) -> &Self::Inner {
+        self
+    }
+
+    fn from_inner(inner: Self::Inner) -> Self {
+        inner
+    }
+}
+
+impl<const P: usize, const S: usize> SupportsRoaring for Fixed<P, S> {}
 
 impl<const P: usize, const S: usize> OptionWeightType for Fixed<P, S> {}
 impl<const P: usize, const S: usize> OptionWeightType for &Fixed<P, S> {}
@@ -22,8 +54,7 @@ impl<const P: usize, const S: usize> HasZero for Fixed<P, S> {
 }
 
 impl<const P: usize, const S: usize> HasOne for Fixed<P, S> {
-    /// This will panic if 1 can't be represented in this type (that is, if `S
-    /// >= P`).
+    /// This will panic if 1 can't be represented in this type (that is, if `S >= P`).
     fn one() -> Self {
         Self::ONE
     }
@@ -56,25 +87,6 @@ impl<const P: usize, const S: usize> MulByRef<i32> for Fixed<P, S> {
     }
 }
 
-fn serialize_with_context_helper<S, T>(
-    value: T,
-    serializer: S,
-    context: &SqlSerdeConfig,
-) -> Result<S::Ok, S::Error>
-where
-    T: Serialize + Display,
-    S: Serializer,
-{
-    match context.decimal_format {
-        DecimalFormat::Numeric => value.serialize(serializer),
-        DecimalFormat::String => {
-            let mut string = SmallString::<[u8; 64]>::new();
-            write!(&mut string, "{value}").unwrap();
-            serializer.serialize_str(&string)
-        }
-    }
-}
-
 impl<const P: usize, const S: usize> SerializeWithContext<SqlSerdeConfig> for Fixed<P, S> {
     fn serialize_with_context<Ser>(
         &self,
@@ -84,7 +96,15 @@ impl<const P: usize, const S: usize> SerializeWithContext<SqlSerdeConfig> for Fi
     where
         Ser: Serializer,
     {
-        serialize_with_context_helper(self, serializer, context)
+        match context.decimal_format {
+            DecimalFormat::Numeric => self.serialize(serializer),
+            DecimalFormat::String => {
+                let mut string = SmallString::<[u8; 64]>::new();
+                write!(&mut string, "{self}").unwrap();
+                serializer.serialize_str(&string)
+            }
+            DecimalFormat::I128 => serializer.serialize_i128(self.0),
+        }
     }
 }
 
@@ -97,11 +117,21 @@ impl SerializeWithContext<SqlSerdeConfig> for DynamicDecimal {
     where
         Ser: Serializer,
     {
-        serialize_with_context_helper(self, serializer, context)
+        match context.decimal_format {
+            DecimalFormat::Numeric => self.serialize(serializer),
+            DecimalFormat::String => {
+                let mut string = SmallString::<[u8; 64]>::new();
+                write!(&mut string, "{self}").unwrap();
+                serializer.serialize_str(&string)
+            }
+            DecimalFormat::I128 => serializer.serialize_i128(self.significand()),
+        }
     }
 }
 
-impl<'de, C, const P: usize, const S: usize> DeserializeWithContext<'de, C> for Fixed<P, S> {
+impl<'de, C, AUX, const P: usize, const S: usize> DeserializeWithContext<'de, C, AUX>
+    for Fixed<P, S>
+{
     #[inline(never)]
     fn deserialize_with_context<D>(deserializer: D, _context: &'de C) -> Result<Self, D::Error>
     where
@@ -111,7 +141,7 @@ impl<'de, C, const P: usize, const S: usize> DeserializeWithContext<'de, C> for 
     }
 }
 
-impl<'de, C> DeserializeWithContext<'de, C> for DynamicDecimal {
+impl<'de, C, AUX> DeserializeWithContext<'de, C, AUX> for DynamicDecimal {
     #[inline(never)]
     fn deserialize_with_context<D>(deserializer: D, _context: &'de C) -> Result<Self, D::Error>
     where
@@ -126,13 +156,13 @@ mod test {
     use std::sync::{Arc, Mutex};
 
     use dbsp::{
-        algebra::DefaultSemigroup, indexed_zset, operator::Fold, typed_batch::OrdIndexedZSet,
-        utils::Tup2, Runtime, ZWeight,
+        Runtime, ZWeight, algebra::DefaultSemigroup, indexed_zset, operator::Fold,
+        typed_batch::OrdIndexedZSet, utils::Tup2,
     };
 
     use crate::Fixed;
 
-    // This is copied from `crates/dbsp/src/operator/dynamic/aggregate/mod.rs`
+    // This is copied from `crates/dbsp/src/operator/dynamic/aggregate.rs`
     // with the value type changed from `i64` to `Fixed<10,0>`.
     fn count_test(workers: usize) {
         type D = Fixed<10, 0>;
@@ -203,7 +233,7 @@ mod test {
         .unwrap();
 
         input_handle.append(&mut vec![Tup2(1u64, Tup2(d(1), 1)), Tup2(1, Tup2(d(2), 2))]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
         assert_eq!(
             &*count_distinct_output_clone.lock().unwrap(),
             &indexed_zset! {1 => {d(2) => 1}}
@@ -226,7 +256,7 @@ mod test {
             Tup2(2, Tup2(d(4), 1)),
             Tup2(1, Tup2(d(2), -1)),
         ]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
         assert_eq!(
             &*count_distinct_output_clone.lock().unwrap(),
             &indexed_zset! {2 => {d(2) => 1}}
@@ -245,7 +275,7 @@ mod test {
         );
 
         input_handle.append(&mut vec![Tup2(1, Tup2(d(3), 1)), Tup2(1, Tup2(d(2), -1))]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
         assert_eq!(
             &*count_distinct_output_clone.lock().unwrap(),
             &indexed_zset! {}

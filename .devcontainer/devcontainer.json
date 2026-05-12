@@ -6,10 +6,16 @@
 	],
 	"service": "workspace",
 	"runServices": [
-		"redpanda"
+		"postgres-dev",
+		"db-admin"
 	],
 	"workspaceFolder": "/workspaces/feldera",
 	"shutdownAction": "stopCompose",
+	"features": {
+		"ghcr.io/devcontainers/features/docker-from-docker:1": {
+			"moby": false
+		}
+	},
 	"customizations": {
 		"vscode": {
 			"extensions": [
@@ -23,7 +29,9 @@
 				"ms-playwright.playwright",
 				"svelte.svelte-vscode",
 				"bradlc.vscode-tailwindcss",
-				"esbenp.prettier-vscode"
+				"esbenp.prettier-vscode",
+				"ms-python.python",
+				"biomejs.biome"
 			],
 			"settings": {
 				"editor.formatOnSave": true,
@@ -34,7 +42,7 @@
 				},
 				"importSorter.generalConfiguration.configurationFilePath": "./import-sorter.json",
 				"editor.defaultFormatter": "esbenp.prettier-vscode",
-				"prettier.configPath": "web-console/.prettierrc"
+				"prettier.configPath": "js-packages/web-console/.prettierrc"
 			}
 		}
 	},

@@ -8,7 +8,8 @@
 
 use anyhow::Result;
 use clap::Parser;
-use dbsp::{OrdZSet, OutputHandle, Runtime, Stream};
+use dbsp::{OrdZSet, OutputHandle, Runtime, Stream, typed_batch::IndexedZSetReader};
+use feldera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 use std::hash::Hash;
@@ -31,6 +32,7 @@ type EmployeeID = u64;
     Archive,
     Serialize,
     Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -54,6 +56,7 @@ struct Manages {
     Archive,
     Serialize,
     Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -121,7 +124,7 @@ fn main() -> Result<()> {
             1,
         );
     }
-    dbsp.step().unwrap();
+    dbsp.transaction().unwrap();
     println!("Initialization:");
     print_output(&output);
 
@@ -142,32 +145,32 @@ fn main() -> Result<()> {
             },
             1,
         );
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
         println!("Changes from adjusting {employee}'s manager:");
         print_output(&output);
 
-        let profile = dbsp.retrieve_profile().unwrap();
-        println!("total used bytes: {}", profile.total_used_bytes().unwrap());
-        println!(
-            "total allocated bytes: {}",
-            profile.total_allocated_bytes().unwrap()
-        );
-        println!(
-            "total shared bytes: {}",
-            profile.total_shared_bytes().unwrap()
-        );
-        println!(
-            "num table entries: {}",
-            profile.total_relation_size().unwrap()
-        );
+        // let profile = dbsp.retrieve_profile().unwrap();
+        // println!("total used bytes: {}", profile.total_used_bytes().unwrap());
+        // println!(
+        //     "total allocated bytes: {}",
+        //     profile.total_allocated_bytes().unwrap()
+        // );
+        // println!(
+        //     "total shared bytes: {}",
+        //     profile.total_shared_bytes().unwrap()
+        // );
+        // println!(
+        //     "num table entries: {}",
+        //     profile.total_relation_size().unwrap()
+        // );
     }
 
-    let profile = dbsp.retrieve_profile().unwrap();
+    // let profile = dbsp.retrieve_profile().unwrap();
 
-    println!(
-        "used bytes profile: {:?}",
-        profile.used_bytes_profile().unwrap()
-    );
+    // println!(
+    //     "used bytes profile: {:?}",
+    //     profile.used_bytes_profile().unwrap()
+    // );
 
     dbsp.kill().unwrap();
 

@@ -9,22 +9,26 @@ import org.dbsp.sqlCompiler.compiler.visitors.inner.Substitution;
 import org.dbsp.sqlCompiler.ir.DBSPParameter;
 import org.dbsp.sqlCompiler.ir.IDBSPDeclaration;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
+import org.dbsp.sqlCompiler.ir.aggregate.LinearAggregate;
+import org.dbsp.sqlCompiler.ir.aggregate.MinMaxAggregate;
+import org.dbsp.sqlCompiler.ir.aggregate.NonLinearAggregate;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPDerefExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPFieldExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPVariablePath;
+import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
 
-/** Rewrite field accesses according to a {@link ParameterFieldRemap}.
+/** Rewrite field accesses according to a {@link ParameterFieldUse}.
  * Very similar to the {@link CanonicalForm} visitor. */
 public class RewriteFields extends InnerRewriteVisitor {
     final Substitution<DBSPParameter, DBSPParameter> newParam;
     /** Maps original parameters to their remap tables
         param.X is remapped to newParam.Y, where newParam is given
         by the 'newParam' table, and Y is given by fieldRemap[param][X]. */
-    final ParameterFieldRemap fieldRemap;
+    final ParameterFieldUse fieldRemap;
     final ResolveReferences resolver;
     final int depth;
     /** Field use map for the currently evaluated expression */
@@ -33,7 +37,7 @@ public class RewriteFields extends InnerRewriteVisitor {
 
     public RewriteFields(DBSPCompiler compiler,
                          Substitution<DBSPParameter, DBSPParameter> newParam,
-                         ParameterFieldRemap fieldRemap,
+                         ParameterFieldUse fieldRemap,
                          int depth) {
         super(compiler, false);
         this.fieldRemap = fieldRemap;
@@ -44,9 +48,9 @@ public class RewriteFields extends InnerRewriteVisitor {
         this.currentDepth = 0;
     }
 
-    /** Essentially says that "all fields of this parameter are used */
+    /** Essentially says that "all fields of this parameter are used" */
     public void parameterFullyUsed(DBSPParameter parameter) {
-        this.fieldRemap.changeMap(parameter, FieldUseMap.identity(parameter.getType()));
+        this.fieldRemap.updateParameterValue(parameter, FieldUseMap.identity(parameter.getType()));
         this.newParam.substitute(parameter, parameter);
     }
 
@@ -110,13 +114,59 @@ public class RewriteFields extends InnerRewriteVisitor {
         return VisitDecision.STOP;
     }
 
+    @Override
     public VisitDecision preorder(DBSPClosureExpression expression) {
-        if (!this.context.isEmpty()) {
-            // Nested closure
-            this.map(expression, expression);
-            return VisitDecision.STOP;
+        for (IDBSPInnerNode node: this.context) {
+            if (node.is(DBSPClosureExpression.class)) {
+                // Nested closure
+                this.map(expression, expression);
+                return VisitDecision.STOP;
+            }
         }
         return super.preorder(expression);
+    }
+
+    @Override
+    public VisitDecision preorder(NonLinearAggregate aggregate) {
+        this.parameterFullyUsed(aggregate.increment.parameters[0]);
+        this.parameterFullyUsed(aggregate.increment.parameters[2]);
+        DBSPExpression increment = this.transform(aggregate.increment);
+        NonLinearAggregate result = new NonLinearAggregate(aggregate.getNode(),
+                aggregate.zero, increment.to(DBSPClosureExpression.class), aggregate.postProcess,
+                aggregate.emptySetResult, aggregate.semigroup);
+        this.map(aggregate, result);
+        return VisitDecision.STOP;
+    }
+
+    @Override
+    public VisitDecision preorder(LinearAggregate aggregate) {
+        DBSPExpression map = this.transform(aggregate.map);
+        LinearAggregate result = new LinearAggregate(aggregate.getNode(),
+                map.to(DBSPClosureExpression.class),
+                aggregate.postProcess, aggregate.emptySetResult);
+        this.map(aggregate, result);
+        return VisitDecision.STOP;
+    }
+
+    @Override
+    public VisitDecision preorder(MinMaxAggregate aggregate) {
+        DBSPExpression aggregatedValue = this.transform(aggregate.comparedValue);
+        this.parameterFullyUsed(aggregate.increment.parameters[0]);
+        this.parameterFullyUsed(aggregate.increment.parameters[2]);
+        DBSPClosureExpression increment = this.transform(aggregate.increment).to(DBSPClosureExpression.class);
+        DBSPClosureExpression postProcess = null;
+        if (aggregate.postProcess != null) {
+            this.parameterFullyUsed(aggregate.postProcess.parameters[0]);
+            postProcess = this.transform(aggregate.postProcess).to(DBSPClosureExpression.class);
+        }
+        Utilities.enforce(aggregate.increment.getResultType().sameType(increment.getResultType()));
+        MinMaxAggregate result = new MinMaxAggregate(aggregate.getNode(),
+                aggregate.zero, increment,
+                aggregate.emptySetResult, aggregate.semigroup,
+                aggregatedValue.to(DBSPClosureExpression.class), postProcess,
+                aggregate.operation);
+        this.map(aggregate, result);
+        return VisitDecision.STOP;
     }
 
     public DBSPClosureExpression rewriteClosure(DBSPClosureExpression closure) {
@@ -126,6 +176,7 @@ public class RewriteFields extends InnerRewriteVisitor {
 
     @Override
     public void startVisit(IDBSPInnerNode node) {
+        this.resolver.reference.clear();
         this.resolver.apply(node);
         super.startVisit(node);
     }

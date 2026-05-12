@@ -1,20 +1,19 @@
 //! Compute random samples of data.
 
 use crate::{
+    Circuit, DBData, RootCircuit, Stream, ZWeight,
     algebra::{
-        zset::{VecZSet, VecZSetFactories},
         HasOne, IndexedZSetReader,
+        zset::{VecZSet, VecZSetFactories},
     },
     circuit::{
-        operator_traits::{BinaryOperator, Operator},
         Scope,
+        operator_traits::{BinaryOperator, Operator},
     },
     dynamic::{DynPair, Erase},
     trace::{Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor},
     utils::Tup2,
-    Circuit, DBData, RootCircuit, Stream, ZWeight,
 };
-use minitrace::trace;
 use rand::thread_rng;
 use std::{borrow::Cow, cmp::min, marker::PhantomData};
 
@@ -139,6 +138,7 @@ where
                     let mut builder = <<VecZSet<_> as Batch>::Builder>::with_capacity(
                         &output_factories,
                         num_quantiles,
+                        num_quantiles,
                     );
                     for i in 0..num_quantiles {
                         let key = &sample.layer.keys[(i * sample_size) / num_quantiles];
@@ -172,6 +172,7 @@ where
                 } else {
                     let mut builder = <<VecZSet<_> as Batch>::Builder>::with_capacity(
                         &factories.output_factories,
+                        num_quantiles,
                         num_quantiles,
                     );
                     for i in 0..num_quantiles {
@@ -221,7 +222,6 @@ impl<T> BinaryOperator<T, usize, VecZSet<T::Key>> for SampleKeys<T>
 where
     T: IndexedZSetReader,
 {
-    #[trace]
     async fn eval(&mut self, input_trace: &T, &sample_size: &usize) -> VecZSet<T::Key> {
         let sample_size = min(sample_size, MAX_SAMPLE_SIZE);
 
@@ -233,6 +233,7 @@ where
 
             let mut builder = <<VecZSet<_> as Batch>::Builder>::with_capacity(
                 &self.output_factories,
+                sample.len(),
                 sample.len(),
             );
             for key in sample.dyn_iter_mut() {
@@ -288,7 +289,6 @@ impl<T> BinaryOperator<T, usize, VecZSet<DynPair<T::Key, T::Val>>> for SampleUni
 where
     T: IndexedZSetReader,
 {
-    #[trace]
     async fn eval(
         &mut self,
         input_trace: &T,
@@ -309,22 +309,18 @@ where
             let mut builder = <<VecZSet<_> as Batch>::Builder>::with_capacity(
                 &self.output_factories,
                 sample_size,
+                sample_size,
             );
 
             for key in sample.dyn_iter_mut() {
                 cursor.seek_key(key);
-                debug_assert!(cursor.key_valid());
+                debug_assert!(cursor.key_valid() && cursor.val_valid());
                 debug_assert_eq!(cursor.key(), key);
 
-                while cursor.val_valid() {
-                    if !cursor.weight().is_zero() {
-                        item.from_refs(key, cursor.val());
-                        builder.push_val_diff(().erase(), ZWeight::one().erase());
-                        builder.push_key_mut(item.as_mut());
-                        break;
-                    }
-                    cursor.step_val();
-                }
+                debug_assert!(!cursor.weight().is_zero());
+                item.from_refs(key, cursor.val());
+                builder.push_val_diff(().erase(), ZWeight::one().erase());
+                builder.push_key_mut(item.as_mut());
             }
 
             builder.done()
@@ -338,19 +334,20 @@ where
 #[allow(clippy::type_complexity)]
 mod test {
     use crate::{
+        DynZWeight, RootCircuit, Runtime, ZWeight,
         dynamic::{DowncastTrait, DynData, DynPair},
         operator::{IndexedZSetHandle, InputHandle, MapHandle, OutputHandle, Update},
         trace::{
-            test::test_batch::{batch_to_tuples, TestBatch, TestBatchFactories},
             Cursor, Trace,
+            test::test_batch::{TestBatch, TestBatchFactories, batch_to_tuples},
         },
         typed_batch::{
             BatchReader, DynBatchReader, DynVecZSet, OrdIndexedZSet, TypedBatch, VecZSet,
         },
         utils::Tup2,
-        DynZWeight, RootCircuit, Runtime, ZWeight,
     };
     use anyhow::Result as AnyResult;
+    use feldera_storage::tokio::TOKIO;
     use proptest::{collection::vec, prelude::*};
     use std::{cmp::Ordering, collections::BTreeSet};
 
@@ -464,7 +461,7 @@ mod test {
                 let records = batch.iter().map(|(k, v, r)| ((*k, *v, ()), *r)).collect::<Vec<_>>();
 
                 let ref_batch = TestBatch::from_typed_data(&records);
-                ref_trace.insert(ref_batch);
+                TOKIO.block_on(ref_trace.insert(ref_batch));
 
                 for (k, v, r) in batch.into_iter() {
                     input_handle.push(k, (v, r));
@@ -472,7 +469,7 @@ mod test {
 
                 sample_size_handle.set_for_all(sample_size);
 
-                dbsp.step().unwrap();
+                dbsp.transaction().unwrap();
 
                 let output_sample = output_sample_handle.consolidate();
                 let output_quantile = output_quantile_handle.consolidate();
@@ -532,7 +529,7 @@ mod test {
 
                 sample_size_handle.set_for_all(sample_size);
 
-                dbsp.step().unwrap();
+                dbsp.transaction().unwrap();
 
                 let output_sample = output_sample_handle.consolidate();
                 let output_quantile = output_quantile_handle.consolidate();

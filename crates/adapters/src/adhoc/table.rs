@@ -4,21 +4,20 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Weak};
 
-use crate::catalog::SyncSerBatchReader;
-use crate::controller::{ConsistentSnapshots, ControllerInner};
+use crate::controller::{ConsistentSnapshot, ControllerInner};
 use crate::transport::adhoc::AdHocInputEndpoint;
 use crate::{DeCollectionHandle, RecordFormat, TransportInputEndpoint};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{exec_err, not_impl_err, plan_err, SchemaExt};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::common::{SchemaExt, exec_err, not_impl_err, plan_err};
 use datafusion::datasource::TableType;
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::MetricsSet;
@@ -28,21 +27,18 @@ use datafusion::physical_plan::stream::{
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use feldera_types::config::{
-    default_max_batch_size, default_max_queued_records, ConnectorConfig, FormatConfig,
-    InputEndpointConfig, TransportConfig,
-};
+use feldera_adapterlib::catalog::SerBatchReader;
+use feldera_types::config::{ConnectorConfig, FormatConfig, InputEndpointConfig, TransportConfig};
 use feldera_types::program_schema::SqlIdentifier;
 use feldera_types::serde_with_context::serde_config::{
     BinaryFormat, DecimalFormat, UuidFormat, VariantFormat,
 };
 use feldera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimeFormat, TimestampFormat};
 use feldera_types::transport::adhoc::AdHocInputConfig;
-use serde_arrow::schema::SerdeArrowSchema;
 use serde_arrow::ArrayBuilder;
-use serde_yaml::Value as YamlValue;
+use serde_arrow::schema::SerdeArrowSchema;
 use tokio::sync::mpsc::Sender;
-use tracing::{info_span, Instrument};
+use tracing::{Instrument, info_span};
 use uuid::Uuid;
 
 pub const fn input_adhoc_arrow_serde_config() -> &'static SqlSerdeConfig {
@@ -81,15 +77,11 @@ pub struct AdHocTable {
     input_handle: Option<Box<dyn DeCollectionHandle>>,
     name: SqlIdentifier,
     materialized: bool,
-    schema: Arc<Schema>,
-    /// Contains the current snapshots for tables.
+    /// True if the table is indexed.
     ///
-    /// Note that not finding a snapshot in `snapshots` doesn't imply
-    /// that the table isn't materialized just that the table might have
-    /// never received any input. One is supposed to check `materialized` to
-    /// determine if the table is materialized and return an error on
-    /// scans if not.
-    snapshots: ConsistentSnapshots,
+    /// When true, table records are stored as values; otherwise, they are stored as keys.
+    indexed: bool,
+    schema: Arc<Schema>,
 }
 
 impl Debug for AdHocTable {
@@ -106,19 +98,19 @@ impl Debug for AdHocTable {
 impl AdHocTable {
     pub fn new(
         materialized: bool,
+        indexed: bool,
         controller: Weak<ControllerInner>,
         input_handle: Option<Box<dyn DeCollectionHandle>>,
         name: SqlIdentifier,
         schema: Arc<Schema>,
-        snapshots: ConsistentSnapshots,
     ) -> Self {
         Self {
             materialized,
+            indexed,
             controller,
             input_handle,
             name,
             schema,
-            snapshots,
         }
     }
 }
@@ -143,10 +135,10 @@ impl TableProvider for AdHocTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        limit: Option<usize>,
+        _limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         // This holds because we don't enable filter push-down for now.
         assert!(filters.is_empty(), "AdHocTable does not support filters");
@@ -157,14 +149,19 @@ impl TableProvider for AdHocTable {
             self.schema.clone()
         };
 
+        let snapshot: ConsistentSnapshot = state
+            .config()
+            .get_extension()
+            .expect("session should contain consistent snapshot of table data");
+
         Ok(Arc::new(AdHocQueryExecution::new(
             self.name.clone(),
             self.materialized,
+            self.indexed,
             self.schema.clone(),
             projected_schema,
-            self.snapshots.lock().await.get(&self.name).cloned(),
+            snapshot.get(&self.name).cloned(),
             projection,
-            limit,
         )))
     }
 
@@ -192,14 +189,13 @@ impl TableProvider for AdHocTable {
                     self.controller.clone(),
                     self.name.clone(),
                     self.schema.clone(),
-                    ih.fork()));
-                Ok(Arc::new(DataSinkExec::new(
-                    input,
-                    sink,
-                    None,
-                )))
+                    ih.fork(),
+                ));
+                Ok(Arc::new(DataSinkExec::new(input, sink, None)))
             }
-            None => exec_err!("Called insert_into on a view, this is a bug in the feldera ad-hoc query implementation."),
+            None => exec_err!(
+                "Called insert_into on a view, this is a bug in the feldera ad-hoc query implementation."
+            ),
         }
     }
 }
@@ -278,23 +274,16 @@ impl DataSink for AdHocTableSink {
         let endpoint = AdHocInputEndpoint::new(config.clone());
 
         // Create endpoint config.
-        let config = InputEndpointConfig {
-            stream: Cow::from(self.name.to_string()),
-            connector_config: ConnectorConfig {
-                transport: TransportConfig::AdHocInput(config),
-                format: Some(FormatConfig {
+        let config = InputEndpointConfig::new(
+            self.name.to_string(),
+            ConnectorConfig::new(
+                TransportConfig::AdHocInput(config),
+                Some(FormatConfig {
                     name: Cow::from("parquet"),
-                    config: YamlValue::Null,
+                    config: serde_json::Value::Null,
                 }),
-                index: None,
-                output_buffer_config: Default::default(),
-                max_batch_size: default_max_batch_size(),
-                max_queued_records: default_max_queued_records(),
-                paused: false,
-                labels: vec![],
-                start_after: None,
-            },
-        };
+            ),
+        );
 
         // Connect endpoint.
         let endpoint_id = controller
@@ -302,6 +291,7 @@ impl DataSink for AdHocTableSink {
                 &endpoint_name,
                 config,
                 Some(Box::new(endpoint.clone()) as Box<dyn TransportInputEndpoint>),
+                None,
             )
             .map_err(|e| DataFusionError::External(e.into()))?;
 
@@ -325,27 +315,29 @@ impl DataSink for AdHocTableSink {
     }
 }
 
+#[derive(Clone)]
 struct AdHocQueryExecution {
     name: SqlIdentifier,
     materialized: bool,
+    indexed: bool,
     table_schema: Arc<Schema>,
     projected_schema: Arc<Schema>,
-    readers: Option<Vec<Arc<dyn SyncSerBatchReader>>>,
+    readers: Vec<Arc<dyn SerBatchReader>>,
     projection: Option<Vec<usize>>,
-    limit: usize,
     plan_properties: PlanProperties,
     children: Vec<Arc<dyn ExecutionPlan>>,
 }
 
 impl AdHocQueryExecution {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         name: SqlIdentifier,
         materialized: bool,
+        indexed: bool,
         table_schema: Arc<Schema>,
         projected_schema: Arc<Schema>,
-        readers: Option<Vec<Arc<dyn SyncSerBatchReader>>>,
+        readers: Option<Vec<Arc<dyn SerBatchReader>>>,
         projection: Option<&Vec<usize>>,
-        limit: Option<usize>,
     ) -> Self {
         // TODO: we could do much better here by encoding our data partitioning schema
         // and using the correct equivalence properties.
@@ -362,11 +354,11 @@ impl AdHocQueryExecution {
         Self {
             name,
             materialized,
+            indexed,
             table_schema,
             projected_schema,
-            readers,
+            readers: readers.unwrap_or_default(),
             projection: projection.cloned(),
-            limit: limit.unwrap_or(usize::MAX),
             plan_properties,
             children: vec![],
         }
@@ -406,23 +398,16 @@ impl ExecutionPlan for AdHocQueryExecution {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        self.children.iter().map(|c| c as _).collect()
+        self.children.iter().collect()
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(AdHocQueryExecution {
-            name: self.name.clone(),
-            materialized: self.materialized,
-            table_schema: self.table_schema.clone(),
-            projected_schema: self.projected_schema.clone(),
-            readers: self.readers.clone(),
-            projection: self.projection.clone(),
-            limit: self.limit,
-            plan_properties: self.plan_properties.clone(),
+        Ok(Arc::new(Self {
             children,
+            ..Arc::unwrap_or_clone(self)
         }))
     }
 
@@ -432,10 +417,11 @@ impl ExecutionPlan for AdHocQueryExecution {
         _context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
         if !self.materialized {
-            return Err(DataFusionError::Execution(
-                format!("Tried to SELECT from a non-materialized source. Make sure `{}` is configured as materialized: \
-use `with ('materialized' = 'true')` for tables, or `create materialized view` for views", self.name),
-            ));
+            return Err(DataFusionError::Execution(format!(
+                "Tried to SELECT from a non-materialized source. Make sure `{}` is configured as materialized: \
+use `with ('materialized' = 'true')` for tables, or `create materialized view` for views",
+                self.name
+            )));
         }
 
         async fn send_batch(
@@ -458,11 +444,10 @@ use `with ('materialized' = 'true')` for tables, or `create materialized view` f
             Ok(())
         }
 
-        if let Some(readers) = &self.readers {
+        if let Some(batch_reader) = self.readers.get(partition).cloned() {
             let mut builder =
                 RecordBatchReceiverStreamBuilder::new(self.projected_schema.clone(), 10);
             // Returns a single batch when the returned stream is polled
-            let batch_reader = readers[partition].clone();
             let schema = self.table_schema.clone();
             let tx = builder.tx();
             let projection = self.projection.clone();
@@ -475,6 +460,8 @@ use `with ('materialized' = 'true')` for tables, or `create materialized view` f
                     ))
                 })?;
 
+            let indexed = self.indexed;
+
             builder.spawn(async move {
                 let mut cursor = batch_reader
                     .cursor(RecordFormat::Parquet(
@@ -484,44 +471,46 @@ use `with ('materialized' = 'true')` for tables, or `create materialized view` f
                 let mut insert_builder = SendableArrowBuilder::new(sas)?;
 
                 let mut cur_batch_size = 0;
+
                 while cursor.key_valid() {
-                    if !cursor.val_valid() {
-                        cursor.step_key();
-                        continue;
-                    }
-                    let mut w = cursor.weight();
+                    while cursor.val_valid() {
+                        let mut w = cursor.weight();
 
-                    // Skip deleted records.
-                    if w < 0 {
-                        cursor.step_key();
-                        panic!("Unexpected key with negative weight encountered while processing ad-hoc query");
-                    }
-
-                    while w != 0 {
-                        cursor
-                            .serialize_key_to_arrow(&mut insert_builder.builder)
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "Unable to serialize record to arrow: {}",
-                                    e
-                                ))
-                            })?;
-                        cur_batch_size += 1;
-                        w -= 1;
-
-                        // `256` turned out to be a good compromise of performance and fast response latency.
-                        // If too high, the HTTP server will wait too long esp. until the first results are sent out.
-                        const MAX_BATCH_SIZE: usize = 256;
-                        if cur_batch_size >= MAX_BATCH_SIZE {
-                            let batch = insert_builder.builder.to_record_batch().map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "Unable to convert ArrayBuilder to RecordBatch: {}",
-                                    e
-                                ))
-                            })?;
-                            send_batch(&tx, &projection, batch).await?;
-                            cur_batch_size = 0;
+                        if w < 0 {
+                            return Err(datafusion::common::DataFusionError::Execution("Unexpected record with negative weight encountered while processing ad-hoc query.".to_string()));
                         }
+
+                        while w != 0 {
+                            let result = if indexed {
+                                cursor
+                                    .serialize_val_to_arrow(&mut insert_builder.builder)
+                            } else {
+                                cursor
+                                    .serialize_key_to_arrow(&mut insert_builder.builder)
+                            };
+
+                            result.map_err(|e| {
+                                    DataFusionError::Execution(format!(
+                                        "Unable to serialize record to arrow: {}",
+                                        e
+                                    ))
+                                })?;
+                            cur_batch_size += 1;
+                            w -= 1;
+
+                            const MAX_BATCH_SIZE: usize = 256;
+                            if cur_batch_size >= MAX_BATCH_SIZE {
+                                let batch = insert_builder.builder.to_record_batch().map_err(|e| {
+                                    DataFusionError::Execution(format!(
+                                        "Unable to convert ArrayBuilder to RecordBatch: {}",
+                                        e
+                                    ))
+                                })?;
+                                send_batch(&tx, &projection, batch).await?;
+                                cur_batch_size = 0;
+                            }
+                        }
+                        cursor.step_val();
                     }
                     cursor.step_key();
                 }
@@ -543,8 +532,18 @@ use `with ('materialized' = 'true')` for tables, or `create materialized view` f
                 builder.build(),
             )))
         } else {
-            // The case of no readers can happen if the table has never received any input &
-            // the circuit has never stepped so the correct response is to send an empty batch
+            // We did not find a reader.  There are two causes:
+            //
+            // - There are no readers at all, because the table has never
+            //   received any input, and the circuit has never stepped.
+            //
+            // - There are some readers but not for every worker, because the
+            //   output operator only produces output for one worker.  (It might
+            //   not even be our worker, it might be on a different host in
+            //   multihost.)
+            //
+            // In either case, the correct thing to do is to produce an empty
+            // batch.
             let fut =
                 futures::future::ready(Ok(RecordBatch::new_empty(self.projected_schema.clone())));
             let stream = futures::stream::once(fut);

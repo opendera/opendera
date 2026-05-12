@@ -14,7 +14,7 @@ use dyn_clone::clone_box;
 use crate::{
     algebra::{IndexedZSet, OrdIndexedZSet},
     dynamic::{DataTrait, DynPair, Factory, WeightTrait},
-    trace::{Batch, BatchReader, Cursor},
+    trace::{Batch, BatchReader, Cursor, cursor::Position},
 };
 use std::marker::PhantomData;
 
@@ -127,6 +127,10 @@ where
         self.cursor.weight()
     }
 
+    fn weight_checked(&mut self) -> &R {
+        self.weight()
+    }
+
     fn map_values(&mut self, logic: &mut dyn FnMut(&V, &R)) {
         while self.cursor.val_valid() {
             if self.cursor.val().fst() == self.key.as_ref() {
@@ -169,7 +173,7 @@ where
         }
     }
 
-    fn seek_key_exact(&mut self, key: &K) -> bool {
+    fn seek_key_exact(&mut self, key: &K, _hash: Option<u64>) -> bool {
         self.seek_key(key);
         self.key_valid() && self.key().eq(key)
     }
@@ -208,11 +212,14 @@ where
     }
 
     fn rewind_keys(&mut self) {
+        debug_assert!(self.cursor.key_valid() && self.cursor.val_valid());
+
         self.cursor.rewind_vals();
         self.cursor.val().fst().clone_to(&mut self.key);
     }
 
     fn fast_forward_keys(&mut self) {
+        debug_assert!(self.cursor.key_valid() && self.cursor.val_valid());
         self.cursor.fast_forward_vals();
         self.cursor.val().fst().clone_to(&mut self.key);
     }
@@ -235,6 +242,10 @@ where
 
     fn fast_forward_vals(&mut self) {
         unimplemented!()
+    }
+
+    fn position(&self) -> Option<Position> {
+        None
     }
 }
 

@@ -1,25 +1,31 @@
+use crate::storage::file::{FilterStats, TouchedWindowCount};
+use crate::trace::ord::merge_batcher::MergeBatcher;
 use crate::{
+    DBData, DBWeight, NumEntries, Timestamp,
     dynamic::{
         DataTrait, DynDataTyped, DynPair, DynUnit, DynVec, DynWeightedPairs, Erase, Factory,
         LeanVec, WeightTrait, WithFactory,
     },
     trace::{
+        Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, DbspSerializer,
+        Deserializer, WeightedItem,
+        cursor::Position,
         layers::{
-            Cursor as _, Layer, LayerCursor, LayerFactories, Leaf, LeafFactories, OrdOffset, Trie,
+            Cursor as TrieCursor, Layer, LayerCursor, LayerFactories, Leaf, LeafFactories,
+            OrdOffset, Trie,
         },
-        Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, Deserializer,
-        Serializer, WeightedItem,
     },
     utils::{ConsolidatePairedSlices, Tup2},
-    DBData, DBWeight, NumEntries, Timestamp,
 };
-use feldera_storage::StoragePath;
+use feldera_storage::FileReader;
 use rand::Rng;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
-use std::fmt::{self, Debug, Display};
-
-use crate::trace::ord::merge_batcher::MergeBatcher;
+use std::any::TypeId;
+use std::{
+    fmt::{self, Debug, Display},
+    sync::Arc,
+};
 
 pub struct VecKeyBatchFactories<K, T, R>
 where
@@ -142,7 +148,6 @@ pub type VecKeyBatchLayer<K, T, R, O> = Layer<K, Leaf<DynDataTyped<T>, R>, O>;
 
 /// An immutable collection of update tuples, from a contiguous interval of
 /// logical times.
-#[derive(SizeOf)]
 pub struct VecKeyBatch<K, T, R, O = usize>
 where
     K: DataTrait + ?Sized,
@@ -152,8 +157,22 @@ where
 {
     /// Where all the dataz is.
     pub layer: VecKeyBatchLayer<K, T, R, O>,
-    #[size_of(skip)]
     factories: VecKeyBatchFactories<K, T, R>,
+    touched_window_count: TouchedWindowCount,
+}
+
+impl<K, T, R, O> SizeOf for VecKeyBatch<K, T, R, O>
+where
+    K: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+    T: Timestamp,
+    O: OrdOffset,
+{
+    fn size_of_children(&self, context: &mut size_of::Context) {
+        // This is only approximate but it is *much* cheaper than measuring all
+        // the elements individually.
+        context.add(self.approximate_byte_size());
+    }
 }
 
 impl<K, T, R, O> Debug for VecKeyBatch<K, T, R, O>
@@ -199,7 +218,7 @@ where
         todo!()
     }
 }
-impl<K, T, R, O: OrdOffset> Serialize<Serializer> for VecKeyBatch<K, T, R, O>
+impl<K, T, R, O: OrdOffset> Serialize<DbspSerializer<'_>> for VecKeyBatch<K, T, R, O>
 where
     K: DataTrait + ?Sized,
     T: Timestamp,
@@ -208,8 +227,8 @@ where
 {
     fn serialize(
         &self,
-        _serializer: &mut Serializer,
-    ) -> Result<Self::Resolver, <Serializer as rkyv::Fallible>::Error> {
+        _serializer: &mut DbspSerializer,
+    ) -> Result<Self::Resolver, <DbspSerializer<'_> as rkyv::Fallible>::Error> {
         todo!()
     }
 }
@@ -225,6 +244,7 @@ where
         Self {
             layer: self.layer.clone(),
             factories: self.factories.clone(),
+            touched_window_count: self.touched_window_count,
         }
     }
 }
@@ -307,12 +327,15 @@ where
     }
 
     fn approximate_byte_size(&self) -> usize {
-        self.size_of().total_bytes()
+        self.layer.approximate_byte_size()
+    }
+
+    fn membership_filter_stats(&self) -> FilterStats {
+        FilterStats::default()
     }
 
     fn sample_keys<RG>(&self, rng: &mut RG, sample_size: usize, sample: &mut DynVec<Self::Key>)
     where
-        Self::Time: PartialEq<()>,
         RG: Rng,
     {
         self.layer.sample_keys(rng, sample_size, sample);
@@ -326,15 +349,24 @@ where
     R: WeightTrait + ?Sized,
     O: OrdOffset,
 {
+    type Timed<T2: Timestamp> = VecKeyBatch<K, T2, R, O>;
     type Batcher = MergeBatcher<Self>;
     type Builder = VecKeyBuilder<K, T, R, O>;
-    fn checkpoint_path(&self) -> Option<StoragePath> {
+    fn file_reader(&self) -> Option<Arc<dyn FileReader>> {
         unimplemented!()
     }
 
-    /*fn from_keys(time: Self::Time, keys: Vec<(Self::Key, Self::R)>) -> Self {
-        Self::from_tuples(time, keys)
-    }*/
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        Some((self.layer.keys.first()?, self.layer.keys.last()?))
+    }
+
+    fn negative_weight_count(&self) -> Option<u64> {
+        None
+    }
+
+    fn touched_window_count(&self) -> TouchedWindowCount {
+        self.touched_window_count
+    }
 }
 
 /// A cursor for navigating a single layer.
@@ -420,8 +452,16 @@ where
     where
         T: PartialEq<()>,
     {
-        debug_assert!(&self.cursor.child.valid());
-        self.cursor.child.current_diff()
+        self.weight_checked()
+    }
+
+    fn weight_checked(&mut self) -> &R {
+        if TypeId::of::<T>() == TypeId::of::<()>() {
+            debug_assert!(&self.cursor.child.valid());
+            self.cursor.child.current_diff()
+        } else {
+            panic!("VecKeyCursor::weight_checked called on non-unit timestamp type");
+        }
     }
 
     fn map_values(&mut self, logic: &mut dyn FnMut(&DynUnit, &R))
@@ -456,7 +496,7 @@ where
         self.valid = true;
     }
 
-    fn seek_key_exact(&mut self, key: &K) -> bool {
+    fn seek_key_exact(&mut self, key: &K, _hash: Option<u64>) -> bool {
         self.seek_key(key);
         self.key_valid() && self.key().eq(key)
     }
@@ -517,6 +557,13 @@ where
     fn fast_forward_vals(&mut self) {
         self.valid = true;
     }
+
+    fn position(&self) -> Option<Position> {
+        Some(Position {
+            total: TrieCursor::keys(&self.cursor) as u64,
+            offset: self.cursor.pos() as u64,
+        })
+    }
 }
 
 /// A builder for creating layers from unsorted update tuples.
@@ -557,18 +604,22 @@ where
     R: WeightTrait + ?Sized,
     O: OrdOffset,
 {
-    fn with_capacity(factories: &VecKeyBatchFactories<K, T, R>, capacity: usize) -> Self {
+    fn with_capacity(
+        factories: &VecKeyBatchFactories<K, T, R>,
+        key_capacity: usize,
+        value_capacity: usize,
+    ) -> Self {
         let mut keys = factories.layer_factories.keys.default_box();
-        keys.reserve_exact(capacity);
+        keys.reserve_exact(key_capacity);
 
-        let mut offs = Vec::with_capacity(capacity + 1);
+        let mut offs = Vec::with_capacity(key_capacity + 1);
         offs.push(O::zero());
 
         let mut times = factories.layer_factories.child.keys.default_box();
-        times.reserve_exact(capacity);
+        times.reserve_exact(value_capacity);
 
         let mut diffs = factories.layer_factories.child.diffs.default_box();
-        diffs.reserve_exact(capacity);
+        diffs.reserve_exact(value_capacity);
         Self {
             factories: factories.clone(),
             keys,
@@ -622,7 +673,16 @@ where
                 ),
             ),
             factories: self.factories,
+            touched_window_count: TouchedWindowCount::default(),
         }
+    }
+
+    fn num_keys(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn num_tuples(&self) -> usize {
+        self.diffs.len()
     }
 }
 

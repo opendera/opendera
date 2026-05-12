@@ -9,11 +9,11 @@
 
 use crate::utils::Tup2;
 use crate::{
-    circuit::{
-        operator_traits::{Operator, SourceOperator},
-        Scope,
-    },
     DBData, OrdZSet, Runtime, ZWeight,
+    circuit::{
+        Scope,
+        operator_traits::{Operator, SourceOperator},
+    },
 };
 use csv::Reader as CsvReader;
 use serde::Deserialize;
@@ -63,6 +63,9 @@ where
     fn fixedpoint(&self, _scope: Scope) -> bool {
         self.time >= 2
     }
+    fn is_input(&self) -> bool {
+        true
+    }
 }
 
 impl<R, T> SourceOperator<OrdZSet<T>> for CsvSource<R, T>
@@ -92,7 +95,7 @@ where
 mod test {
     use crate::operator::CsvSource;
     use crate::utils::Tup3;
-    use crate::{zset, Circuit, OrdZSet, RootCircuit};
+    use crate::{Circuit, OrdZSet, RootCircuit, zset};
     use csv::ReaderBuilder;
 
     #[test]
@@ -128,6 +131,6 @@ mod test {
         .unwrap()
         .0;
 
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
     }
 }

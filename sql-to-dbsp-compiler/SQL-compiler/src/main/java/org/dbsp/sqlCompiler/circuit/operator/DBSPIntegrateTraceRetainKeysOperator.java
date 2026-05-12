@@ -11,11 +11,11 @@ import org.dbsp.sqlCompiler.compiler.visitors.monotone.IMaybeMonotoneType;
 import org.dbsp.sqlCompiler.compiler.visitors.monotone.PartiallyMonotoneTuple;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
 import org.dbsp.sqlCompiler.ir.DBSPParameter;
-import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPOpcode;
 import org.dbsp.sqlCompiler.ir.expression.DBSPVariablePath;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
+import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTupleBase;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
 import org.dbsp.util.Utilities;
@@ -25,26 +25,31 @@ import java.util.List;
 import java.util.Objects;
 
 public final class DBSPIntegrateTraceRetainKeysOperator
-        extends DBSPBinaryOperator implements GCOperator
+        extends DBSPBinaryOperator implements IGCOperator
 {
     public DBSPIntegrateTraceRetainKeysOperator(
             CalciteRelNode node, DBSPExpression expression,
             OutputPort data, OutputPort control) {
-        super(node, "integrate_trace_retain_keys", expression,
-                data.outputType(), data.isMultiset(), data, control, false);
+        super(node, "accumulate_integrate_trace_retain_keys", expression,
+                data.outputType(), data.isMultiset(), data, control);
     }
 
-    /** Create a operator to retain keys and returns it.  May return null if the keys contain no fields. */
+    @Override
+    public DBSPSimpleOperator asOperator() {
+        return this;
+    }
+
+    /** Create an operator to retain keys and returns it.  May return null if the keys contain no fields. */
     @Nullable
     public static DBSPIntegrateTraceRetainKeysOperator create(
             CalciteRelNode node, OutputPort data, IMaybeMonotoneType dataProjection, OutputPort control) {
         DBSPType controlType = control.outputType();
-        Utilities.enforce(controlType.is(DBSPTypeTupleBase.class), "Control type is not a tuple: " + controlType);
+        Utilities.enforce(controlType.is(DBSPTypeTupleBase.class), () -> "Control type is not a tuple: " + controlType);
         DBSPTypeTupleBase controlTuple = controlType.to(DBSPTypeTupleBase.class);
         Utilities.enforce(controlTuple.size() == 2);
         DBSPType leftSliceType = Objects.requireNonNull(dataProjection.getProjectedType());
         Utilities.enforce(leftSliceType.sameType(controlTuple.getFieldType(1)),
-                "Projection type does not match control type " + leftSliceType + "/" + controlType);
+                () -> "Projection type does not match control type " + leftSliceType + "/" + controlType);
 
         DBSPParameter param;
         DBSPExpression compare;
@@ -52,6 +57,8 @@ public final class DBSPIntegrateTraceRetainKeysOperator
         DBSPExpression compare0 = controlArg.deref().field(0).not();
         if (data.outputType().is(DBSPTypeIndexedZSet.class)) {
             DBSPType keyType = data.getOutputIndexedZSetType().keyType;
+            if (keyType.sameType(DBSPTypeTuple.EMPTY))
+                return null;
             DBSPVariablePath dataArg = keyType.ref().var();
             param = new DBSPParameter(dataArg.variable, dataArg.getType());
             IMaybeMonotoneType dataField0 = dataProjection
@@ -84,7 +91,7 @@ public final class DBSPIntegrateTraceRetainKeysOperator
             @Nullable DBSPExpression function, DBSPType outputType,
             List<OutputPort> newInputs, boolean force) {
         if (this.mustReplace(force, function, newInputs, outputType)) {
-            Utilities.enforce(newInputs.size() == 2, "Expected 2 inputs, got " + newInputs.size());
+            Utilities.enforce(newInputs.size() == 2, () -> "Expected 2 inputs, got " + newInputs.size());
             return new DBSPIntegrateTraceRetainKeysOperator(
                     this.getRelNode(), toClosure(function),
                     newInputs.get(0), newInputs.get(1)).copyAnnotations(this);

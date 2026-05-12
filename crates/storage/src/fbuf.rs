@@ -26,11 +26,15 @@ use std::{
 
 use libc::c_void;
 use rkyv::{
+    Archive, Archived, Serialize,
     ser::{ScratchSpace, Serializer},
     vec::ArchivedVec,
-    Archive, Archived, Serialize,
 };
-use rkyv::{vec::VecResolver, ArchiveUnsized, Fallible, RelPtr};
+use rkyv::{ArchiveUnsized, Fallible, RelPtr, vec::VecResolver};
+
+pub mod slab;
+
+use self::slab::{acquire_allocation, layout_for, recycle_or_dealloc};
 
 /// A custom buffer type that works with our read/write APIs and the
 /// buffer-cache.
@@ -48,9 +52,7 @@ impl Drop for FBuf {
     #[inline]
     fn drop(&mut self) {
         if self.cap != 0 {
-            unsafe {
-                alloc::dealloc(self.ptr.as_ptr(), self.layout());
-            }
+            recycle_or_dealloc(self.ptr, self.cap);
         }
     }
 }
@@ -81,7 +83,7 @@ impl FBuf {
 
     /// Constructs a new, empty `FBuf` with the specified capacity.
     ///
-    /// The vector will be able to hold exactly `capacity` bytes without
+    /// The vector will be able to hold at least `capacity` bytes without
     /// reallocating. If `capacity` is 0, the vector will not allocate.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
@@ -92,14 +94,7 @@ impl FBuf {
                 capacity <= Self::MAX_CAPACITY,
                 "`capacity` cannot exceed isize::MAX - 15"
             );
-            let ptr = unsafe {
-                let layout = alloc::Layout::from_size_align_unchecked(capacity, Self::ALIGNMENT);
-                let ptr = alloc::alloc(layout);
-                if ptr.is_null() {
-                    alloc::handle_alloc_error(layout);
-                }
-                NonNull::new_unchecked(ptr)
-            };
+            let (ptr, capacity) = acquire_allocation(capacity);
             Self {
                 ptr,
                 cap: capacity,
@@ -110,7 +105,7 @@ impl FBuf {
 
     #[inline]
     fn layout(&self) -> alloc::Layout {
-        unsafe { alloc::Layout::from_size_align_unchecked(self.cap, Self::ALIGNMENT) }
+        layout_for(self.cap)
     }
 
     /// Clears the vector, removing all values.
@@ -124,7 +119,7 @@ impl FBuf {
 
     /// Change capacity of vector.
     ///
-    /// Will set capacity to exactly `new_cap`.
+    /// Will set capacity to at least `new_cap`.
     /// Can be used to either grow or shrink capacity.
     /// Backing memory will be reallocated.
     ///
@@ -141,33 +136,27 @@ impl FBuf {
     /// - `new_cap` must be greater than or equal to [`len()`](FBuf::len)
     #[inline]
     pub unsafe fn change_capacity(&mut self, new_cap: usize) {
-        debug_assert!(new_cap <= Self::MAX_CAPACITY);
-        debug_assert!(new_cap >= self.len);
+        unsafe {
+            debug_assert!(new_cap <= Self::MAX_CAPACITY);
+            debug_assert!(new_cap >= self.len);
 
-        if new_cap > 0 {
-            let new_ptr = if self.cap > 0 {
-                let new_ptr = alloc::realloc(self.ptr.as_ptr(), self.layout(), new_cap);
-                if new_ptr.is_null() {
-                    alloc::handle_alloc_error(alloc::Layout::from_size_align_unchecked(
-                        new_cap,
-                        Self::ALIGNMENT,
-                    ));
-                }
-                new_ptr
-            } else {
-                let layout = alloc::Layout::from_size_align_unchecked(new_cap, Self::ALIGNMENT);
-                let new_ptr = alloc::alloc(layout);
-                if new_ptr.is_null() {
-                    alloc::handle_alloc_error(layout);
-                }
-                new_ptr
-            };
-            self.ptr = NonNull::new_unchecked(new_ptr);
-            self.cap = new_cap;
-        } else if self.cap > 0 {
-            alloc::dealloc(self.ptr.as_ptr(), self.layout());
-            self.ptr = NonNull::dangling();
-            self.cap = 0;
+            if new_cap > 0 {
+                let (new_ptr, new_cap) = if self.cap > 0 {
+                    let new_ptr = alloc::realloc(self.ptr.as_ptr(), self.layout(), new_cap);
+                    if new_ptr.is_null() {
+                        alloc::handle_alloc_error(layout_for(new_cap));
+                    }
+                    (NonNull::new_unchecked(new_ptr), new_cap)
+                } else {
+                    acquire_allocation(new_cap)
+                };
+                self.ptr = new_ptr;
+                self.cap = new_cap;
+            } else if self.cap > 0 {
+                recycle_or_dealloc(self.ptr, self.cap);
+                self.ptr = NonNull::dangling();
+                self.cap = 0;
+            }
         }
     }
 
@@ -295,21 +284,23 @@ impl FBuf {
     /// - `new_cap` must be greater than current [`capacity()`](FBuf::capacity)
     #[inline]
     pub unsafe fn grow_capacity_to(&mut self, new_cap: usize) {
-        debug_assert!(new_cap > self.cap);
+        unsafe {
+            debug_assert!(new_cap > self.cap);
 
-        let new_cap = if new_cap > (isize::MAX as usize + 1) >> 1 {
-            // Rounding up to next power of 2 would result in `isize::MAX + 1` or higher,
-            // which exceeds max capacity. So cap at max instead.
-            assert!(
-                new_cap <= Self::MAX_CAPACITY,
-                "cannot reserve a larger FBuf"
-            );
-            Self::MAX_CAPACITY
-        } else {
-            // Cannot overflow due to check above
-            new_cap.next_power_of_two()
-        };
-        self.change_capacity(new_cap);
+            let new_cap = if new_cap > (isize::MAX as usize + 1) >> 1 {
+                // Rounding up to next power of 2 would result in `isize::MAX + 1` or higher,
+                // which exceeds max capacity. So cap at max instead.
+                assert!(
+                    new_cap <= Self::MAX_CAPACITY,
+                    "cannot reserve a larger FBuf"
+                );
+                Self::MAX_CAPACITY
+            } else {
+                // Cannot overflow due to check above
+                new_cap.next_power_of_two()
+            };
+            self.change_capacity(new_cap);
+        }
     }
 
     /// Resizes the Vec in-place so that len is equal to new_len.
@@ -465,6 +456,13 @@ impl FBuf {
     #[inline]
     pub fn into_boxed_slice(self) -> Box<[u8]> {
         self.into_vec().into_boxed_slice()
+    }
+
+    /// Creates an `FBuf` by copying the slice.
+    pub fn from_slice(slice: &[u8]) -> Self {
+        let mut fbuf = FBuf::new();
+        fbuf.extend_from_slice(slice);
+        fbuf
     }
 
     /// Converts the vector into `Vec<u8>`.
@@ -733,7 +731,9 @@ impl Archive for FBuf {
 
     #[inline]
     unsafe fn resolve(&self, pos: usize, resolver: Self::Resolver, out: *mut Self::Archived) {
-        ArchivedVec::resolve_from_slice(self.as_slice(), pos, resolver, out);
+        unsafe {
+            ArchivedVec::resolve_from_slice(self.as_slice(), pos, resolver, out);
+        }
     }
 }
 
@@ -760,7 +760,7 @@ impl Unpin for FBuf {}
 /// `WriteSerializer`.
 #[derive(Debug)]
 pub struct FBufSerializer<A> {
-    inner: A,
+    pub inner: A,
     limit: usize,
 }
 
@@ -768,10 +768,17 @@ pub struct FBufSerializer<A> {
 pub struct LimitExceeded;
 
 impl<A: Borrow<FBuf>> FBufSerializer<A> {
-    /// Creates a new `FBufSerializer` by wrapping a `Borrow<FBuf>`.
+    /// Creates a new `FBufSerializer` by wrapping a `FBuf`.
     #[inline]
-    pub fn new(inner: A, limit: usize) -> Self {
-        Self { inner, limit }
+    pub fn new(inner: A) -> Self {
+        Self {
+            inner,
+            limit: usize::MAX,
+        }
+    }
+
+    pub fn with_limit(self, limit: usize) -> Self {
+        Self { limit, ..self }
     }
 
     /// Consumes the serializer and returns the underlying type.
@@ -818,21 +825,23 @@ impl<A: Borrow<FBuf> + BorrowMut<FBuf>> Serializer for FBufSerializer<A> {
         value: &T,
         resolver: T::Resolver,
     ) -> Result<usize, Self::Error> {
-        let pos = self.pos();
-        debug_assert_eq!(pos & (mem::align_of::<T::Archived>() - 1), 0);
-        let vec = self.inner.borrow_mut();
-        let additional = mem::size_of::<T::Archived>();
-        if vec.len() + additional > self.limit {
-            return Err(LimitExceeded);
+        unsafe {
+            let pos = self.pos();
+            debug_assert_eq!(pos & (mem::align_of::<T::Archived>() - 1), 0);
+            let vec = self.inner.borrow_mut();
+            let additional = mem::size_of::<T::Archived>();
+            if vec.len() + additional > self.limit {
+                return Err(LimitExceeded);
+            }
+            vec.reserve(additional);
+            vec.set_len(vec.len() + additional);
+
+            let ptr = vec.as_mut_ptr().add(pos).cast::<T::Archived>();
+            ptr.write_bytes(0, 1);
+            value.resolve(pos, resolver, ptr);
+
+            Ok(pos)
         }
-        vec.reserve(additional);
-        vec.set_len(vec.len() + additional);
-
-        let ptr = vec.as_mut_ptr().add(pos).cast::<T::Archived>();
-        ptr.write_bytes(0, 1);
-        value.resolve(pos, resolver, ptr);
-
-        Ok(pos)
     }
 
     #[inline]
@@ -842,20 +851,22 @@ impl<A: Borrow<FBuf> + BorrowMut<FBuf>> Serializer for FBufSerializer<A> {
         to: usize,
         metadata_resolver: T::MetadataResolver,
     ) -> Result<usize, Self::Error> {
-        let from = self.pos();
-        debug_assert_eq!(from & (mem::align_of::<RelPtr<T::Archived>>() - 1), 0);
-        let vec = self.inner.borrow_mut();
-        let additional = mem::size_of::<RelPtr<T::Archived>>();
-        if vec.len() + additional > self.limit {
-            return Err(LimitExceeded);
+        unsafe {
+            let from = self.pos();
+            debug_assert_eq!(from & (mem::align_of::<RelPtr<T::Archived>>() - 1), 0);
+            let vec = self.inner.borrow_mut();
+            let additional = mem::size_of::<RelPtr<T::Archived>>();
+            if vec.len() + additional > self.limit {
+                return Err(LimitExceeded);
+            }
+            vec.reserve(additional);
+            vec.set_len(vec.len() + additional);
+
+            let ptr = vec.as_mut_ptr().add(from).cast::<RelPtr<T::Archived>>();
+            ptr.write_bytes(0, 1);
+
+            value.resolve_unsized(from, to, metadata_resolver, ptr);
+            Ok(from)
         }
-        vec.reserve(additional);
-        vec.set_len(vec.len() + additional);
-
-        let ptr = vec.as_mut_ptr().add(from).cast::<RelPtr<T::Archived>>();
-        ptr.write_bytes(0, 1);
-
-        value.resolve_unsized(from, to, metadata_resolver, ptr);
-        Ok(from)
     }
 }

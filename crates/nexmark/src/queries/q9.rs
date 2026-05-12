@@ -42,6 +42,9 @@ pub struct Q9Output(
     String,
 );
 
+dbsp::never_none!(Q9Output);
+dbsp::never_roaring_filter!(Q9Output);
+
 type Q9Stream = Stream<RootCircuit, OrdZSet<Q9Output>>;
 
 /// Query 9: Winning Bids (Not in original suite)
@@ -360,7 +363,7 @@ mod tests {
         ]
         .into_iter();
 
-        let (circuit, input_handle) = RootCircuit::build(move |circuit| {
+        let (mut circuit, input_handle) = dbsp::Runtime::init_circuit(1, move |circuit| {
             let (stream, input_handle) = circuit.add_input_zset::<Event>();
 
             let mut expected_output = vec![
@@ -387,7 +390,7 @@ mod tests {
 
         for mut vec in input_vecs {
             input_handle.append(&mut vec);
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 }

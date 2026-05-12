@@ -1,8 +1,12 @@
 use crate::catalog::InputCollectionHandle;
-use crate::format::{get_input_format, InputBuffer, Splitter};
-use crate::{controller::FormatConfig, InputConsumer, ParseError, Parser};
-use anyhow::{anyhow, Error as AnyError};
-use feldera_adapterlib::transport::Resume;
+use crate::format::{InputBuffer, Splitter, get_input_format};
+use crate::{InputConsumer, ParseError, Parser, controller::FormatConfig};
+use anyhow::{Error as AnyError, anyhow};
+use dbsp::operator::StagedBuffers;
+use feldera_adapterlib::ConnectorMetadata;
+use feldera_adapterlib::format::BufferSize;
+use feldera_adapterlib::transport::{Resume, Watermark};
+use feldera_types::adapter_stats::ConnectorHealth;
 use feldera_types::config::FtModel;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -23,6 +27,8 @@ pub struct MockInputConsumerState {
     ///
     /// Panics on error if `None`.
     error_cb: Option<ErrorCallback>,
+
+    pub transaction_in_progress: bool,
 }
 
 impl MockInputConsumerState {
@@ -32,6 +38,7 @@ impl MockInputConsumerState {
             n_extended: 0,
             endpoint_error: None,
             error_cb: None,
+            transaction_in_progress: false,
         }
     }
 
@@ -40,6 +47,7 @@ impl MockInputConsumerState {
         self.eoi = false;
         self.n_extended = 0;
         self.endpoint_error = None;
+        self.transaction_in_progress = false;
     }
 }
 
@@ -62,7 +70,7 @@ impl MockInputConsumer {
         self.state().reset();
     }
 
-    pub fn state(&self) -> MutexGuard<MockInputConsumerState> {
+    pub fn state(&self) -> MutexGuard<'_, MockInputConsumerState> {
         self.0.lock().unwrap()
     }
 
@@ -76,7 +84,7 @@ impl MockInputConsumer {
 }
 
 impl InputConsumer for MockInputConsumer {
-    fn error(&self, fatal: bool, error: AnyError) {
+    fn error(&self, fatal: bool, error: AnyError, _tag: Option<&'static str>) {
         let mut state = self.state();
 
         if let Some(error_cb) = &mut state.error_cb {
@@ -105,14 +113,30 @@ impl InputConsumer for MockInputConsumer {
 
     fn parse_errors(&self, _errors: Vec<ParseError>) {}
 
-    fn buffered(&self, _num_records: usize, _num_bytes: usize) {}
+    fn buffered(&self, _amt: BufferSize) {}
 
-    fn replayed(&self, _num_records: usize, _hash: u64) {}
+    fn replayed(&self, _num_records: BufferSize, _hash: u64) {}
 
     fn request_step(&self) {}
 
-    fn extended(&self, _num_records: usize, _resume: Option<Resume>) {
+    fn extended(&self, _amt: BufferSize, _resume: Option<Resume>, _watermark: Vec<Watermark>) {
         self.state().n_extended += 1;
+    }
+
+    fn start_transaction(&self, _label: Option<&str>) {
+        self.state().transaction_in_progress = true;
+    }
+
+    fn commit_transaction(&self) {
+        self.state().transaction_in_progress = false;
+    }
+
+    fn update_connector_health(&self, _health: ConnectorHealth) {}
+
+    fn completion_watcher(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<feldera_types::coordination::Completion>> {
+        None
     }
 }
 
@@ -166,7 +190,7 @@ impl MockInputParser {
         state.parser_result = None;
     }
 
-    pub fn state(&self) -> MutexGuard<MockInputParserState> {
+    pub fn state(&self) -> MutexGuard<'_, MockInputParserState> {
         self.0.lock().unwrap()
     }
 
@@ -177,10 +201,14 @@ impl MockInputParser {
 }
 
 impl Parser for MockInputParser {
-    fn parse(&mut self, data: &[u8]) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
+    fn parse(
+        &mut self,
+        data: &[u8],
+        metadata: Option<ConnectorMetadata>,
+    ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
         let mut state = self.0.lock().unwrap();
         state.data.extend_from_slice(data);
-        let (buffer, errors) = state.parser.parse(data);
+        let (buffer, errors) = state.parser.parse(data, metadata);
 
         for error in errors.iter() {
             // println!("parser returned '{:?}'", state.parser_result);
@@ -203,5 +231,9 @@ impl Parser for MockInputParser {
     fn splitter(&self) -> Box<dyn Splitter> {
         let state = self.0.lock().unwrap();
         state.parser.splitter()
+    }
+
+    fn stage(&self, buffers: Vec<Box<dyn InputBuffer>>) -> Box<dyn StagedBuffers> {
+        self.0.lock().unwrap().parser.stage(buffers)
     }
 }

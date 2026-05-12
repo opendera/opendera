@@ -27,6 +27,11 @@ class CompilationProfile(Enum):
     The optimized compilation profile, the default for this API.
     """
 
+    OPTIMIZED_SYMBOLS = "optimized_symbols"
+    """
+    The optimized symbols compilation profile, good for profiling and debugging.
+    """
+
 
 class BuildMode(Enum):
     CREATE = 1
@@ -34,130 +39,130 @@ class BuildMode(Enum):
     GET_OR_CREATE = 3
 
 
+class DeploymentDesiredStatus(Enum):
+    """
+    Deployment desired status of the pipeline.
+    """
+
+    STOPPED = 0
+    UNAVAILABLE = 1
+    STANDBY = 2
+    PAUSED = 3
+    RUNNING = 4
+    SUSPENDED = 5
+
+    @staticmethod
+    def from_str(value):
+        for member in DeploymentDesiredStatus:
+            if member.name.lower() == value.lower():
+                return member
+        raise ValueError(
+            f"Unknown value '{value}' for enum {DeploymentDesiredStatus.__name__}"
+        )
+
+
+class DeploymentResourcesDesiredStatus(Enum):
+    """
+    The desired status of deployment resources of the pipeline.
+    """
+
+    STOPPED = 0
+    PROVISIONED = 1
+
+    @staticmethod
+    def from_str(value):
+        for member in DeploymentResourcesDesiredStatus:
+            if member.name.lower() == value.lower():
+                return member
+        raise ValueError(
+            f"Unknown value '{value}' for enum {DeploymentResourcesDesiredStatus.__name__}"
+        )
+
+
+class DeploymentResourcesStatus(Enum):
+    """
+    The desired status of deployment resources of the pipeline.
+    """
+
+    STOPPED = 0
+    PROVISIONING = 1
+    PROVISIONED = 2
+    STOPPING = 3
+
+    @staticmethod
+    def from_str(value):
+        for member in DeploymentResourcesStatus:
+            if member.name.lower() == value.lower():
+                return member
+        raise ValueError(
+            f"Unknown value '{value}' for enum {DeploymentResourcesStatus.__name__}"
+        )
+
+
+class DeploymentRuntimeDesiredStatus(Enum):
+    """
+    Deployment runtime desired status of the pipeline.
+    """
+
+    UNAVAILABLE = 0
+    STANDBY = 1
+    PAUSED = 2
+    RUNNING = 3
+    SUSPENDED = 4
+
+    @staticmethod
+    def from_str(value):
+        for member in DeploymentRuntimeDesiredStatus:
+            if member.name.lower() == value.lower():
+                return member
+        raise ValueError(
+            f"Unknown value '{value}' for enum {DeploymentRuntimeDesiredStatus.__name__}"
+        )
+
+
+class DeploymentRuntimeStatus(Enum):
+    """
+    Deployment runtime status of the pipeline.
+    """
+
+    UNAVAILABLE = 0
+    STANDBY = 1
+    AWAITINGAPPROVAL = 2
+    INITIALIZING = 3
+    BOOTSTRAPPING = 4
+    REPLAYING = 5
+    PAUSED = 6
+    RUNNING = 7
+    SUSPENDED = 8
+
+    @staticmethod
+    def from_str(value):
+        for member in DeploymentRuntimeStatus:
+            if member.name.lower() == value.lower():
+                return member
+        raise ValueError(
+            f"Unknown value '{value}' for enum {DeploymentRuntimeStatus.__name__}"
+        )
+
+
 class PipelineStatus(Enum):
     """
     Represents the state that this pipeline is currently in.
-
-    .. code-block:: text
-
-                    Stopped ◄─────────── Stopping ◄───── All states can transition
-                       │                    ▲            to Stopping by either:
-      /start or /pause │                    │            (1) user calling /stop?force=true, or;
-                       ▼                    │            (2) pipeline encountering a fatal
-                ⌛Provisioning          Suspending            resource or runtime error,
-                       │                    ▲                having the system call /stop?force=true
-                       ▼                    │ /stop          effectively
-                ⌛Initializing ─────────────┤  ?force=false
-                       │                    │
-             ┌─────────┼────────────────────┴─────┐
-             │         ▼                          │
-             │       Paused  ◄──────► Unavailable │
-             │        │   ▲                ▲      │
-             │ /start │   │  /pause        │      │
-             │        ▼   │                │      │
-             │       Running ◄─────────────┘      │
-             └────────────────────────────────────┘
-
     """
 
     NOT_FOUND = 0
-    """
-    The pipeline has not been created yet.
-    """
-
     STOPPED = 1
-    """
-    The pipeline has not (yet) been started or has been stopped either
-    manually by the user or automatically by the system due to a
-    resource or runtime error.
-
-    The pipeline remains in this state until:
-
-        1. The user starts it via `/start` or `/pause`, transitioning to `PROVISIONING`.
-        2. Early start fails (e.g., compilation failure), transitioning to `STOPPING`.
-    """
-
     PROVISIONING = 2
-    """
-    Compute (and optionally storage) resources needed for running the pipeline
-    are being provisioned.
-
-    The pipeline remains in this state until:
-
-        1. Resources are provisioned successfully, transitioning to `INITIALIZING`.
-        2. Provisioning fails or times out, transitioning to `STOPPING`.
-        3. The user cancels the pipeline via `/stop`, transitioning to `STOPPING`.
-    """
-
-    INITIALIZING = 3
-    """
-    The pipeline is initializing its internal state and connectors.
-
-    The pipeline remains in this state until:
-
-        1. Initialization succeeds, transitioning to `PAUSED`.
-        2. Initialization fails or times out, transitioning to `STOPPING`.
-        3. The user suspends the pipeline via `/suspend`, transitioning to `SUSPENDING`.
-        4. The user stops the pipeline via `/stop`, transitioning to `STOPPING`.
-    """
-
-    PAUSED = 4
-    """
-    The pipeline is initialized but data processing is paused.
-
-    The pipeline remains in this state until:
-
-        1. The user starts it via `/start`, transitioning to `RUNNING`.
-        2. A runtime error occurs, transitioning to `STOPPING`.
-        3. The user suspends it via `/suspend`, transitioning to `SUSPENDING`.
-        4. The user stops it via `/stop`, transitioning to `STOPPING`.
-    """
-
-    RUNNING = 5
-    """
-    The pipeline is processing data.
-
-    The pipeline remains in this state until:
-
-        1. The user pauses it via `/pause`, transitioning to `PAUSED`.
-        2. A runtime error occurs, transitioning to `STOPPING`.
-        3. The user suspends it via `/suspend`, transitioning to `SUSPENDING`.
-        4. The user stops it via `/stop`, transitioning to `STOPPING`.
-    """
-
-    UNAVAILABLE = 6
-    """
-    The pipeline was initialized at least once but is currently unreachable
-    or not ready.
-
-    The pipeline remains in this state until:
-
-        1. A successful status check transitions it back to `PAUSED` or `RUNNING`.
-        2. A runtime error occurs, transitioning to `STOPPING`.
-        3. The user suspends it via `/suspend`, transitioning to `SUSPENDING`.
-        4. The user stops it via `/stop`, transitioning to `STOPPING`.
-
-    Note: While in this state, `/start` or `/pause` express desired state but
-    are only applied once the pipeline becomes reachable.
-    """
-
-    SUSPENDING = 7
-    """
-    The pipeline is being suspended to storage.
-
-    The pipeline remains in this state until:
-
-        1. Suspension succeeds, transitioning to `STOPPING`.
-        2. A runtime error occurs, transitioning to `STOPPING`.
-    """
-
-    STOPPING = 8
-    """
-    The pipeline's compute resources are being scaled down to zero.
-
-    The pipeline remains in this state until deallocation completes,
-    transitioning to `STOPPED`.
-    """
+    UNAVAILABLE = 3
+    STANDBY = 4
+    AWAITINGAPPROVAL = 5
+    INITIALIZING = 6
+    BOOTSTRAPPING = 7
+    REPLAYING = 8
+    PAUSED = 9
+    RUNNING = 10
+    SUSPENDED = 11
+    STOPPING = 12
 
     @staticmethod
     def from_str(value):
@@ -165,6 +170,33 @@ class PipelineStatus(Enum):
             if member.name.lower() == value.lower():
                 return member
         raise ValueError(f"Unknown value '{value}' for enum {PipelineStatus.__name__}")
+
+    def __eq__(self, other):
+        return self.value == other.value
+
+
+class TransactionStatus(Enum):
+    """
+    Represents the transaction handling status of a pipeline.
+    """
+
+    NoTransaction = 1
+    """There is currently no active transaction."""
+
+    TransactionInProgress = 2
+    """There is an active transaction in progress."""
+
+    CommitInProgress = 3
+    """A commit is currently in progress."""
+
+    @staticmethod
+    def from_str(value):
+        for member in TransactionStatus:
+            if member.name.lower() == value.lower():
+                return member
+        raise ValueError(
+            f"Unknown value '{value}' for enum {TransactionStatus.__name__}"
+        )
 
     def __eq__(self, other):
         return self.value == other.value
@@ -311,3 +343,36 @@ class FaultToleranceModel(Enum):
         raise ValueError(
             f"Unknown value '{value}' for enum {FaultToleranceModel.__name__}"
         )
+
+
+class PipelineFieldSelector(Enum):
+    ALL = "all"
+    """Select all fields of a pipeline."""
+
+    STATUS = "status"
+    """Select only the fields required to know the status of a pipeline."""
+
+
+class BootstrapPolicy(Enum):
+    AWAIT_APPROVAL = "await_approval"
+    ALLOW = "allow"
+    REJECT = "reject"
+
+    @staticmethod
+    def from_str(value):
+        for member in BootstrapPolicy:
+            if member.name.lower() == value.lower():
+                return member
+        raise ValueError(f"Unknown value '{value}' for enum {BootstrapPolicy.__name__}")
+
+
+class CompletionTokenStatus(Enum):
+    COMPLETE = "complete"
+    """
+    Feldera has completed processing all inputs represented by this token.
+    """
+
+    IN_PROGRESS = "inprogress"
+    """
+    Feldera is still processing the inputs represented by this token.
+    """

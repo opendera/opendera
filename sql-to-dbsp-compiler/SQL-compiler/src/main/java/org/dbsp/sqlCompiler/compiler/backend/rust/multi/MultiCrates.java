@@ -6,6 +6,8 @@ import org.dbsp.sqlCompiler.circuit.ICircuit;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNestedOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceBaseOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPViewBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPViewDeclarationOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.backend.rust.BaseRustCodeGenerator;
@@ -15,9 +17,13 @@ import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.ir.IDBSPNode;
 import org.dbsp.sqlCompiler.ir.expression.DBSPPathExpression;
+import org.dbsp.sqlCompiler.ir.statement.DBSPFunctionItem;
+import org.dbsp.sqlCompiler.ir.type.DBSPType;
+import org.dbsp.sqlCompiler.ir.type.DBSPTypeCode;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPComparatorType;
 import org.dbsp.util.Utilities;
 
@@ -41,10 +47,12 @@ public class MultiCrates {
     final Map<Integer, CrateGenerator> semiCrates;
     @Nullable
     Map<String, DBSPDeclaration> declarationMap = null;
+    final LateMaterializations materializations;
 
     final RustWriter.StructuresUsed used;
     final String pipelineName;
     public final static String FILE_PREFIX = "feldera_pipe_";
+    public final static String CRATES_DIRECTORY = "crates";
 
     public String getGlobalsName() {
         return FILE_PREFIX + this.pipelineName + "_globals";
@@ -58,7 +66,8 @@ public class MultiCrates {
         return this.compiler.options.ioOptions.enterprise;
     }
 
-    MultiCrates(File rootDirectory, String pipelineName, DBSPCompiler compiler, RustWriter.StructuresUsed used) {
+    MultiCrates(File rootDirectory, String pipelineName, DBSPCompiler compiler, RustWriter.StructuresUsed used,
+                LateMaterializations materializations) {
         this.pipelineName = pipelineName;
         this.compiler = compiler;
         this.used = used;
@@ -66,6 +75,7 @@ public class MultiCrates {
         this.tupleCrates = new HashMap<>();
         this.semiCrates = new HashMap<>();
         this.rootDirectory = rootDirectory;
+        this.materializations = materializations;
         boolean enterprise = this.enterprise();
 
         // One crate for each tuple size used
@@ -73,9 +83,10 @@ public class MultiCrates {
             if (used.isPredefined(i)) continue;
             RustWriter.StructuresUsed t = new RustWriter.StructuresUsed();
             t.tupleSizesUsed.add(i);
-            BaseRustCodeGenerator tWriter = new RustFileWriter().setUsed(t).withUdf(false).withMalloc(false);
+            BaseRustCodeGenerator tWriter = new RustFileWriter(this.materializations)
+                    .setUsed(t).withUdf(false).withMalloc(false);
             CrateGenerator tuple = new CrateGenerator(
-                    this.rootDirectory, FILE_PREFIX + "tuple" + i, tWriter, enterprise);
+                    this.rootDirectory, CRATES_DIRECTORY, FILE_PREFIX + "tuple" + i, tWriter, enterprise, true);
             Utilities.putNew(this.tupleCrates, i, tuple);
         }
 
@@ -83,9 +94,10 @@ public class MultiCrates {
         for (int i : used.semigroupSizesUsed) {
             RustWriter.StructuresUsed t = new RustWriter.StructuresUsed();
             t.semigroupSizesUsed.add(i);
-            BaseRustCodeGenerator tWriter = new RustFileWriter().setUsed(t).withUdf(false).withMalloc(false);
+            BaseRustCodeGenerator tWriter = new RustFileWriter(this.materializations)
+                    .setUsed(t).withUdf(false).withMalloc(false);
             CrateGenerator semi = new CrateGenerator(
-                    this.rootDirectory, FILE_PREFIX + "semi" + i, tWriter, enterprise);
+                    this.rootDirectory, CRATES_DIRECTORY, FILE_PREFIX + "semi" + i, tWriter, enterprise, true);
             if (!used.isPredefined(i)) {
                 CrateGenerator tuple = Utilities.getExists(this.tupleCrates, i);
                 semi.addDependency(tuple);
@@ -93,19 +105,21 @@ public class MultiCrates {
             Utilities.putNew(this.semiCrates, i, semi);
         }
 
-        CircuitWriter mainWriter = new CircuitWriter();
-        BaseRustCodeGenerator globalsWriter = new RustFileWriter()
-                .withUdf(true).withMalloc(false).withGenerateTuples(false);
+        CircuitWriter mainWriter = new CircuitWriter(this.materializations);
+        BaseRustCodeGenerator globalsWriter = new RustFileWriter(this.materializations)
+                .withUdf(true).withMalloc(false).withGenerateTuples(false).withDeclareSourceMap(true);
         // Main crate contains the circuit
-        this.main = new CrateGenerator(this.rootDirectory, this.getMainName(), mainWriter, enterprise);
+        this.main = new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, this.getMainName(),
+                mainWriter, enterprise, !compiler.options.generateMultiCrateMain());
         // Crate with global variables
-        this.globals = new CrateGenerator(this.rootDirectory, this.getGlobalsName(), globalsWriter, enterprise);
+        this.globals = new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, this.getGlobalsName(), globalsWriter, enterprise, true);
+        this.main.addDependency(this.globals);
     }
 
     CrateGenerator createOperatorCrate(DBSPCircuit circuit, DBSPOperator operator, ICircuit parent, boolean enterprise) {
         String name = FILE_PREFIX + operator.getNodeName(true);
-        SingleOperatorWriter single = new SingleOperatorWriter(operator, circuit, parent);
-        return new CrateGenerator(this.rootDirectory, name, single, enterprise);
+        SingleOperatorWriter single = new SingleOperatorWriter(operator, circuit, parent, this.materializations);
+        return new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, name, single, enterprise, true);
     }
 
     static class UsesComparator extends InnerVisitor {
@@ -130,11 +144,18 @@ public class MultiCrates {
             this.declarations = declarations;
         }
 
+        @Override
+        public VisitDecision preorder(DBSPType type) {
+            return VisitDecision.STOP;
+        }
+
         public VisitDecision preorder(DBSPPathExpression expression) {
             String string = expression.path.asString();
             if (this.declarations.containsKey(string)) {
                 DBSPDeclaration decl = this.declarations.get(string);
-                if (decl.item.getType().sameType(expression.getType()))
+                if (expression.getType().code == DBSPTypeCode.ANY ||
+                        decl.item.is(DBSPFunctionItem.class) ||
+                        decl.item.getType().sameType(expression.getType()))
                     this.found = true;
             }
             return VisitDecision.STOP;
@@ -165,10 +186,12 @@ public class MultiCrates {
         if (this.usesGlobals(operator))
             op.addDependency(this.globals);
         RustWriter.StructuresUsed locallyUsed = new RustWriter.StructuresUsed();
-        RustWriter.FindResources finder = new RustWriter.FindResources(compiler, locallyUsed);
+        RustWriter.FindInnerResources finder = new RustWriter.FindInnerResources(compiler, locallyUsed);
         CircuitVisitor circuitFinder = finder.getCircuitVisitor(false);
-        if (!operator.is(DBSPNestedOperator.class))
+        if (!operator.is(DBSPNestedOperator.class)) {
+            finder.setOperatorContext(operator);
             operator.accept(circuitFinder);
+        }
 
         for (var input : operator.inputs) {
             input.outputType().accept(finder);
@@ -190,23 +213,26 @@ public class MultiCrates {
     }
 
     void addNodes(List<IDBSPNode> nodes) {
+        RustWriter.StructuresUsed locallyUsed = new RustWriter.StructuresUsed();
+        RustWriter.FindInnerResources finder = new RustWriter.FindInnerResources(compiler, locallyUsed);
+
         for (IDBSPNode node: nodes) {
             if (node.is(IDBSPInnerNode.class))
                 this.globals.add(node);
             else {
                 DBSPCircuit circuit = node.to(DBSPCircuit.class);
-                this.main.add(node);
-                // Add all declarations to the globals crate
-                for (DBSPDeclaration decl: circuit.declarations)
+                this.main.add(circuit);
+                for (DBSPDeclaration decl: circuit.declarations) {
                     this.globals.add(decl.item);
+                }
                 this.declarationMap = circuit.declarationMap;
                 for (DBSPOperator operator: circuit.allOperators) {
                     CrateGenerator op;
                     if (operator.is(DBSPNestedOperator.class)) {
                         DBSPNestedOperator nested = operator.to(DBSPNestedOperator.class);
-                        NestedOperatorWriter writer = new NestedOperatorWriter(nested, circuit);
+                        NestedOperatorWriter writer = new NestedOperatorWriter(nested, circuit, this.materializations);
                         String name = FILE_PREFIX + operator.getNodeName(true);
-                        op = new CrateGenerator(this.rootDirectory, name, writer, this.enterprise());
+                        op = new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, name, writer, this.enterprise(), true);
                         op.add(nested);
                         for (DBSPOperator inside: nested.getAllOperators()) {
                             if (inside.is(DBSPViewDeclarationOperator.class))
@@ -221,9 +247,20 @@ public class MultiCrates {
                         op = this.createOperatorCrate(circuit, operator, circuit, this.enterprise());
                     }
 
+                    if (this.compiler.options.ioOptions.emitHandles &&
+                            (operator.is(DBSPSourceBaseOperator.class) || operator.is(DBSPViewBaseOperator.class))) {
+                        finder.apply(operator.outputType(0));
+                    }
+
                     this.addDependencies(op, operator);
                     this.operators.add(op);
                 }
+            }
+
+            for (int i : locallyUsed.tupleSizesUsed) {
+                if (locallyUsed.isPredefined(i)) continue;
+                CrateGenerator gen = this.tupleCrate(i);
+                this.main.addDependency(gen);
             }
         }
 
@@ -239,7 +276,8 @@ public class MultiCrates {
 
     void write() throws IOException {
         this.globals.write(this.compiler);
-        File file = new File(new File(new File(globals.baseDirectory, globals.crateName), "src"),
+        File file = new File(new File(
+                new File(new File(globals.baseDirectory, MultiCrates.CRATES_DIRECTORY), globals.crateName), "src"),
                 DBSPCompiler.UDF_FILE_NAME);
         if (!file.exists())
             Utilities.createEmptyFile(file.toPath());

@@ -31,7 +31,9 @@ import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPBoolLiteral;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBool;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeVoid;
 import org.dbsp.util.IIndentStream;
 
 import javax.annotation.Nullable;
@@ -88,9 +90,22 @@ public final class DBSPIfExpression extends DBSPExpression {
                 this.negative == o.negative;
     }
 
+    public DBSPExpression simplify() {
+        if (this.condition.is(DBSPBoolLiteral.class)) {
+            Boolean cond = this.condition.to(DBSPBoolLiteral.class).value;
+            if (cond == null || !cond) {
+                if (this.negative == null)
+                    return DBSPTypeVoid.INSTANCE.defaultValue();
+                return this.negative;
+            }
+            return this.positive;
+        }
+        return this;
+    }
+
     @Override
     public IIndentStream toString(IIndentStream builder) {
-        builder.append("if ")
+        builder.append("(if ")
                 .append(this.condition)
                 .append(" ");
         if (this.positive.is(DBSPBlockExpression.class))
@@ -116,6 +131,7 @@ public final class DBSPIfExpression extends DBSPExpression {
                         .append("}");
             }
         }
+        builder.append(")");
         return builder;
     }
 

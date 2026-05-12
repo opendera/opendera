@@ -1,27 +1,27 @@
 //! See crates/iceberg/srd/tests/README.md for a description of the Iceberg test harness.
 
 use crate::{
-    test::{file_to_zset, wait},
     Controller,
+    test::{file_to_zset, wait},
 };
 use crossbeam::channel::Receiver;
 use dbsp::DBData;
-use feldera_sqllib::{ByteArray, F32, F64};
+use feldera_sqllib::{ByteArray, F32, F64, Variant};
 use feldera_types::{
-    config::PipelineConfig,
     program_schema::Field,
     serde_with_context::{DeserializeWithContext, SerializeWithContext, SqlSerdeConfig},
 };
+use serde_json::json;
 
 use std::{collections::HashMap, time::Instant};
 use tempfile::NamedTempFile;
 use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg(feature = "iceberg-tests-fs")]
 use std::io::Write;
 
-use super::{test_circuit, IcebergTestStruct};
+use super::{IcebergTestStruct, test_circuit};
 
 fn init_logging() {
     let _ = tracing_subscriber::registry()
@@ -58,7 +58,7 @@ fn iceberg_snapshot_to_json<T>(schema: &[Field], config: &HashMap<String, String
 where
     T: DBData
         + SerializeWithContext<SqlSerdeConfig>
-        + for<'de> DeserializeWithContext<'de, SqlSerdeConfig>
+        + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
         + Sync,
 {
     let start = Instant::now();
@@ -98,52 +98,52 @@ fn iceberg_input_pipeline<T>(
 where
     T: DBData
         + SerializeWithContext<SqlSerdeConfig>
-        + for<'de> DeserializeWithContext<'de, SqlSerdeConfig>
+        + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
         + Sync,
 {
     init_logging();
 
-    let mut options = String::new();
-    for (key, val) in config.iter() {
-        options += &format!("                {key}: \"{val}\"\n");
-    }
-
     // Create controller.
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-outputs:
-    test_output1:
-        stream: test_output1
-        transport:
-            name: file_output
-            config:
-                path: "{output_file_path}"
-        format:
-            name: json
-            config:
-                update_format: "insert_delete"
-inputs:
-    test_input1:
-        stream: test_input1
-        transport:
-            name: "iceberg_input"
-            config:
-{}
-"#,
-        options,
-    );
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      "outputs": {
+        "test_output1": {
+          "stream": "test_output1",
+          "transport": {
+            "name": "file_output",
+            "config": {
+              "path": output_file_path
+            }
+          },
+          "format": {
+            "name": "json",
+            "config": {
+              "update_format": "insert_delete"
+            }
+          }
+        }
+      },
+      "inputs": {
+        "test_input1": {
+          "stream": "test_input1",
+          "transport": {
+              "name": "iceberg_input",
+              "config": config
+          }
+        }
+      }
+    }))
+    .unwrap();
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
     let schema = schema.to_vec();
 
     let (err_sender, err_receiver) = crossbeam::channel::unbounded();
 
-    let controller = Controller::with_config(
+    let controller = Controller::with_test_config(
         move |workers| Ok(test_circuit::<T>(workers, &schema, &[None])),
         &config,
-        Box::new(move |e| {
+        Box::new(move |e, _| {
             let msg = format!("iceberg_input_test: error: {e}");
             println!("{}", msg);
             err_sender.send(msg).unwrap()
@@ -169,7 +169,7 @@ fn data(n_records: usize) -> Vec<IcebergTestStruct> {
             l: i as i64,
             r: F32::from(i as f32),
             d: F64::from(i as f64),
-            dec: feldera_sqllib::SqlDecimal::from_i128_with_scale(i as i128, 2),
+            dec: feldera_sqllib::SqlDecimal::<10, 3>::new(i as i128, 2).unwrap(),
             dt: feldera_sqllib::Date::from_date(time.date()),
             tm: feldera_sqllib::Time::from_time(time.time()),
             ts: feldera_sqllib::Timestamp::from_naiveDateTime(time),
@@ -275,11 +275,7 @@ fn iceberg_localfs_input_test(
             .map(|x| dbsp::utils::Tup2(dbsp::utils::Tup2(x, ()), 1))
             .collect(),
     );
-    let zset = file_to_zset::<IcebergTestStruct>(
-        json_file.as_file_mut(),
-        "json",
-        r#"update_format: "insert_delete""#,
-    );
+    let zset = file_to_zset::<IcebergTestStruct>(json_file.as_file_mut());
 
     assert_eq!(zset, expected_zset);
 }
@@ -324,11 +320,7 @@ fn iceberg_glue_s3_input_test() {
         .collect::<HashMap<_, _>>(),
     );
 
-    let zset = file_to_zset::<IcebergTestStruct>(
-        json_file.as_file_mut(),
-        "json",
-        r#"update_format: "insert_delete""#,
-    );
+    let zset = file_to_zset::<IcebergTestStruct>(json_file.as_file_mut());
 
     // The data for this test is generated by the Python script, we don't know the
     // exact set of records in the dataset.
@@ -368,11 +360,7 @@ fn iceberg_rest_s3_input_test() {
         .collect::<HashMap<_, _>>(),
     );
 
-    let zset = file_to_zset::<IcebergTestStruct>(
-        json_file.as_file_mut(),
-        "json",
-        r#"update_format: "insert_delete""#,
-    );
+    let zset = file_to_zset::<IcebergTestStruct>(json_file.as_file_mut());
 
     assert_eq!(zset.len(), 2000000);
     //assert_eq!(zset, expected_zset);

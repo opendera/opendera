@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.dbsp.sqlCompiler.compiler.IHasSourcePositionRange;
+import org.dbsp.sqlCompiler.compiler.frontend.ExtendedSqlParserPos;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
@@ -22,14 +23,24 @@ public class SourcePositionRange implements IHasSourcePositionRange {
         this.end = end;
     }
 
-    public SourcePositionRange(@Nullable SqlParserPos pos) {
+    public SourcePositionRange(@Nullable SqlParserPos pos, boolean skipInternal) {
         if (pos == null) {
             this.start = SourcePosition.INVALID;
             this.end = SourcePosition.INVALID;
         } else {
-            this.start = new SourcePosition(pos.getLineNum(), pos.getColumnNum());
-            this.end = new SourcePosition(pos.getEndLineNum(), pos.getEndColumnNum());
+            if (pos instanceof ExtendedSqlParserPos epos &&
+                skipInternal && epos.internal) {
+                this.start = SourcePosition.INVALID;
+                this.end = SourcePosition.INVALID;
+            } else {
+                this.start = new SourcePosition(pos.getLineNum(), pos.getColumnNum());
+                this.end = new SourcePosition(pos.getEndLineNum(), pos.getEndColumnNum());
+            }
         }
+    }
+
+    public SourcePositionRange(@Nullable SqlParserPos pos) {
+        this(pos, true);
     }
 
     public boolean isValid() {
@@ -61,10 +72,6 @@ public class SourcePositionRange implements IHasSourcePositionRange {
         return result;
     }
 
-    public String toRustConstant() {
-        return "\"line " + this.start.line + " column " + this.start.column + "\"";
-    }
-
     @Override
     public boolean equals(Object o) {
         if (o == null || getClass() != o.getClass()) return false;
@@ -73,10 +80,46 @@ public class SourcePositionRange implements IHasSourcePositionRange {
         return start.equals(that.start) && end.equals(that.end);
     }
 
+    boolean includes(SourcePositionRange other) {
+        return this.start.beforeOrEqual(other.start) && other.end.beforeOrEqual(this.end);
+    }
+
+    boolean includes(SourcePosition position) {
+        return this.start.beforeOrEqual(position) && position.beforeOrEqual(this.end);
+    }
+
+    /** Merge two source position ranges by creating a range that spans both. */
+    SourcePositionRange merge(SourcePositionRange other) {
+        SourcePosition start = this.start.min(other.start);
+        SourcePosition end = this.end.max(other.end);
+        return new SourcePositionRange(start, end);
+    }
+
     @Override
     public int hashCode() {
         int result = start.hashCode();
         result = 31 * result + end.hashCode();
         return result;
+    }
+
+    public String toShortString() {
+        if (!this.isValid())
+            return "";
+        if (this.start.line == this.end.line)
+            return "#" + this.start.line;
+        else
+            return "#" + this.start.line + "-" + this.end.line;
+    }
+
+    /** True if a range ends just before another one starts.
+     * Thsi cannot detect the case when the first range ends on a line boundary. */
+    public boolean adjacent(SourcePositionRange p) {
+        return this.end.line == p.start.line && this.end.column >= p.start.column - 1;
+    }
+
+    /** We have a position described by this.  But the first character should not
+     * have position (1, 0), but rather firstCharPosition.  What is the correct position of this? */
+    public SourcePositionRange relativeTo(SourcePosition start) {
+        return new SourcePositionRange(this.start.relativeTo(start), this.end.relativeTo(start));
     }
 }

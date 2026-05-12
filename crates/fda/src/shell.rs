@@ -11,7 +11,7 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::{Cli, Commands, OutputFormat};
-use crate::{handle_errors_fatal, pipeline, UPGRADE_NOTICE};
+use crate::{UPGRADE_NOTICE, handle_errors_fatal, pipeline};
 
 const NEWLINE: &str = if cfg!(windows) { "\r\n" } else { "\n" };
 
@@ -25,6 +25,7 @@ Type:  \h for help with fda shell commands
        - SQL commands: SELECT or INSERT
        - start
        - pause
+       - resume
        - restart [-r, --recompile]
        - shutdown / stop
        - program
@@ -109,6 +110,7 @@ pub async fn shell(format: OutputFormat, name: String, client: Client) {
                     }
                     line if line.starts_with("start")
                         || line.starts_with("pause")
+                        || line.starts_with("resume")
                         || line.starts_with("stop")
                         || line.starts_with("restart")
                         || line.starts_with("shutdown")
@@ -153,6 +155,10 @@ pub async fn shell(format: OutputFormat, name: String, client: Client) {
                                 OutputFormat::Json => "json",
                                 OutputFormat::ArrowIpc => "arrow",
                                 OutputFormat::Parquet => "parquet",
+                                OutputFormat::Hash => "hash",
+                                OutputFormat::Prometheus => {
+                                    panic!("Prometheus format is not supported for ad-hoc SQL");
+                                }
                             };
                             match client
                                 .pipeline_adhoc_sql()

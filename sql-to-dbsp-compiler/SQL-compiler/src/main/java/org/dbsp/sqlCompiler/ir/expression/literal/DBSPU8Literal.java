@@ -47,6 +47,14 @@ public final class DBSPU8Literal extends DBSPIntLiteral implements IsNumericLite
     }
 
     @Override
+    public int compare(IsNumericLiteral other) {
+        DBSPU8Literal oi = other.to(DBSPU8Literal.class);
+        Utilities.enforce(this.value != null);
+        Utilities.enforce(oi.value != null);
+        return this.value.compareTo(oi.value);
+    }
+
+    @Override
     public boolean gt0() {
         Utilities.enforce(this.value != null);
         return this.value > 0;
@@ -95,7 +103,7 @@ public final class DBSPU8Literal extends DBSPIntLiteral implements IsNumericLite
                     .append(this.type)
                     .append(")null");
         else
-            return builder.append(this.value.toString());
+            return builder.append(this.wrapSome(this.value.toString()));
     }
 
     @Override

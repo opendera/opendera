@@ -29,7 +29,6 @@ import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
-import org.dbsp.sqlCompiler.ir.expression.DBSPArrayExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.ICollectionType;
 import org.dbsp.util.Utilities;
@@ -38,7 +37,8 @@ import java.util.List;
 
 import static org.dbsp.sqlCompiler.ir.type.DBSPTypeCode.USER;
 
-/** Represents the type of a Rust Vec as a TypeUser. */
+/** Represents the type of a Rust Vec as a TypeUser.
+ * (Note that Vec is not the same as a SQL Array). */
 public class DBSPTypeVec extends DBSPTypeUser implements ICollectionType {
     public DBSPTypeVec(DBSPType vectorElementType, boolean mayBeNull) {
         super(vectorElementType.getNode(), USER, "Vec", mayBeNull, vectorElementType);
@@ -46,13 +46,6 @@ public class DBSPTypeVec extends DBSPTypeUser implements ICollectionType {
 
     public DBSPType getElementType() {
         return this.getTypeArg(0);
-    }
-
-    @Override
-    public DBSPExpression defaultValue() {
-        if (this.mayBeNull)
-            return this.none();
-        return new DBSPArrayExpression(this, false);
     }
 
     /** vec!() or Some(vec!()), depending on nullability */

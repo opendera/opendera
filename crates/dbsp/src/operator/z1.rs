@@ -1,26 +1,26 @@
 //! z^-1 operator delays its input by one timestamp.
 
-use crate::circuit::circuit_builder::StreamId;
-use crate::circuit::metrics::Gauge;
 use crate::Runtime;
+use crate::circuit::circuit_builder::StreamId;
+use crate::circuit::metadata::{MEMORY_ALLOCATIONS_COUNT, SIZE_DISTRIBUTION, STATE_RECORDS_COUNT};
 use crate::{
+    Error, NumEntries,
     algebra::HasZero,
     circuit::checkpointer::Checkpoint,
     circuit::{
-        metadata::{
-            MetaItem, OperatorMeta, ALLOCATED_BYTES_LABEL, NUM_ENTRIES_LABEL, SHARED_BYTES_LABEL,
-            USED_BYTES_LABEL,
-        },
-        operator_traits::{Operator, StrictOperator, StrictUnaryOperator, UnaryOperator},
         Circuit, ExportId, ExportStream, FeedbackConnector, GlobalNodeId, OwnershipPreference,
         Scope, Stream,
+        metadata::{
+            ALLOCATED_MEMORY_BYTES, MetaItem, OperatorMeta, SHARED_MEMORY_BYTES, USED_MEMORY_BYTES,
+        },
+        operator_traits::{Operator, StrictOperator, StrictUnaryOperator, UnaryOperator},
     },
     circuit_cache_key,
     storage::file::to_bytes,
-    Error, NumEntries,
 };
-use feldera_storage::StoragePath;
+use feldera_storage::{FileCommitter, StoragePath};
 use size_of::{Context, SizeOf};
+use std::sync::Arc;
 use std::{borrow::Cow, mem::replace};
 
 use super::require_persistent_id;
@@ -223,8 +223,6 @@ pub struct Z1<T> {
     global_id: GlobalNodeId,
     empty_output: bool,
     values: T,
-    // Handle to update the metric `total_size`.
-    total_size_metric: Option<Gauge>,
 }
 
 #[derive(rkyv::Serialize, rkyv::Deserialize, rkyv::Archive)]
@@ -255,7 +253,6 @@ where
             global_id: GlobalNodeId::root(),
             zero: zero.clone(),
             values: zero,
-            total_size_metric: None,
         }
     }
 
@@ -272,7 +269,7 @@ where
 
 impl<T> Operator for Z1<T>
 where
-    T: Checkpoint + Eq + SizeOf + NumEntries + Clone + 'static,
+    T: Checkpoint + SizeOf + NumEntries + Clone + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
         Cow::from("Z^-1")
@@ -286,30 +283,16 @@ where
 
     fn init(&mut self, global_id: &GlobalNodeId) {
         self.global_id = global_id.clone();
-        self.total_size_metric = Some(Gauge::new(
-            NUM_ENTRIES_LABEL,
-            Some("Total number of entries stored by the operator".to_owned()),
-            Some("count"),
-            global_id,
-            vec![],
-        ))
-    }
-
-    fn metrics(&self) {
-        self.total_size_metric
-            .as_ref()
-            .unwrap()
-            .set(self.values.num_entries_deep() as f64);
     }
 
     fn metadata(&self, meta: &mut OperatorMeta) {
         let bytes = self.values.size_of();
         meta.extend(metadata! {
-            NUM_ENTRIES_LABEL => MetaItem::Count(self.values.num_entries_deep()),
-            ALLOCATED_BYTES_LABEL => MetaItem::bytes(bytes.total_bytes()),
-            USED_BYTES_LABEL => MetaItem::bytes(bytes.used_bytes()),
-            "allocations" => MetaItem::Count(bytes.distinct_allocations()),
-            SHARED_BYTES_LABEL => MetaItem::bytes(bytes.shared_bytes()),
+            STATE_RECORDS_COUNT => MetaItem::Count(self.values.num_entries_deep()),
+            ALLOCATED_MEMORY_BYTES => MetaItem::bytes(bytes.total_bytes()),
+            USED_MEMORY_BYTES => MetaItem::bytes(bytes.used_bytes()),
+            MEMORY_ALLOCATIONS_COUNT => MetaItem::Count(bytes.distinct_allocations()),
+            SHARED_MEMORY_BYTES => MetaItem::bytes(bytes.shared_bytes()),
         });
     }
 
@@ -321,14 +304,21 @@ where
         }
     }
 
-    fn commit(&mut self, base: &StoragePath, persistent_id: Option<&str>) -> Result<(), Error> {
+    fn checkpoint(
+        &mut self,
+        base: &StoragePath,
+        persistent_id: Option<&str>,
+        files: &mut Vec<Arc<dyn FileCommitter>>,
+    ) -> Result<(), Error> {
         let persistent_id = require_persistent_id(persistent_id, &self.global_id)?;
 
         let committed: CommittedZ1 = (self as &Self).try_into()?;
         let as_bytes = to_bytes(&committed).expect("Serializing CommittedZ1 should work.");
-        Runtime::storage_backend()
-            .unwrap()
-            .write(&Self::checkpoint_file(base, persistent_id), as_bytes)?;
+        files.push(
+            Runtime::storage_backend()
+                .unwrap()
+                .write(&Self::checkpoint_file(base, persistent_id), as_bytes)?,
+        );
         Ok(())
     }
 
@@ -349,16 +339,13 @@ where
     fn clear_state(&mut self) -> Result<(), Error> {
         self.empty_output = false;
         self.values = self.zero.clone();
-        if let Some(metric) = self.total_size_metric.as_ref() {
-            metric.set(0.0)
-        }
         Ok(())
     }
 }
 
 impl<T> UnaryOperator<T, T> for Z1<T>
 where
-    T: Checkpoint + Eq + SizeOf + NumEntries + Clone + 'static,
+    T: Checkpoint + SizeOf + NumEntries + Clone + 'static,
 {
     async fn eval(&mut self, i: &T) -> T {
         replace(&mut self.values, i.clone())
@@ -375,7 +362,7 @@ where
 
 impl<T> StrictOperator<T> for Z1<T>
 where
-    T: Checkpoint + Eq + SizeOf + NumEntries + Clone + 'static,
+    T: Checkpoint + SizeOf + NumEntries + Clone + 'static,
 {
     fn get_output(&mut self) -> T {
         self.empty_output = self.values.num_entries_shallow() == 0;
@@ -389,8 +376,14 @@ where
 
 impl<T> StrictUnaryOperator<T, T> for Z1<T>
 where
-    T: Checkpoint + Eq + SizeOf + NumEntries + Clone + 'static,
+    T: Checkpoint + SizeOf + NumEntries + Clone + 'static,
 {
+    fn flush_input(&mut self) {}
+
+    fn is_flush_input_complete(&self) -> bool {
+        true
+    }
+
     async fn eval_strict(&mut self, i: &T) {
         self.values = i.clone();
     }
@@ -443,8 +436,6 @@ pub struct Z1Nested<T> {
     zero: T,
     timestamp: usize,
     values: Vec<T>,
-    // Handle to the metric `total_size`.
-    total_size_metric: Option<Gauge>,
 }
 
 impl<T> Z1Nested<T> {
@@ -453,7 +444,6 @@ impl<T> Z1Nested<T> {
             zero,
             timestamp: 0,
             values: Vec::new(),
-            total_size_metric: None,
         }
     }
 
@@ -484,29 +474,6 @@ where
         }
     }
 
-    fn init(&mut self, global_id: &GlobalNodeId) {
-        self.total_size_metric = Some(Gauge::new(
-            NUM_ENTRIES_LABEL,
-            Some("Total number of entries stored by the operator".to_owned()),
-            Some("count"),
-            global_id,
-            vec![],
-        ));
-    }
-
-    fn metrics(&self) {
-        let total_size: usize = self
-            .values
-            .iter()
-            .map(|batch| batch.num_entries_deep())
-            .sum();
-
-        self.total_size_metric
-            .as_ref()
-            .unwrap()
-            .set(total_size as f64);
-    }
-
     fn metadata(&self, meta: &mut OperatorMeta) {
         let total_size: usize = self
             .values
@@ -529,12 +496,12 @@ where
         };
 
         meta.extend(metadata! {
-            NUM_ENTRIES_LABEL => MetaItem::Count(total_size),
-            "batch sizes" => MetaItem::Array(batch_sizes),
-            ALLOCATED_BYTES_LABEL => MetaItem::bytes(total_bytes.total_bytes()),
-            USED_BYTES_LABEL => MetaItem::bytes(total_bytes.used_bytes()),
-            "allocations" => MetaItem::Count(total_bytes.distinct_allocations()),
-            SHARED_BYTES_LABEL => MetaItem::bytes(total_bytes.shared_bytes()),
+            STATE_RECORDS_COUNT => MetaItem::Count(total_size),
+            SIZE_DISTRIBUTION => MetaItem::Array(batch_sizes),
+            ALLOCATED_MEMORY_BYTES => MetaItem::bytes(total_bytes.total_bytes()),
+            USED_MEMORY_BYTES => MetaItem::bytes(total_bytes.used_bytes()),
+            MEMORY_ALLOCATIONS_COUNT => MetaItem::Count(total_bytes.distinct_allocations()),
+            SHARED_MEMORY_BYTES => MetaItem::bytes(total_bytes.shared_bytes()),
         });
     }
 
@@ -617,6 +584,12 @@ impl<T> StrictUnaryOperator<T, T> for Z1Nested<T>
 where
     T: Eq + SizeOf + NumEntries + Clone + 'static,
 {
+    fn flush_input(&mut self) {}
+
+    fn is_flush_input_complete(&self) -> bool {
+        true
+    }
+
     async fn eval_strict(&mut self, i: &T) {
         debug_assert!(self.timestamp < self.values.len());
 
@@ -640,7 +613,7 @@ where
 mod test {
     use crate::{
         circuit::operator_traits::{Operator, StrictOperator, StrictUnaryOperator, UnaryOperator},
-        operator::{Z1Nested, Z1},
+        operator::{Z1, Z1Nested},
     };
 
     #[tokio::test]

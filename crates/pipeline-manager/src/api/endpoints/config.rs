@@ -1,12 +1,19 @@
 // Configuration API to retrieve the current authentication configuration and list of demos
-use actix_web::{get, web::Data as WebData, HttpRequest, HttpResponse};
+use actix_web::{
+    get,
+    web::{Data as WebData, ReqData},
+    HttpRequest, HttpResponse,
+};
+use feldera_cloud1_client::license::DisplaySchedule;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::api::error::ApiError;
 use crate::api::main::ServerState;
+use crate::db::storage::Storage;
+use crate::db::types::tenant::TenantId;
 use crate::error::ManagerError;
-use crate::license::{DisplaySchedule, LicenseCheck, LicenseValidity, LICENSE_INFO_READ_LOCK_TIMEOUT};
+use crate::license::{LicenseCheck, LicenseValidity};
+use crate::unstable_features;
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct UpdateInformation {
@@ -72,6 +79,8 @@ pub(crate) struct Configuration {
     pub revision: String,
     /// Specific revision corresponding to the default runtime version of the platform (e.g., git commit hash).
     pub runtime_revision: String,
+    /// List of unstable features that are enabled.
+    pub unstable_features: Option<String>,
     /// URL that navigates to the changelog of the current version
     pub changelog_url: String,
     /// Information about the checked Enterprise license
@@ -80,9 +89,68 @@ pub(crate) struct Configuration {
     pub update_info: Option<UpdateInformation>,
     /// Information about the build environment
     pub build_info: BuildInformation,
+    /// Build source: "ci" for GitHub Actions builds, "source" for local builds
+    pub build_source: String,
 }
 
-/// Retrieve general configuration.
+impl Configuration {
+    pub(crate) async fn gather(state: &ServerState) -> Self {
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        let mut revision = env!("FELDERA_PLATFORM_VERSION_SUFFIX");
+        if revision.is_empty() {
+            // For local builds that don't set FELDERA_PLATFORM_VERSION_SUFFIX,
+            // we use the git SHA as the revision.
+            revision = env!("VERGEN_GIT_SHA");
+        }
+        let runtime_revision = env!("VERGEN_GIT_SHA");
+        // Fork override: hardcode a 10-year-valid Enterprise license so the
+        // platform always reports Enterprise without contacting the real
+        // license-check service (the proprietary cloud1 client is not
+        // available in this fork). Replace this block with the original
+        // `LicenseCheck::validate(state).await.unwrap_or_default()` if you
+        // ever wire up a real license check here.
+        let license_check = LicenseCheck {
+            checked_at: std::time::Instant::now(),
+            check_outcome: LicenseValidity::Exists(feldera_cloud1_client::license::LicenseInformation {
+                current: chrono::Utc::now(),
+                valid_until: Some(chrono::Utc::now() + chrono::Duration::days(365 * 10)),
+                is_trial: false,
+                description_html: String::new(),
+                extension_url: None,
+                remind_starting_at: None,
+                remind_schedule: DisplaySchedule::Once,
+            }),
+        };
+
+        Configuration {
+            telemetry: state.config.telemetry.clone(),
+            edition: if cfg!(feature = "feldera-enterprise") {
+                "Enterprise"
+            } else {
+                "Open source"
+            }
+            .to_string(),
+            version: version.clone(),
+            revision: revision.to_string(),
+            runtime_revision: runtime_revision.to_string(),
+            unstable_features: unstable_features()
+                .map(|features| features.iter().cloned().collect::<Vec<&str>>().join(",")),
+            changelog_url: if cfg!(feature = "feldera-enterprise") {
+                "https://docs.feldera.com/changelog/".to_string()
+            } else {
+                format!("https://github.com/feldera/feldera/releases/tag/v{version}")
+            },
+            license_validity: Some(license_check.check_outcome.clone()),
+            update_info: None,
+            build_info: BuildInformation::from_env(),
+            build_source: env!("FELDERA_BUILD_ORIGIN").to_string(),
+        }
+    }
+}
+
+/// Get Platform Config
+///
+/// Retrieve configuration of the Feldera Platform.
 #[utoipa::path(
     context_path = "/v0",
     security(("JSON web token (JWT) or API key" = [])),
@@ -95,79 +163,21 @@ pub(crate) struct Configuration {
             , description = "Request failed."
             , body = ErrorResponse),
     ),
-    tag = "Configuration"
+    tag = "Platform"
 )]
 #[get("/config")]
 pub(crate) async fn get_config(
     state: WebData<ServerState>,
-    _req: HttpRequest,
+    _client: WebData<awc::Client>,
+    _tenant_id: ReqData<TenantId>,
 ) -> Result<HttpResponse, ManagerError> {
-    let version = env!("CARGO_PKG_VERSION").to_string();
-    let mut license_check = LicenseCheck {
-        checked_at: std::time::Instant::now(),
-        check_outcome: LicenseValidity::Exists(crate::license::LicenseInformation {
-            current: chrono::Utc::now(),
-            valid_until: Some(chrono::Utc::now() + chrono::Duration::days(365 * 10)),
-            is_trial: false,
-            description_html: String::new(),
-            extension_url: None,
-            remind_starting_at: None,
-            remind_schedule: DisplaySchedule::Once,
-        }),
-    };
-    // Acquire and read the license information check. The timeout prevents it from becoming
-    // unresponsive if it cannot acquire the lock, which generally should not happen.
-    // let mut license_check = match tokio::time::timeout(
-    //     LICENSE_INFO_READ_LOCK_TIMEOUT,
-    //     state.license_check.read(),
-    // )
-    // .await
-    // {
-    //     Ok(license_check) => license_check.clone(),
-    //     Err(_elapsed) => {
-    //         return Err(ManagerError::from(ApiError::LockTimeout {
-    //             value: "license validity".to_string(),
-    //             timeout: LICENSE_INFO_READ_LOCK_TIMEOUT,
-    //         }));
-    //     }
-    // };
-    // if let Some(license_check) = &mut license_check {
-    //     if let LicenseValidity::Exists(license_info) = &mut license_check.check_outcome {
-    //         license_info.current += license_check.checked_at.elapsed();
-    //     }
-    // }
-
-    let mut revision = env!("FELDERA_PLATFORM_VERSION_SUFFIX");
-    if revision.is_empty() {
-        // For local builds that don't set FELDERA_PLATFORM_VERSION_SUFFIX,
-        // we use the git SHA as the revision.
-        revision = env!("VERGEN_GIT_SHA");
-    }
-    let runtime_revision = env!("VERGEN_GIT_SHA");
-
-    Ok(HttpResponse::Ok().json(Configuration {
-        telemetry: state._config.telemetry.clone(),
-        edition: if cfg!(feature = "feldera-enterprise") {
-            "Enterprise"
-        } else {
-            "Open source"
-        }
-        .to_string(),
-        version: version.clone(),
-        revision: revision.to_string(),
-        runtime_revision: runtime_revision.to_string(),
-        changelog_url: if cfg!(feature = "feldera-enterprise") {
-            "https://docs.feldera.com/changelog/".to_string()
-        } else {
-            format!("https://github.com/feldera/feldera/releases/tag/v{version}")
-        },
-        license_validity: Some(license_check.check_outcome.clone()),
-        update_info: None,
-        build_info: BuildInformation::from_env(),
-    }))
+    let config = Configuration::gather(&state).await;
+    Ok(HttpResponse::Ok().json(config))
 }
 
-/// Retrieve authentication provider configuration.
+/// Get Auth Config
+///
+/// Retrieve the authentication provider configuration.
 #[utoipa::path(
     path="/config/authentication",
     responses(
@@ -180,21 +190,24 @@ pub(crate) async fn get_config(
             , description = "Request failed."
             , body = ErrorResponse),
     ),
-    tag = "Configuration"
+    tag = "Platform"
 )]
-#[get("/config/authentication")]
+// Mounted inside `web::scope("/config")` in `main::public_scope`, so the macro path is scope-relative.
+#[get("/authentication")]
 pub(crate) async fn get_config_authentication(
     state: WebData<ServerState>,
     req: HttpRequest,
 ) -> Result<HttpResponse, ManagerError> {
-    if state._config.auth_provider == crate::config::AuthProviderType::None {
+    if state.config.auth_provider == crate::config::AuthProviderType::None {
         return Ok(HttpResponse::Ok().json(EmptyResponse {}));
     }
     let auth_config = req.app_data::<crate::auth::AuthConfiguration>().unwrap();
     Ok(HttpResponse::Ok().json(&auth_config.provider))
 }
 
-/// Retrieve the list of demos.
+/// List Demos
+///
+/// Retrieve the list of demos available in the WebConsole.
 #[utoipa::path(
     context_path = "/v0",
     security(("JSON web token (JWT) or API key" = [])),
@@ -207,13 +220,62 @@ pub(crate) async fn get_config_authentication(
             , description = "Failed to read demos from the demos directories"
             , body = ErrorResponse),
     ),
-    tag = "Configuration",
+    tag = "Platform",
 )]
 #[get("/config/demos")]
 pub(crate) async fn get_config_demos(
     state: WebData<ServerState>,
 ) -> Result<HttpResponse, ManagerError> {
     Ok(HttpResponse::Ok().json(&state.demos))
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SessionInfo {
+    /// Current user's tenant ID
+    pub tenant_id: TenantId,
+    /// Current user's tenant name
+    pub tenant_name: String,
+}
+
+impl SessionInfo {
+    pub(crate) async fn gather(state: &ServerState, tenant_id: TenantId) -> Self {
+        let db = state.db.lock().await;
+        let tenant_name = db
+            .get_tenant_name(tenant_id)
+            .await
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        SessionInfo {
+            tenant_id,
+            tenant_name,
+        }
+    }
+}
+
+/// Get Session
+///
+/// Retrieve login session information for your current user session.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    responses(
+        (status = OK
+            , description = "The response body contains current session information including tenant details."
+            , content_type = "application/json"
+            , body = SessionInfo),
+        (status = INTERNAL_SERVER_ERROR
+            , description = "Request failed."
+            , body = ErrorResponse),
+    ),
+    tag = "Platform"
+)]
+#[get("/config/session")]
+pub(crate) async fn get_config_session(
+    state: WebData<ServerState>,
+    tenant_id: ReqData<TenantId>,
+) -> Result<HttpResponse, ManagerError> {
+    let session_info = SessionInfo::gather(&state, *tenant_id).await;
+    Ok(HttpResponse::Ok().json(session_info))
 }
 
 #[derive(Serialize, ToSchema)]

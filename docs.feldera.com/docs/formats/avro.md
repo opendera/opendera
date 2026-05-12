@@ -85,7 +85,8 @@ A SQL column and a field in the Avro schema are compatible if the following cond
 | `REAL`                        | `float`        |                                                                     |
 | `DOUBLE`                      | `double`       |                                                                     |
 | `DECIMAL(precision,scale)`    | `decimal`      | Precision and scale of the Avro decimal type must precisely match the SQL type.  |
-| `CHAR`, `VARCHAR`             | `string`       |                                                                     |
+| `CHAR`, `VARCHAR`             | `string`, `enum` | SQL string type can be deserialized from Avro strings, including strings whose logical type is set to `uuid`. Avro enums are also deserialized into SQL strings. |
+| `UUID`                        | `string`       | The Avro logical type can be _optionally_ set to `uuid`.            |
 | `BINARY`, `VARBINARY`         | `bytes`        |                                                                     |
 | `DATE`                        | `int`          |                                                                     |
 | `TIME`                        | `long` or `int`| logical type must be set to `time-millis` or `time-micros`          |
@@ -167,6 +168,47 @@ CREATE TABLE my_table (
 }]');
 ```
 
+### <a name="metadata"></a>Accessing Avro metadata
+
+The Avro connector exposes the following metadata with every ingested record:
+
+| Metadata attribute | SQL type                 | `CONNECTOR_METADATA()` field |
+|--------------------|--------------------------|------------------------------|
+| Avro schema ID     | `INT UNSIGNED`           | `avro_schema_id`             |
+
+This metadata can be stored in table columns using the [`CONNECTOR_METADATA()`](/sql/grammar#connector_metadata)
+SQL function.  In the following example we extract the `avro_schema_id` attribute along with
+[Kafka message metadata](/connectors/sources/kafka#accessing-kafka-metadata) from the Kafka connector:
+
+```sql
+create table my_table(
+    x int,
+    avro_schema_id INT UNSIGNED DEFAULT CAST(CONNECTOR_METADATA()['avro_schema_id'] as INT UNSIGNED),
+    kafka_offset BIGINT DEFAULT CAST(CONNECTOR_METADATA()['kafka_offset'] AS BIGINT),
+    kafka_partition INT DEFAULT CAST(CONNECTOR_METADATA()['kafka_partition'] AS INT)
+) with (
+    'materialized' = 'true',
+    'connectors' = '[{
+      "transport": {
+          "name": "kafka_input",
+          "config": {
+              "topic": "meta_topic",
+              "start_from": "earliest",
+              "bootstrap.servers": "localhost:19092",
+              "include_offset": true,
+              "include_partition": true
+          }
+      },
+      "format": {
+        "name": "avro",
+        "config": {
+          "update_format": "raw",
+          "registry_urls": ["http://localhost:18081"]
+        }
+      }
+    }]');
+```
+
 ## Avro output
 
 ### Schema management
@@ -214,6 +256,7 @@ However, exactly one of `registry_urls` and `schema` properties must be specifie
 | `registry_password`            | string          | | Password used to authenticate with the registry. Requires `registry_urls` to be set.|
 | `registry_authorization_token` | string          | | Token used to authenticate with the registry. Requires `registry_urls` to be set. This option is mutually exclusive with password-based authentication (see `registry_username` and `registry_password`).|
 | `cdc_field`                    | string          | | <p>Optional name of the field used for Change Data Capture (CDC) annotations.</p> <p>Use this setting with data sinks that expect operation type (insert, delete, or update) encoded as a column in the Avro record, such as the [Iceberg Sink Kafka Connector](/connectors/sinks/iceberg).</p> <p> When set (e.g., `"cdc_field": "op"`), the specified field will be added to each record to indicate the type of change: <ul><li>`"I"` for insert operations</li> <li>`"U"` for upserts</li> <li>`"D"` for deletions</li></ul> </p> <p>If not set, CDC metadata will not be included in the records. Only works with the `raw` update format.</p>|
+| `threads`                     | integer         | `4` | Number of parallel worker threads used to encode messages. **Only supported with [indexed outputs](/connectors/unique_keys).** |
 
 
 ### Examples
@@ -270,8 +313,7 @@ with (
       "name": "kafka_output",
       "config": {
         "bootstrap.servers": "127.0.0.1:19092",
-        "topic": "my_topic",
-        "auto.offset.reset": "earliest"
+        "topic": "my_topic"
       }
     },
     "format": {

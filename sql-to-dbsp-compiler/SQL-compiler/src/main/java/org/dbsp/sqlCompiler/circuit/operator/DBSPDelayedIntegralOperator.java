@@ -14,13 +14,11 @@ import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import javax.annotation.Nullable;
 import java.util.List;
 
-/** This operator is like an integral followed by a delay.
- * This shows up often, and it can be implemented more efficiently
- * than using the pair. */
+/** This operator is like an integral followed by a delay. */
 @NonCoreIR
-public final class DBSPDelayedIntegralOperator extends DBSPUnaryOperator {
+public final class DBSPDelayedIntegralOperator extends DBSPUnaryOperator implements IContainsIntegrator {
     public DBSPDelayedIntegralOperator(CalciteRelNode node, OutputPort source) {
-        super(node, "delay_trace", null, source.outputType(), source.isMultiset(), source);
+        super(node, "accumulate_delay_trace", null, source.outputType(), source.isMultiset(), source);
     }
 
     @Override

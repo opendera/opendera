@@ -3,8 +3,8 @@
 use crate::{
     algebra::HasZero,
     circuit::{
-        operator_traits::{Data, ImportOperator, Operator},
         Circuit, OwnershipPreference, Scope, Stream,
+        operator_traits::{Data, ImportOperator, Operator},
     },
 };
 use std::borrow::Cow;
@@ -122,12 +122,12 @@ impl<D> ImportOperator<D, D> for Delta0<D>
 where
     D: HasZero + Clone + 'static,
 {
-    fn import(&mut self, val: &D) {
+    async fn import(&mut self, val: &D) {
         self.val = Some(val.clone());
         self.fixedpoint = false;
     }
 
-    fn import_owned(&mut self, val: D) {
+    async fn import_owned(&mut self, val: D) {
         self.val = Some(val);
         self.fixedpoint = false;
     }

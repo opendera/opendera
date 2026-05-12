@@ -4,14 +4,11 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
-import org.apache.calcite.sql.SqlCallBinding;
 import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.SqlFunctionCategory;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlKind;
-import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlOperandCountRange;
-import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.type.InferTypes;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.ReturnTypes;
@@ -32,6 +29,7 @@ import org.dbsp.sqlCompiler.ir.DBSPParameter;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyMethodExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPBlockExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPVariablePath;
 import org.dbsp.sqlCompiler.ir.statement.DBSPLetStatement;
@@ -47,29 +45,8 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.List;
 
-import static java.util.Objects.requireNonNull;
-
 /** Represents a function that is implemented by the user in Rust */
 public class ExternalFunction extends SqlFunction {
-    /** A variant of OperandTypes.TypeNameChecker which does not extend the interface
-     * ImplicitCastOperandTypeChecker.  We do not want to allow implicit casts for these operands. */
-    private record ExactTypeNameChecker(SqlTypeName typeName) implements SqlSingleOperandTypeChecker {
-        private ExactTypeNameChecker(SqlTypeName typeName) {
-            this.typeName = requireNonNull(typeName, "typeName");
-        }
-         @Override
-        public boolean checkSingleOperandType(SqlCallBinding callBinding,
-                                              SqlNode operand, int iFormalOperand, boolean throwOnFailure) {
-            final RelDataType operandType =
-                    callBinding.getValidator().getValidatedNodeType(operand);
-            return operandType.getSqlTypeName() == typeName;
-        }
-         @Override
-        public String getAllowedSignatures(SqlOperator op, String opName) {
-            return opName + "(" + typeName.getSpaceName() + ")";
-        }
-    }
-
     public final CalciteObject node;
     public final RelDataType returnType;
     public final List<RelDataTypeField> parameterList;
@@ -82,7 +59,9 @@ public class ExternalFunction extends SqlFunction {
     @Nullable
     public final RexNode body;
 
-    static SqlOperandTypeChecker createTypeChecker(String function, List<RelDataTypeField> parameters) {
+    static final String JSONSTRING_AS = "jsonstring_as_";
+
+    public static SqlOperandTypeChecker createTypeChecker(String function, List<RelDataTypeField> parameters) {
         if (parameters.isEmpty())
             return OperandTypes.NILADIC;
         SqlSingleOperandTypeChecker[] checkers = new SqlSingleOperandTypeChecker[parameters.size()];
@@ -113,14 +92,14 @@ public class ExternalFunction extends SqlFunction {
         return this.body != null;
     }
 
-    static SqlOperandTypeInference createTypeinference(List<RelDataTypeField> parameters) {
+    static SqlOperandTypeInference createTypeInference(List<RelDataTypeField> parameters) {
         return InferTypes.explicit(Linq.map(parameters, RelDataTypeField::getType));
     }
 
     public ExternalFunction(SqlIdentifier name, RelDataType returnType,
                             List<RelDataTypeField> parameters, @Nullable RexNode body, boolean generated) {
         super(name.getSimple(), SqlKind.OTHER_FUNCTION, ReturnTypes.explicit(returnType),
-                createTypeinference(parameters), createTypeChecker(name.getSimple(), parameters),
+                createTypeInference(parameters), createTypeChecker(name.getSimple(), parameters),
                 SqlFunctionCategory.USER_DEFINED_FUNCTION);
         this.node = CalciteObject.create(name);
         this.position = new SourcePositionRange(name.getParserPosition());
@@ -144,7 +123,7 @@ public class ExternalFunction extends SqlFunction {
      * I.e., may be a struct. */
     public DBSPType getFunctionReturnType(TypeCompiler compiler) {
         if (this.structReturnType == null)
-            this.structReturnType = compiler.convertType(this.returnType, true);
+            this.structReturnType = compiler.convertType(this.position, this.returnType, true);
         return this.structReturnType;
     }
 
@@ -173,11 +152,11 @@ public class ExternalFunction extends SqlFunction {
     public DBSPFunction getDeclaration(TypeCompiler typeCompiler) {
         List<DBSPParameter> parameters = new ArrayList<>();
         for (RelDataTypeField param: this.parameterList) {
-            DBSPType type = typeCompiler.convertType(param.getType(), false);
+            DBSPType type = typeCompiler.convertType(this.position, param.getType(), false);
             DBSPParameter p = new DBSPParameter(param.getName(), type);
             parameters.add(p);
         }
-        DBSPType returnType = typeCompiler.convertType(this.returnType, false);
+        DBSPType returnType = typeCompiler.convertType(SourcePositionRange.INVALID, this.returnType, false);
         // Must wrap the return type in a Result
         returnType = new DBSPTypeResult(returnType);
         return new DBSPFunction(this.node, this.getName(), parameters, returnType, null, Linq.list());
@@ -188,20 +167,22 @@ public class ExternalFunction extends SqlFunction {
         if (this.body != null) {
             List<DBSPParameter> parameters = new ArrayList<>();
             for (RelDataTypeField param: this.parameterList) {
-                DBSPType type = typeCompiler.convertType(param.getType(), false);
+                DBSPType type = typeCompiler.convertType(this.position, param.getType(), false);
                 DBSPParameter p = new DBSPParameter(param.getName(), type);
                 parameters.add(p);
             }
             FunctionBodyGenerator generator = new FunctionBodyGenerator(compiler, parameters);
-            DBSPType returnType = typeCompiler.convertType(this.returnType, false);
+            DBSPType returnType = typeCompiler.convertType(this.position, this.returnType, false);
             DBSPExpression functionBody = generator.compile(this.body);
 
             DBSPType functionType = functionBody.getType();
             if (!returnType.sameType(functionType)) {
                 if (returnType.is(DBSPTypeString.class)) {
-                    functionBody = functionBody.cast(functionBody.getNode(), returnType, false);
+                    functionBody = functionBody.cast(
+                            functionBody.getNode(), returnType, DBSPCastExpression.CastType.SqlUnsafe);
                 } else if (returnType.sameType(functionType.withMayBeNull(true))) {
-                    functionBody = functionBody.cast(functionBody.getNode(), returnType, false);
+                    functionBody = functionBody.cast(
+                            functionBody.getNode(), returnType, DBSPCastExpression.CastType.SqlUnsafe);
                 } else {
                     throw new CompilationError("Function " + Utilities.singleQuote(this.getName()) +
                             " should return " + Utilities.singleQuote(this.returnType.getFullTypeString()) +
@@ -213,7 +194,7 @@ public class ExternalFunction extends SqlFunction {
         if (!this.generated)
             return null;
         // Some classes of functions are automatically generated by the compiler.
-        if (this.getName().toLowerCase().startsWith("jsonstring_as_")) {
+        if (this.getName().toLowerCase().startsWith(JSONSTRING_AS)) {
             /*
             TYPE ~ struct
             pub fn JSONSTRING_AS_<TYPE>(_pos: &SourcePositionRange, s: Option<SqlString>) -> Option<Tup1<TYPE>> {
@@ -222,7 +203,7 @@ public class ExternalFunction extends SqlFunction {
                 strct.map(move |x: _, | -> _ { x.into() })
             }
              */
-            DBSPType returnType = typeCompiler.convertType(this.returnType, false);
+            DBSPType returnType = typeCompiler.convertType(this.position, this.returnType, false);
             DBSPType structType = this.getFunctionReturnType(typeCompiler);
             if (this.parameterList.size() != 1) {
                 compiler.reportError(this.position, "Incorrect signature",
@@ -230,7 +211,7 @@ public class ExternalFunction extends SqlFunction {
                                 " must have a single parameter");
                 return null;
             }
-            DBSPType parameterType = typeCompiler.convertType(this.parameterList.get(0).getType(), false);
+            DBSPType parameterType = typeCompiler.convertType(this.position, this.parameterList.get(0).getType(), false);
             DBSPParameter param = new DBSPParameter("s", parameterType);
             List<DBSPStatement> statements = new ArrayList<>();
             if (parameterType.mayBeNull)

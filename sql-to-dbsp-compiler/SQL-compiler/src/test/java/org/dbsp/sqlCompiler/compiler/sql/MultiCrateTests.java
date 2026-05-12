@@ -1,8 +1,11 @@
 package org.dbsp.sqlCompiler.compiler.sql;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.dbsp.sqlCompiler.CompilerMain;
 import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCrates;
 import org.dbsp.sqlCompiler.compiler.errors.CompilerMessages;
+import org.dbsp.sqlCompiler.compiler.errors.UnsupportedException;
 import org.dbsp.sqlCompiler.compiler.sql.tools.BaseSQLTests;
 import org.dbsp.util.Utilities;
 import org.junit.Assert;
@@ -15,22 +18,73 @@ import java.io.FilenameFilter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.sql.SQLException;
 import java.util.Arrays;
 
 public class MultiCrateTests extends BaseSQLTests {
-    void compileToMultiCrate(String file, boolean check) throws SQLException, IOException, InterruptedException {
+    public static void setupCargoLock() throws IOException {
+        Files.copy(Path.of(BaseSQLTests.PROJECT_DIRECTORY, "..", BaseSQLTests.CARGO_LOCK),
+                Path.of(BaseSQLTests.RUST_MULTI_DIRECTORY, BaseSQLTests.CARGO_LOCK),
+                StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    static void compileToMultiCrate(String file, boolean check, boolean noUdfs) throws SQLException, IOException, InterruptedException {
+        if (Utilities.inCI())
+            // Do not compile these tests in CI: all other tests in CI will use multi-crate
+            return;
+        if (noUdfs) {
+            // Make sure there is no stray udf.rs file from a previous test
+            Path path = Paths.get(BaseSQLTests.RUST_MULTI_DIRECTORY + "/crates",
+                    MultiCrates.FILE_PREFIX + "x_globals", "src", "udf.rs");
+            File udfFile = path.toFile();
+            Utilities.deleteFile(udfFile, true);
+        }
+
+        setupCargoLock();
+        String jsonFile = PROJECT_DIRECTORY + "/x.json";
         CompilerMessages messages = CompilerMain.execute(
                 "-i", "--alltables", "-q", "--ignoreOrder", "--crates", "x",
-                "-o", BaseSQLTests.RUST_CRATES_DIRECTORY, file);
+                "-o", BaseSQLTests.RUST_MULTI_DIRECTORY, file, "--dataflow", jsonFile);
         if (messages.errorCount() > 0) {
             messages.print();
             throw new RuntimeException("Error during compilation");
         }
+        File json = new File(jsonFile);
+        Assert.assertTrue(json.exists());
+        ObjectMapper mapper = Utilities.deterministicObjectMapper();
+        JsonNode parsed = mapper.readTree(json);
+        Assert.assertNotNull(parsed);
+        Utilities.deleteFile(json, true);
         if (check && !BaseSQLTests.skipRust)
-            Utilities.compileAndCheckRust(BaseSQLTests.RUST_CRATES_DIRECTORY, true);
+            Utilities.compileAndCheckRust(BaseSQLTests.RUST_MULTI_DIRECTORY, true);
+    }
+
+    static void compileToMultiCrate(String file, boolean check) throws SQLException, IOException, InterruptedException {
+        compileToMultiCrate(file, check, true);
+    }
+
+    @SuppressWarnings("SameParameterValue")
+    static void compileProgramToMultiCrate(String sql, boolean check)
+            throws IOException, SQLException, InterruptedException {
+        File file = createInputScript(sql);
+        compileToMultiCrate(file.getAbsolutePath(), check);
+    }
+
+    @Test @Ignore("These tests are slow")
+    public void qaTests() throws IOException, SQLException, InterruptedException {
+        for (File c : getQATests()) {
+            String sql = Utilities.readFile(c.getPath());
+            try {
+                compileProgramToMultiCrate(sql, true);
+            } catch (UnsupportedException ex) {
+                // This is probably a file containing an ad-hoc query
+                System.out.println(c.getName() + " skipped due to unsupported features.");
+            }
+        }
     }
 
     @Test
@@ -47,8 +101,29 @@ public class MultiCrateTests extends BaseSQLTests {
                 FROM tbl
                 ORDER BY c1 NULLS LAST
                 LIMIT 3;""";
-        File file = createInputScript(sql);
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
+        compileProgramToMultiCrate(sql, true);
+    }
+
+    @Test
+    public void testJsonString() throws IOException, SQLException, InterruptedException {
+        String sql = """
+                CREATE TYPE T0 AS (n VARCHAR, u VARCHAR);
+                CREATE FUNCTION jsonstring_as_t0(line VARCHAR) RETURNS T0;
+                CREATE TABLE T(x VARCHAR);
+                CREATE VIEW V AS SELECT jsonstring_as_t0(x).n FROM T;""";
+        compileProgramToMultiCrate(sql, true);
+    }
+
+    @Test
+    public void issue4457() throws IOException, SQLException, InterruptedException {
+        String sql = """
+                CREATE TABLE test_events (
+                    id VARCHAR NOT NULL PRIMARY KEY,
+                    a VARCHAR,
+                    t TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE
+                );
+                CREATE VIEW V AS SELECT * FROM test_events;""";
+        compileProgramToMultiCrate(sql, true);
     }
 
     @Test
@@ -57,8 +132,7 @@ public class MultiCrateTests extends BaseSQLTests {
                  CREATE TABLE T (C0 INT NOT NULL, C1 DOUBLE NOT NULL, C2 INT, C3 INT LATENESS 2, C4 INT, C5 INT);
                  CREATE VIEW V0 AS SELECT 'x', STDDEV(C1) FROM T;
                  CREATE VIEW V1 AS SELECT * FROM T JOIN T AS R ON T.C0 = R.C3;""";
-        File file = createInputScript(sql);
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
+        compileProgramToMultiCrate(sql, true);
     }
 
     @Test
@@ -66,8 +140,7 @@ public class MultiCrateTests extends BaseSQLTests {
         String sql = """
                  CREATE TABLE T (C0 VARCHAR INTERNED, C1 INT);
                  CREATE VIEW V0 AS SELECT ARG_MAX(C0, C1) FROM T;""";
-        File file = createInputScript(sql);
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
+        compileProgramToMultiCrate(sql, true);
     }
 
     @Test
@@ -85,14 +158,27 @@ public class MultiCrateTests extends BaseSQLTests {
                 c8 BIGINT NOT NULL);
 
                 CREATE MATERIALIZED VIEW int_array_agg AS SELECT
-                ARRAY_AGG(c1) AS c1, ARRAY_AGG(c2) AS c2, ARRAY_AGG(c3) AS c3, ARRAY_AGG(c4) AS c4, ARRAY_AGG(c5) AS c5, ARRAY_AGG(c6) AS c6, ARRAY_AGG(c7) AS c7, ARRAY_AGG(c8) AS c8
+                ARRAY_AGG(c1) AS c1,
+                ARRAY_AGG(c2) AS c2,
+                ARRAY_AGG(c3) AS c3,
+                ARRAY_AGG(c4) AS c4,
+                ARRAY_AGG(c5) AS c5,
+                ARRAY_AGG(c6) AS c6,
+                ARRAY_AGG(c7) AS c7,
+                ARRAY_AGG(c8) AS c8
                 FROM int0_tbl;
 
                 CREATE MATERIALIZED VIEW int_array_agg_where AS SELECT
-                ARRAY_AGG(c1) FILTER(WHERE (c5+C6)> 3) AS f_c1, ARRAY_AGG(c2) FILTER(WHERE (c5+C6)> 3) AS f_c2, ARRAY_AGG(c3) FILTER(WHERE (c5+C6)> 3) AS f_c3, ARRAY_AGG(c4) FILTER(WHERE (c5+C6)> 3) AS f_c4, ARRAY_AGG(c5) FILTER(WHERE (c5+C6)> 3) AS f_c5, ARRAY_AGG(c6) FILTER(WHERE (c5+C6)> 3) AS f_c6,  ARRAY_AGG(c7) FILTER(WHERE (c5+C6)> 3) AS f_c7,  ARRAY_AGG(c8) FILTER(WHERE (c5+C6)> 3) AS f_c8
+                ARRAY_AGG(c1) FILTER(WHERE (c5+C6)> 3) AS f_c1,
+                ARRAY_AGG(c2) FILTER(WHERE (c5+C6)> 3) AS f_c2,
+                ARRAY_AGG(c3) FILTER(WHERE (c5+C6)> 3) AS f_c3,
+                ARRAY_AGG(c4) FILTER(WHERE (c5+C6)> 3) AS f_c4,
+                ARRAY_AGG(c5) FILTER(WHERE (c5+C6)> 3) AS f_c5,
+                ARRAY_AGG(c6) FILTER(WHERE (c5+C6)> 3) AS f_c6,
+                ARRAY_AGG(c7) FILTER(WHERE (c5+C6)> 3) AS f_c7,
+                ARRAY_AGG(c8) FILTER(WHERE (c5+C6)> 3) AS f_c8
                 FROM int0_tbl;""";
-        File file = createInputScript(sql);
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
+        compileProgramToMultiCrate(sql, true);
     }
 
     @Test
@@ -100,8 +186,7 @@ public class MultiCrateTests extends BaseSQLTests {
         String sql = """
                 DECLARE RECURSIVE VIEW V(v INT);
                 CREATE VIEW V AS SELECT v FROM V UNION SELECT 1;""";
-        File file = createInputScript(sql);
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
+        compileProgramToMultiCrate(sql, true);
     }
 
     @Test
@@ -115,22 +200,9 @@ public class MultiCrateTests extends BaseSQLTests {
             , COL5 INT
             , COL6 DECIMAL(6, 2));
             CREATE VIEW V AS SELECT T.COL1, LAG(T.COL1) OVER (ORDER BY T.COL1) FROM T;""";
-        File file = createInputScript(sql);
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
+        compileProgramToMultiCrate(sql, true);
     }
    
-    @Test @Ignore
-    public void testMultiCrateLarge() throws IOException, SQLException, InterruptedException {
-        File file = new File("../extra/current_pipeline.sql");
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
-    }
-
-    @Test @Ignore
-    public void testMultiCrateLarge2() throws IOException, SQLException, InterruptedException {
-        File file = new File("../extra/slicer-q1.sql");
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
-    }
-
     @Test
     public void testJoin() throws IOException, SQLException, InterruptedException {
         String sql = """
@@ -159,14 +231,26 @@ public class MultiCrateTests extends BaseSQLTests {
                     LEFT JOIN t1 AS t19 ON t18.val=t19.val
                     LEFT JOIN t1 AS t20 ON t19.val=t20.val
                     LEFT JOIN t1 AS t21 ON t20.val=t21.val;""";
-        File file = createInputScript(sql);
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
+        compileProgramToMultiCrate(sql, true);
+    }
+
+    @Test
+    public void issue4483() throws IOException, SQLException, InterruptedException {
+        String sql = """
+                CREATE TABLE row_tbl(
+                c1 INT NOT NULL,
+                c2 VARCHAR,
+                c3 VARCHAR) WITH ('append_only' = 'true');
+                CREATE MATERIALIZED VIEW row_max AS SELECT
+                MAX(ROW(c1, c2, c3)) AS c1
+                FROM row_tbl;""";
+        compileProgramToMultiCrate(sql, true);
     }
 
     @Test
     public void testPackagedDemos() throws SQLException, IOException, InterruptedException {
         // Also tests issue 3903
-        final String projectsDirectory = "../../demo/packaged/sql";
+        final String projectsDirectory = "../../crates/pipeline-manager/demos/sql";
         final File dir = new File(projectsDirectory);
         FilenameFilter filter = (_d, name) -> !name.contains("setup") && name.endsWith(".sql");
         String[] sqlFiles = dir.list(filter);
@@ -174,10 +258,9 @@ public class MultiCrateTests extends BaseSQLTests {
         Arrays.sort(sqlFiles);
 
         for (String sqlFile: sqlFiles) {
-            System.out.println(sqlFile);
             String basename = Utilities.getBaseName(sqlFile);
             String originalUdf = basename + ".udf.rs";
-            this.compileToMultiCrate(dir.getPath() + "/" + sqlFile, false);
+            compileToMultiCrate(dir.getPath() + "/" + sqlFile, false);
 
             File udfFile = new File(dir.getPath() + "/" + originalUdf);
             File udf = null;
@@ -191,17 +274,17 @@ public class MultiCrateTests extends BaseSQLTests {
                     this.appendCargoDependencies(cargoContents);
                 }
             }
-            if (!BaseSQLTests.skipRust)
-                Utilities.compileAndCheckRust(BaseSQLTests.RUST_CRATES_DIRECTORY, true);
-            if (udf != null) {
-                //noinspection ResultOfMethodCallIgnored
-                udf.delete();
+            if (!BaseSQLTests.skipRust && !Utilities.inCI()) {
+                setupCargoLock();
+                Utilities.compileAndCheckRust(BaseSQLTests.RUST_MULTI_DIRECTORY, true);
             }
+            Utilities.deleteFile(udf, true);
         }
     }
 
     void appendCargoDependencies(String source) throws IOException {
-        Path dir = Paths.get(BaseSQLTests.RUST_CRATES_DIRECTORY, MultiCrates.FILE_PREFIX + "x_globals");
+        Path dir = Paths.get(BaseSQLTests.RUST_MULTI_DIRECTORY, MultiCrates.CRATES_DIRECTORY,
+                MultiCrates.FILE_PREFIX + "x_globals");
         File cargo = new File(dir.toFile(), "Cargo.toml");
         FileWriter writer = new FileWriter(cargo, true);
         writer.append(source);
@@ -229,13 +312,12 @@ public class MultiCrateTests extends BaseSQLTests {
                     MATCH_CONDITION(transaction.unix_time <= feedback.unix_time)
                     ON transaction.id = feedback.id;
                 """;
-        File file = createInputScript(sql);
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
+        compileProgramToMultiCrate(sql, true);
     }
 
     File createUdfFile(String contents) throws IOException {
         // "x" is the name for the pipeline used by compileMultiCrate
-        Path dir = Paths.get(BaseSQLTests.RUST_CRATES_DIRECTORY, MultiCrates.FILE_PREFIX + "x_globals", "src");
+        Path dir = Paths.get(BaseSQLTests.RUST_MULTI_DIRECTORY, MultiCrates.CRATES_DIRECTORY, MultiCrates.FILE_PREFIX + "x_globals", "src");
         File dirFile = dir.toFile();
         if (!dirFile.exists()) {
             boolean success = dirFile.mkdirs();
@@ -248,6 +330,33 @@ public class MultiCrateTests extends BaseSQLTests {
         udfFile.println(contents);
         udfFile.close();
         return udf;
+    }
+
+    @Test
+    public void testMultiUDA() throws IOException, InterruptedException, SQLException {
+        File file = createInputScript("""
+                CREATE LINEAR AGGREGATE I8_AVG(s TINYINT) RETURNS TINYINT;
+                CREATE TABLE T(x TINYINT);
+                CREATE VIEW V AS SELECT I8_AVG(x) FROM T;""");
+
+        File udf = this.createUdfFile("""
+                use feldera_sqllib::*;
+                use crate::Tup2;
+                
+                pub type i8_avg_accumulator_type = Tup2<i32, i32>;
+                
+                pub fn i8_avg_map(val: i8) -> Tup2<i32, i32> {
+                    Tup2::new(val as i32, 1)
+                }
+                
+                pub fn i8_avg_post(val: i8_avg_accumulator_type) -> i8 {
+                    (val.0 / val.1).try_into().unwrap()
+                }
+                """);
+        compileToMultiCrate(file.getAbsolutePath(), true, false);
+        Utilities.deleteFile(udf, true);
+        // If we interrupt the test
+        udf.deleteOnExit();
     }
 
     @Test
@@ -264,9 +373,27 @@ public class MultiCrateTests extends BaseSQLTests {
                        Some(value) => Ok(str.str().contains(&format!("{}", value).to_string())),
                    }
                 }""");
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
-        //noinspection ResultOfMethodCallIgnored
-        udf.delete();
+        compileToMultiCrate(file.getAbsolutePath(), true, false);
+        Utilities.deleteFile(udf, true);
+        // If we interrupt the test
+        udf.deleteOnExit();
+    }
+
+    @Test
+    public void testMultiSqlUdf() throws IOException, InterruptedException, SQLException {
+        String sql = """
+                CREATE FUNCTION decode_boolean(str VARCHAR NOT NULL) RETURNS BOOLEAN NOT NULL AS CAST(str AS BOOLEAN);
+                CREATE VIEW V0 AS SELECT decode_boolean(CAST('TRUE' AS VARCHAR));""";
+        compileProgramToMultiCrate(sql, true);
+    }
+
+    @Test
+    public void issue4430() throws IOException, SQLException, InterruptedException {
+        String sql = """
+                CREATE TYPE row_type AS(r1 ROW(v11 VARCHAR NOT NULL));
+                CREATE TABLE T(c1 row_type);
+                CREATE VIEW V AS SELECT *, T.c1.r1.v11 FROM T;""";
+        compileProgramToMultiCrate(sql, true);
     }
 
     @Test
@@ -279,7 +406,7 @@ public class MultiCrateTests extends BaseSQLTests {
                 CREATE VIEW V AS SELECT f(X(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)), g(2).a;""");
 
         // "x" is the name for the pipeline used by compileMultiCrate
-        Path dir = Paths.get(BaseSQLTests.RUST_CRATES_DIRECTORY, MultiCrates.FILE_PREFIX + "x_globals", "src");
+        Path dir = Paths.get(BaseSQLTests.RUST_MULTI_DIRECTORY, MultiCrates.CRATES_DIRECTORY, MultiCrates.FILE_PREFIX + "x_globals", "src");
         File dirFile = dir.toFile();
         if (!dirFile.exists()) {
             boolean success = dirFile.mkdirs();
@@ -308,8 +435,23 @@ public class MultiCrateTests extends BaseSQLTests {
                    Ok(Tup2::new(x-1, x+1))
                 }""");
         udfFile.close();
-        this.compileToMultiCrate(file.getAbsolutePath(), true);
-        //noinspection ResultOfMethodCallIgnored
-        udf.delete();
+        compileToMultiCrate(file.getAbsolutePath(), true, false);
+        Utilities.deleteFile(udf, false);
+        udf.deleteOnExit();
+    }
+
+    @Test
+    public void issue6150() throws IOException, SQLException, InterruptedException {
+        StringBuilder builder = new StringBuilder();
+        builder.append("CREATE TABLE T(x INT, y INT, z INT);\n");
+        builder.append("CREATE LOCAL VIEW V AS SELECT z, y, COUNT(X)");
+        for (int i = 0; i < 140; i++) {
+            builder.append(",\n");
+            builder.append("  MAX(x + ").append(i).append(") AS a").append(i);
+        }
+        builder.append(" FROM T GROUP BY y, z;\n");
+        builder.append("CREATE VIEW W AS SELECT * FROM V JOIN T ON V.y = T.y;");
+        File file = createInputScript(builder.toString());
+        compileToMultiCrate(file.getAbsolutePath(), true, true);
     }
 }

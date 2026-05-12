@@ -3,6 +3,8 @@
 A MAP type can be created using the syntax `MAP<type, type>`.
 For example `MAP<VARCHAR, INT>` is a map from strings to integers.
 
+`MAP` keys of type `NULL` or `MAP` are not supported.
+
 In `CREATE TABLE` and `CREATE TYPE` declarations there is no way to
 specify the nullability of the values of a `MAP`.  The compiler will
 always assume that map keys are *not* nullable, while values elements
@@ -48,6 +50,8 @@ Comparison operations (`=`, `<>`, `!=`, `>`, `<`, `>=`, `<=`) can be applied to 
 | _map_`[`_key_`]`       | Returns the element in the map with the specified key. If there is no such key, the result is `NULL`.  | `MAP['x', 4, 'y', 3]['x']` => 4 |
 | <a id="cardinality"></a>`CARDINALITY`(map)     | Returns the number of key-value pairs in the map.                                                      | `CARDINALITY(MAP['x', 4])` => 1 |
 | <a id="map_contains_key"></a>`MAP_CONTAINS_KEY`(map, key) | Returns true when the map has an item with the specified key; `NULL` if any argument is `NULL`.  | `MAP_CONTAINS_KEY(MAP['x', 4], 'x')` => `true` |
+| <a id="map_keys"></a>`MAP_KEYS`(map) | Returns a sorted ARRAY of the appropriate type with all the keys of the MAP.  | `MAP_KEYS(MAP['x', 4, 'y', 5])` => `['x', 'y']` |
+| <a id="map_values"></a>`MAP_VALUES`(map) | Returns an ARRAY of the appropriate type with all the values of the MAP.  | `MAP_VALUES(MAP['x', 4, 'y', 5])` => `[4, 5]` |
 
 ## The `UNNEST` Operator
 

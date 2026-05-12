@@ -9,6 +9,7 @@ import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
+import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
@@ -20,23 +21,22 @@ import java.util.Objects;
 
 /** This class represents a join followed by a filter followed by a map.
  * The operator is eventually lowered to a join_flatmap,
- * where the synthesized function
- * returns None when filter(function) is false, and Some(map(function))
- * otherwise. */
-public final class DBSPJoinFilterMapOperator extends DBSPJoinBaseOperator {
+ * where the synthesized function returns None when filter(function) is false, and Some(map(function))
+ * otherwise.  So the type of the function does NOT always match the output type of the operator. */
+public final class DBSPJoinFilterMapOperator extends DBSPJoinBaseOperator implements IIncremental {
     // If the following is null, the function represents the combined function/filter
     // and the function returns Option.
     @Nullable
-    public final DBSPExpression filter;
+    public final DBSPClosureExpression filter;
     @Nullable
-    public final DBSPExpression map;
+    public final DBSPClosureExpression map;
 
     public DBSPJoinFilterMapOperator(
             CalciteRelNode node, DBSPTypeZSet outputType,
-            DBSPExpression function, @Nullable DBSPExpression filter, @Nullable DBSPExpression map,
+            DBSPExpression function, @Nullable DBSPClosureExpression filter, @Nullable DBSPClosureExpression map,
             boolean isMultiset,
-            OutputPort left, OutputPort right) {
-        super(node, "join_flatmap", function, outputType, isMultiset, left, right);
+            OutputPort left, OutputPort right, boolean balanced) {
+        super(node, joinOperationName("join_flatmap", balanced), function, outputType, isMultiset, left, right, balanced);
         this.filter = filter;
         this.map = map;
         Utilities.enforce(left.getOutputIndexedZSetType().keyType.sameType(right.getOutputIndexedZSetType().keyType));
@@ -54,7 +54,7 @@ public final class DBSPJoinFilterMapOperator extends DBSPJoinBaseOperator {
             return new DBSPJoinFilterMapOperator(
                     this.getRelNode(), outputType.to(DBSPTypeZSet.class),
                     Objects.requireNonNull(function), this.filter, this.map,
-                    this.isMultiset, newInputs.get(0), newInputs.get(1)).copyAnnotations(this);
+                    this.isMultiset, newInputs.get(0), newInputs.get(1), this.balanced).copyAnnotations(this);
         }
         return this;
     }
@@ -95,16 +95,17 @@ public final class DBSPJoinFilterMapOperator extends DBSPJoinBaseOperator {
     @SuppressWarnings("unused")
     public static DBSPJoinFilterMapOperator fromJson(JsonNode node, JsonDecoder decoder) {
         CommonInfo info = DBSPSimpleOperator.commonInfoFromJson(node, decoder);
-        DBSPExpression filter = null;
+        DBSPClosureExpression filter = null;
         if (node.has("filter"))
-            filter = fromJsonInner(node, "filter", decoder, DBSPExpression.class);
-        DBSPExpression map = null;
+            filter = fromJsonInner(node, "filter", decoder, DBSPClosureExpression.class);
+        DBSPClosureExpression map = null;
         if (node.has("map"))
-            map = fromJsonInner(node, "map", decoder, DBSPExpression.class);
+            map = fromJsonInner(node, "map", decoder, DBSPClosureExpression.class);
+        boolean balanced = Utilities.getBooleanProperty(node, "balanced");
         return new DBSPJoinFilterMapOperator(
                 CalciteEmptyRel.INSTANCE, info.getZsetType(), info.getFunction(),
                 filter, map,
-                info.isMultiset(), info.getInput(0), info.getInput(1))
+                info.isMultiset(), info.getInput(0), info.getInput(1), balanced)
                 .addAnnotations(info.annotations(), DBSPJoinFilterMapOperator.class);
     }
 }

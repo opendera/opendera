@@ -158,9 +158,19 @@ REAL '1.23'  -- string style
     <td>Converts the given value in radians to degrees. <code>degrees</code> only supports arguments of type double, so all other types are cast to double. Returns a double.</td>
   </tr>
   <tr>
+    <td><a id="div_null"></a><code>DIV_NULL(numerator, denominator)</code></td>
+    <td><code>REAL</code>, <code>DOUBLE</code></td>
+    <td>Like division, but returns `NULL` when result is Infinite or NaN.</td>
+  </tr>
+  <tr>
     <td><a id="exp"></a><code>EXP(value)</code></td>
     <td><code>DOUBLE</code></td>
     <td>Returns e raised to the power of value (exponential).</td>
+  </tr>
+  <tr>
+    <td><a id="finite_or_null"></a><code>FINITE_OR_NULL(value)</code></td>
+    <td><code>REAL</code>, <code>DOUBLE</code></td>
+    <td>Returns the argument; returns `NULL` if the argument is `NULL`, `NaN` or `Infinity` (plus or minus)</td>
   </tr>
   <tr>
     <td><a id="floor"></a><code>FLOOR(value)</code></td>
@@ -200,7 +210,7 @@ REAL '1.23'  -- string style
   <tr>
     <td><a id="power"></a><code>POWER(BASE, EXPONENT)</code></td>
     <td><code>DOUBLE</code></td>
-    <td>The power function, raising <code>BASE</code> to the power <code>EXPONENT</code></td>
+    <td>The power function, raising <code>BASE</code> to the power <code>EXPONENT</code>.  The exponent can have type `DOUBLE` or `INTEGER`.</td>
   </tr>
   <tr>
     <td><a id="radians"></a><code>RADIANS(value)</code></td>

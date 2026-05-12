@@ -25,7 +25,12 @@
 
 package org.dbsp.util;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonLocation;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -34,19 +39,18 @@ import com.fasterxml.jackson.databind.json.JsonMapper;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.util.TimeString;
-import org.apache.calcite.util.TimestampString;
-import org.apache.commons.io.IOUtils;
 import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
-import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
+import org.dbsp.sqlCompiler.compiler.errors.SourcePosition;
+import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
 import org.jetbrains.annotations.Contract;
 
 import javax.annotation.Nullable;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -61,6 +65,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Supplier;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 public class Utilities {
     private Utilities() {}
@@ -72,6 +79,24 @@ public class Utilities {
             stackTraceBuilder.append(stackTrace[i].toString()).append("\n");
         }
         return stackTraceBuilder.toString();
+    }
+
+    public static byte[] extractFileFromZip(String zipPath, String targetFileName) throws IOException {
+        try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipPath))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.getName().equals(targetFileName)) {
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    byte[] buffer = new byte[4096];
+                    int len;
+                    while ((len = zis.read(buffer)) > 0) {
+                        baos.write(buffer, 0, len);
+                    }
+                    return baos.toByteArray();
+                }
+            }
+        }
+        throw new RuntimeException("Could not find file " + targetFileName + " in zip archive");
     }
 
     /** A custom version of assert.  We would like to use assert,
@@ -90,24 +115,9 @@ public class Utilities {
      * @param expression  When this expression is false, this function throws.
      * @param message     Message for exception when expression is false */
     @Contract("false, _ -> fail")
-    public static void enforce(boolean expression, String message) {
+    public static void enforce(boolean expression, Supplier<String> message) {
         if (!expression)
-            throw new InternalCompilerError(message + System.lineSeparator() + getCurrentStackTrace());
-    }
-
-    public static TimestampString roundMillis(TimestampString ts) {
-        long millis = ts.getMillisSinceEpoch();
-        String str = ts.toString();
-        if (str.length() > 23) {
-            String next = str.substring(23, 24);
-            int nextDigit = Integer.parseInt(next);
-            if (nextDigit > 5) {
-                millis += 1;
-            }
-            return TimestampString.fromMillisSinceEpoch(millis);
-        } else {
-            return ts;
-        }
+            throw new InternalCompilerError(message.get() + System.lineSeparator() + getCurrentStackTrace());
     }
 
     /** Delete a file/directory recursively
@@ -126,15 +136,23 @@ public class Utilities {
                 deleteRecursive(f, true);
         }
         if (self) {
-            boolean success = file.delete();
-            if (!success)
-                throw new RuntimeException("Could not delete file " + singleQuote(file.getPath()));
+            Utilities.deleteFile(file, true);
         }
     }
 
     /** Delete recursively the contents of a directory. */
     public static void deleteContents(File file) {
         deleteRecursive(file, false);
+    }
+
+    public static void deleteFile(@Nullable File file, boolean enforce) {
+        if (file == null)
+            return;
+        if (!file.exists())
+            return;
+        boolean success = file.delete();
+        if (enforce)
+            Utilities.enforce(success, () -> "Could not delete file " + file.getName());
     }
 
     public static String getBaseName(String filePath) {
@@ -144,28 +162,27 @@ public class Utilities {
         return (dotIndex == -1) ? fileName : fileName.substring(0, dotIndex);
     }
 
-    /** Escape special characters in a string. */
-    public static String escape(String value) {
+    /** Escape special characters in a string.
+     * @param unicodeBraces If true write Unicode characters as \\u{}, otherwise just \\u */
+    public static String escape(String value, boolean unicodeBraces) {
         StringBuilder builder = new StringBuilder();
         final int length = value.length();
         for (int offset = 0; offset < length; ) {
             final int c = value.codePointAt(offset);
-            if (c == '\'')
-                builder.append("\\'");
-            else if (c == '\\')
-                builder.append("\\\\");
-            else if (c == '\"' )
-                builder.append("\\\"");
-            else if (c == '\r' )
-                builder.append("\\r");
-            else if (c == '\n' )
-                builder.append("\\n");
-            else if (c == '\t' )
-                builder.append("\\t");
+            //if (c == '\'') builder.append("\\'");
+            // else
+            if (c == '\\') builder.append("\\\\");
+            else if (c == '\"' ) builder.append("\\\"");
+            else if (c == '\r' ) builder.append("\\r");
+            else if (c == '\n' ) builder.append("\\n");
+            else if (c == '\t' ) builder.append("\\t");
             else if (c < 32 || c >= 127) {
-                builder.append("\\u{");
+                builder.append("\\u");
+                if (unicodeBraces)
+                    builder.append("{");
                 builder.append(String.format("%04x", c));
-                builder.append("}");
+                if (unicodeBraces)
+                    builder.append("}");
             } else
                 builder.append((char)c);
             offset += Character.charCount(c);
@@ -207,13 +224,72 @@ public class Utilities {
                 .build();
     }
 
-    /** Add double quotes around string and escape symbols that need it. */
-    public static String doubleQuote(String value) {
-         return "\"" + escape(value) + "\"";
-     }
+    /** Add double quotes around string and escape symbols that need it.
+     * @param unicodeBraces If true use \\u{} for Unicode, otherwise use \\u. */
+    public static String doubleQuote(String value, boolean unicodeBraces) {
+         return "\"" + escape(value, unicodeBraces) + "\"";
+    }
+
+    /** Parse and validate a JSON text string, returning either the parsed object or an error to show to the user */
+    public static Result<JsonNode> validateJson(String body) {
+        try {
+            JsonNode node = Utilities.deterministicObjectMapper().readTree(body);
+            return Result.ok(node);
+        } catch (JsonMappingException e) {
+            throw new RuntimeException(e);
+        } catch (JsonProcessingException e) {
+            JsonLocation location = e.getLocation();
+            if (location != null) {
+                String[] lines = body.split("\\r?\\n");
+                int errorLineIdx = location.getLineNr() - 1; // getLineNr() is 1-based
+                if (errorLineIdx < 0 || errorLineIdx >= lines.length) {
+                    // Check if the position is within the document.
+                    return Result.err(new ErrorWithPosition(e.getMessage(), SourcePositionRange.INVALID));
+                }
+
+                SourcePosition pos = new SourcePosition(location);
+                return Result.err(new ErrorWithPosition(e.getOriginalMessage(), pos.asRange()));
+            } else {
+                return Result.err(new ErrorWithPosition(e.getMessage(), SourcePositionRange.INVALID));
+            }
+        }
+    }
+
+    /**
+     * Given a Json document as a text string, find the position of a specific JSON element
+     * specified using a JSON pointer.
+     *
+     * @param json          The raw JSON source string to scan.
+     * @param targetPointer A standard JSON Pointer string (e.g., "/users/0/email")
+     *                      representing the path to the element.
+     * @param toValue       If true, advance the pointer to the value associated with the key found.
+     * @return A {@link JsonLocation} containing the line and column number of the
+     * start of the target token, or {@code null} if the path is not found or the document is invalid.
+     * @see <a href="https://datatracker.ietf.org/doc/html/rfc6901">RFC 6901 (JSON Pointer)</a>
+     */
+    @Nullable
+    public static SourcePosition jsonPointerLocation(String json, String targetPointer, boolean toValue) {
+        // Unfortunately the Jackson library does not keep track of source positions after parsing JSON,
+        // so we need to reparse it to find out where something is when we need to provide good error messages.
+        JsonFactory factory = new JsonFactory();
+        try (JsonParser parser = factory.createParser(json)) {
+            while (parser.nextToken() != null) {
+                String currentPath = parser.getParsingContext().pathAsPointer().toString();
+                if (currentPath.equals(targetPointer)) {
+                    if (toValue) {
+                        parser.nextToken();
+                    }
+                    return new SourcePosition(parser.currentTokenLocation());
+                }
+            }
+        } catch (IOException e) {
+            return null;
+        }
+        return null;
+    }
 
     /** Just adds single quotes around a string.  No escaping is performed. */
-     public static String singleQuote(@Nullable String other) {
+    public static String singleQuote(@Nullable String other) {
          return "'" + other + "'";
      }
 
@@ -249,13 +325,8 @@ public class Utilities {
         return readFile(Paths.get(filename));
     }
 
-    @SuppressWarnings("unused")
-    public static String readFileFromUrl(String url) throws IOException {
-        URL path = new URL(url);
-        return IOUtils.toString(path, StandardCharsets.UTF_8);
-    }
-
     public static String readFile(Path filename) throws IOException {
+        Utilities.enforce(!filename.toFile().isDirectory(), () -> filename + " is a directory");
         List<String> lines = Files.readAllLines(filename);
         return String.join(System.lineSeparator(), lines);
     }
@@ -276,15 +347,6 @@ public class Utilities {
         if (result == null)
             throw new RuntimeException("Key '" + key + "' does not exist in map");
         return result;
-    }
-
-    public static ProgramIdentifier toIdentifier(SqlIdentifier id) {
-        return new ProgramIdentifier(id.getSimple(), identifierIsQuoted(id));
-    }
-
-    public static ProgramIdentifier toIdentifier(List<String> qualifiedName) {
-        String id = Utilities.last(qualifiedName);
-        return new ProgramIdentifier(id);
     }
 
     /** True when a simple identifier is quoted. */
@@ -318,7 +380,7 @@ public class Utilities {
     public static <T> void removeLast(List<T> data, T expected) {
         T removed = removeLast(data);
         Utilities.enforce(removed.equals(expected),
-                "Unexpected node popped " + removed + " expected " + expected);
+                () -> "Unexpected node popped " + removed + " expected " + expected);
     }
 
     public static <T> T[] arraySlice(T[] data, int start, int endExclusive) {
@@ -376,11 +438,13 @@ public class Utilities {
         runProcess(directory, new HashMap<>(), commands);
     }
 
+    static HashMap<String, String> STACK = new HashMap<>() {{ put("RUST_MIN_STACK", "8388608"); }};
+
     static void compileAndTest(String directory, boolean quiet, String... extraArgs) throws IOException, InterruptedException {
         List<String> args = new ArrayList<>();
         args.add("cargo");
         args.add("test");
-        if (System.getenv("CI") == null) {
+        if (!Utilities.inCI()) {
             args.add("--jobs");
             args.add("6");
         }
@@ -391,7 +455,16 @@ public class Utilities {
             args.add("--");
             args.add("--show-output");
         }
-        runProcess(directory, args.toArray(new String[0]));
+        runProcess(directory, STACK, args.toArray(new String[0]));
+    }
+
+    static void addExtraArgs(List<String> args, String... packages) {
+        for (String pack: packages) {
+            if (pack.isEmpty())
+                continue;
+            args.add("--package");
+            args.add(pack);
+        }
     }
 
     static final boolean retry = false;
@@ -410,17 +483,18 @@ public class Utilities {
     }
 
     /** Compile the rust code generated and check it using 'cargo check' */
-    public static void compileAndCheckRust(String directory, boolean quiet)
+    public static void compileAndCheckRust(String directory, boolean quiet, String... packages)
             throws IOException, InterruptedException {
         List<String> args = new ArrayList<>();
         args.add("cargo");
         args.add("check");
-        if (System.getenv("CI") == null) {
+        if (Utilities.inCI()) {
             args.add("--jobs");
             args.add("6");
         }
         if (quiet)
             args.add("--quiet");
+        addExtraArgs(args, packages);
         runProcess(directory, args.toArray(new String[0]));
     }
 
@@ -474,10 +548,6 @@ public class Utilities {
         return time;
     }
 
-    public static String trimRight(String value) {
-        return value.replaceAll("[ ]*$", "");
-    }
-
     static void toDepth(JsonNode node, int depth, IIndentStream stream) {
         if (depth < 0) {
             stream.append("...").newline();
@@ -501,7 +571,7 @@ public class Utilities {
         }
     }
 
-    /** Serialize as String a object to the specified depth */
+    /** Serialize as String an object to the specified depth */
     public static String toDepth(JsonNode node, int depth) {
         IndentStreamBuilder builder = new IndentStreamBuilder();
         toDepth(node, depth, builder);
@@ -511,7 +581,7 @@ public class Utilities {
     public static JsonNode getProperty(JsonNode node, String property) {
         JsonNode prop = node.get(property);
         Utilities.enforce(prop != null,
-                "Node does not have property " + Utilities.singleQuote(property) +
+                () -> "Node does not have property " + Utilities.singleQuote(property) +
                 Utilities.toDepth(node, 1));
         return prop;
     }
@@ -540,5 +610,44 @@ public class Utilities {
         Set<T> result = new HashSet<>(left);
         result.addAll(right);
         return result;
+    }
+
+    static List<String> appendToEach(List<String> list, String suffix) {
+        if (suffix.isEmpty())
+            return list;
+        List<String> result = new ArrayList<>();
+        for (String l: list) {
+            result.add(l + suffix);
+        }
+        return result;
+    }
+
+    /** Given a filename pattern which contains braces (but not ? or *), expand it into multiple filenames */
+    public static List<String> expandBraces(String pattern) {
+        List<String> expansion = new ArrayList<>();
+        expansion.add("");
+        while (true) {
+            int open = pattern.indexOf("{");
+            if (open < 0)
+                return appendToEach(expansion, pattern);
+            String prefix = pattern.substring(0, open);
+            String tail = pattern.substring(open + 1);
+            int close = tail.indexOf("}");
+            if (close < 0)
+                throw new RuntimeException("{} missing close brace");
+            String choices = tail.substring(0, close);
+            String[] split = choices.split(",");
+            List<String> next = new ArrayList<>();
+            for (String s: split) {
+                next.addAll(appendToEach(expansion, prefix + s));
+            }
+            expansion = next;
+            pattern = tail.substring(close + 1);
+        }
+    }
+
+    /** True if the CI environment variable is set */
+    public static boolean inCI() {
+        return System.getenv("CI") != null;
     }
 }

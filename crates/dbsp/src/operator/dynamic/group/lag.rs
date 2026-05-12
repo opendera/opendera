@@ -1,7 +1,9 @@
 use super::{GroupTransformer, Monotonicity};
+use crate::Circuit;
 use crate::algebra::{OrdIndexedZSetFactories, ZRingValue};
 use crate::operator::dynamic::filter_map::DynFilterMap;
 use crate::{
+    DBData, DynZWeight, RootCircuit, Stream, ZWeight,
     algebra::{HasZero, IndexedZSet, OrdIndexedZSet, ZCursor},
     dynamic::{
         ClonableTrait, DataTrait, DynData, DynPair, DynUnit, DynVec, Erase, Factory, LeanVec,
@@ -9,11 +11,10 @@ use crate::{
     },
     operator::dynamic::MonoIndexedZSet,
     trace::{
-        cursor::{CursorPair, ReverseKeyCursor},
         BatchReaderFactories,
+        cursor::{CursorPair, ReverseKeyCursor},
     },
     utils::Tup2,
-    DBData, DynZWeight, RootCircuit, Stream, ZWeight,
 };
 use std::{cmp::Ordering, marker::PhantomData, ops::Neg};
 
@@ -151,29 +152,37 @@ where
         OV: DataTrait + ?Sized,
         B: for<'a> DynFilterMap<DynItemRef<'a> = (&'a K, &'a V)>,
     {
-        self.dyn_map_index(
-            &factories.lag_factories.input_factories,
-            Box::new(move |(k, v), kv| {
-                let (out_k, out_v) = kv.split_mut();
-                k.clone_to(out_k);
-                encode(v, out_v);
-            }),
-        )
-        .set_persistent_id(
-            persistent_id
-                .map(|name| format!("{name}-ordered"))
-                .as_deref(),
-        )
-        .dyn_lag(persistent_id, &factories.lag_factories, offset, project)
-        .dyn_map_index(
-            &factories.output_factories,
-            Box::new(move |(k, v), kv| {
-                let (out_k, out_v) = kv.split_mut();
-                let (v1, v2) = v.split();
-                k.clone_to(out_k);
-                decode(v1, v2, out_v);
-            }),
-        )
+        let name = if offset > 0 {
+            format!("lag_custom_order_{offset}")
+        } else {
+            format!("lead_custom_order_{}", -offset)
+        };
+
+        self.circuit().region(&name, || {
+            self.dyn_map_index(
+                &factories.lag_factories.input_factories,
+                Box::new(move |(k, v), kv| {
+                    let (out_k, out_v) = kv.split_mut();
+                    k.clone_to(out_k);
+                    encode(v, out_v);
+                }),
+            )
+            .set_persistent_id(
+                persistent_id
+                    .map(|name| format!("{name}-ordered"))
+                    .as_deref(),
+            )
+            .dyn_lag(persistent_id, &factories.lag_factories, offset, project)
+            .dyn_map_index(
+                &factories.output_factories,
+                Box::new(move |(k, v), kv| {
+                    let (out_k, out_v) = kv.split_mut();
+                    let (v1, v2) = v.split();
+                    k.clone_to(out_k);
+                    decode(v1, v2, out_v);
+                }),
+            )
+        })
     }
 }
 
@@ -273,9 +282,9 @@ where
             //println!("retract: {:?} with weight {weight}", &self.output_pair);
             output_cb(self.output_pair.as_mut(), weight.neg().erase_mut());
             result += weight as usize;
-            step_key_skip_zeros(cursor);
+            cursor.step_key();
         }
-        skip_zeros(cursor);
+        debug_assert!(!cursor.key_valid() || !cursor.weight().is_zero());
 
         result
     }
@@ -371,7 +380,7 @@ where
 
         let mut lag: usize = 0;
 
-        skip_zeros(output_trace);
+        debug_assert!(!output_trace.key_valid() || !output_trace.weight().is_zero());
 
         while input_delta.key_valid() && output_trace.key_valid() {
             // - `input_delta` points to the _next_ delta key to process.
@@ -398,7 +407,7 @@ where
                     output_trace.seek_key_with(&|key| {
                         (self.key_cmp)(key.fst(), delta_key) != Ordering::Less
                     });
-                    skip_zeros(output_trace);
+                    debug_assert!(!output_trace.key_valid() || !output_trace.weight().is_zero());
                 }
                 Ordering::Equal => {
                     // Delta modifies current key. Retract all existing values for this key
@@ -665,29 +674,12 @@ where
     }
 }
 
-fn step_key_skip_zeros<I>(cursor: &mut dyn ZCursor<I, DynUnit, ()>)
-where
-    I: DataTrait + ?Sized,
-{
-    cursor.step_key();
-    skip_zeros(cursor)
-}
-
 fn step_key_reverse_skip_non_positive<I>(cursor: &mut dyn ZCursor<I, DynUnit, ()>)
 where
     I: DataTrait + ?Sized,
 {
     cursor.step_key_reverse();
     skip_non_positive_reverse(cursor)
-}
-
-fn skip_zeros<I>(cursor: &mut dyn ZCursor<I, DynUnit, ()>)
-where
-    I: DataTrait + ?Sized,
-{
-    while cursor.key_valid() && cursor.weight().is_zero() {
-        cursor.step_key();
-    }
 }
 
 fn skip_non_positive_reverse<I>(cursor: &mut dyn ZCursor<I, DynUnit, ()>)

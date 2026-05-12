@@ -1,20 +1,35 @@
-use std::{borrow::Cow, cmp::Ordering, marker::PhantomData, panic::Location};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    cmp::Ordering,
+    marker::PhantomData,
+    panic::Location,
+    rc::Rc,
+};
+
+use async_stream::stream;
 
 use crate::{
+    Circuit, DBData, DynZWeight, Position, RootCircuit, Scope, Stream, ZWeight,
     algebra::{IndexedZSet, IndexedZSetReader, OrdIndexedZSet, OrdZSet, ZBatchReader, ZCursor},
     circuit::{
-        metadata::OperatorLocation,
-        operator_traits::{Operator, QuaternaryOperator},
+        metadata::{
+            BatchSizeStats, LEFT_INPUT_BATCHES_STATS, OUTPUT_BATCHES_STATS, OperatorLocation,
+            OperatorMeta, RIGHT_INPUT_BATCHES_STATS,
+        },
+        operator_traits::Operator,
+        splitter_output_chunk_size,
     },
     dynamic::{
-        ClonableTrait, DataTrait, DowncastTrait, DynData, DynPair, DynUnit, DynVec,
+        ClonableTrait, Data, DataTrait, DowncastTrait, DynData, DynPair, DynUnit, DynVec,
         DynWeightedPairs, Erase, Factory, LeanVec, WeightTrait, WithFactory,
     },
+    operator::async_stream_operators::{StreamingQuaternaryOperator, StreamingQuaternaryWrapper},
     trace::{
+        BatchFactories, BatchReader, BatchReaderFactories, Cursor, Spine, SpineSnapshot,
         cursor::{CursorEmpty, CursorPair},
-        BatchFactories, BatchReaderFactories, Cursor,
+        spine_async::WithSnapshot,
     },
-    Circuit, DBData, DynZWeight, RootCircuit, Scope, Stream, ZWeight,
 };
 
 use super::{MonoIndexedZSet, MonoZSet};
@@ -172,28 +187,28 @@ where
         Z: IndexedZSet,
     {
         self.circuit().region("asof_join", || {
-            let left = self.dyn_shard(&factories.left_factories);
-            let right = other.dyn_shard(&factories.right_factories);
+            let left = self;
+            let right = other;
 
             let left_trace = left
-                .dyn_integrate_trace(&factories.left_factories)
-                .delay_trace();
+                .dyn_shard_accumulate_integrate_trace(&factories.left_factories)
+                .accumulate_delay_trace();
             let right_trace = right
-                .dyn_integrate_trace(&factories.right_factories)
-                .delay_trace();
+                .dyn_shard_accumulate_integrate_trace(&factories.right_factories)
+                .accumulate_delay_trace();
 
             self.circuit().add_quaternary_operator(
-                AsofJoin::new(
+                StreamingQuaternaryWrapper::new(AsofJoin::new(
                     factories.clone(),
                     ts_func1,
                     tscmp_func,
                     valts_cmp_func,
                     join_func,
                     Location::caller(),
-                ),
-                &left,
+                )),
+                &left.dyn_shard_accumulate(&factories.left_factories),
                 &left_trace,
-                &right,
+                &right.dyn_shard_accumulate(&factories.right_factories),
                 &right_trace,
             )
         })
@@ -218,6 +233,17 @@ where
     valts_cmp_func: Box<dyn Fn(&I1::Val, &TS) -> Ordering>,
     join_func: Box<AsofJoinFunc<I1::Key, I1::Val, I2::Val, Z::Key, Z::Val>>,
     location: &'static Location<'static>,
+    flush: Cell<bool>,
+    delta1: RefCell<Option<SpineSnapshot<I1>>>,
+    delta2: RefCell<Option<SpineSnapshot<I2>>>,
+
+    // Input batch sizes.
+    delta1_batch_stats: RefCell<BatchSizeStats>,
+    delta2_batch_stats: RefCell<BatchSizeStats>,
+
+    // Output batch sizes.
+    output_batch_stats: RefCell<BatchSizeStats>,
+
     phantom: PhantomData<(I1, T1, I2, T2, Z)>,
 }
 
@@ -245,19 +271,25 @@ where
             valts_cmp_func,
             join_func,
             location,
+            flush: Cell::new(false),
+            delta1: RefCell::new(None),
+            delta2: RefCell::new(None),
+            delta1_batch_stats: RefCell::new(BatchSizeStats::new()),
+            delta2_batch_stats: RefCell::new(BatchSizeStats::new()),
+            output_batch_stats: RefCell::new(BatchSizeStats::new()),
             phantom: PhantomData,
         }
     }
 
     /// Seek to a key; return `None` if exact match was not found.
-    fn try_seek<'a, C, K, V, T, R>(cursor: &'a mut C, key: &K) -> Option<&'a mut C>
+    fn try_seek<'a, C, K, V, T, R>(cursor: &'a mut C, key: &K, hash: u64) -> Option<&'a mut C>
     where
         K: DataTrait + ?Sized,
         V: DataTrait + ?Sized,
         R: WeightTrait + ?Sized,
         C: Cursor<K, V, T, R>,
     {
-        if cursor.seek_key_exact(key) {
+        if cursor.seek_key_exact(key, Some(hash)) {
             Some(cursor)
         } else {
             None
@@ -267,7 +299,7 @@ where
     /// Compute all timestamps affected by the changes.  We will
     /// update the value of the asof-join for these timestamps.
     fn compute_affected_times<DC1, DC2, ZC1, C2>(
-        &mut self,
+        &self,
         delta1: &mut DC1,
         delta2: &mut DC2,
         delayed_cursor1: &mut Option<&mut ZC1>,
@@ -306,9 +338,7 @@ where
 
                 // Find the next timestamp in `cursor2` with non-zero weight.
                 cursor2.seek_val_with(&|v| v > delta2.val());
-                while cursor2.val_valid() && **cursor2.weight() == 0 {
-                    cursor2.step_val()
-                }
+                debug_assert!(!cursor2.val_valid() || **cursor2.weight() != 0);
 
                 // Enumerate all timestamps in `delayed_cursor1` preceding the current
                 // position of `cursor2`.
@@ -345,7 +375,7 @@ where
     /// By setting `multiplier` to +1 or -1, we get this function to produce
     /// insertions and retractions respectively.
     fn eval_val<C1, C2>(
-        &mut self,
+        &self,
         ts: &TS,
         cursor1: &mut Option<&mut C1>,
         cursor2: &mut C2,
@@ -374,10 +404,7 @@ where
             cursor2
                 .seek_val_with_reverse(&|v| (self.tscmp_func)(cursor1.val(), v) != Ordering::Less);
 
-            // Ignore zero weights.
-            while cursor2.val_valid() && **cursor2.weight() == 0 {
-                cursor2.step_val_reverse();
-            }
+            debug_assert!(!cursor2.val_valid() || **cursor2.weight() != 0);
 
             // The weight of the result is the product of input weights.
             // If there is no matching RHS value, then asof-join behaves like
@@ -414,7 +441,7 @@ where
     /// Evaluate operator for the current key.
     #[allow(clippy::too_many_arguments)]
     fn eval_key<DC1, DC2, ZC1, ZC2, C1, C2>(
-        &mut self,
+        &self,
         delta1: &mut DC1,
         delta2: &mut DC2,
         delayed_cursor1: &mut ZC1,
@@ -440,10 +467,11 @@ where
         // println!("key: {key:?}");
 
         // Make sure that all cursors point to the same key or are None.
-        let mut delayed_cursor1 = Self::try_seek(delayed_cursor1, key);
-        let mut delayed_cursor2 = Self::try_seek(delayed_cursor2, key);
-        let mut cursor1 = Self::try_seek(cursor1, key);
-        let mut cursor2 = Self::try_seek(cursor2, key);
+        let hash = key.default_hash();
+        let mut delayed_cursor1 = Self::try_seek(delayed_cursor1, key, hash);
+        let mut delayed_cursor2 = Self::try_seek(delayed_cursor2, key, hash);
+        let mut cursor1 = Self::try_seek(cursor1, key, hash);
+        let mut cursor2 = Self::try_seek(cursor2, key, hash);
 
         let mut empty_cursor = CursorEmpty::new(WithFactory::<ZWeight>::FACTORY);
 
@@ -542,165 +570,221 @@ where
         Some(self.location)
     }
 
-    /*fn metadata(&self, meta: &mut OperatorMeta) {
-        // Find the percentage of consolidated outputs
-        let mut output_redundancy = ((self.stats.output_tuples as f64
-            - self.stats.produced_tuples as f64)
-            / self.stats.output_tuples as f64)
-            * 100.0;
-        if output_redundancy.is_nan() {
-            output_redundancy = 0.0;
-        } else if output_redundancy.is_infinite() {
-            output_redundancy = 100.0;
-        }
+    fn flush(&mut self) {
+        self.flush.set(true);
+    }
 
+    fn metadata(&self, meta: &mut OperatorMeta) {
         meta.extend(metadata! {
-            NUM_ENTRIES_LABEL => total_size,
-            "batch sizes" => batch_sizes,
-            USED_BYTES_LABEL => MetaItem::bytes(bytes.used_bytes()),
-            "allocations" => bytes.distinct_allocations(),
-            SHARED_BYTES_LABEL => MetaItem::bytes(bytes.shared_bytes()),
-            "left inputs" => self.stats.lhs_tuples,
-            "right inputs" => self.stats.rhs_tuples,
-            "computed outputs" => self.stats.output_tuples,
-            "produced outputs" => self.stats.produced_tuples,
-            "output redundancy" => MetaItem::Percent(output_redundancy),
+            LEFT_INPUT_BATCHES_STATS => self.delta1_batch_stats.borrow().metadata(),
+            RIGHT_INPUT_BATCHES_STATS => self.delta2_batch_stats.borrow().metadata(),
+            OUTPUT_BATCHES_STATS => self.output_batch_stats.borrow().metadata(),
         });
-    }*/
+    }
 
     fn fixedpoint(&self, _scope: Scope) -> bool {
         true
     }
 }
 
-impl<TS, I1, T1, I2, T2, Z> QuaternaryOperator<I1, T1, I2, T2, Z>
+impl<TS, I1, T1, I2, T2, Z>
+    StreamingQuaternaryOperator<Option<Spine<I1>>, T1, Option<Spine<I2>>, T2, Z>
     for AsofJoin<TS, I1, T1, I2, T2, Z>
 where
     TS: DataTrait + ?Sized,
     I1: IndexedZSet,
-    T1: ZBatchReader<Key = I1::Key, Val = I1::Val, Time = ()> + Clone,
+    T1: ZBatchReader<Key = I1::Key, Val = I1::Val, Time = ()> + Clone + WithSnapshot<Batch = I1>,
     I2: IndexedZSet<Key = I1::Key>,
-    T2: ZBatchReader<Key = I2::Key, Val = I2::Val, Time = ()> + Clone,
+    T2: ZBatchReader<Key = I2::Key, Val = I2::Val, Time = ()> + Clone + WithSnapshot<Batch = I2>,
     Z: IndexedZSet,
 {
-    async fn eval(
-        &mut self,
-        delta1: Cow<'_, I1>,
+    fn eval(
+        self: Rc<Self>,
+        delta1: Cow<'_, Option<Spine<I1>>>,
         delayed_trace1: Cow<'_, T1>,
-        delta2: Cow<'_, I2>,
+        delta2: Cow<'_, Option<Spine<I2>>>,
         delayed_trace2: Cow<'_, T2>,
-    ) -> Z {
-        let mut delta1_cursor = delta1.cursor();
-        let mut delta2_cursor = delta2.cursor();
+    ) -> impl futures::Stream<Item = (Z, bool, Option<Position>)> + 'static {
+        if let Some(delta1) = delta1.as_ref() {
+            *self.delta1.borrow_mut() = Some(delta1.ro_snapshot());
+        };
 
-        let mut delayed_trace1_cursor = delayed_trace1.cursor();
-        let mut delayed_trace2_cursor = delayed_trace2.cursor();
+        if let Some(delta2) = delta2.as_ref() {
+            *self.delta2.borrow_mut() = Some(delta2.ro_snapshot());
+        };
 
-        let mut trace1_cursor = CursorPair::new(&mut delta1_cursor, &mut delayed_trace1_cursor);
-        let mut trace2_cursor = CursorPair::new(&mut delta2_cursor, &mut delayed_trace2_cursor);
+        let delayed_trace1 = if self.flush.get() {
+            Some(delayed_trace1.as_ref().ro_snapshot())
+        } else {
+            None
+        };
 
-        let mut delta1_cursor = delta1.cursor();
-        let mut delta2_cursor = delta2.cursor();
+        let delayed_trace2 = if self.flush.get() {
+            Some(delayed_trace2.ro_snapshot())
+        } else {
+            None
+        };
 
-        let mut delayed_trace1_cursor = delayed_trace1.cursor();
-        let mut delayed_trace2_cursor = delayed_trace2.cursor();
+        stream! {
+            let chunk_size = splitter_output_chunk_size();
 
-        let mut output_tuples = self
-            .factories
-            .output_factories
-            .weighted_items_factory()
-            .default_box();
+            if !self.flush.replace(false) {
+                // println!("yield empty");
+                yield(Z::dyn_empty(&self.factories.output_factories), true, None);
+                return;
+            }
 
-        // Timestamps that need to be recomputed for each key, created here for allocation
-        // reuse across keys.
-        let mut affected_times = self.factories.timestamps_factory.default_box();
+            let delta1 = self.delta1.take().unwrap();
+            let delta2 = self.delta2.take().unwrap();
 
-        // Iterate over keys in delta1 and delta2.
-        while delta1_cursor.key_valid() && delta2_cursor.key_valid() {
-            match delta1_cursor.key().cmp(delta2_cursor.key()) {
-                Ordering::Less => {
-                    self.eval_key(
-                        &mut delta1_cursor,
-                        &mut CursorEmpty::new(WithFactory::<ZWeight>::FACTORY),
-                        &mut delayed_trace1_cursor,
-                        &mut delayed_trace2_cursor,
-                        &mut trace1_cursor,
-                        &mut trace2_cursor,
-                        affected_times.as_mut(),
-                        output_tuples.as_mut(),
-                    );
-                    delta1_cursor.step_key();
+            self.delta1_batch_stats.borrow_mut().add_batch(delta1.len());
+            self.delta2_batch_stats.borrow_mut().add_batch(delta2.len());
+
+            let mut delta1_cursor = delta1.cursor();
+            let mut delta2_cursor = delta2.cursor();
+
+            let delayed_trace1 = delayed_trace1.expect("no delayed trace1 provided before flush");
+            let delayed_trace2 = delayed_trace2.expect("no delayed trace2 provided before flush");
+
+            let mut delayed_trace1_cursor = delayed_trace1.cursor();
+            let mut delayed_trace2_cursor = delayed_trace2.cursor();
+
+            let mut trace1_cursor = CursorPair::new(&mut delta1_cursor, &mut delayed_trace1_cursor);
+            let mut trace2_cursor = CursorPair::new(&mut delta2_cursor, &mut delayed_trace2_cursor);
+
+            let mut delta1_cursor = delta1.cursor();
+            let mut delta2_cursor = delta2.cursor();
+
+            let mut delayed_trace1_cursor = delayed_trace1.cursor();
+            let mut delayed_trace2_cursor = delayed_trace2.cursor();
+
+            let weighted_items_factory = self.factories.output_factories.weighted_items_factory();
+
+            let mut output_tuples = weighted_items_factory.default_box();
+            output_tuples.try_reserve(chunk_size);
+
+            // Timestamps that need to be recomputed for each key, created here for allocation
+            // reuse across keys.
+            let mut affected_times = self.factories.timestamps_factory.default_box();
+
+            // Iterate over keys in delta1 and delta2.
+            while delta1_cursor.key_valid() && delta2_cursor.key_valid() {
+                match delta1_cursor.key().cmp(delta2_cursor.key()) {
+                    Ordering::Less => {
+                        self.eval_key(
+                            &mut delta1_cursor,
+                            &mut CursorEmpty::new(WithFactory::<ZWeight>::FACTORY),
+                            &mut delayed_trace1_cursor,
+                            &mut delayed_trace2_cursor,
+                            &mut trace1_cursor,
+                            &mut trace2_cursor,
+                            affected_times.as_mut(),
+                            output_tuples.as_mut(),
+                        );
+                        delta1_cursor.step_key();
+                    }
+                    Ordering::Equal => {
+                        self.eval_key(
+                            &mut delta1_cursor,
+                            &mut delta2_cursor,
+                            &mut delayed_trace1_cursor,
+                            &mut delayed_trace2_cursor,
+                            &mut trace1_cursor,
+                            &mut trace2_cursor,
+                            affected_times.as_mut(),
+                            output_tuples.as_mut(),
+                        );
+                        delta1_cursor.step_key();
+                        delta2_cursor.step_key();
+                    }
+                    Ordering::Greater => {
+                        self.eval_key(
+                            &mut CursorEmpty::new(WithFactory::<ZWeight>::FACTORY),
+                            &mut delta2_cursor,
+                            &mut delayed_trace1_cursor,
+                            &mut delayed_trace2_cursor,
+                            &mut trace1_cursor,
+                            &mut trace2_cursor,
+                            affected_times.as_mut(),
+                            output_tuples.as_mut(),
+                        );
+                        delta2_cursor.step_key();
+                    }
                 }
-                Ordering::Equal => {
-                    self.eval_key(
-                        &mut delta1_cursor,
-                        &mut delta2_cursor,
-                        &mut delayed_trace1_cursor,
-                        &mut delayed_trace2_cursor,
-                        &mut trace1_cursor,
-                        &mut trace2_cursor,
-                        affected_times.as_mut(),
-                        output_tuples.as_mut(),
-                    );
-                    delta1_cursor.step_key();
-                    delta2_cursor.step_key();
-                }
-                Ordering::Greater => {
-                    self.eval_key(
-                        &mut CursorEmpty::new(WithFactory::<ZWeight>::FACTORY),
-                        &mut delta2_cursor,
-                        &mut delayed_trace1_cursor,
-                        &mut delayed_trace2_cursor,
-                        &mut trace1_cursor,
-                        &mut trace2_cursor,
-                        affected_times.as_mut(),
-                        output_tuples.as_mut(),
-                    );
-                    delta2_cursor.step_key();
+
+                if output_tuples.len() >= chunk_size {
+                    let result = Z::dyn_from_tuples(&self.factories.output_factories, (), &mut output_tuples);
+                    self.output_batch_stats.borrow_mut().add_batch(result.len());
+                    yield (result, false, delta1_cursor.position());
+                    output_tuples = weighted_items_factory.default_box();
+                    output_tuples.reserve(chunk_size);
                 }
             }
-        }
 
-        while delta1_cursor.key_valid() {
-            self.eval_key(
-                &mut delta1_cursor,
-                &mut CursorEmpty::new(WithFactory::<ZWeight>::FACTORY),
-                &mut delayed_trace1_cursor,
-                &mut delayed_trace2_cursor,
-                &mut trace1_cursor,
-                &mut trace2_cursor,
-                affected_times.as_mut(),
-                output_tuples.as_mut(),
-            );
-            delta1_cursor.step_key();
-        }
+            while delta1_cursor.key_valid() {
+                self.eval_key(
+                    &mut delta1_cursor,
+                    &mut CursorEmpty::new(WithFactory::<ZWeight>::FACTORY),
+                    &mut delayed_trace1_cursor,
+                    &mut delayed_trace2_cursor,
+                    &mut trace1_cursor,
+                    &mut trace2_cursor,
+                    affected_times.as_mut(),
+                    output_tuples.as_mut(),
+                );
+                delta1_cursor.step_key();
 
-        while delta2_cursor.key_valid() {
-            self.eval_key(
-                &mut CursorEmpty::new(WithFactory::<ZWeight>::FACTORY),
-                &mut delta2_cursor,
-                &mut delayed_trace1_cursor,
-                &mut delayed_trace2_cursor,
-                &mut trace1_cursor,
-                &mut trace2_cursor,
-                affected_times.as_mut(),
-                output_tuples.as_mut(),
-            );
-            delta2_cursor.step_key();
-        }
+                if output_tuples.len() >= chunk_size {
+                    let result = Z::dyn_from_tuples(&self.factories.output_factories, (), &mut output_tuples);
+                    self.output_batch_stats.borrow_mut().add_batch(result.len());
+                    yield (result, false, delta1_cursor.position());
+                    output_tuples = weighted_items_factory.default_box();
+                    output_tuples.reserve(chunk_size);
+                }
+            }
 
-        Z::dyn_from_tuples(&self.factories.output_factories, (), &mut output_tuples)
+            while delta2_cursor.key_valid() {
+                self.eval_key(
+                    &mut CursorEmpty::new(WithFactory::<ZWeight>::FACTORY),
+                    &mut delta2_cursor,
+                    &mut delayed_trace1_cursor,
+                    &mut delayed_trace2_cursor,
+                    &mut trace1_cursor,
+                    &mut trace2_cursor,
+                    affected_times.as_mut(),
+                    output_tuples.as_mut(),
+                );
+                delta2_cursor.step_key();
+
+                if output_tuples.len() >= chunk_size {
+                    let result = Z::dyn_from_tuples(&self.factories.output_factories, (), &mut output_tuples);
+                    self.output_batch_stats.borrow_mut().add_batch(result.len());
+                    yield (result, false, delta1_cursor.position());
+                    output_tuples = weighted_items_factory.default_box();
+                    output_tuples.reserve(chunk_size);
+                }
+            }
+
+            let result = Z::dyn_from_tuples(&self.factories.output_factories, (), &mut output_tuples);
+            self.output_batch_stats.borrow_mut().add_batch(result.len());
+            yield (result, true, delta1_cursor.position());
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::cmp::{max, min};
+
     use crate::{
+        DBData, DBSPHandle, OrdIndexedZSet, OrdZSet, OutputHandle, Runtime, TypedBox, ZSetHandle,
+        ZWeight,
         algebra::F32,
         circuit::CircuitConfig,
+        dynamic::DowncastTrait,
+        typed_batch::{IndexedZSetReader, SpineSnapshot},
         utils::{Tup2, Tup3, Tup4},
-        zset, DBData, DBSPHandle, OrdIndexedZSet, OrdZSet, OutputHandle, Runtime, ZSetHandle,
-        ZWeight,
+        zset,
     };
     use proptest::{collection::vec, prelude::*};
 
@@ -711,57 +795,178 @@ mod test {
     type User = Tup3<Time, CCNum, String>;
     type Output = Tup4<Time, CCNum, Amt, Option<String>>;
 
+    fn join(
+        _key: &CCNum,
+        transaction: &Transaction,
+        user: Option<&User>,
+    ) -> Tup4<Time, CCNum, Amt, Option<String>> {
+        Tup4(
+            transaction.0,
+            transaction.1,
+            transaction.2,
+            user.map(|u| u.2.clone()),
+        )
+    }
+    fn ts_func1(transaction: &Transaction) -> Time {
+        transaction.0
+    }
+    fn ts_func2(user: &User) -> Time {
+        user.0
+    }
+
     fn test_circuit() -> (
         DBSPHandle,
         (
             ZSetHandle<Transaction>,
             ZSetHandle<User>,
-            OutputHandle<OrdZSet<Output>>,
+            OutputHandle<SpineSnapshot<OrdZSet<Output>>>,
+            OutputHandle<SpineSnapshot<OrdZSet<Output>>>,
+            OutputHandle<SpineSnapshot<OrdIndexedZSet<CCNum, Transaction>>>,
+            OutputHandle<SpineSnapshot<OrdIndexedZSet<CCNum, User>>>,
         ),
     ) {
-        Runtime::init_circuit(CircuitConfig::with_workers(2), |circuit| {
-            let (transactions, transactions_handle) = circuit.add_input_zset::<Transaction>();
-            let (users, users_handle) = circuit.add_input_zset::<User>();
+        Runtime::init_circuit(
+            CircuitConfig::with_workers(2).with_splitter_chunk_size_records(2),
+            |circuit| {
+                let (transactions, transactions_handle) = circuit.add_input_zset::<Transaction>();
+                let (users, users_handle) = circuit.add_input_zset::<User>();
 
-            let transactions = transactions.map_index(|transaction| (transaction.1, *transaction));
-            let users = users.map_index(|user| (user.1, user.clone()));
+                let transactions =
+                    transactions.map_index(|transaction| (transaction.1, *transaction));
+                let users = users.map_index(|user| (user.1, user.clone()));
 
-            let join = |_key: &CCNum, transaction: &Transaction, user: Option<&User>| {
-                Tup4(
-                    transaction.0,
-                    transaction.1,
-                    transaction.2,
-                    user.map(|u| u.2.clone()),
-                )
-            };
-            let ts_func1 = |transaction: &Transaction| transaction.0;
-            let ts_func2 = |user: &User| user.0;
+                let result = transactions.asof_join(&users, join, ts_func1, ts_func2);
 
-            let result = transactions.asof_join(&users, join, ts_func1, ts_func2);
+                let transactions_output_handle = transactions
+                    .shard()
+                    .accumulate_integrate()
+                    .accumulate_output();
 
-            let expected_result = transactions
-                .shard()
-                .integrate()
-                .apply2(&users.shard().integrate(), move |t, u| {
-                    asof_join_reference(t, u, join, ts_func1, ts_func2)
+                let users_output_handle = users.shard().accumulate_integrate().accumulate_output();
+
+                // let expected_result = transactions
+                //     .shard()
+                //     .integrate()
+                //     .apply2(&users.shard().integrate(), move |t, u| {
+                //         asof_join_reference(t, u, join, ts_func1, ts_func2)
+                //     });
+
+                // result
+                //     .integrate()
+                //     .apply2(&expected_result, |actual, expected| {
+                //         assert_eq!(actual, expected)
+                //     });
+
+                let output_handle = result.accumulate_output();
+                let output_integral_handle = result.accumulate_integrate().accumulate_output();
+
+                Ok((
+                    transactions_handle,
+                    users_handle,
+                    output_handle,
+                    output_integral_handle,
+                    transactions_output_handle,
+                    users_output_handle,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    fn test_circuit_with_waterline() -> (
+        DBSPHandle,
+        (
+            ZSetHandle<Transaction>,
+            ZSetHandle<User>,
+            OutputHandle<SpineSnapshot<OrdZSet<Output>>>,
+            OutputHandle<SpineSnapshot<OrdZSet<Output>>>,
+            OutputHandle<SpineSnapshot<OrdIndexedZSet<CCNum, Transaction>>>,
+            OutputHandle<SpineSnapshot<OrdIndexedZSet<CCNum, User>>>,
+        ),
+    ) {
+        Runtime::init_circuit(
+            CircuitConfig::with_workers(2).with_splitter_chunk_size_records(2),
+            |circuit| {
+                let (transactions, transactions_handle) = circuit.add_input_zset::<Transaction>();
+                let (users, users_handle) = circuit.add_input_zset::<User>();
+
+                let transactions =
+                    transactions.map_index(|transaction| (transaction.1, *transaction));
+                let users = users.map_index(|user| (user.1, user.clone()));
+
+                let user_waterline = users.waterline(
+                    || u64::MIN,
+                    |_k, Tup3(ts, _, _)| {
+                        // println!("{} ts: {:?}", Runtime::worker_index(), *ts);
+                        (*ts).saturating_sub(LATENESS)
+                    },
+                    |ts1, ts2| {
+                        // println!("{} max({:?}, {:?})", Runtime::worker_index(), ts1, ts2);
+                        max(*ts1, *ts2)
+                    },
+                );
+
+                let transaction_waterline = transactions.waterline(
+                    || u64::MIN,
+                    |_k, Tup3(ts, _, _)| (*ts).saturating_sub(LATENESS),
+                    |ts1, ts2| max(*ts1, *ts2),
+                );
+
+                let waterline = transaction_waterline.apply2(&user_waterline, |ts1, ts2| {
+                    TypedBox::new(min(unsafe { *ts1.inner().downcast::<u64>() }, unsafe {
+                        *ts2.inner().downcast::<u64>()
+                    }))
                 });
 
-            result
-                .integrate()
-                .apply2(&expected_result, |actual, expected| {
-                    assert_eq!(actual, expected)
-                });
+                let result = transactions.asof_join(&users, join, ts_func1, ts_func2);
 
-            let output_handle = result.output();
+                transactions.accumulate_integrate_trace_retain_values(
+                    &waterline,
+                    |transaction: &Transaction, ts: &u64| transaction.0 >= *ts,
+                );
 
-            Ok((transactions_handle, users_handle, output_handle))
-        })
+                users.accumulate_integrate_trace_retain_values_last_n(
+                    &waterline,
+                    |user: &User, ts: &u64| user.0 >= *ts,
+                    1,
+                );
+
+                let transactions_output_handle = transactions
+                    .shard()
+                    .accumulate_integrate()
+                    .accumulate_output();
+
+                let users_output_handle = users.shard().accumulate_integrate().accumulate_output();
+
+                let output_handle = result.accumulate_output();
+                let output_integral_handle = result.accumulate_integrate().accumulate_output();
+
+                Ok((
+                    transactions_handle,
+                    users_handle,
+                    output_handle,
+                    output_integral_handle,
+                    transactions_output_handle,
+                    users_output_handle,
+                ))
+            },
+        )
         .unwrap()
     }
 
     #[test]
     fn asof_join_test() {
-        let (mut dbsp, (transactions, users, result)) = test_circuit();
+        let (
+            mut dbsp,
+            (
+                transactions,
+                users,
+                result,
+                _result_integral,
+                _transactions_output_handle,
+                _users_output_handle,
+            ),
+        ) = test_circuit();
 
         // Step 1. Add some transactions without users.
         transactions.append(&mut vec![
@@ -774,10 +979,10 @@ mod test {
             // CCNum = 3
             Tup2(Tup3(100, 3, F32::new(30.0)), 1),
         ]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
-            result.consolidate(),
+            result.concat().consolidate(),
             zset! {
                Tup4(100, 1, F32::new(10.0), None) => 1,
                Tup4(200, 1, F32::new(10.0), None) => 1,
@@ -796,10 +1001,10 @@ mod test {
             // CCNum = 3
             Tup2(Tup3(110, 3, "C110".to_string()), 1),
         ]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
-            result.consolidate(),
+            result.concat().consolidate(),
             zset! {
                 Tup4(100, 1, F32::new(10.0), None) => -1,
                 Tup4(200, 1, F32::new(10.0), None) => -1,
@@ -825,10 +1030,10 @@ mod test {
 
         transactions.append(&mut vec![Tup2(Tup3(200, 3, F32::new(30.0)), 1)]);
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
-            result.consolidate(),
+            result.concat().consolidate(),
             zset! {
                 Tup4(100, 1, F32::new(10.0), Some("A50".to_string())) => -1,
                 Tup4(100, 1, F32::new(10.0), Some("A60".to_string())) => 1,
@@ -851,9 +1056,9 @@ mod test {
             Tup2(Tup3(110, 3, "C105".to_string()), 1),
         ]);
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
-        assert_eq!(result.consolidate(), zset! {});
+        assert_eq!(result.concat().consolidate(), zset! {});
 
         // Step 5. Add multiple transactions per timestamp.
         transactions.append(&mut vec![
@@ -866,10 +1071,10 @@ mod test {
             // CCNum = 3
             Tup2(Tup3(100, 3, F32::new(300.0)), 1),
         ]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
-            result.consolidate(),
+            result.concat().consolidate(),
             zset! {
                 Tup4(100, 1, F32::new(100.0), Some("A60".to_string())) => 1,
                 Tup4(200, 1, F32::new(100.0), Some("A60".to_string())) => 1,
@@ -886,9 +1091,9 @@ mod test {
             Tup2(Tup3(10, 3, "C10".to_string()), -1),
         ]);
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
-        assert_eq!(result.consolidate(), zset! {});
+        assert_eq!(result.concat().consolidate(), zset! {});
 
         // Step 7. Delete more users.
         users.append(&mut vec![
@@ -904,10 +1109,10 @@ mod test {
             Tup2(Tup3(110, 3, "C110".to_string()), -1),
         ]);
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
-            result.consolidate(),
+            result.concat().consolidate(),
             zset! {
                 Tup4(100, 1, F32::new(100.0), Some("A60".to_string())) => -1,
                 Tup4(200, 1, F32::new(100.0), Some("A60".to_string())) => -1,
@@ -929,22 +1134,61 @@ mod test {
 
     #[test]
     fn asof_join_regressions() {
-        let (mut dbsp, (transactions, users, _result)) = test_circuit();
+        let (
+            mut dbsp,
+            (
+                transactions,
+                users,
+                _result,
+                result_integral,
+                transactions_output_handle,
+                users_output_handle,
+            ),
+        ) = test_circuit();
 
         users.append(&mut vec![
             Tup2(Tup3(37, 0, "L".to_string()), 1),
             Tup2(Tup3(0, 0, "A".to_string()), 1),
         ]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
+        assert_eq!(
+            result_integral.concat().consolidate(),
+            asof_join_reference2(&transactions_output_handle, &users_output_handle,)
+        );
 
         transactions.append(&mut vec![Tup2(Tup3(37, 0, F32::new(0.0)), 1)]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
+        assert_eq!(
+            result_integral.concat().consolidate(),
+            asof_join_reference2(&transactions_output_handle, &users_output_handle,)
+        );
 
         users.append(&mut vec![Tup2(Tup3(37, 0, "L".to_string()), -1)]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
+        assert_eq!(
+            result_integral.concat().consolidate(),
+            asof_join_reference2(&transactions_output_handle, &users_output_handle,)
+        );
 
         users.append(&mut vec![Tup2(Tup3(0, 0, "A".to_string()), -1)]);
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
+        assert_eq!(
+            result_integral.concat().consolidate(),
+            asof_join_reference2(&transactions_output_handle, &users_output_handle,)
+        );
+    }
+
+    fn asof_join_reference2(
+        transactions_handle: &OutputHandle<SpineSnapshot<OrdIndexedZSet<CCNum, Transaction>>>,
+        users_handle: &OutputHandle<SpineSnapshot<OrdIndexedZSet<CCNum, User>>>,
+    ) -> OrdZSet<Output> {
+        asof_join_reference(
+            &transactions_handle.concat().consolidate(),
+            &users_handle.concat().consolidate(),
+            join,
+            ts_func1,
+            ts_func2,
+        )
     }
 
     /// Reference implementaton of asof-join for testing.
@@ -988,49 +1232,61 @@ mod test {
         OrdZSet::from_keys((), result)
     }
 
+    /// We generate both input streams to the asof join to have this lateness.
+    const LATENESS: u64 = 20;
+
+    // Generate a transaction for step `step`. Adds the value of `step` to
+    // a randomly generated timestamp in order to make sure that the waterline
+    // of the stream moves forward.
     prop_compose! {
-        fn transaction()
-            (time in 0..100u64,
+        fn transaction(step: usize)
+            (time in 0..LATENESS,
             cc_num in 0..10u64,
             amt in 0..100i32,
             w in 1..=2 as ZWeight)
             -> Tup2<Transaction, ZWeight> {
-            Tup2(Tup3(time, cc_num, F32::new(amt as f32)), w)
+            Tup2(Tup3(step as u64 + time, cc_num, F32::new(amt as f32)), w)
         }
     }
 
+    // Generate a random user for step `step`. Adds the value of `step` to
+    // a randomly generated timestamp in order to make sure that the waterline
+    // of the stream moves forward.
     prop_compose! {
-        fn user()
-            (time in 0..100u64,
+        fn user(step: usize)
+            (time in 0..LATENESS,
             cc_num in 0..5u64,
             name in "[A-Z][a-z]{5}",
             w in 1..=2 as ZWeight)
             -> Tup2<User, ZWeight> {
-            Tup2(Tup3(time, cc_num, name), w)
+            Tup2(Tup3(step as u64 + time, cc_num, name), w)
         }
     }
 
+    // Generates an array of transactions and an array of users to feed to the circuit during step `step`.
     prop_compose! {
-        fn input()
-            (transactions in vec(transaction(), 0..20),
-            users in vec(user(), 0..10))
+        fn input(step: usize)
+            (transactions in vec(transaction(step), 0..20),
+            users in vec(user(step), 0..10))
             -> (Vec<Tup2<Transaction, ZWeight>>, Vec<Tup2<User, ZWeight>>) {
             (transactions, users)
         }
     }
 
-    prop_compose! {
-        fn inputs(steps: usize)
-            (inputs in vec(input(), 0..=steps))
-        -> Vec<(Vec<Tup2<Transaction,ZWeight>>, Vec<Tup2<User, ZWeight>>)> {
-            inputs
-        }
+    /// Generate inputs to the test circuit for `steps` steps.
+    fn inputs(
+        steps: usize,
+    ) -> impl Strategy<Value = Vec<(Vec<Tup2<Transaction, ZWeight>>, Vec<Tup2<User, ZWeight>>)>>
+    {
+        (0..steps).map(input).collect::<Vec<_>>().prop_map(|v| v)
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(30))]
+
         #[test]
         fn asof_join_proptest(inputs in inputs(50)) {
-            let (mut dbsp, (htransactions, husers, _hresult)) = test_circuit();
+            let (mut dbsp, (htransactions, husers, _hresult, hresult_integral, htransactions_output_handle, husers_output_handle)) = test_circuit();
 
             let mut deletions = inputs.clone();
             for (ts, us) in deletions.iter_mut() {
@@ -1038,7 +1294,7 @@ mod test {
                     *w = -*w;
                 }
                 for Tup2(_u, w) in us.iter_mut() {
-                     *w = -*w;
+                        *w = -*w;
                 }
             }
 
@@ -1046,14 +1302,42 @@ mod test {
                 htransactions.append(&mut transactions);
                 husers.append(&mut users);
 
-                dbsp.step().unwrap();
+                dbsp.transaction().unwrap();
+                assert_eq!(
+                    hresult_integral.concat().consolidate(),
+                    asof_join_reference2(&htransactions_output_handle, &husers_output_handle)
+                );
             }
 
             for (mut transactions, mut users) in deletions {
                 htransactions.append(&mut transactions);
                 husers.append(&mut users);
 
-                dbsp.step().unwrap();
+                dbsp.transaction().unwrap();
+                assert_eq!(
+                    hresult_integral.concat().consolidate(),
+                    asof_join_reference2(&htransactions_output_handle, &husers_output_handle)
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(20))]
+
+        #[test]
+        fn asof_join_with_waterline_proptest(inputs in inputs(100)) {
+            let (mut dbsp, (htransactions, husers, _hresult, hresult_integral, htransactions_output_handle, husers_output_handle)) = test_circuit_with_waterline();
+
+            for (mut transactions, mut users) in inputs {
+                htransactions.append(&mut transactions);
+                husers.append(&mut users);
+
+                dbsp.transaction().unwrap();
+                assert_eq!(
+                    hresult_integral.concat().consolidate(),
+                    asof_join_reference2(&htransactions_output_handle, &husers_output_handle)
+                );
             }
         }
     }

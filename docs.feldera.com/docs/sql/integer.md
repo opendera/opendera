@@ -6,7 +6,8 @@ bits).
 
 The legal operations are `+` (plus, unary and binary), `-` (minus,
 unary and binary), `*` (multiplication), `/` (division), `%`
-(modulus).
+(modulus).  Unary minus (negation) cannot be applied to unsigned
+values.
 
 Modulus involving negative numbers happens as follows:
 
@@ -66,6 +67,10 @@ of minimum integer value by -1) produce run time errors.
   <tr>
     <td><a id="abs"></a><code>ABS(value)</code></td>
     <td>return absolute value.</td>
+  </tr>
+  <tr>
+    <td><a id="div_null"></a><code>DIV_NULL(numerator, denominator)</code></td>
+    <td>Like division, but returns `NULL` when denominator is zero.</td>
   </tr>
   <tr>
     <td><a id="mod"></a><code>MOD(left, right)</code></td>

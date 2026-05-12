@@ -40,6 +40,10 @@ import static org.dbsp.sqlCompiler.ir.type.DBSPTypeCode.TIMESTAMP;
 
 public class DBSPTypeTimestamp extends DBSPTypeBaseType
         implements IsDateType, IsTimeRelatedType {
+
+    /** Number of digits after decimal point (microseconds) */
+    public static final int PRECISION = 6;
+
     DBSPTypeTimestamp(CalciteObject node, boolean mayBeNull) {
         super(node, TIMESTAMP, mayBeNull);
     }
@@ -61,12 +65,12 @@ public class DBSPTypeTimestamp extends DBSPTypeBaseType
     public DBSPExpression defaultValue() {
         if (this.mayBeNull)
             return this.none();
-        return new DBSPTimestampLiteral(this.getNode(), this, 0L);
+        return DBSPTimestampLiteral.fromMicroseconds(this.getNode(), this, 0L);
     }
 
     @Override
     public DBSPExpression getMaxValue() {
-        return new DBSPTimestampLiteral("9999-12-12 23:59:59.99999999", this.mayBeNull);
+        return new DBSPTimestampLiteral("9999-12-31 23:59:59.99999999", this.mayBeNull);
     }
 
     @Override

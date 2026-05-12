@@ -1,0 +1,132 @@
+use crate::controller::{ControllerInner, EndpointId};
+use crate::transport::IntegratedInputEndpoint;
+use crate::{ControllerError, Encoder, InputConsumer, OutputEndpoint};
+use feldera_types::config::{ConnectorConfig, TransportConfig};
+use feldera_types::program_schema::Relation;
+use std::sync::Weak;
+
+#[cfg(feature = "with-deltalake")]
+pub mod delta_table;
+mod postgres;
+
+#[cfg(feature = "with-postgres-cdc")]
+use crate::integrated::postgres::PostgresCdcInputEndpoint;
+use crate::integrated::postgres::PostgresInputEndpoint;
+pub use crate::integrated::postgres::PostgresOutputEndpoint;
+
+/// An integrated output connector implements both transport endpoint
+/// (`OutputEndpoint`) and `Encoder` traits.  It is used to implement
+/// connectors whose transport protocol and data format are tightly coupled.
+pub trait IntegratedOutputEndpoint: OutputEndpoint + Encoder {
+    fn into_encoder(self: Box<Self>) -> Box<dyn Encoder>;
+    fn as_endpoint(&mut self) -> &mut dyn OutputEndpoint;
+}
+
+impl<EP> IntegratedOutputEndpoint for EP
+where
+    EP: OutputEndpoint + Encoder + 'static,
+{
+    fn into_encoder(self: Box<Self>) -> Box<dyn Encoder> {
+        self
+    }
+
+    fn as_endpoint(&mut self) -> &mut dyn OutputEndpoint {
+        self
+    }
+}
+
+/// Create an instance of an integrated output endpoint given its config
+/// and output relation schema.p
+#[allow(unused)]
+pub fn create_integrated_output_endpoint(
+    endpoint_id: EndpointId,
+    endpoint_name: &str,
+    connector_config: &ConnectorConfig,
+    key_schema: &Option<Relation>,
+    schema: &Relation,
+    controller: Weak<ControllerInner>,
+    is_restart: bool,
+) -> Result<Box<dyn IntegratedOutputEndpoint>, ControllerError> {
+    let ep: Box<dyn IntegratedOutputEndpoint> = match &connector_config.transport {
+        #[cfg(feature = "with-deltalake")]
+        TransportConfig::DeltaTableOutput(config) => Box::new(delta_table::DeltaTableWriter::new(
+            endpoint_id,
+            endpoint_name,
+            config,
+            key_schema,
+            schema,
+            controller,
+            is_restart,
+        )?),
+        TransportConfig::PostgresOutput(config) => Box::new(PostgresOutputEndpoint::new(
+            endpoint_id,
+            endpoint_name,
+            config,
+            key_schema,
+            schema,
+            controller,
+        )?),
+        transport => {
+            return Err(ControllerError::unknown_output_transport(
+                endpoint_name,
+                &transport.name(),
+            ));
+        }
+    };
+
+    if connector_config.format.is_some() {
+        return Err(ControllerError::invalid_parser_configuration(
+            endpoint_name,
+            &format!(
+                "{} transport does not allow 'format' specification",
+                connector_config.transport.name()
+            ),
+        ));
+    }
+
+    Ok(ep)
+}
+
+pub fn create_integrated_input_endpoint(
+    endpoint_name: &str,
+    config: &ConnectorConfig,
+    consumer: Box<dyn InputConsumer>,
+) -> Result<Box<dyn IntegratedInputEndpoint>, ControllerError> {
+    let ep: Box<dyn IntegratedInputEndpoint> = match &config.transport {
+        #[cfg(feature = "with-deltalake")]
+        TransportConfig::DeltaTableInput(config) => Box::new(
+            delta_table::DeltaTableInputEndpoint::new(endpoint_name, config, consumer),
+        ),
+        #[cfg(feature = "with-iceberg")]
+        TransportConfig::IcebergInput(config) => Box::new(
+            feldera_iceberg::IcebergInputEndpoint::new(endpoint_name, config, consumer),
+        ),
+        TransportConfig::PostgresInput(config) => {
+            Box::new(PostgresInputEndpoint::new(endpoint_name, config, consumer))
+        }
+        #[cfg(feature = "with-postgres-cdc")]
+        TransportConfig::PostgresCdcInput(config) => Box::new(PostgresCdcInputEndpoint::new(
+            endpoint_name,
+            config,
+            consumer,
+        )),
+        transport => {
+            return Err(ControllerError::unknown_input_transport(
+                endpoint_name,
+                &transport.name(),
+            ));
+        }
+    };
+
+    if config.format.is_some() {
+        return Err(ControllerError::invalid_parser_configuration(
+            endpoint_name,
+            &format!(
+                "{} transport does not allow 'format' specification",
+                config.transport.name()
+            ),
+        ));
+    }
+
+    Ok(ep)
+}

@@ -1,0 +1,337 @@
+//! Interface between the coordinator and the pipeline.
+//!
+//! To support multihost pipelines, a coordinator process interposes between the
+//! pipeline manager and each of the pipeline processes.  To the pipeline
+//! manager, the coordinator presents the same interface as a single-host
+//! pipeline.  To the pipelines below it, the coordinator needs some additional
+//! interface endpoints, defined in this module.  These endpoints use paths that
+//! begin with `/coordination`.
+//!
+//! # Startup
+//!
+//! At startup, a pipeline within a multihost pipeline enters a special
+//! [RuntimeStatus::Coordination] state, in which it waits for instructions from
+//! the coordinator.  When it is ready, the coordinator sends a
+//! [CoordinationActivate] request to properly start the pipeline.
+//!
+//! [RuntimeStatus::Coordination]: crate::runtime_status::RuntimeStatus::Coordination
+//!
+//! # Steps
+//!
+//! Once it is activated, a multihost pipeline behaves differently from
+//! single-host regarding running circuit steps.  The pipelines do not take any
+//! steps on their own.  Rather, the coordinator is responsible for coordinating
+//! individual steps.  The coordinator sends [StepRequest] to trigger steps,
+//! while reading a stream of [StepStatus] updates to find out the effects.
+//!
+//! The coordinator is responsible for enabling and disabling input connector
+//! buffering using `/start` and `/pause`.  In multihost mode, these control
+//! buffering but not running steps.
+//!
+//! # Checkpointing
+//!
+//! The coordinator is responsible for coordinating checkpoints as well.  It
+//! reads a stream of [CheckpointCoordination] updates from each pipeline to
+//! track the status.  To execute a checkpoint, it calls
+//! `/coordination/checkpoint/prepare` on each pipeline.  The pipelines may
+//! update their status to indicate that some of their input connectors have
+//! barriers; if so, then the coordinator should force steps until the barriers
+//! are cleared.  When all of the pipelines are ready, the coordinator uses
+//! `/coordination/checkpoint/release` to trigger it.  Then the coordinator
+//! waits for all of the checkpoints to complete, or for at least one to fail.
+//!
+//! # Transactions
+//!
+//! The coordinator is responsible for coordinating transactions.  It reads a
+//! stream of [TransactionCoordination] updates from each pipeline.  It merges
+//! the set of transactions requested by input connectors from these updates
+//! with those requested through its own API from the pipeline manager, and in
+//! turn uses the same API to start and commit transactions in the pipelines.
+//! The pipelines only use transactions started through the API, as instructed
+//! by the coordinator; they report input connector requested transactions
+//! upward to the coordinator but do not otherwise act on them.
+
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
+    net::SocketAddr,
+};
+
+use arrow_schema::Schema;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::{
+    config::{InputEndpointConfig, OutputEndpointConfig},
+    program_schema::SqlIdentifier,
+    runtime_status::{ExtendedRuntimeStatus, ExtendedRuntimeStatusError, RuntimeDesiredStatus},
+    suspend::TemporarySuspendError,
+};
+
+/// `/coordination/status` update, streamed by pipeline to coordinator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct CoordinationStatus {
+    pub incarnation_uuid: Uuid,
+    pub status: Result<ExtendedRuntimeStatus, ExtendedRuntimeStatusError>,
+}
+
+/// `/coordination/activate` request, sent by coordinator to pipeline to
+/// transition out of [RuntimeDesiredStatus::Coordination].
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CoordinationActivate {
+    /// The socket address that "exchange" operators should use to reach each of
+    /// the hosts in the multihost pipeline.
+    ///
+    /// The `usize` component of each tuple is the number of workers at that
+    /// socket address.
+    pub exchanges: Vec<(SocketAddr, usize)>,
+
+    /// The local address for this pipeline.  This must be one of the addresses
+    /// in `exchanges`.
+    pub local_address: SocketAddr,
+
+    /// The desired status for the pipeline to initially enter.
+    pub desired_status: RuntimeDesiredStatus,
+
+    /// The checkpoint that the pipeline should start from, if any.
+    pub checkpoint: Option<Uuid>,
+
+    /// Local input endpoint configuration.
+    pub inputs: BTreeMap<Cow<'static, str>, InputEndpointConfig>,
+
+    /// Local output endpoint configuration.
+    #[serde(default)]
+    pub outputs: BTreeMap<Cow<'static, str>, OutputEndpointConfig>,
+
+    /// Global assignment of output streams to workers.
+    pub output_assignment: BTreeMap<String, usize>,
+}
+
+/// A step number.
+pub type Step = u64;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StepAction {
+    /// Wait for instructions from the coordinator.
+    Idle,
+    /// Wait for a triggering condition to occur, such as arrival of a
+    /// sufficient amount of data on an input connector or if a transaction is
+    /// committing.  If one does, execute a step.
+    Trigger,
+    /// Execute a step.
+    Step,
+}
+
+/// `/coordination/step/status` update, streamed by pipeline to coordinator.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct StepStatus {
+    /// The step that is running or will run next.
+    pub step: Step,
+    /// Current action.
+    pub action: StepAction,
+    /// Whether a transaction is open:
+    ///
+    /// - `None`: No transaction open or committing.
+    ///
+    /// - `Some(true)`: Transaction is open.
+    ///
+    /// - `Some(false)`: Transaction is committing.  The coordinator needs to
+    ///   execute at least one more step to commit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_status: Option<bool>,
+}
+
+impl StepStatus {
+    pub fn new(step: Step, action: StepAction, transaction_status: Option<bool>) -> Self {
+        Self {
+            step,
+            action,
+            transaction_status,
+        }
+    }
+    pub fn is_triggered(&self, step: Step) -> bool {
+        (self.step == step && self.action == StepAction::Step) || self.is_idle(step + 1)
+    }
+    pub fn is_idle(&self, step: Step) -> bool {
+        self.step == step && self.action == StepAction::Idle
+    }
+}
+
+/// `/coordination/step/request` request, sent by coordinator to pipeline to
+/// control step behavior.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct StepRequest {
+    /// The action for the pipeline to take:
+    ///
+    /// - [Idle][]: Do not start a step.
+    ///
+    /// - [Trigger][]: Start a step if input arrives on an input endpoint or if
+    ///   a transaction is committing.
+    ///
+    /// - [Step][]: Start a step.
+    ///
+    /// [Idle]: StepAction::Idle
+    /// [Trigger]: StepAction::Trigger
+    /// [Step]: StepAction::Step
+    pub action: StepAction,
+
+    /// The step to which `action` applies.
+    ///
+    /// `action` applies only if `step` is the pipeline's current step.
+    /// Otherwise, the pipeline will not start a step.
+    pub step: Step,
+
+    /// Which input endpoints to use.
+    ///
+    /// This is not significant for [StepAction::Idle].
+    pub inputs: StepInputs,
+}
+
+impl StepRequest {
+    pub fn new(step: Step, action: StepAction, inputs: StepInputs) -> Self {
+        Self {
+            step,
+            action,
+            inputs,
+        }
+    }
+    pub fn new_idle(step: Step) -> Self {
+        Self::new(step, StepAction::Idle, StepInputs::All)
+    }
+}
+
+/// The input endpoints to consider in a [StepRequest].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum StepInputs {
+    /// Consider input arriving on any input endpoint to trigger a step.  For
+    /// executing a step, use input from all the input endpoints.
+    All,
+
+    /// Consider input arriving only on input endpoints that are blocking a
+    /// checkpoint to trigger a step.  For executing a step, use input only from
+    /// input endpoints that are blocking a checkpoint.
+    CheckpointBarriers,
+
+    /// Do not consider any input as triggering a step.  For executing a step,
+    /// do not use any input.
+    ///
+    /// This is for committing a transaction.
+    None,
+}
+
+/// `/coordination/checkpoint/status`, streamed by pipeline to coordinator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointCoordination {
+    /// This pipeline can't checkpoint yet for the given reasons.  The
+    /// coordinator can't do anything to help.
+    Delayed(Vec<TemporarySuspendError>),
+
+    /// This pipeline can't checkpoint yet for the given reasons.  The
+    /// coordinator must run the pipeline for another step to help clear up the
+    /// issue.
+    Barriers(Vec<TemporarySuspendError>),
+
+    /// This pipeline is ready to write a checkpoint.
+    Ready,
+
+    /// This pipeline is writing a checkpoint.
+    InProgress,
+
+    /// Checkpoint failed.
+    Error(String),
+
+    /// The checkpoint is complete.
+    Done,
+}
+
+/// `/coordination/transaction/status` update, streamed by pipeline to coordinator.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TransactionCoordination {
+    /// Endpoints that want to join a transaction, with their optional labels.
+    pub requests: HashMap<String, Option<String>>,
+}
+
+/// `/coordination/adhoc/catalog` reply.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdHocCatalog {
+    pub tables: Vec<AdHocTable>,
+}
+
+/// One table in an [AdHocCatalog].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdHocTable {
+    pub name: SqlIdentifier,
+    pub materialized: bool,
+    pub indexed: bool,
+    pub schema: Schema,
+    #[serde(default)]
+    pub table_type: AdHocTableType,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdHocTableType {
+    #[default]
+    View,
+    Table,
+}
+
+/// `/coordination/adhoc/scan` request.
+///
+/// The reply is a stream of undelimited Arrow IPC record batches.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdHocScan {
+    /// The step whose data is to be scanned.  The client must hold a lease on
+    /// the step.
+    pub step: Step,
+
+    /// The worker within the step whose data is to be scanned.
+    pub worker: usize,
+
+    /// Table to scan.
+    pub table: SqlIdentifier,
+
+    /// Columnar projection.
+    pub projection: Option<Vec<usize>>,
+}
+
+/// `/coordination/labels/incomplete` reply, streamed from pipeline to coordinator.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Labels {
+    /// All the labels on incomplete connectors.
+    pub incomplete: HashSet<String>,
+}
+
+/// `/coordination/completion/status` reply, streamed from pipeline to coordinator.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Completion {
+    /// Number of steps whose input records have been processed to completion.
+    ///
+    /// A record is processed to completion if it has been processed by the DBSP engine and
+    /// all outputs derived from it have been processed by all output connectors.
+    ///
+    /// # Interpretation
+    ///
+    /// This is a count, not a step number.  If `total_completed_steps` is 0, no
+    /// steps have been processed to completion.  If `total_completed_steps >
+    /// 0`, then the last step whose input records have been processed to
+    /// completion is `total_completed_steps - 1`. A record that was ingested
+    /// in step `n` is fully processed when `total_completed_steps >= n`.
+    #[serde(rename = "c")]
+    pub total_completed_steps: Step,
+}
+
+/// `/coordination/restart` arguments.
+///
+/// This pipeline request restarts the pipeline process.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartArgs {
+    /// The incarnation UUID of the pipeline process to restart.
+    ///
+    /// If this doesn't match the incarnation UUID of the running pipeline, then
+    /// the request returns an error (since it has presumably already
+    /// restarted).
+    pub incarnation_uuid: Uuid,
+}

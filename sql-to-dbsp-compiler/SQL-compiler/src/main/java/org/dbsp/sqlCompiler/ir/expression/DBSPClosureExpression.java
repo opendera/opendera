@@ -32,6 +32,7 @@ import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.Expensive;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.Projection;
 import org.dbsp.sqlCompiler.ir.DBSPParameter;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
@@ -84,6 +85,8 @@ public final class DBSPClosureExpression extends DBSPExpression {
         newContext.leftDeclaration.newContext();
         newContext.rightDeclaration.newContext();
         for (int i = 0; i < parameters.length; i++) {
+            if (!this.parameters[i].getType().sameType(otherExpression.parameters[i].getType()))
+                return false;
             newContext.leftDeclaration.substitute(this.parameters[i].name, this.parameters[i]);
             newContext.rightDeclaration.substitute(otherExpression.parameters[i].name, otherExpression.parameters[i]);
             newContext.leftToRight.put(this.parameters[i], otherExpression.parameters[i]);
@@ -96,6 +99,11 @@ public final class DBSPClosureExpression extends DBSPExpression {
             throw new InternalCompilerError("Received " + arguments.length +
                     " arguments, but need " + this.parameters.length, this);
         return new DBSPApplyExpression(this, arguments);
+    }
+
+    public DBSPApplyExpression call(List<DBSPExpression> arguments) {
+        DBSPExpression[] args = arguments.toArray(DBSPExpression[]::new);
+        return this.call(args);
     }
 
     @Override
@@ -153,8 +161,21 @@ public final class DBSPClosureExpression extends DBSPExpression {
                 .append(")");
     }
 
+    public boolean shouldInlineComposition(DBSPCompiler compiler, DBSPClosureExpression before) {
+        Projection projection = new Projection(compiler, true, true);
+        projection.apply(this);
+        if (projection.isProjection && before.body.is(DBSPBaseTupleExpression.class)) {
+            return true;
+        } else {
+            // TODO: this could be refined by checking how many times the source expression
+            // is substituted in the result.
+            return !Expensive.isExpensive(compiler, before);
+        }
+    }
+
     /** Compose this closure by applying it after the 'before'
      * closure expression.  This closure must have exactly 1
+     * parameter, while the before one can have multiple ones.
      * parameter, while the before one can have multiple ones.
      * @param before Closure to compose.
      * @param inline If {@link Maybe#YES}, inline the call,
@@ -165,16 +186,13 @@ public final class DBSPClosureExpression extends DBSPExpression {
         if (this.parameters.length != 1)
             throw new InternalCompilerError("Expected closure with 1 parameter", this);
 
-        if (inline == MAYBE) {
-            Expensive expensive = new Expensive(compiler);
-            expensive.apply(before);
-            if (expensive.isExpensive())
-                inline = NO;
-            else
-                inline = YES;
-        }
+        boolean shouldInline;
+        if (inline == MAYBE)
+            shouldInline = this.shouldInlineComposition(compiler, before);
+        else
+            shouldInline = inline.toBool();
 
-        if (inline == YES) {
+        if (shouldInline) {
             DBSPExpression apply = this.call(before.body.borrow());
             DBSPClosureExpression closure = apply.closure(before.parameters);
             DBSPExpression reduced = closure.reduce(compiler);

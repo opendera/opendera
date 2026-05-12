@@ -8,11 +8,13 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPConcreteAsofJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPBinaryOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPConstantOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIndexedTopKOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainNValuesOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPLagOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNestedOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperatorWithError;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPRankOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMapOperator;
@@ -21,6 +23,7 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceTableOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPUnaryOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPViewBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainValuesOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
@@ -95,7 +98,7 @@ public class ToJsonOuterVisitor extends CircuitVisitor {
     public void property(String name) {
         this.stream.label(name);
     }
-    
+
     @SuppressWarnings("SameParameterValue")
     boolean checkDone(IDBSPOuterNode node, boolean silent) {
         if (this.serialized.contains(node.getId())) {
@@ -167,6 +170,16 @@ public class ToJsonOuterVisitor extends CircuitVisitor {
 
     @Override
     public VisitDecision preorder(DBSPIndexedTopKOperator operator) {
+        VisitDecision decision = this.preorder(operator.to(DBSPUnaryOperator.class));
+        if (decision.stop())
+            return VisitDecision.STOP;
+        this.label("numbering");
+        this.stream.append(operator.numbering.name());
+        return VisitDecision.CONTINUE;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPRankOperator operator) {
         VisitDecision decision = this.preorder(operator.to(DBSPUnaryOperator.class));
         if (decision.stop())
             return VisitDecision.STOP;
@@ -268,8 +281,15 @@ public class ToJsonOuterVisitor extends CircuitVisitor {
         VisitDecision decision = this.preorder(operator.to(DBSPSimpleOperator.class));
         if (decision.stop())
             return VisitDecision.STOP;
-        this.property("incremental");
-        this.stream.append(operator.incremental);
+        return VisitDecision.CONTINUE;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPJoinBaseOperator operator) {
+        if (this.preorder(operator.to(DBSPBinaryOperator.class)).stop())
+            return VisitDecision.STOP;
+        this.property("balanced");
+        this.stream.append(operator.balanced);
         return VisitDecision.CONTINUE;
     }
 
@@ -288,9 +308,9 @@ public class ToJsonOuterVisitor extends CircuitVisitor {
             return VisitDecision.STOP;
         this.property("isLeft");
         this.stream.append(operator.isLeft);
-        this.property("leftTimestampindex");
+        this.property("leftTimestampIndex");
         this.stream.append(operator.leftTimestampIndex);
-        this.property("rightTimestampindex");
+        this.property("rightTimestampIndex");
         this.stream.append(operator.rightTimestampIndex);
         return VisitDecision.CONTINUE;
     }
@@ -303,6 +323,26 @@ public class ToJsonOuterVisitor extends CircuitVisitor {
         this.stream.append(operator.lowerInclusive);
         this.property("upperInclusive");
         this.stream.append(operator.upperInclusive);
+        return VisitDecision.CONTINUE;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPIntegrateTraceRetainValuesOperator operator) {
+        if (this.preorder(operator.to(DBSPBinaryOperator.class)).stop())
+            return VisitDecision.STOP;
+        this.property("accumulate");
+        this.stream.append(operator.accumulate);
+        return VisitDecision.CONTINUE;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPIntegrateTraceRetainNValuesOperator operator) {
+        if (this.preorder(operator.to(DBSPBinaryOperator.class)).stop())
+            return VisitDecision.STOP;
+        this.property("which");
+        this.stream.append(operator.which.name());
+        this.property("n");
+        this.stream.append(operator.n);
         return VisitDecision.CONTINUE;
     }
 

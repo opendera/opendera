@@ -20,7 +20,7 @@ public abstract class DBSPApplyBaseExpression extends DBSPExpression {
         if (this.function.getType().is(DBSPTypeFunction.class)) {
             DBSPTypeFunction funcType = this.function.getType().to(DBSPTypeFunction.class);
             Utilities.enforce(funcType.parameterTypes.length == this.arguments.length,
-                    "Has " + funcType.parameterTypes.length + " parameters, but " +
+                    () -> "Has " + funcType.parameterTypes.length + " parameters, but " +
                             this.arguments.length + " arguments");
             parameterTypes = funcType.parameterTypes;
         }
@@ -30,7 +30,7 @@ public abstract class DBSPApplyBaseExpression extends DBSPExpression {
                 throw new InternalCompilerError("Null argument for apply expression", this);
             }
             if (parameterTypes != null && !parameterTypes[index].sameType(arg.getType()))
-                    throw new InternalCompilerError("Argument " + arg + " type " +
+                    throw new InternalCompilerError("Argument " + index + " " + arg + " type " +
                     arg.getType() + " does not match parameter type " + parameterTypes[index]);
             index++;
         }

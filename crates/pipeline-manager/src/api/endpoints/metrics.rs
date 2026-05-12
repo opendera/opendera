@@ -1,3 +1,6 @@
+use crate::api::main::ServerState;
+use crate::db::{storage::Storage as _, types::tenant::TenantId};
+use crate::error::ManagerError;
 use actix_web::{
     get,
     http::Method,
@@ -5,14 +8,10 @@ use actix_web::{
     HttpResponse,
 };
 use awc::body::MessageBody as _;
+use feldera_types::runtime_status::RuntimeStatus;
 
-use crate::api::main::ServerState;
-use crate::db::{
-    storage::Storage as _,
-    types::{pipeline::PipelineStatus, tenant::TenantId},
-};
-use crate::error::ManagerError;
-
+/// List All Metrics
+///
 /// Retrieve the metrics of all running pipelines belonging to this tenant.
 ///
 /// The metrics are collected by making individual HTTP requests to `/metrics`
@@ -27,7 +26,7 @@ use crate::error::ManagerError;
         , content_type = "text/plain"
         , body = Vec<u8>),
     ),
-    tag = "Metrics"
+    tag = "Metrics & Debugging"
 )]
 #[get("/metrics")]
 pub(crate) async fn get_metrics(
@@ -46,8 +45,8 @@ pub(crate) async fn get_metrics(
     let mut result = Vec::new();
 
     for pipeline in pipelines {
-        if pipeline.deployment_status == PipelineStatus::Running
-            || pipeline.deployment_status == PipelineStatus::Paused
+        if pipeline.deployment_runtime_status == Some(RuntimeStatus::Running)
+            || pipeline.deployment_runtime_status == Some(RuntimeStatus::Paused)
         {
             if let Ok(res) = state
                 .runner
@@ -58,6 +57,7 @@ pub(crate) async fn get_metrics(
                     Method::GET,
                     "metrics",
                     "",
+                    None,
                     None,
                 )
                 .await

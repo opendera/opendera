@@ -39,12 +39,12 @@ This table shows the operators associativity, starting from highest to lowest:
     <td>arithmetic</td>
   </tr>
   <tr>
-    <td><a id="between"></a><code>BETWEEN, IN, LIKE, SIMILAR, OVERLAPS, CONTAINS</code></td>
+    <td><a id="between"></a><code>BETWEEN, IN, LIKE, OVERLAPS, CONTAINS</code></td>
     <td>N/A</td>
     <td></td>
   </tr>
   <tr>
-    <td><code>&lt;, &gt;, =, &lt;=, &gt;=, &lt;&gt;, !=, &lt;=&gt;</code></td>
+    <td><a id="comparisons"></a><a id="<=>"></a><code>&lt;, &gt;, =, &lt;=, &gt;=, &lt;&gt;, !=, &lt;=&gt;</code></td>
     <td>left</td>
     <td>comparisons</td>
   </tr>

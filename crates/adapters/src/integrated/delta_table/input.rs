@@ -1,93 +1,78 @@
 use crate::catalog::{ArrowStream, InputCollectionHandle};
-use crate::controller::{ControllerInner, EndpointId};
 use crate::format::InputBuffer;
 use crate::integrated::delta_table::{delta_input_serde_config, register_storage_handlers};
-use crate::transport::{
-    InputEndpoint, InputQueue, InputReaderCommand, IntegratedInputEndpoint, NonFtInputReaderCommand,
-};
-use crate::util::{root_cause, JobQueue};
-use crate::{
-    ControllerError, InputConsumer, InputReader, PipelineState, RecordFormat,
-    TransportInputEndpoint,
-};
-use actix_web::web::Data;
-use anyhow::{anyhow, bail, Error as AnyError, Result as AnyResult};
+use crate::transport::{InputEndpoint, InputQueue, InputReaderCommand, IntegratedInputEndpoint};
+use crate::util::JobQueue;
+use crate::{ControllerError, InputConsumer, InputReader, PipelineState};
+use anyhow::{Error as AnyError, Result as AnyResult, anyhow, bail};
 use arrow::array::BooleanArray;
-use arrow::datatypes::Schema;
-use arrow::error::ArrowError;
+use chrono::{DateTime, Utc};
 use datafusion::catalog::TableProvider;
-use datafusion::common::arrow::array::{AsArray, RecordBatch};
+use datafusion::common::arrow::array::RecordBatch;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::datasource::MemTable;
-use datafusion::error::DataFusionError;
-use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::sqlparser::parser::ParserError;
-use datafusion::logical_expr::{Filter, LogicalPlan, Projection};
-use datafusion::physical_plan::PhysicalExpr;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::{PhysicalExpr, displayable};
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionConfig;
-use datafusion::scalar::ScalarValue;
 use dbsp::circuit::tokio::TOKIO;
-use dbsp::operator::input;
-use dbsp::InputHandle;
-use deltalake::datafusion::common::Column;
 use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::execution::context::SQLOptions;
-use deltalake::datafusion::prelude::{Expr, ParquetReadOptions, SessionContext};
-use deltalake::datafusion::sql::sqlparser::dialect::GenericDialect;
-use deltalake::datafusion::sql::sqlparser::keywords::Keyword::SQL;
-use deltalake::datafusion::sql::sqlparser::parser::Parser;
-use deltalake::datafusion::sql::sqlparser::test_utils::table;
-use deltalake::delta_datafusion::cdf::FileAction;
-use deltalake::delta_datafusion::logical;
+use deltalake::datafusion::prelude::SessionContext;
 use deltalake::kernel::Action;
-use deltalake::kernel::Error::Parse;
-use deltalake::operations::create::CreateBuilder;
-use deltalake::protocol::SaveMode;
+use deltalake::logstore::{self, IORuntime};
 use deltalake::table::builder::ensure_table_uri;
-use deltalake::table::PeekCommit;
-use deltalake::{datafusion, DeltaTable, DeltaTableBuilder, Path};
-use feldera_adapterlib::format::ParseError;
-use feldera_adapterlib::transport::Resume;
+use deltalake::{DeltaTable, DeltaTableBuilder, datafusion};
+use feldera_adapterlib::format::{ParseError, StagedInputBuffer};
+use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
+use feldera_adapterlib::transport::{InputQueueEntry, Resume, Watermark, parse_resume_info};
 use feldera_adapterlib::utils::datafusion::{
-    execute_query_collect, execute_singleton_query, timestamp_to_sql_expression,
+    array_to_string, execute_query_collect, execute_singleton_query, timestamp_to_sql_expression,
     validate_sql_expression, validate_timestamp_column,
 };
-use feldera_types::config::{FtModel, InputEndpointConfig};
-use feldera_types::format::json::JsonFlavor;
-use feldera_types::program_schema::{ColumnType, Field, Relation, SqlType};
-use feldera_types::transport::delta_table::{DeltaTableIngestMode, DeltaTableReaderConfig};
-use feldera_types::transport::s3::S3InputConfig;
-use futures::TryFutureExt;
+use feldera_storage::tokio::TOKIO_DEDICATED_IO;
+use feldera_types::adapter_stats::ConnectorHealth;
+use feldera_types::config::FtModel;
+use feldera_types::program_schema::Relation;
+use feldera_types::transport::delta_table::{DeltaTableReaderConfig, DeltaTableTransactionMode};
 use futures_util::StreamExt;
-use rkyv::with::Atomic;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::error::Error;
-use std::fmt::format;
+use serde_json::Value as JsonValue;
+use std::cmp::min;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt::Display;
 use std::future::Future;
-use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::select;
-use tokio::sync::watch::{channel, Receiver, Sender};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::watch::{Receiver, Sender, channel};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
-use tokio_util::time;
-use tracing::{debug, error, info, trace};
-use tracing_subscriber::fmt::fmt;
+use tracing::{debug, info, trace, warn};
 use url::Url;
-use utoipa::ToSchema;
 
 /// Polling interval when following a delta table.
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
-/// Polling delay before retrying an unsuccessful read from a delta log.
-const RETRY_INTERVAL: Duration = Duration::from_millis(2000);
+/// Calculate exponential backoff delay for retrying delta log reads.
+/// Starts at 0.5s, doubles each retry, caps at 32s, plus uniform jitter up to 25% of that delay
+/// (capped at `max_delay_ms`) to reduce synchronized retries.
+fn calculate_backoff_delay(retry_count: u32) -> Duration {
+    let base_delay_ms: u64 = 500; // 0.5 seconds
+    let max_delay_ms: u64 = 32_000; // 32 seconds
+    let delay_ms = min(
+        base_delay_ms.checked_shl(retry_count).unwrap_or(u64::MAX),
+        max_delay_ms,
+    );
+    let jitter_span = (delay_ms / 4).max(1);
+    let jitter_ms = rand::thread_rng().gen_range(0..jitter_span);
+    Duration::from_millis(min(delay_ms + jitter_ms, max_delay_ms))
+}
 
 /// Default object store timeout. When not explicitly set by the user,
 /// we use a large timeout value to avoid this issue:
@@ -102,13 +87,19 @@ const REPORT_ERROR: &str =
 /// as a workaround for https://github.com/apache/arrow-rs-object-store/issues/14.
 /// (see `max_concurrent_readers` in `DeltaTableReaderConfig`).
 static DELTA_READER_SEMAPHORE: std::sync::LazyLock<Semaphore> =
-    std::sync::LazyLock::new(|| Semaphore::new(6));
+    std::sync::LazyLock::new(|| Semaphore::new(DEFAULT_MAX_CONCURRENT_READERS));
+
+/// Default cap for concurrent Delta object-store reads, used both as the
+/// initial token count for `DELTA_READER_SEMAPHORE` and as the fallback
+/// for DataFusion's `target_partitions` when neither
+/// `DELTA_DF_TARGET_PARTITIONS` nor `max_concurrent_readers` is set.
+const DEFAULT_MAX_CONCURRENT_READERS: usize = 6;
 
 /// True if the `max_concurrent_readers` attribute was set by one of the connectors.
 /// Used to detect conflicting values of `max_concurrent_readers`.
 static MAX_CONCURRENT_READERS_SET: AtomicBool = AtomicBool::new(false);
 
-/// Takes a column name from a DeltaLake schema and returns a qouted string
+/// Takes a column name from a DeltaLake schema and returns a quoted string
 /// that can be used in datafusion queries like `select "foo""bar" from my_table`.
 fn quote_sql_identifier<S: AsRef<str>>(ident: S) -> String {
     format!("\"{}\"", ident.as_ref().replace("\"", "\"\""))
@@ -146,12 +137,14 @@ impl IntegratedInputEndpoint for DeltaTableInputEndpoint {
     fn open(
         self: Box<Self>,
         input_handle: &InputCollectionHandle,
+        resume_info: Option<JsonValue>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(DeltaTableInputReader::new(
             self.endpoint_name,
             self.config,
             self.consumer,
             input_handle,
+            resume_info,
         )?))
     }
 }
@@ -167,9 +160,51 @@ impl DeltaTableInputReader {
         mut config: DeltaTableReaderConfig,
         consumer: Box<dyn InputConsumer>,
         input_handle: &InputCollectionHandle,
+        resume_info: Option<JsonValue>,
     ) -> AnyResult<Self> {
         let (sender, receiver) = channel(PipelineState::Paused);
         let receiver_clone = receiver.clone();
+
+        let resume_info = if let Some(resume_info) = resume_info {
+            let resume_info = parse_resume_info::<DeltaResumeInfo>(&resume_info)?;
+            match &resume_info {
+                DeltaResumeInfo { eoi: true, .. } => {
+                    info!(
+                        "delta_table {endpoint_name}: skipping connector initialization because the connector is already in the end-of-input state"
+                    );
+                }
+                DeltaResumeInfo {
+                    version: Some(version),
+                    snapshot_timestamp: Some(snapshot_timestamp),
+                    ..
+                } => {
+                    info!(
+                        "delta_table {endpoint_name}: resuming to ingest the initial snapshot from table version {version} at timestamp {snapshot_timestamp}"
+                    );
+                }
+                DeltaResumeInfo {
+                    version: Some(version),
+                    ..
+                } => {
+                    info!(
+                        "delta_table {endpoint_name}: resuming in follow mode from table version {version}"
+                    );
+                }
+                DeltaResumeInfo { version: None, .. } => {
+                    info!("delta_table {endpoint_name}: resuming from clean state");
+                }
+            }
+
+            Some(resume_info)
+        } else {
+            None
+        };
+
+        let eoi = if let Some(resume_info) = &resume_info {
+            resume_info.eoi
+        } else {
+            false
+        };
 
         // Used to communicate the status of connector initialization.
         let (init_status_sender, mut init_status_receiver) =
@@ -200,18 +235,24 @@ impl DeltaTableInputReader {
             let available_permits = DELTA_READER_SEMAPHORE.available_permits();
 
             if max_concurrent_readers == 0 {
-                bail!("invalid 'max_concurrent_readers' value: 'max_concurrent_readers' must be greater than 0");
+                bail!(
+                    "invalid 'max_concurrent_readers' value: 'max_concurrent_readers' must be greater than 0"
+                );
             }
 
             if MAX_CONCURRENT_READERS_SET.load(Ordering::Acquire)
                 && max_concurrent_readers != available_permits
             {
-                bail!("found conflicting values of the `max_concurrent_readers` attribute: this is a global setting that affects all Delta Lake connectors, and not just the connector where it is specified; if multiple connectors specify `max_concurrent_readers`, they must all use the same value.");
+                bail!(
+                    "found conflicting values of the `max_concurrent_readers` attribute: this is a global setting that affects all Delta Lake connectors, and not just the connector where it is specified; if multiple connectors specify `max_concurrent_readers`, they must all use the same value."
+                );
             }
 
             MAX_CONCURRENT_READERS_SET.store(true, Ordering::Release);
 
-            info!("delta_table {endpoint_name}: adjusting the number of concurrent readers to {max_concurrent_readers}");
+            info!(
+                "delta_table {endpoint_name}: adjusting the number of concurrent readers to {max_concurrent_readers}"
+            );
 
             // The semaphore doesn't allow changing the total token count directly, but at this point,
             // while initializing connectors, none of the tokens have been acquired, so we can adjust
@@ -230,6 +271,8 @@ impl DeltaTableInputReader {
             );
         }
 
+        Self::prepare_unity_config(&config.object_store_config);
+
         let input_stream = input_handle
             .handle
             .configure_arrow_deserializer(delta_input_serde_config())?;
@@ -240,63 +283,78 @@ impl DeltaTableInputReader {
             config,
             consumer,
             schema,
+            resume_info.clone(),
         ));
-        let endpoint_clone = endpoint.clone();
 
-        std::thread::spawn(move || {
-            TOKIO.block_on(async {
-                let _ = endpoint_clone
-                    .worker_task(input_stream, receiver_clone, init_status_sender)
-                    .await;
-            })
-        });
+        // This is needed to initialize completed_frontier for the connector. It's not ideal, as the completion
+        // status for the frontier will be set to the current time instead of whenever the table version in resume_info
+        // was actually processed. The right solution is to checkpoint the frontier with the connector.
+        if resume_info.is_some() {
+            endpoint.queue.push_with_aux(
+                (None, Vec::new()),
+                Utc::now(),
+                QueueEntry::ResumeInfo(resume_info),
+            );
+        }
 
-        init_status_receiver.blocking_recv().ok_or_else(|| {
-            ControllerError::input_transport_error(
-                &endpoint.endpoint_name,
-                true,
-                anyhow!("worker thread terminated unexpectedly during initialization"),
-            )
-        })??;
+        if eoi {
+            endpoint
+                .metrics
+                .phase
+                .store(DeltaPhase::Completed as u64, Ordering::Relaxed);
+            endpoint.consumer.eoi();
+        } else {
+            let endpoint_clone = endpoint.clone();
+            thread::Builder::new()
+                .name(format!("{endpoint_name}-delta-input-tokio-wrapper"))
+                .spawn(move || {
+                    TOKIO.block_on(async {
+                        let _ = endpoint_clone
+                            .worker_task(input_stream, receiver_clone, init_status_sender)
+                            .await;
+                    })
+                })
+                .expect("failed to spawn delta connector tokio wrapper thread");
+
+            init_status_receiver.blocking_recv().ok_or_else(|| {
+                ControllerError::input_transport_error(
+                    &endpoint.endpoint_name,
+                    true,
+                    anyhow!("worker thread terminated unexpectedly during initialization"),
+                )
+            })??;
+        }
 
         Ok(Self {
             sender,
             inner: endpoint.clone(),
         })
     }
+
+    /// deltalake_catalog_unity expects all configuration settings to be provided as environment variables.
+    /// This function sets environment variables for all configuration settings that start with "unity_" or "databricks_".
+    fn prepare_unity_config(object_store_config: &HashMap<String, String>) {
+        for (key, val) in object_store_config.iter() {
+            if key.to_lowercase().starts_with("unity_")
+                || key.to_lowercase().starts_with("databricks_")
+            {
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                unsafe { std::env::set_var(key.to_uppercase(), val) };
+            }
+        }
+    }
 }
 
 impl InputReader for DeltaTableInputReader {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         match command {
-            InputReaderCommand::Seek(value) => {
-                let resume_info = match serde_json::from_value::<DeltaResumeInfo>(value.clone())  {
-                    Ok(resume_info) => resume_info,
-                    Err(e) =>{
-                        self.inner.consumer.error(
-                            true,
-                            anyhow!("unable to parse checkpointed connector state (checkpointed state: {value}; parse error: {e})"),
-                        );
-                        return;
-                    }
-                };
-
-                // When resuming from a checkpoint, set the initial table version to start reading from.
-                // The worker thread will check this version after receiving the Extend command and will
-                // jump to it instead of reading the entire table snapshot.
-                //
-                // In addition, this version will be reported by each `Queue` command until we start getting
-                // any actual input data, so the connector will remain checkpointable (i.e., will not create a
-                // checkpoint barrier) until then.
-                info!(
-                    "delta_table {}: resuming from table version {}",
-                    &self.inner.endpoint_name, resume_info.version
-                );
-
-                *self.inner.last_resume_status.lock().unwrap() = Some(resume_info);
-            }
-            InputReaderCommand::Replay { metadata, data } => panic!(
-                "replay command is not supported by DeltaTableInputReader; this is a bug, please report it to developers"),
+            InputReaderCommand::Replay { .. } => panic!(
+                "replay command is not supported by DeltaTableInputReader; this is a bug, please report it to developers"
+            ),
             InputReaderCommand::Extend => {
                 let _ = self.sender.send_replace(PipelineState::Running);
             }
@@ -306,26 +364,56 @@ impl InputReader for DeltaTableInputReader {
             InputReaderCommand::Queue {
                 checkpoint_requested,
             } => {
-                // When initiating a checkpoint, try to stop at a transaction boundary.
-                let stop_at: &dyn Fn(&Option<DeltaResumeInfo>) -> bool = if checkpoint_requested {
-                    &|resume_info: &Option<DeltaResumeInfo>| resume_info.is_some()
+                // When initiating a checkpoint, try to stop at a delta table transaction boundary.
+                let stop_at: &dyn Fn(&QueueEntry) -> bool = if checkpoint_requested {
+                    &|entry: &QueueEntry| {
+                        matches!(
+                            entry,
+                            QueueEntry::ResumeInfo(Some(_)) | QueueEntry::Rollback
+                        )
+                    }
                 } else {
-                    &|_: &Option<DeltaResumeInfo>| false
+                    &|_: &QueueEntry| false
                 };
+
                 let (total, _, resume_info) = self.inner.queue.flush_with_aux_until(stop_at);
-                let resume_status = resume_info
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| self.inner.last_resume_status.lock().unwrap().clone());
+                let resume_status = match resume_info.last() {
+                    None => self.inner.last_resume_status.lock().unwrap().clone(),
+                    Some((_ts, QueueEntry::ResumeInfo(resume_info))) => resume_info.clone(),
+                    Some((_ts, QueueEntry::Rollback)) => Some(
+                        self.inner
+                            .last_checkpointable_status
+                            .lock()
+                            .unwrap()
+                            .clone(),
+                    ),
+                };
+
                 *self.inner.last_resume_status.lock().unwrap() = resume_status.clone();
+                if let Some(resume_status) = &resume_status {
+                    *self.inner.last_checkpointable_status.lock().unwrap() = resume_status.clone();
+                }
 
                 let resume = match resume_status {
                     None => Resume::Barrier,
-                    Some(delta_resume_info) => Resume::Seek {
-                        seek: serde_json::to_value(delta_resume_info).unwrap(),
-                    },
+                    Some(delta_resume_info) => delta_resume_info.to_resume(),
                 };
-                self.inner.consumer.extended(total, Some(resume));
+
+                // We use the same format (DeltaResumeInfo) for resume info and watermark metadata.
+                self.inner.consumer.extended(
+                    total,
+                    Some(resume),
+                    resume_info
+                        .into_iter()
+                        .filter_map(|(timestamp, metadata)| match metadata {
+                            QueueEntry::ResumeInfo(resume_info) => Some(Watermark::new(
+                                timestamp,
+                                resume_info.map(|m| serde_json::to_value(m).unwrap()),
+                            )),
+                            QueueEntry::Rollback => None,
+                        })
+                        .collect(),
+                );
             }
             InputReaderCommand::Disconnect => {
                 let _ = self.sender.send_replace(PipelineState::Terminated);
@@ -347,14 +435,136 @@ impl Drop for DeltaTableInputReader {
 /// Resume info stored in each checkpoint for the DeltaTableInputEndpoint.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 struct DeltaResumeInfo {
-    /// Table version where the connector stopped reading before the checkpoint.
-    version: i64,
+    /// Table version where the connector stopped reading before the checkpoint,
+    /// `None` if the connector hasn't started reading yet.
+    ///
+    /// If the connector is still processing the initial snapshot, this is the version of the snapshot.
+    version: Option<i64>,
+
+    /// The upper bound of timestamps previously ingested as part of the initial snapshot.
+    ///
+    /// Only set if the connector is still processing the initial snapshot,
+    /// and if `timestamp_column` is set in the configuration.
+    ///
+    /// The connector will resume loading the snapshot from this timestamp after
+    /// resuming from a checkpoint.
+    snapshot_timestamp: Option<String>,
+
+    /// True if the connector reached the end-of-input state.
+    eoi: bool,
 }
 
 impl DeltaResumeInfo {
-    fn new(version: i64) -> Self {
-        Self { version }
+    /// Checkpoint taken before the connector started ingesting data.
+    fn initial() -> Self {
+        Self {
+            version: None,
+            snapshot_timestamp: None,
+            eoi: false,
+        }
     }
+
+    /// Checkpoint taken after the connector reached the end-of-input state.
+    fn eoi() -> Self {
+        Self {
+            version: None,
+            snapshot_timestamp: None,
+            eoi: true,
+        }
+    }
+
+    /// Checkpoint taken in follow mode, after the connector has ingested the initial snapshot
+    /// (if any).
+    ///
+    /// * `version` - the last processed version of the table.
+    /// * `eoi` - true if the connector reached the end-of-input state
+    ///   (can happen if `end_version` is set in the configuration or if the connector is
+    ///   configured to ingest the initial snapshot only).
+    fn follow_mode(version: i64, eoi: bool) -> Self {
+        Self {
+            version: Some(version),
+            snapshot_timestamp: None,
+            eoi,
+        }
+    }
+
+    /// Checkpoint taken while the connector is ingesting the initial snapshot.
+    ///
+    /// * `version` is the version of the table being snapshotted.
+    /// * `timestamp` is the timestamp of the last record ingested as part of the initial snapshot.
+    fn snapshot_mode(version: i64, timestamp: &str) -> Self {
+        Self {
+            version: Some(version),
+            snapshot_timestamp: Some(timestamp.to_string()),
+            eoi: false,
+        }
+    }
+
+    fn to_resume(&self) -> Resume {
+        Resume::Seek {
+            seek: serde_json::to_value(self).unwrap(),
+        }
+    }
+}
+
+/// Current phase of a delta table input connector.
+// Using repr u64 as we using AtomicU64 to store the phase in metrics
+#[repr(u64)]
+enum DeltaPhase {
+    LoadingSnapshot = 0,
+    Follow = 1,
+    Completed = 2,
+}
+
+struct DeltaTableMetrics {
+    /// Current phase of the connector (see [DeltaPhase]).
+    phase: AtomicU64,
+    /// Unix epoch seconds when snapshot phase finished; 0 if not yet complete.
+    snapshot_completed_ts: AtomicU64,
+    /// Total records loaded during snapshot phase.
+    snapshot_records_total: AtomicU64,
+}
+
+impl DeltaTableMetrics {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU64::new(DeltaPhase::LoadingSnapshot as u64),
+            snapshot_completed_ts: AtomicU64::new(0),
+            snapshot_records_total: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ConnectorMetrics for DeltaTableMetrics {
+    fn metrics(&self) -> Vec<(&'static str, &'static str, ValueType, f64)> {
+        vec![
+            (
+                "input_connector_delta_phase",
+                "Current phase: 0=loading_snapshot, 1=follow/streaming, 2=completed.",
+                ValueType::Gauge,
+                self.phase.load(Ordering::Relaxed) as f64,
+            ),
+            (
+                "input_connector_delta_snapshot_completed_seconds",
+                "Unix epoch seconds when the snapshot phase finished (0 if not yet complete).",
+                ValueType::Gauge,
+                self.snapshot_completed_ts.load(Ordering::Relaxed) as f64,
+            ),
+            (
+                "input_connector_delta_snapshot_records_total",
+                "Total records loaded during the snapshot phase.",
+                ValueType::Counter,
+                self.snapshot_records_total.load(Ordering::Relaxed) as f64,
+            ),
+        ]
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 struct DeltaTableInputEndpointInner {
@@ -364,13 +574,37 @@ struct DeltaTableInputEndpointInner {
     consumer: Box<dyn InputConsumer>,
     datafusion: SessionContext,
 
+    /// Index of the last transaction initiated by this connector.
+    ///
+    /// This is different from the transaction ID assigned to the transaction by the controller.
+    /// Used for debugging to track the number of transactions initiated by this connector.
+    transaction_index: AtomicUsize,
+
     /// The latest resume status of this endpoint:
-    /// * Initialized to `None`.
-    /// * Updated to `Some(version)` when a Seek command is received when resuming from a checkpoint.
+    /// * Initialized to `None` or `Some(version)` (when resume_info is specified) on initialization.
     /// * Updated to `Some(new_version)` after advancing to the next table version in the transaction log
     ///   in follow mode or after ingesting the initial snapshot.
     last_resume_status: Mutex<Option<DeltaResumeInfo>>,
-    queue: Arc<InputQueue<Option<DeltaResumeInfo>>>,
+
+    /// The latest checkpointable status of this endpoint.
+    last_checkpointable_status: Mutex<DeltaResumeInfo>,
+
+    queue: Arc<InputQueue<QueueEntry, StagedInputBuffer>>,
+    metrics: Arc<DeltaTableMetrics>,
+}
+
+#[derive(Debug, Clone)]
+enum QueueEntry {
+    /// Resume info for the connector after processing this queue entry.
+    ResumeInfo(Option<DeltaResumeInfo>),
+
+    /// Sent after failing to read a delta log entry, before retrying or
+    /// declaring a fatal error. Makes sure that the connector can be checkpointed
+    /// between retries.
+    ///
+    /// Note: this is not the actual transaction rollback: the current transaction,
+    /// if any, will be committed.
+    Rollback,
 }
 
 impl DeltaTableInputEndpointInner {
@@ -379,14 +613,65 @@ impl DeltaTableInputEndpointInner {
         config: DeltaTableReaderConfig,
         consumer: Box<dyn InputConsumer>,
         schema: Relation,
+        resume_info: Option<DeltaResumeInfo>,
     ) -> Self {
         let queue = Arc::new(InputQueue::new(consumer.clone()));
         // Configure datafusion not to generate Utf8View arrow types, which are not yet
         // supported by the `serde_arrow` crate.
-        let session_config = SessionConfig::new().set_bool(
+        let mut session_config = SessionConfig::new().set_bool(
             "datafusion.execution.parquet.schema_force_view_types",
             false,
         );
+        // Number of parallel scan partitions DataFusion plans for the
+        // snapshot read. Resolution order:
+        //
+        //   1. `DELTA_DF_TARGET_PARTITIONS` env var (process-wide override).
+        //   2. `max_concurrent_readers` from the connector config (which
+        //      also drives the global `DELTA_READER_SEMAPHORE`); using the
+        //      same value here keeps the per-connector parallelism aligned
+        //      with the process-wide concurrent-reader cap.
+        //   3. `DEFAULT_MAX_CONCURRENT_READERS` (6), matching the semaphore
+        //      default.
+        let env_target_partitions = match std::env::var("DELTA_DF_TARGET_PARTITIONS").ok() {
+            None => None,
+            Some(s) => match s.parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    warn!(
+                        "delta_table {endpoint_name}: ignoring DELTA_DF_TARGET_PARTITIONS={s:?}; expected a positive integer"
+                    );
+                    None
+                }
+            },
+        };
+        let target_partitions = env_target_partitions
+            .or_else(|| {
+                config
+                    .max_concurrent_readers
+                    .map(|n| n as usize)
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_READERS);
+        session_config =
+            session_config.set_usize("datafusion.execution.target_partitions", target_partitions);
+        info!("delta_table {endpoint_name}: target_partitions={target_partitions}");
+
+        if let Ok(s) = std::env::var("DELTA_DF_BATCH_SIZE") {
+            match s.parse::<usize>() {
+                Ok(n) if n > 0 => {
+                    session_config = session_config.set_usize("datafusion.execution.batch_size", n);
+                    info!("delta_table {endpoint_name}: applying DELTA_DF_BATCH_SIZE={n}");
+                }
+                _ => warn!(
+                    "delta_table {endpoint_name}: ignoring DELTA_DF_BATCH_SIZE={s:?}; expected a positive integer"
+                ),
+            }
+        }
+
+        let metrics = Arc::new(DeltaTableMetrics::new());
+        consumer.set_custom_metrics(Arc::clone(&metrics) as Arc<dyn ConnectorMetrics>);
+
+        let resume_status = resume_info.unwrap_or_else(DeltaResumeInfo::initial);
 
         Self {
             endpoint_name: endpoint_name.to_string(),
@@ -394,14 +679,52 @@ impl DeltaTableInputEndpointInner {
             config,
             consumer,
             datafusion: SessionContext::new_with_config(session_config),
-            last_resume_status: Mutex::new(None),
+            transaction_index: AtomicUsize::new(0),
+
+            // Set version to None by default so that the connector is checkpointable in the initial state.
+            last_resume_status: Mutex::new(Some(resume_status.clone())),
+
+            last_checkpointable_status: Mutex::new(resume_status),
             queue,
+            metrics,
+        }
+    }
+
+    fn skip_unused_columns(&self) -> bool {
+        // Old-style: property in the connector configuration.
+        // New-style: property in the table definition.
+        self.config.skip_unused_columns
+            || self.schema.get_property("skip_unused_columns") == Some("true")
+    }
+
+    fn allocate_follow_transaction_label(&self) -> Option<Option<String>> {
+        if self.config.transaction_mode == DeltaTableTransactionMode::Always {
+            Some(Some(format!(
+                "follow-{}",
+                self.transaction_index.fetch_add(1, Ordering::Release)
+            )))
+        } else {
+            None
+        }
+    }
+
+    fn allocate_snapshot_transaction_label(&self) -> Option<Option<String>> {
+        if matches!(
+            self.config.transaction_mode,
+            DeltaTableTransactionMode::Always | DeltaTableTransactionMode::Snapshot
+        ) {
+            Some(Some(format!(
+                "snapshot-{}",
+                self.transaction_index.fetch_add(1, Ordering::Release),
+            )))
+        } else {
+            None
         }
     }
 
     fn validate_cdc_config(&self) -> Result<(), ControllerError> {
         if self.config.is_cdc() {
-            let Some(cdc_order_by) = &self.config.cdc_order_by else {
+            if self.config.cdc_order_by.is_none() {
                 return Err(ControllerError::invalid_transport_configuration(
                     &self.endpoint_name,
                     "the DeltaLake connector is configured in 'cdc' mode, but the 'cdc_order_by' property is not set",
@@ -459,7 +782,7 @@ impl DeltaTableInputEndpointInner {
     /// table declaration.
     fn used_columns(&self, table: &DeltaTable) -> Vec<String> {
         // Column names in the SQL schema.
-        let sql_columns = if self.config.skip_unused_columns {
+        let sql_columns = if self.skip_unused_columns() {
             self.schema
                 .fields
                 .iter()
@@ -475,33 +798,31 @@ impl DeltaTableInputEndpointInner {
                 .collect::<Vec<String>>()
         };
 
-        if let Some(table_schema) = table.schema() {
-            let delta_columns = table_schema
-                .fields()
-                .map(|f| f.name().clone())
-                .collect::<Vec<String>>();
+        let table_schema = table.schema();
+        let delta_columns = table_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect::<Vec<String>>();
 
-            // We need to be careful in checking whether a Delta column name occurs in
-            // sql_columns.  Delta doesn't seem to include case sensitivity information any
-            // any form in its schema.  So we conservatively check whether column name
-            // occurs in the SQL tables as is or whether a lowercase column name occurs
-            // in the set of SQL columns converted to lowercase.
+        // We need to be careful in checking whether a Delta column name occurs in
+        // sql_columns.  Delta doesn't seem to include case sensitivity information any
+        // any form in its schema.  So we conservatively check whether column name
+        // occurs in the SQL tables as is or whether a lowercase column name occurs
+        // in the set of SQL columns converted to lowercase.
 
-            let sql_columns = sql_columns.iter().cloned().collect::<BTreeSet<_>>();
-            let sql_columns_lowercase = sql_columns
-                .iter()
-                .map(|c| c.to_lowercase())
-                .collect::<BTreeSet<_>>();
+        let sql_columns = sql_columns.iter().cloned().collect::<BTreeSet<_>>();
+        let sql_columns_lowercase = sql_columns
+            .iter()
+            .map(|c| c.to_lowercase())
+            .collect::<BTreeSet<_>>();
 
-            delta_columns
-                .into_iter()
-                .filter(|c| {
-                    sql_columns.contains(c) || sql_columns_lowercase.contains(&c.to_lowercase())
-                })
-                .collect::<Vec<_>>()
-        } else {
-            sql_columns
-        }
+        delta_columns
+            .into_iter()
+            .filter(|c| {
+                sql_columns.contains(c) || sql_columns_lowercase.contains(&c.to_lowercase())
+            })
+            .collect::<Vec<_>>()
     }
 
     fn used_column_list(&self, table: &DeltaTable) -> String {
@@ -515,12 +836,17 @@ impl DeltaTableInputEndpointInner {
     }
 
     /// Load the entire table snapshot as a single "select * where <filter>" query.
+    /// Returns the total number of records processed.
+    ///
+    /// Fails with an error if the function fails to read the snapshot.  This function
+    /// doesn't retry (the idea being that the snapshot can be large, and it's better to
+    /// fail fast and give the user a chance to restart the pipeline).
     async fn read_unordered_snapshot(
         &self,
         table: &DeltaTable,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
-    ) {
+    ) -> AnyResult<usize> {
         let column_names = self.used_column_list(table);
 
         let mut snapshot_query = format!("select {column_names} from snapshot");
@@ -533,41 +859,88 @@ impl DeltaTableInputEndpointInner {
             &self.endpoint_name,
         );
 
-        self.execute_snapshot_query(&snapshot_query, "initial snapshot", input_stream, receiver)
-            .await;
+        // Use the time when we started reading the snapshot as the ingestion timestamp for the snapshot.
+        let timestamp = Utc::now();
+
+        let record_count = self
+            .execute_snapshot_query(
+                &snapshot_query,
+                "initial snapshot",
+                input_stream,
+                receiver,
+                self.config.max_retries(),
+            )
+            .await?;
+        self.metrics
+            .snapshot_records_total
+            .fetch_add(record_count as u64, Ordering::Relaxed);
 
         // Empty buffer to indicate checkpointable state.
-        self.queue.push_with_aux(
-            (None, Vec::new()),
-            0,
-            Some(DeltaResumeInfo::new(table.version())),
+        self.queue.push_entry(
+            InputQueueEntry::new_with_aux(
+                timestamp,
+                QueueEntry::ResumeInfo(Some(DeltaResumeInfo::follow_mode(
+                    // We verified that the table version is not None in the open_table method.
+                    table.version().unwrap(),
+                    !self.config.follow(),
+                ))),
+            )
+            // If we started a transaction while processing the snapshot, commit it now.
+            .with_commit_transaction(true),
+            Vec::new(),
         );
 
         //let _ = self.datafusion.deregister_table("snapshot");
         info!(
-            "delta_table {}: finished reading initial snapshot",
+            "delta_table {}: snapshot load completed (records: {}, version: {})",
             &self.endpoint_name,
+            record_count,
+            table.version().unwrap()
         );
+        Ok(record_count)
     }
 
     /// Load the initial snapshot by issuing a sequence of queries for monotonically
     /// increasing timestamp ranges.
+    /// Returns the total number of records processed.
+    ///
+    /// Fails with an error if the function fails to complete one of the range queries
+    /// after retrying `self.config.max_retries` times.
     async fn read_ordered_snapshot(
         &self,
         table: &DeltaTable,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
-    ) {
-        self.read_ordered_snapshot_inner(table, input_stream, receiver)
-            .await
-            .unwrap_or_else(|e| self.consumer.error(true, e));
+    ) -> AnyResult<usize> {
+        // Use the time when we started reading the snapshot as the ingestion timestamp for the snapshot.
+        let timestamp = Utc::now();
+
+        let total_records = self
+            .read_ordered_snapshot_inner(table, input_stream, receiver)
+            .await?;
 
         // Empty buffer to indicate checkpointable state.
-        self.queue.push_with_aux(
-            (None, Vec::new()),
-            0,
-            Some(DeltaResumeInfo::new(table.version())),
+        self.queue.push_entry(
+            InputQueueEntry::new_with_aux(
+                timestamp,
+                QueueEntry::ResumeInfo(Some(DeltaResumeInfo::follow_mode(
+                    // We verified that the table version is not None in the open_table method.
+                    table.version().unwrap(),
+                    !self.config.follow(),
+                ))),
+            )
+            // If we started a transaction while processing the snapshot, commit it now.
+            .with_commit_transaction(true),
+            Vec::new(),
         );
+
+        info!(
+            "delta_table {}: snapshot load completed (records: {}, version: {})",
+            &self.endpoint_name,
+            total_records,
+            table.version().unwrap()
+        );
+        Ok(total_records)
     }
 
     async fn read_ordered_snapshot_inner(
@@ -575,7 +948,7 @@ impl DeltaTableInputEndpointInner {
         table: &DeltaTable,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
-    ) -> Result<(), AnyError> {
+    ) -> Result<usize, AnyError> {
         let timestamp_column = self.config.timestamp_column.as_ref().unwrap();
 
         let timestamp_field = self.schema.field(timestamp_column).unwrap();
@@ -584,13 +957,14 @@ impl DeltaTableInputEndpointInner {
         let lateness = timestamp_field.lateness.as_ref().unwrap();
 
         // Query the table for min and max values of the timestamp column that satisfy the filter.
-        let bounds_query =
-            format!("select * from (select cast(min({timestamp_column}) as string) as start_ts, cast(max({timestamp_column}) as string) as end_ts from snapshot {}) where start_ts is not null",
+        let bounds_query = format!(
+            "select * from (select cast(min({timestamp_column}) as string) as start_ts, cast(max({timestamp_column}) as string) as end_ts from snapshot {}) where start_ts is not null",
             if let Some(filter) = &self.effective_snapshot_filter() {
                 format!("where {filter}")
             } else {
                 String::new()
-            });
+            }
+        );
 
         let bounds = execute_query_collect(&self.datafusion, &bounds_query).await?;
 
@@ -609,25 +983,35 @@ impl DeltaTableInputEndpointInner {
                     String::new()
                 }
             );
-            return Ok(());
+            return Ok(0);
         }
 
         if bounds[0].num_columns() != 2 {
             // Should never happen.
             return Err(anyhow!(
-                    "internal error: query '{bounds_query}' returned a result with {} columns; expected 2 columns",
-                    bounds[0].num_columns()
-                ));
+                "internal error: query '{bounds_query}' returned a result with {} columns; expected 2 columns",
+                bounds[0].num_columns()
+            ));
         }
 
-        let min = bounds[0]
-            .column(0)
-            .as_string_opt::<i32>()
-            .ok_or_else(|| anyhow!("internal error: cannot retrieve the output of query '{bounds_query}' as a string"))?
-            .value(0)
-            .to_string();
+        // If the connector is restarting from a checkpoint where the initial snapshot has been partially ingested,
+        // resume from the checkpointed timestamp value; otherwise use the earliest timestamp in the table.
+        let min = match &*self.last_resume_status.lock().unwrap()
+        { Some(DeltaResumeInfo {
+            snapshot_timestamp: Some(snapshot_timestamp),
+            ..
+        }) => {
+            snapshot_timestamp.clone()
+        } _ => {
+            array_to_string(bounds[0].column(0))
+            .ok_or_else(|| anyhow!("internal error: cannot retrieve the first column in the output of query '{bounds_query}' as a string"))?
+        }};
 
-        let max = bounds[0].column(1).as_string::<i32>().value(0).to_string();
+        let max = array_to_string(bounds[0].column(1)).ok_or_else(|| {
+            anyhow!(
+                "internal error: cannot retrieve the second column in the output of query '{bounds_query}' as a string"
+            )
+        })?;
 
         let columns = self.used_columns(table);
         let column_names = columns
@@ -637,7 +1021,7 @@ impl DeltaTableInputEndpointInner {
             .join(", ");
 
         info!(
-            "delta_table {}: reading table snapshot in the range '{min} <= {timestamp_column} <= {max}'",
+            "delta_table {}: reading table snapshot in the range '{min} <= {timestamp_column} < {max}'",
             &self.endpoint_name,
         );
 
@@ -645,9 +1029,9 @@ impl DeltaTableInputEndpointInner {
         let max = timestamp_to_sql_expression(&timestamp_field.columntype, &max);
 
         let mut start = min.clone();
-        let mut done = "false".to_string();
+        let mut total_records = 0usize;
 
-        while &done != "true" {
+        loop {
             // Evaluate SQL expression for the new end of the interval.
             let end = execute_singleton_query(
                 &self.datafusion,
@@ -657,25 +1041,104 @@ impl DeltaTableInputEndpointInner {
             let end = timestamp_to_sql_expression(&timestamp_field.columntype, &end);
 
             // Query the table for the range.
-            let mut range_query =
-                format!("select {column_names} from snapshot where {timestamp_column} >= {start} and {timestamp_column} < {end}");
+            let mut range_query = format!(
+                "select {column_names} from snapshot where {timestamp_column} >= {start} and {timestamp_column} < {end}"
+            );
             if let Some(filter) = &self.effective_snapshot_filter() {
                 range_query = format!("{range_query} and {filter}");
             }
 
-            self.execute_snapshot_query(&range_query, "range", input_stream, receiver)
-                .await;
+            let range_record_count = self
+                .execute_snapshot_query(
+                    &range_query,
+                    "range",
+                    input_stream,
+                    receiver,
+                    self.config.max_retries(),
+                )
+                .await?;
+            self.metrics
+                .snapshot_records_total
+                .fetch_add(range_record_count as u64, Ordering::Relaxed);
+            total_records += range_record_count;
 
             start = end.clone();
 
-            done = execute_singleton_query(
+            let done = execute_singleton_query(
                 &self.datafusion,
                 &format!("select cast({start} > {max} as string)"),
             )
             .await?;
+
+            if done == "true" {
+                break;
+            }
+
+            self.queue.push_entry(
+                InputQueueEntry::new_with_aux(
+                    Utc::now(),
+                    QueueEntry::ResumeInfo(Some(DeltaResumeInfo::snapshot_mode(
+                        // We verified that the table version is not None in the open_table method.
+                        table.version().unwrap(),
+                        &start,
+                    ))),
+                )
+                // If we started a transaction while processing the range query, commit it now.
+                .with_commit_transaction(true),
+                Vec::new(),
+            );
         }
 
-        Ok(())
+        Ok(total_records)
+    }
+
+    /// Runs `operation` until it succeeds or [`DeltaTableReaderConfig::max_retries`] is exhausted.
+    ///
+    /// On failure before the limit: sets connector health to unhealthy, logs a warning with
+    /// `description` as the message prefix, sleeps using [`calculate_backoff_delay`], then retries.
+    /// On final failure: updates health, invokes [`InputConsumer::error`], and returns `Err`.
+    async fn retry<F, Fut, T, E>(
+        &self,
+        description: &str,
+        error_tag: Option<&'static str>,
+        mut operation: F,
+    ) -> Result<T, AnyError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: Display,
+    {
+        let max_retries = self.config.max_retries();
+        let mut retry_count = 0u32;
+        loop {
+            match operation().await {
+                Ok(value) => {
+                    self.consumer
+                        .update_connector_health(ConnectorHealth::healthy());
+                    return Ok(value);
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count - 1 == max_retries {
+                        let message = format!("{description} after {retry_count} attempts: {e}");
+                        self.consumer
+                            .update_connector_health(ConnectorHealth::unhealthy(&message));
+                        self.consumer
+                            .error(true, anyhow!(message.clone()), error_tag);
+                        return Err(anyhow!(message));
+                    }
+                    let backoff_delay = calculate_backoff_delay(retry_count - 1);
+                    let message = format!(
+                        "{description} after {retry_count} attempts: {e}; retrying in {:?}",
+                        backoff_delay
+                    );
+                    self.consumer
+                        .update_connector_health(ConnectorHealth::unhealthy(&message));
+                    warn!("delta_table {}: {message}", &self.endpoint_name);
+                    sleep(backoff_delay).await;
+                }
+            }
+        }
     }
 
     async fn worker_task_inner(
@@ -717,60 +1180,188 @@ impl DeltaTableInputEndpointInner {
 
         let last_resume_status = self.last_resume_status.lock().unwrap().clone();
 
-        let mut version = table.version();
+        // We verified that the table version is not None in the open_table method.
+        let mut version = table.version().unwrap();
 
-        if let Some(resume_status) = last_resume_status {
-            // If resume_status was set during initialization, it means that we are resuming from a checkpoint,
-            // and should start reading from the specified version instead of reading the entire snapshot.
-            version = resume_status.version;
-        } else if self.config.snapshot() && self.config.timestamp_column.is_none() {
+        // We haven't completed a snapshot before the checkpoint was taken if
+        // - there is no checkpoint
+        // - the checkpoint was taken in the initial state
+        // - the checkpoint was taken mid-snapshot (snapshot_timestamp is set)
+        let snapshot_incomplete = matches!(
+            last_resume_status,
+            None | Some(DeltaResumeInfo { version: None, .. })
+                | Some(DeltaResumeInfo {
+                    snapshot_timestamp: Some(_),
+                    ..
+                })
+        );
+
+        let snapshot_record_count = if snapshot_incomplete
+            && self.config.snapshot()
+            && self.config.timestamp_column.is_none()
+        {
             // Read snapshot chunk-by-chunk.
             self.read_unordered_snapshot(&table, input_stream.as_mut(), &mut receiver)
-                .await;
-        } else if self.config.snapshot() {
+                .await
+        } else if snapshot_incomplete && self.config.snapshot() {
             // Read the entire snapshot in one query.
             self.read_ordered_snapshot(&table, input_stream.as_mut(), &mut receiver)
-                .await;
+                .await
+        } else {
+            Ok(0)
+        };
+
+        let snapshot_record_count = match snapshot_record_count {
+            Ok(snapshot_record_count) => snapshot_record_count,
+            Err(e) => {
+                self.consumer.error(true, e, None);
+                return;
+            }
         };
 
         // Start following the table if required by the configuration.
         if self.config.follow() {
+            // Log the appropriate message based on whether we just completed a snapshot
+            if self.config.snapshot() && snapshot_incomplete {
+                // We just completed reading a snapshot, now switching to follow mode
+                self.metrics
+                    .snapshot_completed_ts
+                    .store(now_unix_secs(), Ordering::Relaxed);
+                self.metrics
+                    .phase
+                    .store(DeltaPhase::Follow as u64, Ordering::Relaxed);
+                info!(
+                    "delta_table {}: snapshot phase completed, switching to follow mode (records: {}, version: {})",
+                    &self.endpoint_name, snapshot_record_count, version
+                );
+            } else if !self.config.snapshot() {
+                // Pure CDC follow mode (no snapshot configured)
+                self.metrics
+                    .phase
+                    .store(DeltaPhase::Follow as u64, Ordering::Relaxed);
+                info!(
+                    "delta_table {}: CDC follow started (from version: {})",
+                    &self.endpoint_name, version
+                );
+            }
+            // Note: If self.config.snapshot() && !snapshot_incomplete, we're resuming from a checkpoint
+            // where the snapshot was already completed, so no special log needed
+
+            // If we haven't previously read a snapshot of the table, report initial frontier.
+            // This makes sure that even if the current version of the table is the final version,
+            // we will report the frontier.
+            if !self.config.snapshot() {
+                self.queue.push_with_aux(
+                    (None, Vec::new()),
+                    Utc::now(),
+                    QueueEntry::ResumeInfo(Some(DeltaResumeInfo::follow_mode(version, false))),
+                );
+            }
+
             loop {
                 wait_running(&mut receiver).await;
-                match table.log_store().peek_next_commit(version).await {
-                    Ok(PeekCommit::UpToDate) => sleep(POLL_INTERVAL).await,
-                    Ok(PeekCommit::New(new_version, actions))
+                let new_version = version + 1;
+
+                let table_for_retry = Arc::clone(&table);
+                let entry = match self
+                    .retry(
+                        &format!(
+                            "error reading the next log entry (current table version: {version})"
+                        ),
+                        Some("delta-next-log"),
+                        move || {
+                            let table = Arc::clone(&table_for_retry);
+                            async move { table.log_store().read_commit_entry(new_version).await }
+                        },
+                    )
+                    .await
+                {
+                    Ok(entry) => entry,
+                    Err(_) => break,
+                };
+
+                match entry {
+                    None => sleep(POLL_INTERVAL).await,
+                    Some(bytes)
                         if self.config.end_version.is_none()
                             || self.config.end_version.unwrap() >= new_version =>
                     {
+                        let actions = match logstore::get_actions(new_version, &bytes) {
+                            Ok(actions) => actions,
+                            Err(e) => {
+                                self.consumer.error(
+                                    true,
+                                    anyhow!(
+                                        "error parsing log entry for table version {new_version}: {e}"
+                                    ),
+                                    None,
+                                );
+                                break;
+                            }
+                        };
+
                         version = new_version;
-                        self.process_log_entry(
-                            new_version,
-                            &actions,
-                            &table,
-                            cdc_delete_filter.clone(),
-                            input_stream.as_mut(),
-                            &mut receiver,
-                        )
-                        .await;
+                        if let Err(e) = self
+                            .process_log_entry(
+                                new_version,
+                                &actions,
+                                &table,
+                                cdc_delete_filter.clone(),
+                                input_stream.as_mut(),
+                                &mut receiver,
+                            )
+                            .await
+                        {
+                            self.consumer.error(true, e, None);
+                            break;
+                        };
+
+                        if let Some(end_version) = self.config.end_version
+                            && end_version <= new_version
+                        {
+                            info!(
+                                "delta_table {}: reached table version {} specified as 'end_version' in connector config: stopping the connector",
+                                &self.endpoint_name, end_version
+                            );
+                            self.metrics
+                                .phase
+                                .store(DeltaPhase::Completed as u64, Ordering::Relaxed);
+                            self.consumer.eoi();
+                            break;
+                        }
                     }
-                    Ok(PeekCommit::New(new_version, actions)) => {
+                    Some(_bytes) => {
                         info!(
-                            "delta_table {}: reached table version {new_version}, which is greater or equal than the 'end_version' {} specified in connector config: stopping the connector",
+                            "delta_table {}: reached table version {new_version}, which is greater than the 'end_version' {} specified in connector config: stopping the connector",
                             &self.endpoint_name,
                             self.config.end_version.unwrap()
                         );
+                        self.metrics
+                            .phase
+                            .store(DeltaPhase::Completed as u64, Ordering::Relaxed);
                         self.consumer.eoi();
+
+                        // Empty buffer to indicate eoi.
+                        self.queue.push_with_aux(
+                            (None, Vec::new()),
+                            Utc::now(),
+                            QueueEntry::ResumeInfo(Some(DeltaResumeInfo::eoi())),
+                        );
+
                         break;
-                    }
-                    Err(e) => {
-                        self.consumer.error(
-                            false,anyhow!("error reading the next log entry (current table version: {version}): {e}"));
-                        sleep(RETRY_INTERVAL).await;
                     }
                 }
             }
         } else {
+            // Snapshot-only mode: record completion timestamp and transition to Completed.
+            if self.config.snapshot() && snapshot_incomplete {
+                self.metrics
+                    .snapshot_completed_ts
+                    .store(now_unix_secs(), Ordering::Relaxed);
+            }
+            self.metrics
+                .phase
+                .store(DeltaPhase::Completed as u64, Ordering::Relaxed);
             self.consumer.eoi();
         }
     }
@@ -790,58 +1381,130 @@ impl DeltaTableInputEndpointInner {
             )
         })?;
 
-        let table_builder = DeltaTableBuilder::from_valid_uri(&url)
-            .map_err(|e| {
-                ControllerError::invalid_transport_configuration(
-                    &self.endpoint_name,
-                    &format!("invalid Delta table URL '{url}': {e}"),
-                )
-            })?
-            .with_storage_options(self.config.object_store_config.clone());
+        let delta_table: DeltaTable = {
+            let mut retry_count = 0;
+            // We don't use config.max_retries here. Do we want unlimited retries opening the table?
+            const MAX_RETRIES: u32 = 10;
 
-        let table_builder = match &self.config {
-            DeltaTableReaderConfig {
-                version: Some(_),
-                datetime: Some(_),
-                ..
-            } => {
-                return Err(ControllerError::invalid_transport_configuration(
-                    &self.endpoint_name,
-                    "at most one of 'version' and 'datetime' options can be specified",
-                ));
+            // We've seen the table builder get stuck forever in S3 authentication for some configurations
+            // (see https://github.com/delta-io/delta-rs/issues/3768). So we add a timeout and retry logic
+            // in that case.
+            //
+            // In other situations, the operation fails returning a timeout error. There is no easy way to
+            // distinguish such errors from permanent failures such as incorrect credentials, we therefore
+            // resort to checking the returned error message for the word "timeout".
+            let mut operation_timeout: Duration = Duration::from_secs(60);
+
+            loop {
+                // DeltaTableBuilder doesn't implement Clone, so we need to create a new instance every time.
+                let table_builder = DeltaTableBuilder::from_url(url.clone())
+                    .map_err(|e| {
+                        ControllerError::invalid_transport_configuration(
+                            &self.endpoint_name,
+                            &format!("invalid Delta table URL '{url}': {e}"),
+                        )
+                    })?
+                    .with_storage_options(self.config.object_store_config.clone())
+                    .with_io_runtime(IORuntime::RT(TOKIO_DEDICATED_IO.handle().clone()));
+
+                let table_builder = if let Some(DeltaResumeInfo {
+                    version: Some(version),
+                    ..
+                }) = self.last_resume_status.lock().unwrap().clone()
+                {
+                    // If we are resuming from a checkpoint, use the version specified in the checkpoint.
+                    table_builder.with_version(version)
+                } else {
+                    match &self.config {
+                        DeltaTableReaderConfig {
+                            version: Some(_),
+                            datetime: Some(_),
+                            ..
+                        } => {
+                            return Err(ControllerError::invalid_transport_configuration(
+                                &self.endpoint_name,
+                                "at most one of 'version' and 'datetime' options can be specified",
+                            ));
+                        }
+                        DeltaTableReaderConfig {
+                            version: None,
+                            datetime: None,
+                            ..
+                        } => table_builder,
+                        DeltaTableReaderConfig {
+                            version: Some(version),
+                            datetime: None,
+                            ..
+                        } => table_builder.with_version(*version),
+                        DeltaTableReaderConfig {
+                            version: None,
+                            datetime: Some(datetime),
+                            ..
+                        } => table_builder.with_datestring(datetime).map_err(|e| {
+                            ControllerError::invalid_transport_configuration(
+                                &self.endpoint_name,
+                                &format!(
+                            "invalid 'datetime' format (expected ISO-8601/RFC-3339 timestamp): {e}"
+                        ),
+                            )
+                        })?,
+                    }
+                };
+
+                match tokio::time::timeout(operation_timeout, table_builder.load()).await {
+                    Ok(Ok(table)) => break table,
+                    Ok(Err(e)) => {
+                        // Timeout errors can originate from multiple transitive dependencies. There is no easy
+                        // way to identify them in a strongly-typed fashion. Instead, we check for the "timeout"
+                        // substring in a formatter representation of the error.
+                        //
+                        // Debug-format `e` as the timeout error is often found toward the end of the error chain.
+                        let is_timeout = format!("{:?}", e).to_lowercase().contains("timeout");
+
+                        if is_timeout && retry_count < MAX_RETRIES {
+                            retry_count += 1;
+                            let backoff_ms = min(1000 * (1 << (retry_count - 1)), 10_000);
+                            warn!(
+                                "delta_table {}: error loading delta table '{}' after {retry_count} attempts (retrying in {backoff_ms} ms): {e:?}",
+                                &self.endpoint_name, &self.config.uri,
+                            );
+
+                            sleep(Duration::from_millis(backoff_ms)).await;
+                        } else {
+                            return Err(ControllerError::invalid_transport_configuration(
+                                &self.endpoint_name,
+                                &format!("error opening delta table '{}': {e:?}", &self.config.uri),
+                            ));
+                        }
+                    }
+                    Err(_timeout) => {
+                        if retry_count >= MAX_RETRIES {
+                            return Err(ControllerError::invalid_transport_configuration(
+                                &self.endpoint_name,
+                                &format!(
+                                    "timeout loading delta table '{}' after {retry_count} attempts",
+                                    &self.config.uri,
+                                ),
+                            ));
+                        } else {
+                            warn!(
+                                "delta_table {}: timeout loading delta table '{}' after {retry_count} attempts, retrying",
+                                &self.endpoint_name, &self.config.uri,
+                            );
+                            retry_count += 1;
+                            if operation_timeout < Duration::from_secs(240) {
+                                operation_timeout *= 2;
+                            }
+                        }
+                    }
+                }
             }
-            DeltaTableReaderConfig {
-                version: None,
-                datetime: None,
-                ..
-            } => table_builder,
-            DeltaTableReaderConfig {
-                version: Some(version),
-                datetime: None,
-                ..
-            } => table_builder.with_version(*version),
-            DeltaTableReaderConfig {
-                version: None,
-                datetime: Some(datetime),
-                ..
-            } => table_builder.with_datestring(datetime).map_err(|e| {
-                ControllerError::invalid_transport_configuration(
-                    &self.endpoint_name,
-                    &format!(
-                        "invalid 'datetime' format (expected ISO-8601/RFC-3339 timestamp): {e}"
-                    ),
-                )
-            })?,
         };
 
-        let delta_table = table_builder.load().await.map_err(|e| {
+        let version = delta_table.version().ok_or_else(|| {
             ControllerError::invalid_transport_configuration(
                 &self.endpoint_name,
-                &format!(
-                    "error opening delta table '{}': {e} (root cause: {})",
-                    &self.config.uri,
-                    root_cause(&e)
-                ),
+                "internal error: table version is not available",
             )
         })?;
 
@@ -849,7 +1512,9 @@ impl DeltaTableInputEndpointInner {
         // the connector will remain in the barrier state until at least one transaction is added to the log.
         if !self.config.snapshot() {
             *self.last_resume_status.lock().unwrap() =
-                Some(DeltaResumeInfo::new(delta_table.version()));
+                Some(DeltaResumeInfo::follow_mode(version, false));
+            *self.last_checkpointable_status.lock().unwrap() =
+                DeltaResumeInfo::follow_mode(version, false);
         }
 
         // Register object store with datafusion, so it will recognize individual parquet
@@ -869,9 +1534,7 @@ impl DeltaTableInputEndpointInner {
 
         info!(
             "delta_table {}: opened delta table '{}' (current table version {})",
-            &self.endpoint_name,
-            &self.config.uri,
-            delta_table.version()
+            &self.endpoint_name, &self.config.uri, version
         );
 
         // TODO: Validate that table schema matches relation schema
@@ -994,13 +1657,17 @@ impl DeltaTableInputEndpointInner {
             } else {
                 return Err(ControllerError::invalid_encoder_configuration(
                     &self.endpoint_name,
-                    &format!("internal error when compiling the 'cdc_delete_filter' expression '{delete_filter}'; {REPORT_ERROR}: unexpected logical plan {logical_plan}"),
+                    &format!(
+                        "internal error when compiling the 'cdc_delete_filter' expression '{delete_filter}'; {REPORT_ERROR}: unexpected logical plan {logical_plan}"
+                    ),
                 ));
             }
         } else {
             return Err(ControllerError::invalid_encoder_configuration(
                 &self.endpoint_name,
-                &format!("internal error when compiling the 'cdc_delete_filter' expression '{delete_filter}'; {REPORT_ERROR}: unexpected logical plan {logical_plan}"),
+                &format!(
+                    "internal error when compiling the 'cdc_delete_filter' expression '{delete_filter}'; {REPORT_ERROR}: unexpected logical plan {logical_plan}"
+                ),
             ));
         };
 
@@ -1008,7 +1675,7 @@ impl DeltaTableInputEndpointInner {
             .datafusion
             .table("snapshot")
             .await
-            .map_err(|e| {
+            .map_err(|_e| {
                 ControllerError::invalid_transport_configuration(&self.endpoint_name, &format!("internal error when compiling the 'cdc_delete_filter' expression '{delete_filter}'; {REPORT_ERROR}: table 'snapshot' not found"))
             })?
             .schema()
@@ -1091,13 +1758,18 @@ impl DeltaTableInputEndpointInner {
     }
 
     /// Execute a SQL query to load a complete or partial snapshot of the DeltaTable.
+    /// Returns the total number of records processed.
+    ///
+    /// Fails with an error if the function fails to read the snapshot after retrying
+    /// `num_retries` times.
     async fn execute_snapshot_query(
         &self,
         query: &str,
         descr: &str,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
-    ) {
+        num_retries: u32,
+    ) -> Result<usize, AnyError> {
         let descr = format!("{descr} query '{query}'");
         debug!(
             "delta_table {}: retrieving data from the Delta table snapshot using {descr}",
@@ -1111,14 +1783,46 @@ impl DeltaTableInputEndpointInner {
         let df = match self.datafusion.sql_with_options(query, options).await {
             Ok(df) => df,
             Err(e) => {
-                self.consumer
-                    .error(true, anyhow!("error compiling query '{query}': {e}"));
-                return;
+                return Err(anyhow!("error compiling query '{query}': {e}"));
             }
         };
 
-        self.execute_df(df, true, None, &descr, input_stream, receiver)
-            .await;
+        // One-shot physical-plan dump for debugging ordering / parallelism
+        // decisions. Enable with DELTA_SNAPSHOT_EXPLAIN=true. The plan is
+        // logged once per snapshot query at INFO level.
+        if matches!(
+            std::env::var("DELTA_SNAPSHOT_EXPLAIN")
+                .ok()
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("true" | "1")
+        ) {
+            match df.clone().create_physical_plan().await {
+                Ok(plan) => info!(
+                    "delta_table {}: physical plan for {descr}:\n{}",
+                    &self.endpoint_name,
+                    displayable(plan.as_ref()).indent(true)
+                ),
+                Err(e) => warn!(
+                    "delta_table {}: failed to compute physical plan for {descr}: {e}",
+                    &self.endpoint_name,
+                ),
+            }
+        }
+
+        self.execute_df(
+            df,
+            true,
+            None,
+            &descr,
+            input_stream,
+            receiver,
+            self.allocate_snapshot_transaction_label(),
+            num_retries,
+            None,
+        )
+        .await
     }
 
     /// Execute a prepared dataframe and push data from it to the circuit.
@@ -1131,6 +1835,23 @@ impl DeltaTableInputEndpointInner {
     /// * `input_stream` - handle to push updates to.
     ///
     /// * `receiver` - used to block the function until the endpoint is unpaused.
+    ///
+    /// * `transaction` - execute the dataframe as part of a transaction with the given label (is `Some`).
+    ///
+    /// * `max_retries` - the maximum number of retries to attempt if the function fails to read the log entry.
+    ///
+    /// Returns the total number of records processed.
+    ///
+    /// Returns an error if the function fails to read the log entry after performing the configured
+    /// number of retries. Note that errors parsing table records are not reported here; they are
+    /// reported by calling `consumer.error`.
+    ///
+    /// On error, the function commits the current transaction if any. It is possible that some of the
+    /// records have been processed and pushed to the circuit before the error.
+    ///
+    /// If `max_retries` is >0, the function can push duplicate inputs to the circuit as part of the
+    /// retry loop.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_df(
         &self,
         dataframe: DataFrame,
@@ -1139,82 +1860,173 @@ impl DeltaTableInputEndpointInner {
         descr: &str,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
-    ) {
+        transaction: Option<Option<String>>,
+        max_retries: u32,
+        current_table_version: Option<i64>,
+    ) -> Result<usize, AnyError> {
+        let mut retry_count = 0;
+        loop {
+            match self
+                .execute_df_inner(
+                    dataframe.clone(),
+                    polarity,
+                    cdc_delete_filter.clone(),
+                    input_stream,
+                    receiver,
+                    &transaction,
+                )
+                .await
+            {
+                Ok(total_records) => {
+                    self.consumer
+                        .update_connector_health(ConnectorHealth::healthy());
+                    return Ok(total_records);
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count - 1 == max_retries {
+                        let message = format!(
+                            "error retrieving {descr} after {retry_count} attempts{}: {e}",
+                            if let Some(version) = current_table_version {
+                                format!(" (current table version: {version})")
+                            } else {
+                                String::new()
+                            }
+                        );
+                        self.consumer
+                            .update_connector_health(ConnectorHealth::unhealthy(&message));
+                        return Err(anyhow!(message));
+                    }
+                    let backoff_delay = calculate_backoff_delay(retry_count - 1);
+
+                    let message = format!(
+                        "error retrieving {descr} after {retry_count} attempts{}: {e}; retrying in {backoff_delay:?}",
+                        if let Some(version) = current_table_version {
+                            format!(" (current table version: {version})")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    self.consumer
+                        .update_connector_health(ConnectorHealth::unhealthy(&message));
+                    warn!("delta_table {}: {message}", &self.endpoint_name);
+                    sleep(backoff_delay).await;
+                }
+            }
+        }
+    }
+
+    // A single attempt of the `execute_df` retry loop.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_df_inner(
+        &self,
+        dataframe: DataFrame,
+        polarity: bool,
+        cdc_delete_filter: Option<Arc<dyn PhysicalExpr>>,
+        input_stream: &mut dyn ArrowStream,
+        receiver: &mut Receiver<PipelineState>,
+        transaction: &Option<Option<String>>,
+    ) -> Result<usize, String> {
         wait_running(receiver).await;
+        let transaction = transaction.clone();
 
         // Limit the number of connectors simultaneously reading from Delta Lake.
-        let token = DELTA_READER_SEMAPHORE.acquire().await.unwrap();
+        let _token = DELTA_READER_SEMAPHORE.acquire().await.unwrap();
 
         let mut stream = match dataframe.execute_stream().await {
             Err(e) => {
-                self.consumer
-                    .error(true, anyhow!("error retrieving {descr}: {e}"));
-                return;
+                return Err(format!("{e:?}"));
             }
             Ok(stream) => stream,
         };
 
+        // We declare the connector healthy at this point.
+        self.consumer
+            .update_connector_health(ConnectorHealth::healthy());
+
         let mut num_batches = 0;
+        let mut total_records = 0usize;
 
         let queue = self.queue.clone();
 
         let num_parsers = self.config.num_parsers as usize;
 
         // Create a job queue to efficiently parse record batches retrieved by the query.
-        let job_queue =
-            JobQueue::<RecordBatch, (Option<Box<dyn InputBuffer>>, Vec<ParseError>, usize)>::new(
-                num_parsers,
-                move || {
-                    let cdc_delete_filter: Option<Arc<dyn PhysicalExpr>> =
-                        cdc_delete_filter.clone();
-                    let input_stream = input_stream.fork();
+        let job_queue = JobQueue::<
+            (RecordBatch, DateTime<Utc>),
+            (Option<StagedInputBuffer>, Vec<ParseError>, DateTime<Utc>),
+        >::new(
+            num_parsers,
+            move || {
+                let cdc_delete_filter: Option<Arc<dyn PhysicalExpr>> = cdc_delete_filter.clone();
+                let input_stream = input_stream.fork();
 
-                    Box::new(move |batch| {
-                        Box::pin({
-                            let cdc_delete_filter: Option<Arc<dyn PhysicalExpr>> =
-                                cdc_delete_filter.clone();
-                            let mut input_stream = input_stream.fork();
+                Box::new(move |(batch, timestamp)| {
+                    Box::pin({
+                        let cdc_delete_filter: Option<Arc<dyn PhysicalExpr>> =
+                            cdc_delete_filter.clone();
+                        let mut input_stream = input_stream.fork();
 
-                            async move {
-                                Self::parse_record_batch(
-                                    batch,
-                                    polarity,
-                                    &cdc_delete_filter,
-                                    input_stream.as_mut(),
-                                )
-                                .await
-                            }
-                        })
+                        async move {
+                            let (parsed_buffer, errors) = Self::parse_record_batch(
+                                batch,
+                                polarity,
+                                &cdc_delete_filter,
+                                input_stream.as_mut(),
+                            )
+                            .await;
+                            let staged_buffer = parsed_buffer.map(|buffer| {
+                                let len = buffer.len();
+                                StagedInputBuffer::new(input_stream.stage(vec![buffer]), len)
+                            });
+                            (staged_buffer, errors, timestamp)
+                        }
                     })
-                },
-                move |(buffer, errors, bytes)| queue.push_with_aux((buffer, errors), bytes, None),
-            );
+                })
+            },
+            move |(buffer, errors, timestamp)| {
+                queue.push_entry(
+                    InputQueueEntry::new_with_aux(timestamp, QueueEntry::ResumeInfo(None))
+                        .with_buffer(buffer)
+                        .with_start_transaction(transaction.clone()),
+                    errors,
+                )
+            },
+        );
+
+        // Use the timestamp when we start retrieving the next batch as the ingestion timestamp.
+        let mut timestamp = Utc::now();
 
         while let Some(batch) = stream.next().await {
             wait_running(receiver).await;
             let batch = match batch {
                 Ok(batch) => batch,
                 Err(e) => {
-                    match e {
-                        DataFusionError::ArrowError(ArrowError::ExternalError(error), _) => self.consumer.error(
-                            false,
-                            anyhow!("error retrieving batch {num_batches} of {descr}: external error: {error} (root cause: {})", root_cause(error.as_ref()),
-                        )),
-                        e => self.consumer.error(
-                            false,
-                            anyhow!("error retrieving batch {num_batches} of {descr}: {e}"),
-                        ),
-                    }
+                    drop(job_queue);
+                    // We don't have a way to rollback the transaction at this point. The best
+                    // we can do is commit the transaction so it doesn't block the pipeline.
+                    // This means that the connector will generate duplicate inputs on a retry.
+                    self.queue.push_entry(
+                        InputQueueEntry::new_with_aux(timestamp, QueueEntry::Rollback)
+                            // If we started a transaction while processing the log entry, commit it now.
+                            .with_commit_transaction(true),
+                        Vec::new(),
+                    );
 
-                    continue;
+                    return Err(format!("error retrieving batch {num_batches}: {e:?}"));
                 }
             };
             // info!("schema: {}", batch.schema());
             num_batches += 1;
-            job_queue.push_job(batch).await;
+            total_records += batch.num_rows();
+
+            // Use the timestamp when the batch was retrieved as the ingestion timestamp.
+            job_queue.push_job((batch, timestamp)).await;
+            timestamp = Utc::now();
         }
 
-        job_queue.flush().await
+        job_queue.flush().await;
+        Ok(total_records)
     }
 
     async fn parse_record_batch(
@@ -1222,8 +2034,7 @@ impl DeltaTableInputEndpointInner {
         polarity: bool,
         cdc_delete_filter: &Option<Arc<dyn PhysicalExpr>>,
         input_stream: &mut dyn ArrowStream,
-    ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>, usize) {
-        let bytes = batch.get_array_memory_size();
+    ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
         let result = if polarity {
             if let Some(delete_filter_expr) = cdc_delete_filter {
                 let polarities =
@@ -1233,7 +2044,6 @@ impl DeltaTableInputEndpointInner {
                             return (
                                 None,
                                 vec![ParseError::bin_envelope_error(e.to_string(), &[], None)],
-                                bytes,
                             );
                         }
                     };
@@ -1242,12 +2052,12 @@ impl DeltaTableInputEndpointInner {
                 //     polarities.len(),
                 //     polarities.iter().filter(|x| **x == true).count()
                 // );
-                input_stream.insert_with_polarities(&batch, &polarities)
+                input_stream.insert_with_polarities(&batch, &polarities, &None)
             } else {
-                input_stream.insert(&batch)
+                input_stream.insert(&batch, &None)
             }
         } else {
-            input_stream.delete(&batch)
+            input_stream.delete(&batch, &None)
         };
         let errors = result.map_or_else(
             |e| {
@@ -1260,12 +2070,22 @@ impl DeltaTableInputEndpointInner {
             |()| Vec::new(),
         );
 
-        (input_stream.take_all(), errors, bytes)
+        (input_stream.take_all(), errors)
     }
 
     /// Apply actions from a transaction log entry.
     ///
     /// Only `Add` and `Remove` actions are picked up.
+    ///
+    /// Returns an error if the connector failed to read the log entry after performing the `self.config.max_retries`
+    /// number of retries. Note that errors parsing table records are not reported here; they are
+    /// reported in the `execute_df` method by calling `consumer.error`.
+    ///
+    /// On error, the function commits the current transaction if any. It is possible that some of the
+    /// records have been processed and pushed to the circuit before the error.
+    ///
+    /// If `self.config.max_retries` is >0, the function can push duplicate inputs to the circuit as part of the
+    /// retry loop.
     async fn process_log_entry(
         &self,
         new_version: i64,
@@ -1274,36 +2094,104 @@ impl DeltaTableInputEndpointInner {
         cdc_delete_filter: Option<Arc<dyn PhysicalExpr>>,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
-    ) {
+    ) -> AnyResult<()> {
+        if self.config.verbose > 0 {
+            // Don't log actions we ignore to limit spurious logging. E.g., delta lake
+            // optimization passes can generate thousand of noop actions.
+            let data_change_actions = actions
+                .iter()
+                .filter(|action| match action {
+                    Action::Add(add) if add.data_change => true,
+                    Action::Remove(remove) if remove.data_change => true,
+                    _ => false,
+                })
+                .collect::<Vec<_>>();
+            info!(
+                "delta_table {}: log entry for table version {new_version}: {data_change_actions:?}{}",
+                &self.endpoint_name,
+                if actions.len() > data_change_actions.len() {
+                    format!(
+                        " ({} other actions)",
+                        actions.len() - data_change_actions.len()
+                    )
+                } else {
+                    "".to_string()
+                }
+            );
+        }
+
+        // Use the time when we _started_ reading transaction data as the ingestion timestamp.
+        let timestamp = Utc::now();
+
         if self.config.is_cdc() {
             self.process_cdc_transaction(actions, table, cdc_delete_filter, input_stream, receiver)
-                .await;
+                .await?;
         } else {
             let column_names = self.used_column_list(table);
+
+            let start_transaction = self.allocate_follow_transaction_label();
 
             // TODO: consider processing all Add actions and all Remove actions in one
             // go using `ListingTable`, which understands partitioning and can probably
             // parallelize the load.
+
+            // Process deletes before inserts. Semantically, delete actions in
+            // are applied before insert actions; however the delta standard doesn't
+            // guarantee that actions occur in any particular order in the transaction log
+            // entry.
             for action in actions {
-                self.process_action(action, table, &column_names, input_stream, receiver)
-                    .await;
+                if matches!(action, Action::Remove(_)) {
+                    self.process_action(
+                        action,
+                        table,
+                        &column_names,
+                        input_stream,
+                        receiver,
+                        start_transaction.clone(),
+                    )
+                    .await?;
+                }
+            }
+
+            for action in actions {
+                if matches!(action, Action::Add(_)) {
+                    self.process_action(
+                        action,
+                        table,
+                        &column_names,
+                        input_stream,
+                        receiver,
+                        start_transaction.clone(),
+                    )
+                    .await?;
+                }
             }
         }
 
         // Empty buffer to indicate checkpointable state.
-        self.queue.push_with_aux(
-            (None, Vec::new()),
-            0,
-            Some(DeltaResumeInfo::new(new_version)),
+        self.queue.push_entry(
+            InputQueueEntry::new_with_aux(
+                timestamp,
+                QueueEntry::ResumeInfo(Some(DeltaResumeInfo::follow_mode(
+                    new_version,
+                    self.config.end_version == Some(new_version),
+                ))),
+            )
+            // If we started a transaction while processing the log entry, commit it now.
+            .with_commit_transaction(true),
+            Vec::new(),
         );
+
+        Ok(())
     }
 
     /// Process a DeltaLake transaction in CDC mode:
     ///
-    /// * Ignore delete actions (the assumption is that CDC tables are append-only,
-    ///   where only old records are deleted as part of the table maintenance)
-    /// * Order all rows from all insert actions by `cdc_order_by`, compute the
-    ///   polarity of each row using `cdc_delete_filter` and insert the row with
+    /// * Subtract rows in Remove actions from rows in Add actions, so that
+    ///   file rewrites that change no logical data (no-op UPDATE, MERGE,
+    ///   etc.) don't re-emit unchanged rows as duplicate inserts.
+    /// * Order the surviving rows by `cdc_order_by`, compute the polarity of
+    ///   each row using `cdc_delete_filter` and insert the row with
     ///   appropriate polarity.
     async fn process_cdc_transaction(
         &self,
@@ -1312,18 +2200,17 @@ impl DeltaTableInputEndpointInner {
         cdc_delete_filter: Option<Arc<dyn PhysicalExpr>>,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
-    ) {
+    ) -> AnyResult<()> {
         let result = self
             .do_process_cdc_transaction(actions, table, cdc_delete_filter, input_stream, receiver)
             .await;
 
-        // Deregister the table registered by `do_process_cdc_transaction`.
-        // If the table does not exist, there's no harm.
-        let _ = self.datafusion.deregister_table("tmp_table");
+        // Deregister the tables registered by `do_process_cdc_transaction`.
+        // If a table does not exist, there's no harm.
+        let _ = self.datafusion.deregister_table("cdc_adds");
+        let _ = self.datafusion.deregister_table("cdc_removes");
 
-        if let Err(e) = result {
-            self.consumer.error(false, e);
-        }
+        result
     }
 
     async fn do_process_cdc_transaction(
@@ -1334,60 +2221,113 @@ impl DeltaTableInputEndpointInner {
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
     ) -> AnyResult<()> {
-        // List all files that occur in Add actions.
-        let files = actions
+        // Collect Add and Remove file paths separately. The query below
+        // subtracts Removes from Adds via `EXCEPT ALL` to cancel rewrites
+        // that don't change logical data.
+        let url = table.log_store().object_store_url();
+        let path_of = |p: &str| format!("{}{}", url.as_str(), p);
+        let adds: Vec<String> = actions
             .iter()
-            .flat_map(|action| match action {
-                Action::Add(add) if add.data_change => Some(format!(
-                    "{}{}",
-                    table.log_store().object_store_url().as_str(),
-                    add.path
-                )),
+            .filter_map(|a| match a {
+                Action::Add(x) if x.data_change => Some(path_of(&x.path)),
                 _ => None,
             })
-            .collect::<Vec<_>>();
+            .collect();
+        let removes: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Remove(x) if x.data_change => Some(path_of(&x.path)),
+                _ => None,
+            })
+            .collect();
+
+        // No Adds means no new rows to ingest (e.g. OPTIMIZE with
+        // `data_change=false` on every action), so there is nothing to do.
+        if adds.is_empty() {
+            return Ok(());
+        }
 
         let description = format!(
-            "CDC transaction consisting of {} files {:?}",
-            files.len(),
-            &files
+            "CDC transaction with {} adds {:?} and {} removes {:?}",
+            adds.len(),
+            &adds,
+            removes.len(),
+            &removes,
         );
 
-        // Create a datafusion table backed by these files.
-        let table = Arc::new(
-            self.create_parquet_table(table, files, &description)
-                .await?,
-        );
-
-        self.datafusion.register_table("tmp_table", table).map_err(|e| {
-            anyhow!("internal error processing {description}; {REPORT_ERROR}; error registering Parquet table: {e}")
+        // `self.datafusion` is a per-endpoint `SessionContext` and
+        // `process_cdc_transaction` is invoked serially from the single
+        // dedicated `worker_task` loop, so the fixed table names
+        // `cdc_adds`/`cdc_removes` cannot collide across calls.
+        let adds_table = Arc::new(self.create_parquet_table(table, adds, &description).await?);
+        self.datafusion.register_table("cdc_adds", adds_table).map_err(|e| {
+            anyhow!("internal error processing {description}; {REPORT_ERROR}; error registering 'cdc_adds' table: {e}")
         })?;
 
+        // `EXCEPT ALL` (multiset difference) cancels each Remove row against
+        // exactly one matching Add row; plain `EXCEPT` would collapse
+        // duplicates and under-count legitimately repeated inserts.
+        //
+        // The optional `filter` is pushed into both sides of the set
+        // difference so each Remove only has to cancel against rows that
+        // would have been ingested anyway. This also shrinks the inputs to
+        // `EXCEPT ALL`, which sorts both relations.
+        //
+        // Caveat: `EXCEPT ALL` relies on `arrow_row::RowConverter`,
+        // which in the currently pinned `arrow-row` does not support
+        // `Map` columns.
+        // Pure-append transactions on tables with `Map` columns are unaffected
+        // (the `EXCEPT ALL` branch isn't taken when `removes` is empty);
+        // transactions that do produce Removes fail here with `NotImplemented`.
+        // see issue:
+        //   - https://github.com/apache/datafusion/issues/15428
+        //   - https://github.com/apache/arrow-rs/issues/7879
         let where_clause = if let Some(filter) = &self.config.filter {
-            format!("where {filter}")
+            format!("WHERE {filter}")
         } else {
             "".to_string()
         };
 
-        // Order the table by the `cdc_order_by` expression.
+        let from_clause = if removes.is_empty() {
+            format!("cdc_adds {where_clause}")
+        } else {
+            let removes_table = Arc::new(
+                self.create_parquet_table(table, removes, &description)
+                    .await?,
+            );
+            self.datafusion.register_table("cdc_removes", removes_table).map_err(|e| {
+                anyhow!("internal error processing {description}; {REPORT_ERROR}; error registering 'cdc_removes' table: {e}")
+            })?;
+            format!(
+                "(SELECT * FROM cdc_adds {where_clause} \
+                  EXCEPT ALL \
+                  SELECT * FROM cdc_removes {where_clause})"
+            )
+        };
+
+        // Order the resulting relation by the `cdc_order_by` expression.
         // TODO: We don't use `used_column_list` here, as the resulting dataframe will have a different
         // schema than the original table, and the `cdc_delete_filter` physical expression won't be valid for it.
         let order_by = self.config.cdc_order_by.as_ref().unwrap();
-        let query = format!("SELECT * FROM tmp_table {where_clause} ORDER BY {order_by}");
+        let query = format!("SELECT * FROM {from_clause} ORDER BY {order_by}");
 
         let df = self.datafusion.sql(&query).await.map_err(|e| {
-            anyhow!("invalid 'cdc_order_by' or 'filter' expression: 'cdc_order_by' and 'filter' (when specified) must be valid SQL expressions that can be used in a 'SELECT * FROM <table> WHERE <filter> ORDER BY <cdc_order_by>' query, but the following error was encountered when compiling '{query}': {e}")
+            anyhow!("failed to compile the CDC query '{query}': {e}. This typically indicates one of: (1) `cdc_order_by` or `filter` is not a valid SQL expression for a query of the form `SELECT * FROM <table> WHERE <filter> ORDER BY <cdc_order_by>`; or (2) the Delta table contains a `Map` column, which the CDC deduplication step (`EXCEPT ALL`) does not yet support.")
         })?;
 
-        self.execute_df(
-            df,
-            true,
-            cdc_delete_filter,
-            &description,
-            input_stream,
-            receiver,
-        )
-        .await;
+        let _record_count = self
+            .execute_df(
+                df,
+                true,
+                cdc_delete_filter,
+                &description,
+                input_stream,
+                receiver,
+                self.allocate_follow_transaction_label(),
+                self.config.max_retries(),
+                table.version(),
+            )
+            .await?;
 
         Ok(())
     }
@@ -1399,15 +2339,7 @@ impl DeltaTableInputEndpointInner {
         files: Vec<String>,
         description: &str,
     ) -> AnyResult<ListingTable> {
-        let Some(schema) = table.schema() else {
-            // At this point the table should have a schema, as it's definitely not empty.
-            return Err(anyhow!("internal error processing {description}; {REPORT_ERROR}: Delta table has not schema"));
-        };
-
-        let schema: Schema = schema.try_into().map_err(|e| anyhow!("internal error processing {description}; {REPORT_ERROR}; error converting Delta schema {schema:?} to arrow schema: {e}"))?;
-
-        let listing_options =
-            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let schema = table.schema();
 
         let mut urls = Vec::with_capacity(files.len());
         for file in files.iter() {
@@ -1418,8 +2350,8 @@ impl DeltaTableInputEndpointInner {
             .with_file_extension_opt(Some(".parquet"));
 
         let table_config = ListingTableConfig::new_with_multi_paths(urls)
-            .with_schema(Arc::new(schema))
-            .with_listing_options(listing_options);
+            .with_listing_options(listing_options)
+            .with_schema(schema);
 
         ListingTable::try_new(table_config).map_err(|e| {
             anyhow!("internal error processing {description}; {REPORT_ERROR}; error creating Parquet table: {e}")
@@ -1433,11 +2365,20 @@ impl DeltaTableInputEndpointInner {
         column_names: &str,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
-    ) {
+        start_transaction: Option<Option<String>>,
+    ) -> AnyResult<()> {
         let result = match action {
             Action::Add(add) if add.data_change => {
-                self.add_with_polarity(&add.path, true, table, column_names, input_stream, receiver)
-                    .await
+                self.add_with_polarity(
+                    &add.path,
+                    true,
+                    table,
+                    column_names,
+                    input_stream,
+                    receiver,
+                    start_transaction,
+                )
+                .await
             }
             Action::Remove(remove)
                 if remove.data_change && self.config.cdc_delete_filter.is_none() =>
@@ -1449,25 +2390,25 @@ impl DeltaTableInputEndpointInner {
                     column_names,
                     input_stream,
                     receiver,
+                    start_transaction,
                 )
                 .await
             }
-            _ => return,
+            _ => return Ok(()),
         };
 
         // Deregister the table registered by `add_with_polarity`.
         // If the table does not exist, there's no harm.
         let _ = self.datafusion.deregister_table("tmp_table");
 
-        if let Err(e) = result {
-            self.consumer.error(false, e);
-        }
+        result
     }
 
     // TODO: here, as well as in `process_cdc_transaction`, we can get some potential speedup by only reading a subset
     // of columns that occurs in the SQL declaration, similar to how we already do when reading the snapshot.  However,
     // this requires some extra care, since different transactions in the log can have different schemas. The implementation
     // should therefore monitor for schema changes and update the set of relevant columns appropriately.
+    #[allow(clippy::too_many_arguments)]
     async fn add_with_polarity(
         &self,
         path: &str,
@@ -1476,6 +2417,7 @@ impl DeltaTableInputEndpointInner {
         column_names: &str,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
+        start_transaction: Option<Option<String>>,
     ) -> AnyResult<()> {
         let description = format!("file '{path}'");
 
@@ -1483,12 +2425,12 @@ impl DeltaTableInputEndpointInner {
         let full_path = format!("{}{}", table.log_store().object_store_url().as_str(), path);
 
         // Create a datafusion table backed by these files.
-        let table = Arc::new(
+        let parquet_table = Arc::new(
             self.create_parquet_table(table, vec![full_path.clone()], &description)
                 .await?,
         );
 
-        self.datafusion.register_table("tmp_table", table).map_err(|e| {
+        self.datafusion.register_table("tmp_table", parquet_table).map_err(|e| {
             anyhow!("internal error processing file {full_path}; {REPORT_ERROR}; error registering Parquet table: {e}")
         })?;
 
@@ -1504,8 +2446,19 @@ impl DeltaTableInputEndpointInner {
             })?
         };
 
-        self.execute_df(df, polarity, None, &description, input_stream, receiver)
-            .await;
+        let _record_count = self
+            .execute_df(
+                df,
+                polarity,
+                None,
+                &description,
+                input_stream,
+                receiver,
+                start_transaction,
+                self.config.max_retries(),
+                table.version(),
+            )
+            .await?;
 
         Ok(())
     }

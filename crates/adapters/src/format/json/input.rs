@@ -4,18 +4,21 @@ use super::{DebeziumUpdate, InsDelUpdate, WeightedUpdate};
 use crate::catalog::InputCollectionHandle;
 use crate::format::{InputBuffer, LineSplitter};
 use crate::{
+    ControllerError,
     catalog::{DeCollectionStream, RecordFormat},
     format::{InputFormat, ParseError, Parser},
-    ControllerError,
 };
 use actix_web::HttpRequest;
+use dbsp::operator::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
+use feldera_adapterlib::ConnectorMetadata;
 use feldera_adapterlib::format::Splitter;
+use feldera_sqllib::Variant;
 use feldera_types::format::json::{JsonLines, JsonParserConfig, JsonUpdateFormat};
 use serde::Deserialize;
+use serde_json::json;
 use serde_json::value::RawValue;
 use serde_urlencoded::Deserializer as UrlDeserializer;
-use serde_yaml::Value as YamlValue;
 use std::borrow::Cow;
 
 /// JSON format parser.
@@ -26,7 +29,11 @@ trait UpdateFormat {
     fn array_error() -> &'static str;
     fn example() -> Option<&'static str>;
     fn array_example() -> Option<&'static str>;
-    fn apply(self, parser: &mut JsonParser) -> Result<usize, ParseError>;
+    fn apply(
+        self,
+        parser: &mut JsonParser,
+        metadata: &Option<Variant>,
+    ) -> Result<usize, ParseError>;
 }
 
 impl UpdateFormat for InsDelUpdate<&'_ RawValue> {
@@ -46,21 +53,25 @@ impl UpdateFormat for InsDelUpdate<&'_ RawValue> {
         Some("Example valid JSON: '[{{\"insert\": {{...}} }}, {{\"delete\": {{...}} }}]'")
     }
 
-    fn apply(self, parser: &mut JsonParser) -> Result<usize, ParseError> {
+    fn apply(
+        self,
+        parser: &mut JsonParser,
+        metadata: &Option<Variant>,
+    ) -> Result<usize, ParseError> {
         let mut updates = 0;
 
         if let Some(val) = self.delete {
-            parser.delete(val)?;
+            parser.delete(val, metadata)?;
             updates += 1;
         }
 
         if let Some(val) = self.insert {
-            parser.insert(val)?;
+            parser.insert(val, metadata)?;
             updates += 1;
         }
 
         if let Some(val) = self.update {
-            parser.update(val)?;
+            parser.update(val, metadata)?;
             updates += 1;
         }
 
@@ -78,14 +89,22 @@ impl UpdateFormat for DebeziumUpdate<&'_ RawValue> {
     }
 
     fn example() -> Option<&'static str> {
-        Some("Example valid JSON: '{{\"payload\": {{\"op\": \"u\", \"before\": {{...}}, \"after\": {{...}} }} }}'")
+        Some(
+            "Example valid JSON: '{{\"payload\": {{\"op\": \"u\", \"before\": {{...}}, \"after\": {{...}} }} }}'",
+        )
     }
 
     fn array_example() -> Option<&'static str> {
-        Some("Example valid JSON: '[{{\"payload\": {{\"op\": \"u\", \"before\": {{...}}, \"after\": {{...}} }} }}]'")
+        Some(
+            "Example valid JSON: '[{{\"payload\": {{\"op\": \"u\", \"before\": {{...}}, \"after\": {{...}} }} }}]'",
+        )
     }
 
-    fn apply(self, parser: &mut JsonParser) -> Result<usize, ParseError> {
+    fn apply(
+        self,
+        parser: &mut JsonParser,
+        metadata: &Option<Variant>,
+    ) -> Result<usize, ParseError> {
         // TODO: validate table name.
         // We currently allow a JSON connector to feed data to a single table.
         // The name of the table may or may not match table name in the CDC
@@ -109,12 +128,12 @@ impl UpdateFormat for DebeziumUpdate<&'_ RawValue> {
         let mut updates = 0;
 
         if let Some(before) = &self.payload.before {
-            parser.delete(before)?;
+            parser.delete(before, metadata)?;
             updates += 1;
         };
 
         if let Some(after) = &self.payload.after {
-            parser.insert(after)?;
+            parser.insert(after, metadata)?;
             updates += 1;
         };
 
@@ -136,10 +155,16 @@ impl UpdateFormat for WeightedUpdate<&'_ RawValue> {
     }
 
     fn array_example() -> Option<&'static str> {
-        Some("Example valid JSON: '[{{\"weight\": 1, \"data\": {{...}} }}, {{\"weight\": -1, \"data\": {{...}} }}]'")
+        Some(
+            "Example valid JSON: '[{{\"weight\": 1, \"data\": {{...}} }}, {{\"weight\": -1, \"data\": {{...}} }}]'",
+        )
     }
 
-    fn apply(self, _parser: &mut JsonParser) -> Result<usize, ParseError> {
+    fn apply(
+        self,
+        _parser: &mut JsonParser,
+        _metadata: &Option<Variant>,
+    ) -> Result<usize, ParseError> {
         todo!()
     }
 }
@@ -161,8 +186,12 @@ impl UpdateFormat for &'_ RawValue {
         None
     }
 
-    fn apply(self, parser: &mut JsonParser) -> Result<usize, ParseError> {
-        parser.insert(self)?;
+    fn apply(
+        self,
+        parser: &mut JsonParser,
+        metadata: &Option<Variant>,
+    ) -> Result<usize, ParseError> {
+        parser.insert(self, metadata)?;
         Ok(1)
     }
 }
@@ -176,14 +205,11 @@ impl InputFormat for JsonInputFormat {
         &self,
         endpoint_name: &str,
         input_handle: &InputCollectionHandle,
-        config: &YamlValue,
+        config: &serde_json::Value,
     ) -> Result<Box<dyn Parser>, ControllerError> {
+        let config = if config.is_null() { &json!({}) } else { config };
         let config = JsonParserConfig::deserialize(config).map_err(|e| {
-            ControllerError::parser_config_parse_error(
-                endpoint_name,
-                &e,
-                &serde_yaml::to_string(config).unwrap_or_default(),
-            )
+            ControllerError::parser_config_parse_error(endpoint_name, &e, &config.to_string())
         })?;
         validate_parser_config(&config, endpoint_name)?;
         let input_stream = input_handle
@@ -245,44 +271,54 @@ impl JsonParser {
         }
     }
 
-    fn delete(&mut self, val: &RawValue) -> Result<(), ParseError> {
-        self.input_stream.delete(val.get().as_bytes()).map_err(|e| {
-            ParseError::text_event_error(
-                "failed to deserialize JSON record",
-                e,
-                self.last_event_number + 1,
-                Some(val.get()),
-                None,
-            )
-        })
+    fn delete(&mut self, val: &RawValue, metadata: &Option<Variant>) -> Result<(), ParseError> {
+        self.input_stream
+            .delete(val.get().as_bytes(), metadata)
+            .map_err(|e| {
+                ParseError::text_event_error(
+                    "failed to deserialize JSON record",
+                    e,
+                    self.last_event_number + 1,
+                    Some(val.get()),
+                    None,
+                )
+            })
     }
 
-    fn insert(&mut self, val: &RawValue) -> Result<(), ParseError> {
-        self.input_stream.insert(val.get().as_bytes()).map_err(|e| {
-            ParseError::text_event_error(
-                "failed to deserialize JSON record",
-                e,
-                self.last_event_number + 1,
-                Some(val.get()),
-                None,
-            )
-        })
+    fn insert(&mut self, val: &RawValue, metadata: &Option<Variant>) -> Result<(), ParseError> {
+        self.input_stream
+            .insert(val.get().as_bytes(), metadata)
+            .map_err(|e| {
+                ParseError::text_event_error(
+                    "failed to deserialize JSON record",
+                    e,
+                    self.last_event_number + 1,
+                    Some(val.get()),
+                    None,
+                )
+            })
     }
 
-    fn update(&mut self, val: &RawValue) -> Result<(), ParseError> {
-        self.input_stream.update(val.get().as_bytes()).map_err(|e| {
-            ParseError::text_event_error(
-                "failed to deserialize JSON record",
-                e,
-                self.last_event_number + 1,
-                Some(val.get()),
-                None,
-            )
-        })
+    fn update(&mut self, val: &RawValue, metadata: &Option<Variant>) -> Result<(), ParseError> {
+        self.input_stream
+            .update(val.get().as_bytes(), metadata)
+            .map_err(|e| {
+                ParseError::text_event_error(
+                    "failed to deserialize JSON record",
+                    e,
+                    self.last_event_number + 1,
+                    Some(val.get()),
+                    None,
+                )
+            })
     }
 
-    fn apply_update<'de, F>(&mut self, update: &'de RawValue, errors: &mut Vec<ParseError>)
-    where
+    fn apply_update<'de, F>(
+        &mut self,
+        update: &'de RawValue,
+        metadata: &Option<Variant>,
+        errors: &mut Vec<ParseError>,
+    ) where
         F: UpdateFormat + Deserialize<'de>,
     {
         if self.config.array {
@@ -296,16 +332,16 @@ impl JsonParser {
                 }
                 Ok(updates) => {
                     let mut error = false;
-                    let old_len = self.input_stream.len();
+                    let old_n_records = self.input_stream.len().records;
                     for update in updates {
-                        if let Err(e) = update.apply(self) {
+                        if let Err(e) = update.apply(self, metadata) {
                             error = true;
                             errors.push(e);
                         }
                         self.last_event_number += 1;
                     }
                     if error {
-                        self.input_stream.truncate(old_len);
+                        self.input_stream.truncate(old_n_records);
                     }
                 }
             };
@@ -321,7 +357,7 @@ impl JsonParser {
                     ));
                 }
                 Ok(update) => {
-                    if let Err(e) = update.apply(self) {
+                    if let Err(e) = update.apply(self, metadata) {
                         errors.push(e);
                     }
                 }
@@ -332,7 +368,13 @@ impl JsonParser {
 }
 
 impl Parser for JsonParser {
-    fn parse(&mut self, data: &[u8]) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
+    fn parse(
+        &mut self,
+        data: &[u8],
+        metadata: Option<ConnectorMetadata>,
+    ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
+        let metadata = metadata.map(Variant::from);
+
         let mut errors = Vec::new();
 
         let mut stream = serde_json::Deserializer::from_slice(data).into_iter::<&RawValue>();
@@ -353,15 +395,17 @@ impl Parser for JsonParser {
 
             match self.config.update_format {
                 JsonUpdateFormat::InsertDelete => {
-                    self.apply_update::<InsDelUpdate<_>>(update, &mut errors)
+                    self.apply_update::<InsDelUpdate<_>>(update, &metadata, &mut errors)
                 }
                 JsonUpdateFormat::Debezium => {
-                    self.apply_update::<DebeziumUpdate<_>>(update, &mut errors)
+                    self.apply_update::<DebeziumUpdate<_>>(update, &metadata, &mut errors)
                 }
                 JsonUpdateFormat::Weighted => {
-                    self.apply_update::<WeightedUpdate<_>>(update, &mut errors)
+                    self.apply_update::<WeightedUpdate<_>>(update, &metadata, &mut errors)
                 }
-                JsonUpdateFormat::Raw => self.apply_update::<&RawValue>(update, &mut errors),
+                JsonUpdateFormat::Raw => {
+                    self.apply_update::<&RawValue>(update, &metadata, &mut errors)
+                }
                 JsonUpdateFormat::Redis | JsonUpdateFormat::Snowflake => {
                     panic!("Unexpected update format: {:?}", &self.config.update_format)
                 }
@@ -369,6 +413,10 @@ impl Parser for JsonParser {
         }
 
         (self.input_stream.take_all(), errors)
+    }
+
+    fn stage(&self, buffers: Vec<Box<dyn InputBuffer>>) -> Box<dyn StagedBuffers> {
+        self.input_stream.stage(buffers)
     }
 
     fn fork(&self) -> Box<dyn Parser> {
@@ -501,19 +549,22 @@ impl JsonSplitter {
 #[cfg(test)]
 mod test {
     use crate::{
-        format::{InputBuffer, Parser},
-        test::{init_test_logger, mock_parser_pipeline, MockUpdate},
-        transport::InputConsumer,
         FormatConfig, ParseError,
+        format::{InputBuffer, Parser},
+        test::{MockUpdate, data::TestStructMetadata, init_test_logger, mock_parser_pipeline},
+        transport::InputConsumer,
     };
-    use feldera_adapterlib::format::Splitter;
+    use feldera_adapterlib::{ConnectorMetadata, format::Splitter};
+    use feldera_sqllib::{SqlString, Timestamp, Variant};
     use feldera_types::{
         deserialize_table_record,
         format::json::{JsonFlavor, JsonLines, JsonParserConfig, JsonUpdateFormat},
         program_schema::Relation,
         serde_with_context::{DeserializeWithContext, SqlSerdeConfig},
     };
-    use std::{borrow::Cow, fmt::Debug, hash::Hash, panic::Location};
+    use std::{
+        borrow::Cow, collections::BTreeMap, fmt::Debug, hash::Hash, panic::Location, sync::Arc,
+    };
     use tracing::trace;
 
     use super::JsonSplitter;
@@ -525,10 +576,10 @@ mod test {
         s: Option<String>,
     }
 
-    deserialize_table_record!(TestStruct["TestStruct", 3] {
-        (b, "b", false, bool, None),
-        (i, "i", false, i32, None),
-        (s, "s", false, Option<String>, Some(None))
+    deserialize_table_record!(TestStruct["TestStruct", Variant, 3] {
+        (b, "b", false, bool, |_| None),
+        (i, "i", false, i32, |_| None),
+        (s, "s", false, Option<String>, |_| Some(None))
     });
 
     // TODO: tests for RecordFormat::Raw.
@@ -556,10 +607,10 @@ mod test {
         s: Option<Option<String>>,
     }
 
-    deserialize_table_record!(TestStructUpd["TestStructUpd", 3] {
-        (b, "b", false, Option<bool>, Some(None)),
-        (i, "i", false, i32, None),
-        (s, "s", false, Option<Option<String>>, Some(None), |x| if x.is_none() { Some(None) } else {x})
+    deserialize_table_record!(TestStructUpd["TestStructUpd", Variant, 3] {
+        (b, "b", false, Option<bool>, |_| Some(None)),
+        (i, "i", false, i32, |_| None),
+        (s, "s", false, Option<Option<String>>, |_| Some(None), |x| if x.is_none() { Some(None) } else {x})
     });
 
     impl TestStructUpd {
@@ -584,13 +635,14 @@ mod test {
         input_batches: Vec<(String, Vec<ParseError>)>,
         /// Expected contents at the end of the test.
         expected_output: Vec<MockUpdate<T, U>>,
+        metadata: Option<ConnectorMetadata>,
     }
 
     fn run_test_cases<T, U>(test_cases: Vec<TestCase<T, U>>)
     where
         T: Debug
             + Eq
-            + for<'de> DeserializeWithContext<'de, SqlSerdeConfig>
+            + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
             + Hash
             + Send
             + Sync
@@ -599,7 +651,7 @@ mod test {
             + 'static,
         U: Debug
             + Eq
-            + for<'de> DeserializeWithContext<'de, SqlSerdeConfig>
+            + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
             + Hash
             + Send
             + Sync
@@ -611,7 +663,7 @@ mod test {
             trace!("test: {test:?}");
             let format_config = FormatConfig {
                 name: Cow::from("json"),
-                config: serde_yaml::to_value(test.config).unwrap(),
+                config: serde_json::to_value(test.config).unwrap(),
             };
 
             let (consumer, mut parser, outputs) =
@@ -619,7 +671,7 @@ mod test {
             consumer.on_error(Some(Box::new(|_, _| {})));
             parser.on_error(Some(Box::new(|_, _| {})));
             for (json, expected_errors) in test.input_batches {
-                let (mut buffer, errors) = parser.parse(json.as_bytes());
+                let (mut buffer, errors) = parser.parse(json.as_bytes(), test.metadata.clone());
                 assert_eq!(&errors, &expected_errors);
                 buffer.flush();
             }
@@ -640,6 +692,14 @@ mod test {
                 config,
                 input_batches,
                 expected_output,
+                metadata: None,
+            }
+        }
+
+        fn with_metadata(self, metadata: ConnectorMetadata) -> Self {
+            Self {
+                metadata: Some(metadata),
+                ..self
             }
         }
     }
@@ -845,7 +905,13 @@ mod test {
                     lines: JsonLines::Single,
                 },
                 vec![ (r#"{"b": true, "i": 0}"#.to_string(), Vec::new())
-                    , (r#"{"b": false, "i": 5}{"b": false}{"b": false, "i": "hello"}"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None), ParseError::new("failed to deserialize JSON record: error parsing field 'i': invalid type: string \"hello\", expected i32 at line 1 column 25".to_string(), Some(4), Some("i".to_string()), Some("{\"b\": false, \"i\": \"hello\"}"), None, None)])],
+                    , (r#"{"b": false, "i": 5}{"b": false}{"b": false, "i": "hello"}"#.to_string(),
+                        vec![
+                            ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None, Some("text_event_err".to_string())),
+                            ParseError::new("failed to deserialize JSON record: error parsing field 'i': invalid type: string \"hello\", expected i32 at line 1 column 25".to_string(), Some(4), Some("i".to_string()), Some("{\"b\": false, \"i\": \"hello\"}"), None, None, Some("text_event_err".to_string()))
+                        ]
+                    )
+                ],
                 vec![MockUpdate::with_polarity(TestStruct::new(true, 0, None), true), MockUpdate::with_polarity(TestStruct::new(false, 5, None), true)],
             ),
             TestCase::new(
@@ -856,8 +922,8 @@ mod test {
                     lines: JsonLines::Single,
                 },
                 vec![ (r#"[{"b": true, "i": 0}]"#.to_string(), Vec::new())
-                    , (r#"[{"b": false, "i": 5},{"b": false}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None)])
-                    , (r#"[{"b": false, "i": 5},{"b": 20, "i": 10}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: error parsing field 'b': invalid type: integer `20`, expected a boolean at line 1 column 8".to_string(), Some(5), Some("b".to_string()), Some("{\"b\": 20, \"i\": 10}"), None, None)])
+                    , (r#"[{"b": false, "i": 5},{"b": false}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None, Some("text_event_err".to_string()))])
+                    , (r#"[{"b": false, "i": 5},{"b": 20, "i": 10}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: error parsing field 'b': invalid type: integer `20`, expected a boolean at line 1 column 8".to_string(), Some(5), Some("b".to_string()), Some("{\"b\": 20, \"i\": 10}"), None, None, Some("text_event_err".to_string()))])
                 ],
                 vec![MockUpdate::with_polarity(TestStruct::new(true, 0, None), true)],
             ),
@@ -869,7 +935,7 @@ mod test {
                     lines: JsonLines::Single,
                 },
                 vec![ (r#"[[true, 0, "h"]]"#.to_string(), Vec::new())
-                            , (r#"[{"b": false, "i": 5},[false]]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: invalid length 1, expected 3 columns at line 1 column 7".to_string(), Some(3), None, Some("[false]"), None, None)])],
+                            , (r#"[{"b": false, "i": 5},[false]]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: invalid length 1, expected 3 columns at line 1 column 7".to_string(), Some(3), None, Some("[false]"), None, None, Some("text_event_err".to_string()))])],
                 vec![MockUpdate::with_polarity(TestStruct::new(true, 0, Some("h")), true)],
             ),
 
@@ -1007,7 +1073,7 @@ mod test {
                     lines: JsonLines::Single,
                 },
                 vec![ (r#"{"insert": {"b": true, "i": 0}}"#.to_string(), Vec::new())
-                    , (r#"{"insert": {"b": false, "i": 5}}{"delete": {"b": false}}"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None)])],
+                    , (r#"{"insert": {"b": false, "i": 5}}{"delete": {"b": false}}"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None, Some("text_event_err".to_string()))])],
                 vec![MockUpdate::with_polarity(TestStruct::new(true, 0, None), true), MockUpdate::with_polarity(TestStruct::new(false, 5, None), true)],
             ),
             TestCase::new(
@@ -1018,7 +1084,7 @@ mod test {
                     lines: JsonLines::Single,
                 },
                 vec![ (r#"[{"insert": {"b": true, "i": 0}}]"#.to_string(), Vec::new())
-                    , (r#"[{"insert": {"b": false, "i": 5}},{"delete": {"b": false}}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None)])],
+                    , (r#"[{"insert": {"b": false, "i": 5}},{"delete": {"b": false}}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None, Some("text_event_err".to_string()))])],
                 vec![MockUpdate::with_polarity(TestStruct::new(true, 0, None), true)],
             ),
             TestCase::new(
@@ -1029,9 +1095,9 @@ mod test {
                     lines: JsonLines::Single,
                 },
                 vec![ (r#"[{"insert": {"b": true, "i": 0}}]"#.to_string(), Vec::new())
-                    , (r#"[{"insert": {"b": false, "i": 5}},{"delete": {"b": false}}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None)])
+                    , (r#"[{"insert": {"b": false, "i": 5}},{"delete": {"b": false}}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None, Some("text_event_err".to_string()))])
                     , (r#"[{"insert": {"b": true, "i": 0}}]"#.to_string(), Vec::new())
-                    , (r#"[{"delete": {"b": false}}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(5), None, Some("{\"b\": false}"), None, None)])
+                    , (r#"[{"delete": {"b": false}}]"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(5), None, Some("{\"b\": false}"), None, None, Some("text_event_err".to_string()))])
                     , (r#"[{"b": false}]"#.to_string(), vec![ParseError::text_envelope_error("error deserializing string as a JSON array of updates: unknown field `b`, expected one of `table`, `insert`, `delete`, `update` at line 1 column 5".to_string(), "[{\"b\": false}]", Some(Cow::from("Example valid JSON: '[{{\"insert\": {{...}} }}, {{\"delete\": {{...}} }}]'")))])],
                 vec![MockUpdate::with_polarity(TestStruct::new(true, 0, None), true), MockUpdate::with_polarity(TestStruct::new(true, 0, None), true)],
             ),
@@ -1114,9 +1180,50 @@ mod test {
                     lines: JsonLines::Single,
                 },
                 vec![ (r#"{"payload": {"op": "c", "after": {"b": true, "i": 0}}}"#.to_string(), Vec::new())
-                    , (r#"{"payload": {"op": "c", "after": {"b": false, "i": 5}}}{"payload": {"op": "d", "before": {"b": false}}}"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None)])],
+                    , (r#"{"payload": {"op": "c", "after": {"b": false, "i": 5}}}{"payload": {"op": "d", "before": {"b": false}}}"#.to_string(), vec![ParseError::new("failed to deserialize JSON record: missing field `i` at line 1 column 12".to_string(), Some(3), None, Some("{\"b\": false}"), None, None, Some("text_event_err".to_string()))])],
                 vec![MockUpdate::with_polarity(TestStruct::new(true, 0, None), true), MockUpdate::with_polarity(TestStruct::new(false, 5, None), true)],
             ),
+        ];
+
+        run_test_cases(test_cases);
+    }
+
+    #[test]
+    fn test_json_with_metadata() {
+        init_test_logger();
+
+        let mut metadata = ConnectorMetadata::new();
+        metadata.insert("kafka_headers", Variant::Map(Arc::new(BTreeMap::new())));
+        metadata.insert("kafka_topic", Variant::String(SqlString::from("my_topic")));
+        metadata.insert(
+            "kafka_timestamp",
+            Variant::Timestamp(Timestamp::from_milliseconds(1763626606441)),
+        );
+        metadata.insert("kafka_partition", Variant::Int(10));
+        metadata.insert("kafka_offset", Variant::Int(1_000_000));
+
+        let test_cases: Vec<TestCase<TestStructMetadata, ()>> = vec![
+            TestCase::new(
+                JsonParserConfig {
+                    update_format: JsonUpdateFormat::Raw,
+                    json_flavor: JsonFlavor::Default,
+                    array: false,
+                    lines: JsonLines::Single,
+                },
+                vec![(r#"{"i": 0}"#.to_string(), Vec::new())],
+                vec![MockUpdate::with_polarity(
+                    TestStructMetadata::new(
+                        0,
+                        Variant::Map(Arc::new(BTreeMap::new())),
+                        SqlString::from("my_topic"),
+                        Timestamp::from_milliseconds(1763626606441),
+                        10,
+                        1_000_000,
+                    ),
+                    true,
+                )],
+            )
+            .with_metadata(metadata),
         ];
 
         run_test_cases(test_cases);

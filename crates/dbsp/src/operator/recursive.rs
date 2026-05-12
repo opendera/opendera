@@ -1,12 +1,13 @@
+use crate::Timestamp;
 use crate::circuit::checkpointer::Checkpoint;
+use crate::circuit::circuit_builder::IterativeCircuit;
 use crate::{
-    circuit::WithClock,
+    ChildCircuit, Circuit, DBData, SchedulerError, Stream, ZWeight,
     dynamic::Erase,
     operator::dynamic::{
         distinct::DistinctFactories, recursive::RecursiveStreams as DynRecursiveStreams,
     },
     typed_batch::{DynIndexedZSet, TypedBatch},
-    ChildCircuit, Circuit, DBData, SchedulerError, Stream, ZWeight,
 };
 use impl_trait_for_tuples::impl_for_tuples;
 
@@ -65,7 +66,7 @@ where
 }
 
 #[allow(clippy::unused_unit)]
-#[impl_for_tuples(12)]
+#[impl_for_tuples(14)]
 #[tuple_types_custom_trait_bound(RecursiveStreams<C>)]
 impl<C> RecursiveStreams<C> for Tuple {
     for_tuples!( type Inner = ( #( Tuple::Inner ),* ); );
@@ -90,9 +91,10 @@ impl<C> RecursiveStreams<C> for Tuple {
     }
 }
 
-impl<P> ChildCircuit<P>
+impl<P, T> ChildCircuit<P, T>
 where
-    P: WithClock,
+    P: 'static,
+    T: Timestamp,
     Self: Circuit,
 {
     /// Create a nested circuit that computes one or more mutually recursive
@@ -152,13 +154,13 @@ where
     ///     OrdZSet,
     ///     Circuit, RootCircuit, Stream, zset, zset_set,
     ///     utils::Tup2,
-    ///     Error as DbspError,
+    ///     Error as DbspError, Runtime
     /// };
     ///
     /// const STEPS: usize = 3;
     ///
     /// // Propagate labels along graph edges.
-    /// let (circuit_handle, _output_handle) = RootCircuit::build(move |root_circuit| {
+    /// let (mut circuit_handle, _output_handle) = Runtime::init_circuit(1, move |root_circuit| {
     ///     // Graph topology.
     ///     let mut edges = ([
     ///         // Start with four nodes connected in a cycle.
@@ -218,7 +220,7 @@ where
     /// })?;
     ///
     /// for _ in 0..STEPS {
-    ///     circuit_handle.step().unwrap();
+    ///     circuit_handle.transaction().unwrap();
     /// }
     ///
     /// Ok::<(), DbspError>(())
@@ -226,8 +228,8 @@ where
     #[track_caller]
     pub fn recursive<F, S>(&self, f: F) -> Result<S::Output, SchedulerError>
     where
-        S: RecursiveStreams<ChildCircuit<Self>>,
-        F: FnOnce(&ChildCircuit<Self>, S) -> Result<S, SchedulerError>,
+        S: RecursiveStreams<IterativeCircuit<Self>>,
+        F: FnOnce(&IterativeCircuit<Self>, S) -> Result<S, SchedulerError>,
     {
         self.dyn_recursive(&S::factories(), |circuit, streams: S::Inner| {
             f(circuit, unsafe { S::typed(&streams) }).map(|streams| streams.inner())

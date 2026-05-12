@@ -110,13 +110,13 @@ public class PostgresStringTests extends SqlIoTest {
     @Test
     public void testCharN() {
         this.q("""
-                SELECT CAST(f1 AS text) AS "text(char)" FROM CHAR_TBL;
-                 text(char)
-                ------------
-                 a
-                 ab
-                 abcd
-                 abcd""");
+                SELECT CAST(f1 AS text) AS "text(char)", 1 FROM CHAR_TBL;
+                 text(char) | 1
+                ----------------
+                 a   | 1
+                 ab  | 1
+                 abcd| 1
+                 abcd| 1""");
     }
 
     @Test
@@ -142,25 +142,25 @@ public class PostgresStringTests extends SqlIoTest {
     @Test
     public void testVarcharN() {
         this.q("""
-                SELECT CAST(f1 AS text) AS "text(varchar)" FROM VARCHAR_TBL;
-                 text(varchar)
-                ------------
-                 a
-                 ab
-                 abcd
-                 abcd""");
+                SELECT CAST(f1 AS text) AS "text(varchar)", 1 FROM VARCHAR_TBL;
+                 text(varchar) | 1
+                -------------------
+                 a|    1
+                 ab|   1
+                 abcd| 1
+                 abcd| 1""");
     }
 
     @Test
     public void testVarchar() {
         this.q("""
-                SELECT f1 AS "text(varchar)" FROM UVARCHAR_TBL;
-                 text(varchar)
-                ------------
-                 a
-                 ab
-                 abcd
-                 abcd""");
+                SELECT f1 AS "text(varchar)", 1 FROM UVARCHAR_TBL;
+                 text(varchar) | 1
+                -------------------
+                 a| 1
+                 ab| 1
+                 abcd| 1
+                 abcd    | 1""");
     }
 
     // 'name' not supported
@@ -211,13 +211,13 @@ public class PostgresStringTests extends SqlIoTest {
     @Test
     public void testCharTbl() {
         this.q("""
-                SELECT CAST(f1 AS varchar) AS "varchar(char)" FROM CHAR_TBL;
-                 varchar(char)
-                ---------------
-                 a
-                 ab
-                 abcd
-                 abcd""");
+                SELECT CAST(f1 AS varchar) AS "varchar(char)", 1 FROM CHAR_TBL;
+                 varchar(char) | 1
+                -------------------
+                 a   | 1
+                 ab  | 1
+                 abcd| 1
+                 abcd| 1""");
     }
 
     @Test
@@ -294,6 +294,12 @@ public class PostgresStringTests extends SqlIoTest {
                 string
                --------
                 string
+               (1 row)
+               
+               SELECT SUBSTRING('string' FROM -10 FOR 5) AS "string";
+                string
+               --------
+               \s
                (1 row)""");
     }
 
@@ -367,7 +373,7 @@ public class PostgresStringTests extends SqlIoTest {
                  bubba""");
     }
 
-    @Test @Ignore("Not yet implemented")
+    @Test @Ignore("regexp_replace with 4 arguments not implemented")
     public void testRegexpReplace() {
         this.qs("""
                 SELECT regexp_replace('1112223333', E'(\\\\d{3})(\\\\d{3})(\\\\d{4})', E'(\\\\1) \\\\2-\\\\3');
@@ -479,151 +485,179 @@ public class PostgresStringTests extends SqlIoTest {
 
     @Test
     public void testLike2() {
-        this.q("""
+        this.qs("""
                 SELECT 'hawkeye' LIKE 'h%' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'hawkeye' NOT LIKE 'h%' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'hawkeye' LIKE 'H%' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'hawkeye' NOT LIKE 'H%' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'hawkeye' LIKE 'indio%' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'hawkeye' NOT LIKE 'indio%' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'hawkeye' LIKE 'h%eye' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'hawkeye' NOT LIKE 'h%eye' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'indio' LIKE '_ndio' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'indio' NOT LIKE '_ndio' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'indio' LIKE 'in__o' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'indio' NOT LIKE 'in__o' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'indio' LIKE 'in_o' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'indio' NOT LIKE 'in_o' AS "true";
                  true
                 ------
-                 t""");
+                 t
+                (1 row)""");
     }
 
     @Test
     public void testRlike() {
         // This is not a postgres operator
-        this.q("""
+        this.qs("""
                 SELECT 'hawkeye' RLIKE 'h.*' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'hawkeye' NOT RLIKE 'h.*' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'hawkeye' RLIKE 'H.*' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+                
                 SELECT 'hawkeye' NOT RLIKE 'H.*' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+                
                 SELECT 'hawkeye' RLIKE 'indio.*' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+                
                 SELECT 'hawkeye' NOT RLIKE 'indio.*' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'hawkeye' RLIKE 'h.*eye' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'hawkeye' NOT RLIKE 'h.*eye' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'indio' RLIKE '.ndio' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'indio' NOT RLIKE '.ndio' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'indio' RLIKE 'in..o' AS "true";
                  true
                 ------
-                 t""");
-        this.q("""
+                 t
+                (1 row)
+
                 SELECT 'indio' NOT RLIKE 'in..o' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+                
                 SELECT 'indio' RLIKE 'in.o' AS "false";
                  false
                 -------
-                 f""");
-        this.q("""
+                 f
+                (1 row)
+
                 SELECT 'indio' NOT RLIKE 'in.o' AS "true";
                  true
                 ------
-                 t""");
+                 t
+                (1 row)""");
     }
 
     @Test
@@ -768,61 +802,6 @@ public class PostgresStringTests extends SqlIoTest {
                  false
                 -------
                  f""");
-    }
-
-    @Test @Ignore("We do not allow escape characters that are % or _")
-    public void testLike3Pattern() {
-        // -- escape character same as pattern character\n"
-        this.q("""
-                SELECT 'maca' LIKE 'm%aca' ESCAPE '%' AS "true";
-                 true
-                ------
-                 t""");
-        this.q("""
-                SELECT 'maca' NOT LIKE 'm%aca' ESCAPE '%' AS "false";
-                 false
-                -------
-                 f""");
-        this.q("""
-                SELECT 'ma%a' LIKE 'm%a%%a' ESCAPE '%' AS "true";
-                 true
-                ------
-                 t""");
-        this.q("""
-                SELECT 'ma%a' NOT LIKE 'm%a%%a' ESCAPE '%' AS "false";
-                 false
-                -------
-                 f""");
-        this.q("""
-                SELECT 'bear' LIKE 'b_ear' ESCAPE '_' AS "true";
-                 true
-                ------
-                 t""");
-        this.q("""
-                SELECT 'bear' NOT LIKE 'b_ear' ESCAPE '_' AS "false";
-                 false
-                -------
-                 f""");
-        this.q("""
-                SELECT 'be_r' LIKE 'b_e__r' ESCAPE '_' AS "true";
-                 true
-                ------
-                 t""");
-        this.q("""
-                SELECT 'be_r' NOT LIKE 'b_e__r' ESCAPE '_' AS "false";
-                 false
-                -------
-                 f""");
-        this.q("""
-                SELECT 'be_r' LIKE '__e__r' ESCAPE '_' AS "false";
-                 false
-                -------
-                 f""");
-        this.q("""
-                SELECT 'be_r' NOT LIKE '__e__r' ESCAPE '_' AS "true";
-                 true
-                ------
-                 t""");
     }
 
     @Test
@@ -1162,11 +1141,34 @@ public class PostgresStringTests extends SqlIoTest {
             -------
              abc
             (1 row)
+            
+            SELECT split_part('abc', '', 1) AS result;
+             result
+            -------
+             abc
+            (1 row)
+            
+            SELECT split_part('abc', '', 2) AS result;
+             result
+            -------
+            \s
+            (1 row)
+            
+            SELECT split_part('abc', NULL, 2) AS result;
+             result
+            -------
+            NULL
+            (1 row)
             """);
     }
 
+    @Test
+    public void invalidRegex() {
+        this.runtimeConstantFail(
+                "SELECT RLIKE('x', '(')",
+                "Invalid regular expression in RLIKE '(': regex parse error:");
+    }
 
-    // TODO: to_hex
     // TODO: sha, encode, decode
 
     @Test
@@ -1225,9 +1227,7 @@ public class PostgresStringTests extends SqlIoTest {
     @Test
     public void testLikeTable() {
         String sql = """
-                CREATE TABLE example (
-                    name VARCHAR
-                );
+                CREATE TABLE example (name VARCHAR);
 
                 CREATE VIEW example_count AS
                 SELECT COUNT(*) FROM example WHERE name LIKE 'abc%' OR name LIKE name;

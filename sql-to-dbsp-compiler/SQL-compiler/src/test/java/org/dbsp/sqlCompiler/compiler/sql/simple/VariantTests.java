@@ -4,11 +4,12 @@ import org.apache.calcite.util.TimeString;
 import org.apache.calcite.util.TimestampString;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.frontend.TableData;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
-import org.dbsp.sqlCompiler.compiler.sql.tools.BaseSQLTests;
 import org.dbsp.sqlCompiler.compiler.sql.tools.Change;
 import org.dbsp.sqlCompiler.compiler.sql.tools.CompilerCircuitStream;
 import org.dbsp.sqlCompiler.compiler.sql.tools.InputOutputChange;
+import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPTupleExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPBinaryLiteral;
@@ -17,22 +18,24 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPDateLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPDecimalLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI8Literal;
-import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntervalMillisLiteral;
-import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntervalMonthsLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPShortIntervalLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLongIntervalLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLiteral;
 import org.dbsp.sqlCompiler.ir.expression.DBSPMapExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPStringLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimeLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimestampLiteral;
 import org.dbsp.sqlCompiler.ir.expression.DBSPVariantExpression;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU64Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPVariantNullLiteral;
 import org.dbsp.sqlCompiler.ir.expression.DBSPArrayExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPZSetExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBinary;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDecimal;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeMillisInterval;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeMonthsInterval;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeShortInterval;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeLongInterval;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeString;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTime;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTimestamp;
@@ -43,8 +46,9 @@ import org.dbsp.util.Linq;
 import org.junit.Test;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
 
-public class VariantTests extends BaseSQLTests {
+public class VariantTests extends SqlIoTest {
     /** Return the default compiler used for testing. */
     @Override
     public CompilerOptions testOptions() {
@@ -74,7 +78,7 @@ public class VariantTests extends BaseSQLTests {
         query = "CREATE VIEW V AS " + query;
         CompilerCircuitStream ccs = this.getCCS(query);
         DBSPZSetExpression expectedOutput = new DBSPZSetExpression(new DBSPTupleExpression(fields));
-        InputOutputChange change = new InputOutputChange(new Change(), new Change(expectedOutput));
+        InputOutputChange change = new InputOutputChange(new Change(), new Change(new TableData("V", expectedOutput)));
         ccs.addChange(change);
     }
 
@@ -173,17 +177,19 @@ public class VariantTests extends BaseSQLTests {
                         new DBSPTypeTime(CalciteObject.EMPTY, false),
                         new TimeString("10:01:01"))));
         this.testQuery("SELECT CAST(INTERVAL '4-1' YEARS TO MONTHS AS VARIANT)",
-                new DBSPVariantExpression(new DBSPIntervalMonthsLiteral(
-                        DBSPTypeMonthsInterval.Units.YEARS_TO_MONTHS, 49)));
+                new DBSPVariantExpression(DBSPLongIntervalLiteral.fromMonths(
+                        DBSPTypeLongInterval.Units.YEARS_TO_MONTHS, 49)));
         this.testQuery("SELECT CAST(INTERVAL '4 10:01' DAYS TO MINUTES AS VARIANT)",
-                new DBSPVariantExpression(new DBSPIntervalMillisLiteral(
-                        DBSPTypeMillisInterval.Units.SECONDS, 1000L * (4 * 86400 + 10 * 3600 + 60), false)));
+                new DBSPVariantExpression(DBSPShortIntervalLiteral.fromMicroseconds(
+                        DBSPTypeShortInterval.Units.SECONDS, 1000_000L * (4 * 86400 + 10 * 3600 + 60), false)));
         this.testQuery("SELECT CAST(CAST(1 AS VARIANT) AS VARIANT)",
                 new DBSPVariantExpression(new DBSPI32Literal(1)));
+        DBSPTypeBinary binary = new DBSPTypeBinary(CalciteObject.EMPTY, 2, false, false);
+        DBSPBinaryLiteral lit = new DBSPBinaryLiteral(CalciteObject.EMPTY, binary, new byte[] { 1, 2 });
         this.testQuery("SELECT CAST(x'0102' AS VARIANT)",
-                new DBSPVariantExpression(new DBSPBinaryLiteral(new byte[] { 1, 2 })));
+                new DBSPVariantExpression(lit));
         this.testQuery("SELECT CAST(CAST(x'0102' AS VARBINARY) AS VARIANT)",
-                new DBSPVariantExpression(new DBSPBinaryLiteral(new byte[] { 1, 2 })));
+                new DBSPVariantExpression(lit));
     }
 
     @Test
@@ -224,12 +230,12 @@ public class VariantTests extends BaseSQLTests {
     public void parseJsonTests() {
         this.testQuery("SELECT PARSE_JSON(1)",
                 new DBSPVariantExpression(
-                        new DBSPDecimalLiteral(1)));
+                        new DBSPU64Literal(BigInteger.ONE, false)));
         this.testQuery("SELECT PARSE_JSON('1')",
                 new DBSPVariantExpression(
-                        new DBSPDecimalLiteral(1)));
+                        new DBSPU64Literal(BigInteger.ONE, false)));
         this.testQuery("SELECT TYPEOF(PARSE_JSON('1'))",
-                new DBSPStringLiteral("DECIMAL"));
+                new DBSPStringLiteral("BIGINT UNSIGNED"));
         this.testQuery("SELECT PARSE_JSON('\"a\"')",
                 new DBSPVariantExpression(
                         new DBSPStringLiteral("a")));
@@ -245,9 +251,9 @@ public class VariantTests extends BaseSQLTests {
         this.testQuery("SELECT PARSE_JSON('[1,2,3]')",
                 new DBSPVariantExpression(
                         new DBSPArrayExpression(
-                                new DBSPVariantExpression(new DBSPDecimalLiteral(1)),
-                                new DBSPVariantExpression(new DBSPDecimalLiteral(2)),
-                                new DBSPVariantExpression(new DBSPDecimalLiteral(3)))));
+                                new DBSPVariantExpression(new DBSPU64Literal(BigInteger.valueOf(1), false)),
+                                new DBSPVariantExpression(new DBSPU64Literal(BigInteger.valueOf(2), false)),
+                                new DBSPVariantExpression(new DBSPU64Literal(BigInteger.valueOf(3), false)))));
         this.testQuery("SELECT PARSE_JSON('{\"a\": 1, \"b\": 2}')",
                 new DBSPVariantExpression(
                         new DBSPMapExpression(
@@ -256,15 +262,15 @@ public class VariantTests extends BaseSQLTests {
                                         DBSPTypeVariant.INSTANCE, false),
                                 Linq.list(
                                         new DBSPVariantExpression(new DBSPStringLiteral("a")),
-                                        new DBSPVariantExpression(new DBSPDecimalLiteral(1)),
+                                        new DBSPVariantExpression(new DBSPU64Literal(BigInteger.valueOf(1), false)),
                                         new DBSPVariantExpression(new DBSPStringLiteral("b")),
-                                        new DBSPVariantExpression(new DBSPDecimalLiteral(2))))));
+                                        new DBSPVariantExpression(new DBSPU64Literal(BigInteger.valueOf(2), false))))));
         this.testQuery("""
-                SELECT PARSE_JSON('{"a": 1, "b": [2, 3.3, null]}') = CAST(
+                SELECT PARSE_JSON('{"a": 1.0, "b": [2.2, 3.3, null]}') = CAST(
                    MAP[
                       CAST('a' AS VARIANT), CAST(1.0 AS VARIANT),
                       CAST('b' AS VARIANT), CAST(ARRAY[
-                          CAST(2.0 AS VARIANT),
+                          CAST(2.2 AS VARIANT),
                           CAST(3.3 AS VARIANT),
                           VARIANTNULL()
                                                       ] AS VARIANT)
@@ -274,20 +280,24 @@ public class VariantTests extends BaseSQLTests {
 
     @Test
     public void testCastVec() {
-        // This is a bug in Calcite, the array should be nullable, and the elements should be nullable too
+        this.testQuery("""
+                SELECT CAST(PARSE_JSON('["10:10:10"]') AS TIME ARRAY)""",
+                new DBSPArrayExpression(true,
+                        new DBSPTimeLiteral(
+                                CalciteObject.EMPTY, DBSPTypeTime.NULLABLE_INSTANCE, new TimeString("10:10:10"))));
         this.testQuery("""
                 SELECT CAST(ARRAY[NULL, 1] AS INT ARRAY)""",
                 new DBSPArrayExpression(false,
                         new DBSPTypeInteger(CalciteObject.EMPTY, 32, true, true).none(),
                         new DBSPI32Literal(1, true)));
-        // result is null, since 1 cannot be converted to a string
+        // result is null, since 1 cannot be converted to a TIME
         this.testQuery("""
-                SELECT CAST(PARSE_JSON('["a", 1]') AS STRING ARRAY)""",
+                SELECT CAST(PARSE_JSON('["10:10:10", 1]') AS TIME ARRAY)""",
                 new DBSPArrayExpression(
-                        new DBSPTypeArray(DBSPTypeString.varchar(true), true),
+                        new DBSPTypeArray(DBSPTypeTime.NULLABLE_INSTANCE, true),
                         true));
         this.testQuery("""
-                SELECT CAST(PARSE_JSON('["a", 1]') AS VARIANT ARRAY)""",
+                SELECT CAST(PARSE_JSON('["a", 1.0]') AS VARIANT ARRAY)""",
                 new DBSPArrayExpression(true,
                         new DBSPVariantExpression(new DBSPStringLiteral("a", true), true),
                         new DBSPVariantExpression(new DBSPDecimalLiteral(CalciteObject.EMPTY,
@@ -311,9 +321,9 @@ public class VariantTests extends BaseSQLTests {
                                 true),
                                 Linq.list(
                                         new DBSPVariantExpression(new DBSPStringLiteral("a")),
-                                        new DBSPVariantExpression(new DBSPDecimalLiteral(1), true))));
+                                        new DBSPVariantExpression(new DBSPU64Literal(BigInteger.ONE, false), true))));
         this.testQuery("""
-                SELECT CAST(PARSE_JSON('{"a": 1}') AS MAP<STRING, VARIANT>)""",
+                SELECT CAST(PARSE_JSON('{"a": 1.0}') AS MAP<STRING, VARIANT>)""",
                 new DBSPMapExpression(
                         new DBSPTypeMap(
                                 DBSPTypeString.varchar(false),
@@ -480,11 +490,142 @@ public class VariantTests extends BaseSQLTests {
                 -- extract and flatten the arrays from the DECODE view
                 CREATE VIEW OUT(name, "uuid") AS SELECT x.name, x."uuid" FROM DECODE, UNNEST(DECODE.rec.steps) AS x;
                 """);
-        ccs.step("INSERT INTO DATA VALUES (" + data + ")",
+        ccs.stepWeightOne("INSERT INTO DATA VALUES (" + data + ")",
                 """
-                         name | uuid  | weight
-                        -----------------------
-                         blah | uuid0 | 1
-                         boo  |NULL   | 1""");
+                         name | uuid
+                        -------------
+                         blah| uuid0
+                         boo|NULL""");
+    }
+
+    @Test
+    public void issue5938() {
+        // type -> Variant -> string
+        this.qs("""
+                SELECT CAST(CAST(1 AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 1
+                (1 row)
+                
+                SELECT CAST(CAST('a' AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 a
+                (1 row)
+                
+                SELECT CAST(CAST(1.5 AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 1.5
+                (1 row)
+                
+                 SELECT CAST(CAST(1.5e0 AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 1.5
+                (1 row)
+                
+                SELECT CAST(CAST(TRUE AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 true
+                (1 row)
+                
+                SELECT CAST(CAST(UUID '123e4567-e89b-12d3-a456-426655440000' AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 123e4567-e89b-12d3-a456-426655440000
+                (1 row)
+                
+                SELECT CAST(CAST(INTERVAL '+1 10:10:10.123' DAYS TO SECONDS AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 +1 10:10:10.123000
+                (1 row)
+
+                SELECT CAST(CAST(x'0abc' AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 0abc
+                (1 row)
+                
+                SELECT CAST(CAST(TIME '10:00:00.123' AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 10:00:00.123000000
+                (1 row)
+                
+                SELECT CAST(CAST(TIMESTAMP '2024-02-02 10:00:00.123' AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 2024-02-02 10:00:00.123000
+                (1 row)
+
+                SELECT CAST(CAST(DATE '2024-02-02' AS VARIANT) AS VARCHAR);
+                 r
+                ---
+                 2024-02-02
+                (1 row)
+                """);
+    }
+
+    @Test
+    public void issue5938a() {
+        // String -> Variant -> type
+        this.qs("""
+                SELECT CAST(CAST('1' AS VARIANT) AS INT);
+                 r
+                ---
+                 1
+                (1 row)
+                
+                SELECT CAST(CAST('1.5' AS VARIANT) AS DECIMAL(10, 1));
+                 r
+                ---
+                 1.5
+                (1 row)
+                
+                SELECT CAST(CAST('1.5e0' AS VARIANT) AS DOUBLE);
+                 r
+                ---
+                 1.5
+                (1 row)
+                
+                SELECT CAST(CAST('TRUE' AS VARIANT) AS BOOLEAN);
+                 r
+                ---
+                 true
+                (1 row)
+                
+                SELECT CAST(CAST('123e4567-e89b-12d3-a456-426655440000' AS VARIANT) AS UUID);
+                 r
+                ---
+                 123e4567-e89b-12d3-a456-426655440000
+                (1 row)
+                
+                SELECT CAST(CAST('+1 10:10:10.123' AS VARIANT) AS INTERVAL DAYS TO SECONDS);
+                 r
+                ---
+                 1 days 10 hours 10 mins 10.123000 secs
+                (1 row)
+
+                SELECT CAST(CAST('10:00:00.123' AS VARIANT) AS TIME);
+                 r
+                ---
+                 10:00:00.123000000
+                (1 row)
+                
+                SELECT CAST(CAST('2024-02-02 10:00:00.123' AS VARIANT) AS TIMESTAMP);
+                 r
+                ---
+                 2024-02-02 10:00:00.123000
+                (1 row)
+
+                SELECT CAST(CAST('2024-02-02' AS VARIANT) AS DATE);
+                 r
+                ---
+                 2024-02-02
+                (1 row)""");
     }
 }

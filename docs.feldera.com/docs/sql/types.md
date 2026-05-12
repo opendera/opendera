@@ -10,15 +10,15 @@ The compiler supports the following SQL data types:
 | `INTEGER`                   | 32-bit signed integer using two's complement.                                                                                                                      | `INT`, `SIGNED`, `INT4`    |
 | `BIGINT`                    | 64-bit signed integer using two's complement.                                                                                                                      | `INT8`, `INT64`            |
 | `TINYINT UNSIGNED`          | 8-bit unsigned integer                     .                                                                                                                       |                            |
-| `SMALLINT UNSIGNED`         | 16-bit signed integer.                                                                                                                                             |                            |
-| `INTEGER UNSIGNED`          | 32-bit signed integer.                                                                                                                                             | `INT UNSIGNED`, `UNSIGNED` |
-| `BIGINT UNSIGNED`           | 64-bit signed integer.                                                                                                                                             |                            |
+| `SMALLINT UNSIGNED`         | 16-bit unsigned integer.                                                                                                                                           |                            |
+| `INTEGER UNSIGNED`          | 32-bit unsigned integer.                                                                                                                                           | `INT UNSIGNED`, `UNSIGNED` |
+| `BIGINT UNSIGNED`           | 64-bit unsigned integer.                                                                                                                                           |                            |
 | `DECIMAL(precision, scale)` | A high precision fixed-point type, with a precision (total number of decimal digits) and a scale (number of decimal digits after period).                          | `DEC`, `NUMERIC`, `NUMBER` |
 | `REAL`                      | IEEE 32-bit floating point number                                                                                                                                  | `FLOAT4`, `FLOAT32`        |
 | `DOUBLE`                    | IEEE 64-bit floating point number                                                                                                                                  | `FLOAT8`, `FLOAT64`        |
-| `VARCHAR(n)`                | A string value with maximum fixed width. Trailing spaces are removed when converting a value to this type.                                                         | `CHARACTER VARYING(n)`     |
-| `CHAR(n)`                   | A string value with a fixed width. Values are truncated if longer, or padded with spaces if shorter, to be brought to the specified size.                          | `CHARACTER(n)`             |
-| `VARCHAR`                   | A string of unlimited length. Trailing spaces are removed when converting a `CHAR(n)` value to this type.                                                          | `STRING`, `TEXT`           |
+| `VARCHAR`                   | A string of unlimited length. Trailing spaces are removed when converting a `CHAR(n)` value to this type. This is the preferred string type.                       | `STRING`, `TEXT`           |
+| `VARCHAR(n)`                | A string that holds at most `n` Unicode characters. Trailing spaces are removed when converting a `CHAR(n)` value to this type.                                    | `CHARACTER VARYING(n)`     |
+| `CHAR(n)`                   | A string value that holds exactly `n` Unicode characters. Values are truncated if longer, or padded with spaces if shorter, to be brought to the specified size. We recommend against using CHAR(n) columns; see [below](#string-types)  | `CHARACTER(n)`             |
 | `BINARY(n)`                 | A byte string with a fixed width; n is the number of bytes.                                                                                                        |                            |
 | `VARBINARY`                 | A byte string with an unlimited width.                                                                                                                             | `BYTEA`                    |
 | `NULL`                      | A type comprising only the `NULL` value.                                                                                                                           |                            |
@@ -74,6 +74,27 @@ Most SQL operations are defined for nullable types. Our compiler
 follows the SQL standard in this respect. Most operations (e.g.,
 `+`), when applied a `NULL` operand will produce a `NULL`
 value.
+
+## String types
+
+The `n` in `VARCHAR(n)` and `CHAR(n)` is measured in Unicode
+characters, not in bytes.  Thus, `"🎉"` fits in a `VARCHAR(1)` or
+`CHAR(1)` string, even though it requires 4 bytes in the UTF-8
+encoding that Feldera uses internally.
+
+The preferred type for string data is `VARCHAR`, omitting a maximum
+length, because operations on `VARCHAR(n)` strings can require extra
+work to count Unicode characters so that extra ones can be trimmed
+off.
+
+We strongly suggest avoiding `CHAR(n)` entirely.  It suffers from the
+same performance problems as `VARCHAR(n)`, but worse, because Feldera
+has to count Unicode characters in many more cases.  It also behaves
+unintuitively by padding strings with spaces to length `n`.  Comparing
+such values with values having different types (e.g., `CHAR(k)` for `k
+≠ n`) or even string literals of different lengths may provide
+surprising results.  It is supported only for legacy reasons.  The
+runtime also expects data sources to provide correctly padded data.
 
 ## User-defined types
 
@@ -135,6 +156,15 @@ employee_typ(315, 'Francis', 'Logan', 'FLOGAN',
      address_typ('376 Mission', 'San Francisco', 'CA', '94222'))
 ```
 
+Here is an example query creating an object with the user-defined type
+`address_typ` defined above (the `CREATE TYPE` definition should be in
+the same program):
+
+```sql
+CREATE TABLE T(street VARCHAR, city VARCHAR, year INT);
+CREATE VIEW V AS SELECT address_typ(T.street, city, 'CA', 94087) as address, T.year as year FROM T;
+```
+
 Tables can have structure-valued columns, but these have to be fully
 qualified using both the table name and the column name in programs:
 
@@ -158,8 +188,8 @@ typeName:
   |   ROW ( columnDecl [, columnDecl ]* )
 
 sqlTypeName:
-      char [ precision ] [ charSet ]
-  |   varchar [ precision ] [ charSet ]
+      char [ precision ]
+  |   varchar [ precision ]
   |   DATE
   |   time
   |   timestamp
@@ -198,13 +228,10 @@ double:
       DOUBLE [ PRECISION ]
 
 time:
-      TIME [ precision ] [ timeZone ]
+      TIME
 
 timestamp:
-      TIMESTAMP [ precision ] [ timeZone ]
-
-charSet:
-      CHARACTER SET charSetName
+      TIMESTAMP
 
 timeZone:
       WITHOUT TIME ZONE

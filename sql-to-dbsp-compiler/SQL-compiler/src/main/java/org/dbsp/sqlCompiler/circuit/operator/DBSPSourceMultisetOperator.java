@@ -13,8 +13,10 @@ import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
 import org.dbsp.sqlCompiler.ir.DBSPNode;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
+import org.dbsp.sqlCompiler.ir.type.DBSPTypeCode;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeStruct;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeUser;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
 import org.dbsp.util.Utilities;
 
@@ -53,7 +55,7 @@ public final class DBSPSourceMultisetOperator
     }
 
     @Override
-    public DBSPSimpleOperator with(
+    public DBSPOperator with(
             @Nullable DBSPExpression function, DBSPType outputType,
             List<OutputPort> newInputs, boolean force) {
         if (this.mustReplace(force, function, newInputs, outputType)) {
@@ -63,6 +65,14 @@ public final class DBSPSourceMultisetOperator
                     this.metadata, this.tableName, this.comment).copyAnnotations(this);
         }
         return this;
+    }
+
+    @Override
+    public DBSPTypeUser getHandleType() {
+        DBSPType elementType = this.getOutputZSetElementType();
+        return new DBSPTypeUser(
+                this.getNode(), DBSPTypeCode.USER, "ZSetHandle", false,
+                elementType);
     }
 
     @Override
@@ -77,12 +87,19 @@ public final class DBSPSourceMultisetOperator
 
     @SuppressWarnings("unused")
     public static DBSPSourceMultisetOperator fromJson(JsonNode node, JsonDecoder decoder) {
-        DBSPType originalRowType = DBSPNode.fromJsonInner(node, "originalRowType", decoder, DBSPType.class);
+        DBSPTypeStruct originalRowType = DBSPNode.fromJsonInner(
+                node, "originalRowType", decoder, DBSPTypeStruct.class);
         CommonInfo info = DBSPSimpleOperator.commonInfoFromJson(node, decoder);
         ProgramIdentifier name = ProgramIdentifier.fromJson(Utilities.getProperty(node, "tableName"));
         TableMetadata metadata = TableMetadata.fromJson(Utilities.getProperty(node, "metadata"), decoder);
         return new DBSPSourceMultisetOperator(CalciteEmptyRel.INSTANCE, CalciteObject.EMPTY,
-                info.getZsetType(), originalRowType.to(DBSPTypeStruct.class), metadata, name, null)
+                info.getZsetType(), originalRowType, metadata, name, null)
                 .addAnnotations(info.annotations(), DBSPSourceMultisetOperator.class);
+    }
+
+    @Override
+    public DBSPSourceTableOperator withMetadata(TableMetadata metadata) {
+        return new DBSPSourceMultisetOperator(this.getRelNode(), this.sourceName, this.getOutputZSetType(),
+                this.originalRowType, metadata, this.tableName, this.comment);
     }
 }

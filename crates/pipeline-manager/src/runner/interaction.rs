@@ -1,27 +1,33 @@
 use crate::api::error::ApiError;
 use crate::config::CommonConfig;
-use crate::db::notifier::DbNotification;
 use crate::db::storage::Storage;
 use crate::db::storage_postgres::StoragePostgres;
-use crate::db::types::pipeline::{ExtendedPipelineDescrMonitoring, PipelineStatus};
+use crate::db::types::pipeline::ExtendedPipelineDescrMonitoring;
 use crate::db::types::tenant::TenantId;
 use crate::error::ManagerError;
 use crate::runner::error::RunnerError;
 use actix_web::{http::Method, web::Payload, HttpRequest, HttpResponse, HttpResponseBuilder};
 use actix_ws::{CloseCode, CloseReason};
 use awc::error::{ConnectError, SendRequestError};
+use awc::{ClientRequest, ClientResponse};
 use crossbeam::sync::ShardedLock;
+use feldera_observability::AwcRequestTracingExt;
 use feldera_types::query::MAX_WS_FRAME_SIZE;
-use log::error;
 use std::fmt::Display;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use tracing::{error, info};
 
-/// Max non-streaming HTTP response body returned by the pipeline.
+use crate::db::listen_table::PIPELINE_NOTIFY_CHANNEL_CAPACITY;
+use crate::db::types::resources_status::ResourcesStatus;
+use actix_http::encoding::Decoder;
+use feldera_types::runtime_status::RuntimeStatus;
+
+/// Max non-streaming decompressed HTTP response body size returned by the pipeline.
 /// The awc default is 2MiB, which is not enough to, for example, retrieve
 /// a large circuit profile.
-const RESPONSE_SIZE_LIMIT: usize = 20 * 1024 * 1024;
+const RESPONSE_SIZE_LIMIT: usize = 50 * 1024 * 1024;
 
 pub(crate) struct CachedPipelineDescr {
     pipeline: ExtendedPipelineDescrMonitoring,
@@ -34,21 +40,28 @@ impl CachedPipelineDescr {
     /// Return the deployment location only if the pipeline is in the correct
     /// status to be interacted with (i.e., running or paused).
     fn deployment_location_based_on_status(&self) -> Result<String, ManagerError> {
-        match self.pipeline.deployment_status {
-            PipelineStatus::Running | PipelineStatus::Paused | PipelineStatus::Suspending => {}
-            PipelineStatus::Unavailable => Err(RunnerError::PipelineInteractionUnreachable {
-                error: "deployment status is currently 'unavailable' -- wait for it to become 'running' or 'paused' again".to_string()
-            })?,
-            status => Err(RunnerError::PipelineInteractionNotDeployed {
-                status,
-                desired_status: self.pipeline.deployment_desired_status
-            })?,
-        };
+        // Interaction with the pipeline is only useful to be attempted if the pipeline has its
+        // resources provisioned, and the latest runtime status check did not return indicate even
+        // the runner can't interact with it.
+        if self.pipeline.deployment_resources_status == ResourcesStatus::Provisioned {
+            if self.pipeline.deployment_runtime_status == Some(RuntimeStatus::Unavailable) {
+                return Err(ManagerError::from(RunnerError::PipelineUnavailable {
+                    pipeline_name: self.pipeline.name.clone(),
+                }));
+            }
+        } else {
+            return Err(ManagerError::from(
+                RunnerError::PipelineInteractionNotDeployed {
+                    pipeline_name: self.pipeline.name.clone(),
+                    status: self.pipeline.deployment_resources_status,
+                    desired_status: self.pipeline.deployment_resources_desired_status,
+                },
+            ));
+        }
 
         Ok(match &self.pipeline.deployment_location {
-            None => Err(RunnerError::PipelineInteractionUnreachable {
-                error: "deployment location is missing despite status being 'running' or 'paused'"
-                    .to_string(),
+            None => Err(RunnerError::PipelineMissingDeploymentLocation {
+                pipeline_name: self.pipeline.name.clone(),
             })?,
             Some(location) => location.clone(),
         })
@@ -130,13 +143,11 @@ impl RunnerInteraction {
     pub fn new(common_config: CommonConfig, db: Arc<Mutex<StoragePostgres>>) -> Self {
         let endpoint_cache = Arc::new(ShardedLock::new(HashMap::new()));
         {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            tokio::spawn(crate::db::notifier::listen(db.clone(), tx));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(PIPELINE_NOTIFY_CHANNEL_CAPACITY);
+            tokio::spawn(crate::db::listen_table::listen_table(db.clone(), tx));
             let endpoint_cache = endpoint_cache.clone();
             tokio::spawn(async move {
-                while let Some(DbNotification::Pipeline(_op, _tenant, _pipeline_id)) =
-                    rx.recv().await
-                {
+                while rx.recv().await.is_some() {
                     let mut cache = endpoint_cache.write().unwrap();
                     cache.clear();
                 }
@@ -190,57 +201,90 @@ impl RunnerInteraction {
     /// This method is static as it is directly provided the pipeline
     /// identifier and location. It thus does not need to retrieve it
     /// from the database.
+    #[allow(clippy::too_many_arguments)]
     pub async fn forward_http_request_to_pipeline(
+        common_config: &CommonConfig,
         client: &awc::Client,
+        pipeline_name: &str,
         location: &str,
         method: Method,
         endpoint: &str,
         query_string: &str,
         timeout: Option<Duration>,
+        body_size_limit: Option<usize>,
     ) -> Result<HttpResponse, ManagerError> {
         // Perform request to the pipeline
-        let url = format_pipeline_url("http", location, endpoint, query_string);
+        let url = format_pipeline_url(
+            if common_config.enable_https {
+                "https"
+            } else {
+                "http"
+            },
+            location,
+            endpoint,
+            query_string,
+        );
         let timeout = timeout.unwrap_or(Self::PIPELINE_HTTP_REQUEST_TIMEOUT);
-        let mut original_response = client
+        let request = client
             .request(method, &url)
             .timeout(timeout)
-            .send()
-            .await
-            .map_err(|e| match e {
-                SendRequestError::Timeout => RunnerError::PipelineInteractionUnreachable {
-                    error: format_timeout_error_message(timeout, e),
-                },
-                SendRequestError::Connect(ConnectError::Disconnected) => {
-                    RunnerError::PipelineInteractionUnreachable {
-                        error: format_disconnected_error_message(e),
-                    }
+            .force_close()
+            .with_sentry_tracing();
+        let request_str = Self::format_request(&request);
+
+        let mut original_response = request.send().await.map_err(|e| match e {
+            SendRequestError::Timeout => RunnerError::PipelineInteractionUnreachable {
+                pipeline_name: pipeline_name.to_string(),
+                request: request_str.clone(),
+                error: format_timeout_error_message(timeout, e),
+            },
+            SendRequestError::Connect(ConnectError::Disconnected) => {
+                RunnerError::PipelineInteractionUnreachable {
+                    pipeline_name: pipeline_name.to_string(),
+                    request: request_str.clone(),
+                    error: format_disconnected_error_message(e),
                 }
-                _ => RunnerError::PipelineInteractionUnreachable {
-                    error: format!("unable to send request due to: {e}"),
-                },
-            })?;
+            }
+            _ => RunnerError::PipelineInteractionUnreachable {
+                pipeline_name: pipeline_name.to_string(),
+                request: request_str.clone(),
+                error: format!("{e}"),
+            },
+        })?;
         let status = original_response.status();
+
+        if !status.is_success() {
+            info!(
+                pipeline = pipeline_name,
+                pipeline_id = "N/A",
+                "HTTP request to pipeline returned status code {status}. Failed request: {request_str}"
+            );
+        }
 
         // Build the HTTP response with the original status
         let mut response_builder = HttpResponse::build(status);
 
-        // Add all the same headers as the original response,
-        // excluding `Connection` as this is proxy, as per:
-        // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection#Directives
-        for (header_name, header_value) in original_response
-            .headers()
-            .iter()
-            .filter(|(h, _)| *h != "connection")
-        {
+        // Add all the same headers as the original response, excluding:
+        // - `connection`: hop-by-hop header, must not be forwarded by proxies
+        //   (https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection#Directives)
+        // - `content-encoding`: awc auto-decompresses the body, so the body we forward is already
+        //   decoded — forwarding the original Content-Encoding would make the caller try to
+        //   decompress an already-plain body.
+        // - `content-length`: after decompression the body size differs from the
+        //   original Content-Length; let actix-web recompute it.
+        for (header_name, header_value) in original_response.headers().iter().filter(|(h, _)| {
+            *h != "connection" && *h != "content-length" && *h != "content-encoding"
+        }) {
             response_builder.insert_header((header_name.clone(), header_value.clone()));
         }
 
         // Copy over the original response body
         let response_body = original_response
             .body()
-            .limit(RESPONSE_SIZE_LIMIT)
+            .limit(body_size_limit.unwrap_or(RESPONSE_SIZE_LIMIT))
             .await
             .map_err(|e| RunnerError::PipelineInteractionInvalidResponse {
+                pipeline_name: pipeline_name.to_string(),
                 error: format!("unable to reconstruct response body due to: {e}"),
             })?;
         Ok(response_builder.body(response_body))
@@ -261,15 +305,19 @@ impl RunnerInteraction {
         endpoint: &str,
         query_string: &str,
         timeout: Option<Duration>,
+        body_size_limit: Option<usize>,
     ) -> Result<HttpResponse, ManagerError> {
         let (location, cache_hit) = self.check_pipeline(tenant_id, pipeline_name).await?;
         let r = RunnerInteraction::forward_http_request_to_pipeline(
+            &self.common_config,
             client,
+            pipeline_name,
             &location,
             method.clone(),
             endpoint,
             query_string,
             timeout,
+            body_size_limit,
         )
         .await;
 
@@ -297,6 +345,7 @@ impl RunnerInteraction {
                         endpoint,
                         query_string,
                         timeout,
+                        body_size_limit,
                     ))
                     .await
                 }
@@ -329,8 +378,16 @@ impl RunnerInteraction {
         let mut client_rx = client_rx.max_frame_size(MAX_WS_FRAME_SIZE);
 
         // Connect to the pipeline
-        let server_url =
-            format_pipeline_url("ws", &location, endpoint, client_request.query_string());
+        let server_url = format_pipeline_url(
+            if self.common_config.enable_https {
+                "wss"
+            } else {
+                "ws"
+            },
+            &location,
+            endpoint,
+            client_request.query_string(),
+        );
         let (_response, pipeline_conn) = awc_client
             .ws(server_url)
             .max_frame_size(MAX_WS_FRAME_SIZE)
@@ -432,44 +489,67 @@ impl RunnerInteraction {
         timeout: Option<Duration>, // If no timeout is specified, a default timeout is used
     ) -> Result<HttpResponse, ManagerError> {
         let (location, _cache_hit) = self.check_pipeline(tenant_id, pipeline_name).await?;
-
-        // Build new request to pipeline
-        let url = format_pipeline_url("http", &location, endpoint, request.query_string());
+        let url = format_pipeline_url(
+            if self.common_config.enable_https {
+                "https"
+            } else {
+                "http"
+            },
+            &location,
+            endpoint,
+            request.query_string(),
+        );
         let timeout = timeout.unwrap_or(Self::PIPELINE_HTTP_REQUEST_TIMEOUT);
-        let mut new_request = client
-            .request(request.method().clone(), &url)
-            .timeout(timeout);
+        streaming_proxy(client, &url, pipeline_name, &request, body, timeout).await
+    }
 
-        // Add headers of the original request
-        for header in request
-            .headers()
-            .into_iter()
-            .filter(|(h, _)| *h != "connection")
-        {
-            new_request = new_request.append_header(header);
-        }
+    pub(crate) async fn get_logs_from_pipeline(
+        &self,
+        client: &awc::Client,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+    ) -> Result<ClientResponse<Decoder<actix_http::Payload>>, ManagerError> {
+        // Retrieve pipeline
+        let pipeline = self
+            .db
+            .lock()
+            .await
+            .get_pipeline_for_monitoring(tenant_id, pipeline_name)
+            .await?;
 
-        // Perform request to the pipeline
-        let response = new_request.send_stream(body).await.map_err(|e| match e {
-            SendRequestError::Timeout => RunnerError::PipelineInteractionUnreachable {
-                error: format_timeout_error_message(timeout, e),
+        // Build request to the runner
+        let url = format!(
+            "{}://{}:{}/logs/{}",
+            if self.common_config.enable_https {
+                "https"
+            } else {
+                "http"
             },
-            SendRequestError::Connect(ConnectError::Disconnected) => {
-                RunnerError::PipelineInteractionUnreachable {
-                    error: format_disconnected_error_message(e),
-                }
-            }
-            _ => RunnerError::PipelineInteractionUnreachable {
-                error: format!("unable to send request due to: {e}"),
-            },
-        })?;
+            self.common_config.runner_host,
+            self.common_config.runner_port,
+            pipeline.id
+        );
 
-        // Build the new HTTP response with the same status, headers and streaming body
-        let mut builder = HttpResponseBuilder::new(response.status());
-        for header in response.headers().into_iter() {
-            builder.append_header(header);
-        }
-        Ok(builder.streaming(response))
+        // Perform request to the runner
+        let response = client
+            .request(Method::GET, &url)
+            .timeout(Self::RUNNER_HTTP_REQUEST_TIMEOUT)
+            .with_sentry_tracing()
+            .send()
+            .await
+            .map_err(|e| match e {
+                SendRequestError::Timeout => RunnerError::RunnerInteractionUnreachable {
+                    error: format_runner_timeout_error_message(
+                        Self::RUNNER_HTTP_REQUEST_TIMEOUT,
+                        e,
+                    ),
+                },
+                _ => RunnerError::RunnerInteractionUnreachable {
+                    error: format!("{e}"),
+                },
+            })?;
+
+        Ok(response)
     }
 
     /// Retrieves the streaming logs of the pipeline through the runner.
@@ -482,43 +562,200 @@ impl RunnerInteraction {
         tenant_id: TenantId,
         pipeline_name: &str,
     ) -> Result<HttpResponse, ManagerError> {
-        // Retrieve pipeline
-        let pipeline = self
-            .db
-            .lock()
-            .await
-            .get_pipeline_for_monitoring(tenant_id, pipeline_name)
-            .await?;
-
-        // Build request to the runner
-        let url = format!(
-            "http://{}:{}/logs/{}",
-            self.common_config.runner_host, self.common_config.runner_port, pipeline.id
-        );
-
         // Perform request to the runner
-        let response = client
-            .request(Method::GET, &url)
-            .timeout(Self::RUNNER_HTTP_REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|e| match e {
-                SendRequestError::Timeout => RunnerError::RunnerInteractionUnreachable {
-                    error: format_runner_timeout_error_message(
-                        Self::RUNNER_HTTP_REQUEST_TIMEOUT,
-                        e,
-                    ),
-                },
-                _ => RunnerError::RunnerInteractionUnreachable {
-                    error: format!("unable to send request due to: {e}"),
-                },
-            })?;
+        let response = self
+            .get_logs_from_pipeline(client, tenant_id, pipeline_name)
+            .await?;
 
         // Build the HTTP response with the same status, headers and streaming body
         let mut builder = HttpResponseBuilder::new(response.status());
         for header in response.headers().into_iter() {
             builder.append_header(header);
         }
+        // Disable compression to avoid gzip frame buffering that causes clients to block
+        builder.insert_header(actix_http::ContentEncoding::Identity);
         Ok(builder.streaming(response))
+    }
+
+    /// Format HTTP request for logging.
+    pub(crate) fn format_request(request: &ClientRequest) -> String {
+        format!(
+            "{:?} {} {}",
+            request.get_version(),
+            request.get_method(),
+            request.get_uri()
+        )
+    }
+}
+
+/// Core streaming proxy: forwards `request` + `body` to `url` and streams
+/// the response back. Extracted from [`RunnerInteraction`] so it can be
+/// unit-tested without a database.
+///
+/// Strips the client's `Accept-Encoding` and forces `Content-Encoding: identity`
+/// on the response (prevents gzip frame buffering that blocks streaming clients).
+pub(crate) async fn streaming_proxy(
+    client: &awc::Client,
+    url: &str,
+    pipeline_name: &str,
+    request: &HttpRequest,
+    body: Payload,
+    timeout: Duration,
+) -> Result<HttpResponse, ManagerError> {
+    let mut new_request = client
+        .request(request.method().clone(), url)
+        .timeout(timeout)
+        .force_close()
+        .no_decompress();
+
+    // Strip `Accept-Encoding` to prevent compressed responses from the pipeline —
+    // compression causes gzip frame buffering that blocks streaming clients (see the
+    // `Content-Encoding: identity` override below). `.no_decompress()` above suppresses
+    // awc's own `Accept-Encoding` header; here we also strip the client's.
+    for header in request
+        .headers()
+        .into_iter()
+        .filter(|(h, _)| *h != "connection" && *h != "accept-encoding")
+    {
+        new_request = new_request.append_header(header);
+    }
+
+    let new_request = new_request.with_sentry_tracing();
+    let request_str = RunnerInteraction::format_request(&new_request);
+
+    // Perform request to the pipeline
+    let response = new_request.send_stream(body).await.map_err(|e| match e {
+        SendRequestError::Timeout => RunnerError::PipelineInteractionUnreachable {
+            pipeline_name: pipeline_name.to_string(),
+            request: request_str.to_string(),
+            error: format_timeout_error_message(timeout, e),
+        },
+        SendRequestError::Connect(ConnectError::Disconnected) => {
+            RunnerError::PipelineInteractionUnreachable {
+                pipeline_name: pipeline_name.to_string(),
+                request: request_str.to_string(),
+                error: format_disconnected_error_message(e),
+            }
+        }
+        _ => RunnerError::PipelineInteractionUnreachable {
+            pipeline_name: pipeline_name.to_string(),
+            request: request_str.to_string(),
+            error: format!("{e}"),
+        },
+    })?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        info!(
+            pipeline = pipeline_name,
+            pipeline_id = "N/A",
+            "HTTP request to pipeline returned status code {status}. Failed request: {request_str}"
+        );
+    }
+
+    // Build the new HTTP response with the same status, headers and streaming body
+    let mut builder = HttpResponseBuilder::new(status);
+    for header in response.headers().into_iter() {
+        builder.append_header(header);
+    }
+    // Disable compression to avoid gzip frame buffering that causes clients to block
+    builder.insert_header(actix_http::ContentEncoding::Identity);
+    Ok(builder.streaming(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::body::to_bytes;
+    use actix_web::test::TestRequest;
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn setup() {
+        crate::ensure_default_crypto_provider();
+    }
+
+    /// Build `(HttpRequest, web::Payload)` for a GET with optional headers.
+    fn test_get_request(headers: &[(&str, &str)]) -> (HttpRequest, Payload) {
+        use actix_web::FromRequest as _;
+        let mut builder = TestRequest::get();
+        for &(k, v) in headers {
+            builder = builder.insert_header((k, v));
+        }
+        let (req, mut inner_payload) = builder.to_http_parts();
+        // web::Payload has a private inner field, so use the FromRequest impl
+        // (which is `ready(Ok(Payload(payload.take())))`) to construct it safely.
+        let web_payload = Payload::from_request(&req, &mut inner_payload)
+            .into_inner()
+            .unwrap();
+        (req, web_payload)
+    }
+
+    /// Read the full body of an HttpResponse returned by `streaming_proxy`.
+    async fn read_body(resp: HttpResponse) -> Vec<u8> {
+        to_bytes(resp.into_body()).await.unwrap().to_vec()
+    }
+
+    /// Test that streaming_proxy strips Accept-Encoding from the forwarded request
+    /// (verified via wiremock expect(0)) and forces Content-Encoding: identity
+    /// on the response.
+    #[actix_web::test]
+    async fn test_streaming_proxy() {
+        setup();
+        let mock_server = MockServer::start().await;
+
+        let plain = b"{\"profile\":\"data\"}";
+
+        // Fallback: matches any GET regardless of headers, returns the plain body.
+        // Registered first so wiremock checks it *last*.
+        Mock::given(method("GET"))
+            .and(path("/dump_json_profile"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(plain.to_vec())
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Registered second so wiremock checks it *first*: if accept-encoding
+        // is present this more-specific mock matches instead of the fallback.
+        // expect(0) makes the test fail if this mock is ever hit — proving the
+        // proxy stripped the header before it reached the upstream.
+        Mock::given(method("GET"))
+            .and(path("/dump_json_profile"))
+            .and(header_exists("accept-encoding"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .named("should-not-receive-accept-encoding")
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/dump_json_profile", mock_server.uri());
+        let client = awc::Client::default();
+
+        // Even though the original client sends Accept-Encoding, the proxy strips it.
+        let (req, payload) = test_get_request(&[("accept-encoding", "gzip")]);
+        let resp = streaming_proxy(
+            &client,
+            &url,
+            "test-pipeline",
+            &req,
+            payload,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-encoding").unwrap(),
+            "identity",
+            "streaming_proxy must force Content-Encoding: identity"
+        );
+        let body = read_body(resp).await;
+        assert_eq!(body, plain);
+        // Dropping mock_server verifies the expect(0) assertion.
     }
 }

@@ -1,26 +1,24 @@
 package org.dbsp.sqlCompiler.compiler.visitors.outer;
 
 import org.dbsp.sqlCompiler.circuit.ICircuit;
+import org.dbsp.sqlCompiler.circuit.operator.IMultiOutput;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPConstantOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPDeltaOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainKeysOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainValuesOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNestedOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPOperatorWithError;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
+import org.dbsp.sqlCompiler.circuit.operator.IGCOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.util.Logger;
 import org.dbsp.util.graph.Port;
 
+import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
-/** Common-subexpression elimination */
+/** Common-subexpression elimination at the level of circuit operators */
 public class CSE extends Repeat {
     public CSE(DBSPCompiler compiler) {
         super(compiler, new OneCSEPass(compiler));
@@ -47,13 +45,13 @@ public class CSE extends Repeat {
     public static class FindCSE extends CircuitWithGraphsVisitor {
         /** Maps each operator to its canonical representative */
         final Map<DBSPOperator, DBSPOperator> canonical;
-        final Set<DBSPConstantOperator> constants;
+        final List<DBSPConstantOperator> constants;
 
         public FindCSE(DBSPCompiler compiler, CircuitGraphs graphs,
                        Map<DBSPOperator, DBSPOperator> canonical) {
             super(compiler, graphs);
             this.canonical = canonical;
-            this.constants = new HashSet<>();
+            this.constants = new ArrayList<>();
         }
 
         @Override
@@ -61,16 +59,16 @@ public class CSE extends Repeat {
             for (DBSPConstantOperator op: this.constants) {
                 if (op.equivalent(operator)) {
                     this.setCanonical(operator, op);
-                } else {
-                    this.constants.add(op);
+                    return;
                 }
             }
+            this.constants.add(operator);
+            postorder(operator.to(DBSPOperator.class));
         }
 
         boolean hasGcSuccessor(DBSPOperator operator) {
             for (Port<DBSPOperator> succ: this.getGraph().getSuccessors(operator)) {
-                if (succ.node().is(DBSPIntegrateTraceRetainKeysOperator.class) ||
-                        succ.node().is(DBSPIntegrateTraceRetainValuesOperator.class))
+                if (succ.node().is(IGCOperator.class))
                     // only input 0 of these operators affects the GC
                     return succ.port() == 0;
             }
@@ -142,7 +140,7 @@ public class CSE extends Repeat {
         @Override
         public void replace(DBSPSimpleOperator operator) {
             DBSPOperator replacement = this.canonical.get(operator);
-            if (replacement == null) {
+            if (replacement == null || replacement == operator) {
                 super.replace(operator);
                 return;
             }
@@ -151,14 +149,14 @@ public class CSE extends Repeat {
         }
 
         @Override
-        public void replace(DBSPOperatorWithError operator) {
-            DBSPOperator replacement = this.canonical.get(operator);
+        public void replaceMultiOutput(IMultiOutput operator) {
+            DBSPOperator replacement = this.canonical.get(operator.asOperator());
             if (replacement == null) {
-                super.replace(operator);
+                super.replaceMultiOutput(operator);
                 return;
             }
 
-            DBSPOperatorWithError we = replacement.to(DBSPOperatorWithError.class);
+            IMultiOutput we = replacement.to(IMultiOutput.class);
             this.map(operator, we, true);
         }
     }

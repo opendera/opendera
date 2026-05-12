@@ -28,6 +28,7 @@ import org.dbsp.sqlCompiler.circuit.annotation.Annotation;
 import org.dbsp.sqlCompiler.circuit.annotation.Annotations;
 import org.dbsp.sqlCompiler.circuit.annotation.CompactName;
 import org.dbsp.sqlCompiler.circuit.annotation.OperatorHash;
+import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeStream;
@@ -52,12 +53,19 @@ public abstract class DBSPOperator extends DBSPNode implements IDBSPOuterNode {
     public final Annotations annotations;
     /** id of the operator this one is derived from. */
     public long derivedFrom;
+    @Nullable
+    public final String comment;
 
-    protected DBSPOperator(CalciteRelNode node) {
+    protected DBSPOperator(CalciteRelNode node, @Nullable String comment) {
         super(node);
         this.inputs = new ArrayList<>();
         this.annotations = new Annotations();
         this.derivedFrom = this.id;
+        this.comment = comment;
+    }
+
+    protected DBSPOperator(CalciteRelNode node) {
+        this(node, null);
     }
 
     /** True if the operator has a port with such an output number.
@@ -81,11 +89,16 @@ public abstract class DBSPOperator extends DBSPNode implements IDBSPOuterNode {
         return this.derivedFrom;
     }
 
+    /** Explicitly set the origin of this operator. */
     public void setDerivedFrom(long id) {
-        if (id != this.id) {
+        if (id != this.id && this.derivedFrom > id) {
             this.derivedFrom = id;
             Utilities.enforce(id < this.id);
         }
+    }
+
+    public void setDerivedFrom(DBSPOperator operator) {
+        this.setDerivedFrom(operator.getDerivedFrom());
     }
 
     protected void addInput(OutputPort port) {
@@ -105,6 +118,10 @@ public abstract class DBSPOperator extends DBSPNode implements IDBSPOuterNode {
 
     public boolean hasAnnotation(Predicate<Annotation> test) {
         return this.annotations.contains(test);
+    }
+
+    public <T extends Annotation> boolean hasAnnotation(Class<T> clazz) {
+        return this.hasAnnotation(clazz::isInstance);
     }
 
     /**
@@ -142,7 +159,7 @@ public abstract class DBSPOperator extends DBSPNode implements IDBSPOuterNode {
         if (name != null)
             return name;
         String result = Long.toString(this.id);
-        if (this.derivedFrom >= 0)
+        if (this.derivedFrom >= 0 && this.derivedFrom != this.id)
             result += "(" + this.derivedFrom + ")";
         return result;
     }
@@ -179,6 +196,13 @@ public abstract class DBSPOperator extends DBSPNode implements IDBSPOuterNode {
         return name;
     }
 
+    /** Return a version of this operator with the inputs replaced.
+     * @param newInputs  Inputs to use instead of the old ones.
+     * @param force      If true always return a new operator.
+     *                   If false and the inputs are the same this may return this.
+     */
+    public abstract DBSPOperator withInputs(List<OutputPort> newInputs, boolean force);
+
     public DBSPType outputStreamType(int outputNo, boolean outerCircuit) {
         return new DBSPTypeStream(this.outputType(outputNo), outerCircuit);
     }
@@ -189,5 +213,9 @@ public abstract class DBSPOperator extends DBSPNode implements IDBSPOuterNode {
 
     public CalciteRelNode getRelNode() {
         return this.node.to(CalciteRelNode.class);
+    }
+
+    public List<SourcePositionRange> getSourcePositions() {
+        return this.getRelNode().getSourcePositions();
     }
 }

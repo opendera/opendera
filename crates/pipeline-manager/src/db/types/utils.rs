@@ -1,10 +1,12 @@
 use crate::db::error::DBError;
 use crate::db::types::program::{ProgramConfig, ProgramInfo};
+use crate::pipeline_env::validate_pipeline_env;
 use feldera_types::config::{PipelineConfig, RuntimeConfig};
-use log::error;
+use feldera_types::runtime_status::StorageStatusDetails;
 use regex::Regex;
 use serde::Serialize;
 use thiserror::Error as ThisError;
+use tracing::error;
 
 // Utility functions related to types which are stored in the database.
 // The functions center around serialization, deserialization and validation.
@@ -50,6 +52,8 @@ pub enum ValidationError {
     DeserializationFailed(String),
     #[error("enterprise feature: {0}")]
     EnterpriseFeature(String),
+    #[error("invalid pipeline environment: {0}")]
+    InvalidPipelineEnv(String),
 }
 
 /// Deserializes generic JSON value into [`RuntimeConfig`] and performs any additional validation.
@@ -65,6 +69,13 @@ pub(crate) fn validate_runtime_config(
             #[cfg(not(feature = "feldera-enterprise"))]
             if runtime_config.fault_tolerance.is_enabled() {
                 let e = ValidationError::EnterpriseFeature("fault tolerance".to_string());
+                if log_if_invalid {
+                    error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}");
+                }
+                return Err(e);
+            }
+            if let Err(e) = validate_pipeline_env(&runtime_config.env) {
+                let e = ValidationError::InvalidPipelineEnv(e);
                 if log_if_invalid {
                     error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}");
                 }
@@ -113,10 +124,33 @@ pub(crate) fn validate_program_info(
 pub(crate) fn validate_deployment_config(
     value: &serde_json::Value,
 ) -> Result<PipelineConfig, ValidationError> {
+    let deserialize_result = serde_json::from_value::<PipelineConfig>(value.clone())
+        .map_err(|e| ValidationError::DeserializationFailed(e.to_string()));
+    match deserialize_result {
+        Ok(deployment_config) => {
+            if let Err(e) = validate_pipeline_env(&deployment_config.global.env) {
+                let e = ValidationError::InvalidPipelineEnv(e);
+                error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid deployment configuration due to: {e}");
+                Err(e)
+            } else {
+                Ok(deployment_config)
+            }
+        }
+        Err(e) => {
+            error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid deployment configuration due to: {e}");
+            Err(e)
+        }
+    }
+}
+
+/// Deserializes the generic JSON value into [`StorageStatusDetails`] and performs any additional validation.
+pub(crate) fn validate_storage_status_details(
+    value: &serde_json::Value,
+) -> Result<StorageStatusDetails, ValidationError> {
     let deserialize_result = serde_json::from_value(value.clone())
         .map_err(|e| ValidationError::DeserializationFailed(e.to_string()));
     if let Err(e) = &deserialize_result {
-        error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid deployment configuration due to: {e}");
+        error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid storage status details due to: {e}");
     }
     deserialize_result
 }
@@ -205,6 +239,11 @@ mod tests {
             validate_runtime_config(&json!({ "fault_tolerance": {} }), true),
             Err(ValidationError::EnterpriseFeature(s)) if s == "fault tolerance"
         ));
+
+        assert!(matches!(
+            validate_runtime_config(&json!({ "env": { "TOKIO_WORKER_THREADS": "1" } }), true),
+            Err(ValidationError::InvalidPipelineEnv(_))
+        ));
     }
 
     #[test]
@@ -240,7 +279,7 @@ mod tests {
             udf_stubs: "".to_string(),
             input_connectors: Default::default(),
             output_connectors: Default::default(),
-            dataflow: serde_json::Value::Null,
+            dataflow: None,
         };
         let value = serde_json::to_value(program_info.clone()).unwrap();
         assert_eq!(program_info, validate_program_info(&value).unwrap());
@@ -257,10 +296,14 @@ mod tests {
         // PipelineConfig -> JSON -> PipelineConfig is the same as original
         let deployment_config = PipelineConfig {
             global: Default::default(),
+            multihost: None,
             name: None,
+            given_name: None,
             storage_config: None,
+            secrets_dir: None,
             inputs: Default::default(),
             outputs: Default::default(),
+            program_ir: None,
         };
         let value = serde_json::to_value(deployment_config.clone()).unwrap();
         assert_eq!(
@@ -272,6 +315,13 @@ mod tests {
         assert!(matches!(
             validate_deployment_config(&json!({ "name": 123 })),
             Err(ValidationError::DeserializationFailed(_))
+        ));
+
+        assert!(matches!(
+            validate_deployment_config(
+                &json!({ "workers": 8, "env": { "TOKIO_WORKER_THREADS": "1" } })
+            ),
+            Err(ValidationError::InvalidPipelineEnv(_))
         ));
     }
 }

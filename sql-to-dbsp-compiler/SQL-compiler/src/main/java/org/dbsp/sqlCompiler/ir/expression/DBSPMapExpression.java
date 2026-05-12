@@ -24,7 +24,7 @@ import java.util.List;
 import java.util.Objects;
 
 /** Represents a map constructor. */
-public final class DBSPMapExpression extends DBSPExpression implements ISameValue, IConstructor {
+public final class DBSPMapExpression extends DBSPExpression implements ISameValue, IConstructor, IDBSPContainer {
     // Both lists must have the same length
     @Nullable
     public final List<DBSPExpression> keys;
@@ -184,18 +184,20 @@ public final class DBSPMapExpression extends DBSPExpression implements ISameValu
                     .append(this.type)
                     .append(")")
                     .append("null");
-        builder.append("Map::from([")
-                .increase();
+        builder.append("Map::from([");
+        if (this.size() > 0)
+            builder.increase();
         Utilities.enforce(this.values != null);
         for (int i = 0; i < keys.size(); i++) {
             builder.append(this.keys.get(i))
                     .append(" => ")
                     .append(this.values.get(i))
-                    .append(",");
+                    .append(",").newline();
         }
-        return builder.append("])")
-                .decrease()
-                .newline();
+        builder.append("])");
+        if (this.size() > 0)
+            builder.decrease();
+        return builder.newline();
     }
 
     @Override

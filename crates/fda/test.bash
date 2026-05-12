@@ -1,6 +1,13 @@
 #!/bin/bash
 set -ex
 
+FDA_BINARY=${FDA_BINARY:-../../target/debug/fda}
+
+fda() {
+    ${FDA_BINARY} "$@"
+}
+
+
 fail_on_success() {
   # Run the command with `|| true` to prevent `set -e` from exiting the script
   set +e
@@ -31,14 +38,11 @@ compare_output() {
   return 0
 }
 
-fda() {
-    ../../target/debug/fda "$@"
-}
-#export FELDERA_HOST=http://localhost:8080
-
-cargo build
-
-EDITION=`curl "${FELDERA_HOST%/}/v0/config" | jq .edition | sed s/\"//g`
+curl_opts=()
+if [[ "${FELDERA_TLS_INSECURE:-}" == "1" || "${FELDERA_TLS_INSECURE:-}" == "true" ]]; then
+  curl_opts+=(--insecure)
+fi
+EDITION=`curl "${curl_opts[@]}" -H "Authorization: Bearer ${FELDERA_API_KEY}" "${FELDERA_HOST%/}/v0/config" | jq .edition | sed s/\"//g`
 echo "Edition: $EDITION"
 case $EDITION in
     Enterprise) enterprise=true ;;
@@ -68,16 +72,23 @@ fda apikey delete a
 echo "base64 = '0.22.1'" > udf.toml
 echo "use feldera_sqllib::F32;" > udf.rs
 cat > program.sql <<EOF
-CREATE TABLE example ( id INT NOT NULL PRIMARY KEY ) WITH ('connectors' = '[{ "name": "c", "transport": { "name": "datagen", "config": { "plan": [{ "limit": 1 }] } } }]');
+CREATE TABLE example ( id INT NOT NULL PRIMARY KEY ) WITH ('materialized' = 'true', 'connectors' = '[{ "name": "c", "transport": { "name": "datagen", "config": { "plan": [{ "limit": 1 }] } } }]');
 CREATE VIEW example_count WITH ('connectors' = '[{ "name": "c", "transport": { "name": "file_output", "config": { "path": "bla" } }, "format": { "name": "csv" } }]') AS ( SELECT COUNT(*) AS num_rows FROM example );
 EOF
 
 fda create p1 program.sql
 fda program get p1 | fda create p2 -s
 compare_output "fda program get p1" "fda program get p2"
-fda program set-config p1 dev
+fda program set-config p1 --profile dev
+fda program set-config p1 --profile optimized
 fda program config p1
 fda program status p1
+fda events p1
+fda events p1 status
+fda events p1 all
+fda event p1 latest
+fda event p1 latest status
+fda event p1 latest all
 
 fda create pudf program.sql --udf-toml udf.toml --udf-rs udf.rs
 compare_output "fda program get pudf --udf-toml" "cat udf.toml"
@@ -91,6 +102,8 @@ compare_output "fda program get p1 --udf-rs" "fda program get p2 --udf-rs"
 
 fda config p1
 
+fda dismiss-error p1
+fda start p1 --no-dismiss-error
 fda start p1
 fda --format json stats p1 | jq '.metrics'
 fda log p1
@@ -98,12 +111,26 @@ fda logs p1
 fda connector p1 example c stats
 fda connector p1 example_count c stats
 fda connector p1 example unknown stats || true
-fda connector p1 unknown c stats || true
-fda connector unknown example c stats || true
+# Connectors
 fda connector p1 example c pause
 fda connector p1 example_count c pause || true
 fda connector p1 example c start
 fda connector p1 example unknown start || true
+
+# Adhoc queries
+fda query p1 "SELECT * FROM example"
+
+# Transaction tests
+echo "Testing transaction commands..."
+fail_on_success fda commit-transaction p1
+fda start-transaction p1
+fail_on_success fda commit-transaction p1 --tid 999
+fda commit-transaction p1
+fda start-transaction p1
+fda commit-transaction p1 --timeout 10
+fda start-transaction p1
+fda commit-transaction p1 --no-wait
+
 fda shutdown p1
 
 if $enterprise; then
@@ -111,7 +138,7 @@ if $enterprise; then
 else
     enterprise_only=fail_on_success
 fi
-$enterprise_only fda clear p1
+fda clear p1
 $enterprise_only fda set-config p1 fault_tolerance true
 fda set-config p1 fault_tolerance false
 fda set-config p1 fault_tolerance none
@@ -120,10 +147,65 @@ $enterprise_only fda set-config p1 fault_tolerance exactly_once
 fail_on_success fda set-config p1 fault_tolerance exactly_one
 fail_on_success fda program set-config p1 -p optimized --runtime-version invalid-version
 
+# Test dev_tweaks setting
+fda set-config p1 dev_tweaks '{"x": 2}'
+fail_on_success fda set-config p1 dev_tweaks 'invalid-json'
+
 fda delete p1
 fda delete p2
 fda delete pudf
 fda shell unknown || true
+
+# Test support bundle with all collections skipped
+echo "Testing support bundle with all collections skipped..."
+fda create p1 program.sql
+fda start p1
+sleep 2  # Give pipeline time to start
+
+# Test support bundle
+echo "Testing support bundle with all collections enabled..."
+fda support-bundle p1 -o test-support-bundle-full.zip
+# Verify the ZIP file exists
+if [ ! -f test-support-bundle-full.zip ]; then
+    echo "Support bundle file was not created"
+    exit 1
+fi
+# Count files in the ZIP and verify we have multiple files (manifest + data files)
+# this counts one more than what is in the archive
+file_count=$(unzip -l test-support-bundle-full.zip | grep -E "^\s*[0-9]+" | wc -l)
+if [ "$file_count" -lt 9 ]; then
+    echo "Expected at least 8 files in support bundle (manifest.txt + data files +/- the heap profile which doesnt work on macos), found $file_count"
+    unzip -l test-support-bundle-full.zip
+    exit 1
+fi
+
+# Create support bundle with all collections skipped
+fda support-bundle p1 \
+  --no-circuit-profile \
+  --no-heap-profile \
+  --no-metrics \
+  --no-logs \
+  --no-stats \
+  --no-pipeline-config \
+  --no-system-config \
+  --no-dataflow-graph \
+  -o test-support-bundle-none.zip
+
+# Verify the ZIP file exists and check its contents
+if [ ! -f test-support-bundle-none.zip ]; then
+    echo "Support bundle file was not created"
+    exit 1
+fi
+# Count files in the ZIP and verify only manifest.txt exists
+# this counts one more than what is in the archive
+file_count=$(unzip -l test-support-bundle-none.zip | grep -E "^\s*[0-9]+" | wc -l)
+if [ "$file_count" -ne 2 ]; then
+    echo "Expected 1 file in support bundle (manifest.txt), found $file_count"
+    unzip -l test-support-bundle-none.zip
+    exit 1
+fi
+
+fda shutdown p1
 
 # Verify argument conflicts, these invocations should fail
 fail_on_success fda create set punknown --stdin
@@ -131,7 +213,19 @@ fail_on_success fda program set punknown file-path --stdin
 fail_on_success fda program set p1 --udf-toml udf.toml --stdin
 fail_on_success fda program set p1 --udf-rs udf.toml --stdin
 fail_on_success fda program set p1 --udf-rs udf.toml --udf-toml udf.toml --stdin
+# --tls-cert and --insecure are mutually exclusive: supplying both must fail
+# before any request is attempted.
+fail_on_success fda --insecure --tls-cert /tmp/does-not-matter.pem pipelines
+fail_on_success fda -k --tls-cert /tmp/does-not-matter.pem pipelines
 
 rm program.sql
 rm udf.toml
 rm udf.rs
+rm -f test-support-bundle-full.zip
+rm -f test-support-bundle-none.zip
+
+# Cluster events
+fda cluster events
+fda cluster event latest
+fda cluster event latest status
+fda cluster event latest all

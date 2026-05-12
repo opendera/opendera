@@ -1,31 +1,33 @@
 use crate::catalog::ArrowStream;
 use crate::transport::{InputEndpoint, InputQueue, InputReaderCommand};
 use crate::{
-    server::PipelineError, transport::InputReader, ControllerError, InputConsumer, PipelineState,
-    TransportInputEndpoint,
+    ControllerError, InputConsumer, PipelineState, TransportInputEndpoint, server::PipelineError,
+    transport::InputReader,
 };
 use crate::{InputBuffer, Parser};
-use anyhow::{anyhow, Error as AnyError, Result as AnyResult};
+use anyhow::{Error as AnyError, Result as AnyResult, anyhow};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use atomic::Atomic;
 use bytes::Bytes;
+use chrono::Utc;
 use datafusion::execution::SendableRecordBatchStream;
-use feldera_adapterlib::transport::Resume;
+use feldera_adapterlib::format::BufferSize;
+use feldera_adapterlib::transport::{Resume, Watermark};
 use feldera_types::config::FtModel;
 use feldera_types::program_schema::Relation;
 use feldera_types::transport::adhoc::AdHocInputConfig;
 use futures::future::{BoxFuture, FutureExt};
 use futures_util::StreamExt;
-use parquet::arrow::async_writer::AsyncFileWriter;
 use parquet::arrow::AsyncArrowWriter;
+use parquet::arrow::async_writer::AsyncFileWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::{
     hash::Hasher,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 use tokio::{
@@ -125,9 +127,11 @@ impl AdHocInputEndpoint {
         schema: &Arc<Schema>,
         arrow_inserter: &mut Box<dyn ArrowStream>,
     ) -> AnyResult<u64> {
-        arrow_inserter.insert(&batch)?;
+        let timestamp = Utc::now();
+
+        arrow_inserter.insert(&batch, &None)?;
         let buffer = arrow_inserter.take_all();
-        let num_records = buffer.len();
+        let size = buffer.len();
         if !buffer.is_empty() {
             let mut aux = Vec::new();
             if self.fault_tolerance() == Some(FtModel::ExactlyOnce) {
@@ -147,13 +151,15 @@ impl AdHocInputEndpoint {
 
             let mut guard = self.inner.details.lock().unwrap();
             let details = guard.as_mut().unwrap();
-            details.queue.push_with_aux((buffer, Vec::new()), 0, aux);
+            details
+                .queue
+                .push_with_aux((buffer, Vec::new()), timestamp, aux);
         }
 
-        Ok(num_records as u64)
+        Ok(size.records as u64)
     }
 
-    fn error(&self, fatal: bool, error: AnyError) {
+    fn error(&self, fatal: bool, error: AnyError, tag: Option<&'static str>) {
         self.inner
             .details
             .lock()
@@ -161,7 +167,7 @@ impl AdHocInputEndpoint {
             .as_mut()
             .unwrap()
             .consumer
-            .error(fatal, error);
+            .error(fatal, error, tag);
     }
 
     fn queue_len(&self) -> usize {
@@ -206,7 +212,7 @@ impl AdHocInputEndpoint {
                                 })?;
                         }
                         Ok(Some(Err(e))) => {
-                            self.error(true, anyhow!(e.to_string()));
+                            self.error(true, anyhow!(e.to_string()), None);
                             Err(ControllerError::input_transport_error(
                                 self.name(),
                                 true,
@@ -249,6 +255,7 @@ impl TransportInputEndpoint for AdHocInputEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         _schema: Relation,
+        _resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         let queue = InputQueue::new(consumer.clone());
         *self.inner.details.lock().unwrap() = Some(AdHocInputEndpointDetails {
@@ -261,24 +268,28 @@ impl TransportInputEndpoint for AdHocInputEndpoint {
 }
 
 impl InputReader for AdHocInputEndpoint {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         match command {
-            InputReaderCommand::Seek(_) => (),
             InputReaderCommand::Replay { data, .. } => {
                 let Metadata { batches: chunks } = rmpv::ext::from_value(data).unwrap();
                 let mut guard = self.inner.details.lock().unwrap();
                 let details = guard.as_mut().unwrap();
-                let mut num_records = 0;
+                let mut total = BufferSize::empty();
                 let mut hasher = Xxh3Default::new();
                 for chunk in chunks {
-                    let (mut buffer, errors) = details.parser.parse(&chunk);
-                    details.consumer.buffered(buffer.len(), !chunk.len());
+                    let (mut buffer, errors) = details.parser.parse(&chunk, None);
+                    let len = buffer.len();
+                    details.consumer.buffered(len);
                     details.consumer.parse_errors(errors);
-                    num_records += buffer.len();
+                    total += len;
                     buffer.hash(&mut hasher);
                     buffer.flush();
                 }
-                details.consumer.replayed(num_records, hasher.finish());
+                details.consumer.replayed(total, hasher.finish());
             }
             InputReaderCommand::Extend => self.set_state(PipelineState::Running),
             InputReaderCommand::Pause => self.set_state(PipelineState::Paused),
@@ -286,6 +297,8 @@ impl InputReader for AdHocInputEndpoint {
                 let mut guard = self.inner.details.lock().unwrap();
                 let details = guard.as_mut().unwrap();
                 let (num_records, hasher, batches) = details.queue.flush_with_aux();
+                let (timestamps, batches): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
+
                 let resume = Resume::new_data_only(
                     || {
                         rmpv::ext::to_value(Metadata {
@@ -293,9 +306,16 @@ impl InputReader for AdHocInputEndpoint {
                         })
                         .unwrap()
                     },
-                    hasher,
+                    hasher.map(|h| h.finish()),
                 );
-                details.consumer.extended(num_records, Some(resume));
+                details.consumer.extended(
+                    num_records,
+                    Some(resume),
+                    timestamps
+                        .into_iter()
+                        .map(|ts| Watermark::new(ts, None))
+                        .collect(),
+                );
             }
             InputReaderCommand::Disconnect => self.set_state(PipelineState::Terminated),
         }

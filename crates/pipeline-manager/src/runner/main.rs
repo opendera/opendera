@@ -1,22 +1,22 @@
 use crate::api::error::ApiError;
 use crate::api::util::parse_url_parameter;
 use crate::config::CommonConfig;
-use crate::db::notifier::{DbNotification, Operation};
+use crate::db::listen_table::{Operation, PIPELINE_NOTIFY_CHANNEL_CAPACITY};
 use crate::db::probe::DbProbe;
+use crate::db::storage::Storage;
 use crate::db::storage_postgres::StoragePostgres;
 use crate::db::types::pipeline::PipelineId;
 use crate::error::ManagerError;
 use crate::runner::error::RunnerError;
 use crate::runner::pipeline_automata::PipelineAutomaton;
 use crate::runner::pipeline_executor::PipelineExecutor;
-use crate::runner::pipeline_logs::LogMessage;
+use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use actix_web::HttpResponse;
 use actix_web::Responder;
 use actix_web::{get, web, HttpRequest, HttpServer};
 use async_stream::try_stream;
-use log::{debug, error, trace};
-use reqwest::{Method, StatusCode};
 use std::collections::BTreeMap;
+use std::net::TcpListener;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +24,10 @@ use tokio::spawn;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{Mutex, Notify};
-use tokio::time::sleep;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tokio_stream::Stream;
+use tracing::{error, info};
 use uuid::Uuid;
 
 /// Maximum number of outstanding log follow requests that have
@@ -37,25 +39,20 @@ pub const MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS: usize = 100;
 /// is returned an error upon `try_send` that the buffer is full, the follower will
 /// be dropped in order to not slow down others. It should be set to at least the
 /// circular buffer size such that catch up will not cause the limit to be hit.
-pub const MAXIMUM_BUFFERED_LINES_PER_FOLLOWER: usize = 100_000;
+const MAXIMUM_BUFFERED_LINES_PER_FOLLOWER: usize = 100_000;
 
-/// Timeout of each request to check if the main HTTP server is ready.
-pub const READY_CHECK_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_millis(2_000);
-
-/// Poll period between each check whether the main HTTP server is ready.
-pub const READY_CHECK_POLL_PERIOD: Duration = Duration::from_millis(2_000);
-
-/// Number of request tries before giving up.
-pub const READY_CHECK_HTTP_RETRIES: u64 = 8;
+/// Interval at which to discover new pipelines in order to start their runners, or to join pipeline
+/// runners that have finished.
+const PIPELINE_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Type alias shorthand for the pipelines state the runner manager maintains and interacts with.
-type PipelinesState = BTreeMap<PipelineId, (Arc<Notify>, Sender<Sender<String>>)>;
+type PipelinesState = BTreeMap<PipelineId, (JoinHandle<()>, Arc<Notify>, Sender<Sender<String>>)>;
 
 /// Returns whether the runner is healthy.
 /// The health check consults the continuous probe of database reachability.
 #[get("/healthz")]
 async fn get_healthz(data: web::Data<Arc<Mutex<DbProbe>>>) -> Result<impl Responder, ManagerError> {
-    data.lock().await.status_as_http_response()
+    Ok(data.lock().await.as_http_response())
 }
 
 /// Produces a continuous stream of logs which are received from the pipeline runner.
@@ -97,7 +94,7 @@ async fn get_logs(
     // Attempt to follow the logs and return them in a streaming response
     match data.lock().await.get(&pipeline_id) {
         None => Ok(HttpResponse::NotFound().finish()),
-        Some((_, follow_request_sender)) => {
+        Some((_, _, follow_request_sender)) => {
             let (sender, receiver) = channel::<String>(MAXIMUM_BUFFERED_LINES_PER_FOLLOWER);
             match follow_request_sender.try_send(sender) {
                 Ok(()) => {
@@ -131,30 +128,7 @@ async fn get_logs(
     }
 }
 
-/// Waits for the HTTP server to become ready by polling it.
-/// Returns false if after a predefined number of tries with timeouts
-/// it was unable to receive an OK response from the health endpoint.
-async fn wait_for_http_server_ready(client: &reqwest::Client, port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/healthz");
-    let mut tries = READY_CHECK_HTTP_RETRIES;
-    while tries > 0 {
-        if let Ok(response) = client
-            .request(Method::GET, &url)
-            .timeout(READY_CHECK_HTTP_REQUEST_TIMEOUT)
-            .send()
-            .await
-        {
-            if response.status() == StatusCode::OK {
-                return true;
-            }
-        }
-        sleep(READY_CHECK_POLL_PERIOD).await;
-        tries -= 1;
-    }
-    false
-}
-
-/// Main to start the runner, which consists of starting a web server and
+/// Main to start the runner, which consists of starting an HTTP(S) server and
 /// a reconciliation loop which matches pipelines with runner automatons.
 pub async fn runner_main<E: PipelineExecutor + 'static>(
     // Database handle
@@ -163,13 +137,13 @@ pub async fn runner_main<E: PipelineExecutor + 'static>(
     common_config: CommonConfig,
     // Pipeline executor configuration
     config: E::Config,
-) -> Result<(), ManagerError> {
+) {
     // Mapping of the present pipelines to how to reach them:
     // - A notification mechanism for the automata to act quickly on change
     // - A sender channel to request getting logs from the pipeline runner
     let pipelines: Arc<Mutex<PipelinesState>> = Arc::new(Mutex::new(BTreeMap::new()));
 
-    // Setup web server
+    // Setup HTTP(S) server
     let data_healthz = web::Data::new(DbProbe::new(db.clone()).await);
     let data_logs = web::Data::new(pipelines.clone());
     let server = HttpServer::new(move || {
@@ -181,53 +155,124 @@ pub async fn runner_main<E: PipelineExecutor + 'static>(
     })
     .workers(common_config.http_workers)
     .worker_max_blocking_threads(std::cmp::max(512 / common_config.http_workers, 1));
-    spawn(
-        server
-            .bind((
-                common_config.bind_address.clone(),
-                common_config.runner_port,
-            ))
-            .expect("Unable to bind runner main HTTP server to port {main_http_server_port}")
-            .run(),
-    );
-
-    // Reused HTTP client
-    let client = reqwest::Client::new();
-
-    if !wait_for_http_server_ready(&client, common_config.runner_port).await {
+    let listener = TcpListener::bind((
+        common_config.bind_address.clone(),
+        common_config.runner_port,
+    ))
+    .unwrap_or_else(|_| {
         panic!(
-            "Unable to reach runner HTTP server on port {}",
-            common_config.runner_port
-        );
-    }
-    debug!(
-        "Runner HTTP server ready on port {}",
-        common_config.runner_port
+            "runner unable to bind listener to {}:{} -- is the port occupied?",
+            common_config.bind_address, common_config.runner_port
+        )
+    });
+    spawn(
+        if let Some(server_config) = common_config.https_server_config() {
+            server
+                .listen_rustls_0_23(listener, server_config)
+                .expect("runner HTTPS server unable to listen")
+                .run()
+        } else {
+            server
+                .listen(listener)
+                .expect("runner HTTP server unable to listen")
+                .run()
+        },
     );
+    info!(
+        "Runner {} server: ready on port {} ({} workers)",
+        if common_config.enable_https {
+            "HTTPS"
+        } else {
+            "HTTP"
+        },
+        common_config.runner_port,
+        common_config.http_workers,
+    );
+
+    // Reused HTTP(S) client
+    let client = common_config.reqwest_client().await;
 
     // Launch the reconciliation loop
-    reconcile::<E>(db, client, pipelines, common_config, config).await
+    reconcile::<E>(db, client, pipelines, common_config, config).await;
 }
 
-/// Continuous reconciliation loop between what is stored about the pipelines in the database and
-/// the runner managing their deployment.
-/// It continuously waits and acts on pipeline database notifications (create, update, delete).
+/// For each of the rows in the pipeline table, the runner spawns an automaton, also referred to as
+/// the "pipeline runner".
+///
+/// - Periodically, the list of all pipelines is retrieved (identifiers only): for pipelines that do
+///   not have a runner, one is spawned for them. For each pipeline runner, its own notifier is
+///   generated. The periodic check can be preempted by the main notifier.
+/// - Periodically, each pipeline runner fetches its table row and takes action. This can be
+///   preempted by its notifier.
+/// - If a pipeline runner fetches its table row, but it is not found, it will terminate itself.
+///   This termination is detected by the join handle.
+/// - In parallel we LISTEN to the pipeline table: if a pipeline is added, updated or deleted, the
+///   notifiers are used to have the main and each pipeline runner respond more quickly. This is
+///   purely supplemental, as both already have a periodic check anyway.
 async fn reconcile<E: PipelineExecutor + 'static>(
     db: Arc<Mutex<StoragePostgres>>,
     client: reqwest::Client,
     pipelines: Arc<Mutex<PipelinesState>>,
     common_config: CommonConfig,
     config: E::Config,
-) -> Result<(), ManagerError> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    spawn(crate::db::notifier::listen(db.clone(), tx));
-    debug!("Runner has started");
+) {
+    // Listen to the pipeline table in order to be able to send quick notification to the pipeline
+    // runner that something changed in the pipeline, and it might need to take action
+    let db_cloned = db.clone();
+    let pipelines_cloned = pipelines.clone();
+    let main_notifier = Arc::new(Notify::new());
+    let main_notifier_cloned = main_notifier.clone();
+    spawn(async move {
+        // Spawn a separate thread that listens to the table and sends out related notifications
+        let (listen_sender, mut listen_receiver) = channel(PIPELINE_NOTIFY_CHANNEL_CAPACITY);
+        spawn(crate::db::listen_table::listen_table(
+            db_cloned,
+            listen_sender,
+        ));
+
+        // Receive any table listen notifications and notify the main and its corresponding pipeline
+        // runner
+        loop {
+            match listen_receiver.recv().await {
+                Some(notification) => {
+                    // Notify the pipeline runner if it already exists
+                    if let Some((_, notifier, _)) =
+                        pipelines_cloned.lock().await.get(&notification.pipeline_id)
+                    {
+                        notifier.notify_one();
+                    }
+
+                    // If it is an addition, notify the main loop that spawns runner so it can more
+                    // quickly spawn the runner
+                    if notification.operation == Operation::Add {
+                        main_notifier_cloned.notify_one();
+                    }
+                }
+                None => {
+                    error!("Runner main: listen notifier sending side has disconnected -- no longer able to send notifications");
+                    break;
+                }
+            }
+        }
+    });
+
+    // Periodically check for new pipelines and start runners for them, followed by checking whether
+    // any existing runners have terminated
+    let mut db_error_previously = false;
     loop {
-        trace!("Waiting for pipeline operation notification from database...");
-        if let Some(DbNotification::Pipeline(op, tenant_id, pipeline_id)) = rx.recv().await {
-            debug!("Received pipeline operation notification: operation={op:?} tenant_id={tenant_id} pipeline_id={pipeline_id}");
-            match op {
-                Operation::Add | Operation::Update => {
+        // Discover new pipelines and delete finished ones at an interval, or it can also be
+        // preempted via the listening mechanism
+        let _ = timeout(PIPELINE_DISCOVERY_INTERVAL, main_notifier.notified()).await;
+
+        // Retrieve the full list of pipeline identifiers, and start a pipeline runner for each one
+        // which is not yet in the state
+        match db.lock().await.list_pipeline_ids_across_all_tenants().await {
+            Ok(pipeline_ids) => {
+                if db_error_previously {
+                    info!("Runner main: again able to retrieve pipeline identifiers from the database. Any new pipelines will be retroactively detected.");
+                    db_error_previously = false;
+                }
+                for (tenant_id, pipeline_id) in pipeline_ids {
                     pipelines
                         .lock()
                         .await
@@ -237,7 +282,8 @@ async fn reconcile<E: PipelineExecutor + 'static>(
                             let (follow_request_sender, follow_request_receiver) =
                                 channel::<Sender<String>>(MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS);
                             let (logs_sender, logs_receiver) =
-                                channel::<LogMessage>(MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS);
+                                channel::<LogMessage>(MAXIMUM_BUFFERED_LINES_PER_FOLLOWER);
+                            let logs_sender = LogsSender::new(logs_sender);
                             let pipeline_handle = E::new(
                                 pipeline_id,
                                 common_config.clone(),
@@ -245,10 +291,11 @@ async fn reconcile<E: PipelineExecutor + 'static>(
                                 client.clone(),
                                 logs_sender.clone(),
                             );
-                            spawn(
+                            let pipeline_runner_handle = spawn(
                                 PipelineAutomaton::new(
-                                    &common_config.platform_version,
+                                    common_config.clone(),
                                     pipeline_id,
+                                    None,
                                     tenant_id,
                                     db.clone(),
                                     notifier.clone(),
@@ -261,21 +308,41 @@ async fn reconcile<E: PipelineExecutor + 'static>(
                                 )
                                 .run(),
                             );
-                            (notifier, follow_request_sender)
-                        })
-                        .0
-                        .notify_one();
+                            (pipeline_runner_handle, notifier, follow_request_sender)
+                        });
                 }
-                Operation::Delete => {
-                    if let Some((notifier, _follow_request_sender)) =
-                        pipelines.lock().await.remove(&pipeline_id)
-                    {
-                        // Notify the automaton so it shuts down
-                        notifier.notify_one();
-                        // The _follow_request_sender will be dropped here automatically
-                    }
+            }
+            Err(e) => {
+                error!("Runner main: unable to retrieve pipeline identifiers from the database. Any new pipelines are not detected until again able to. Error: {e}");
+                db_error_previously = true;
+            }
+        }
+
+        // Find the pipeline runners that have finished by checking whether the join handle
+        // indicates it has finished
+        let mut finished = vec![];
+        for (pipeline_id, (join_handle, _, _)) in pipelines.lock().await.iter() {
+            if join_handle.is_finished() {
+                finished.push(*pipeline_id);
+            }
+        }
+        for pipeline_id in finished {
+            if let Some((join_handle, _, _)) = pipelines.lock().await.remove(&pipeline_id) {
+                if let Err(e) = join_handle.await {
+                    error!(
+                        pipeline_id = %pipeline_id,
+                        pipeline = "N/A",
+                        "Pipeline experienced a join error: {e}"
+                    )
                 }
-            };
+            } else {
+                // Should be unreachable as this loop is the only one removing entries
+                error!(
+                    pipeline_id = %pipeline_id,
+                    pipeline = "N/A",
+                    "Pipeline was marked as finished, and as such to be joined and removed. It has however already been removed."
+                );
+            }
         }
     }
 }

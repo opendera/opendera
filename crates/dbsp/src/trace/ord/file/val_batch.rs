@@ -1,28 +1,35 @@
 use crate::storage::buffer_cache::CacheStats;
+use crate::storage::file::{
+    FilterKind, FilterStats, TouchedWindowCount, TouchedWindowCounter, collect_roaring_metadata,
+};
 use crate::trace::BatchLocation;
+use crate::trace::cursor::Position;
+use crate::trace::ord::file::UnwrapStorage;
 use crate::{
+    DBData, DBWeight, NumEntries, Runtime, Timestamp,
     dynamic::{
         DataTrait, DynDataTyped, DynOpt, DynPair, DynUnit, DynVec, DynWeightedPairs, Erase,
         Factory, LeanVec, WeightTrait, WithFactory,
     },
     storage::file::{
+        Factories as FileFactories, FilterPlan,
+        format::BatchMetadata,
         reader::{Cursor as FileCursor, Error as ReaderError, Reader},
         writer::Writer2,
-        Factories as FileFactories,
     },
     trace::{
-        ord::merge_batcher::MergeBatcher, Batch, BatchFactories, BatchReader, BatchReaderFactories,
-        Builder, Cursor, WeightedItem,
+        Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, WeightedItem,
+        filter::BatchFilters, ord::merge_batcher::MergeBatcher,
     },
     utils::Tup2,
-    DBData, DBWeight, NumEntries, Runtime, Timestamp,
 };
 use derive_more::Debug;
 use dyn_clone::clone_box;
-use feldera_storage::StoragePath;
-use rand::{seq::index::sample, Rng};
-use rkyv::{ser::Serializer, Archive, Archived, Deserialize, Fallible, Serialize};
+use feldera_storage::{FileReader, StoragePath};
+use rand::{Rng, seq::index::sample};
+use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, ser::Serializer};
 use size_of::SizeOf;
+use std::any::TypeId;
 use std::sync::Arc;
 use std::{
     fmt,
@@ -207,8 +214,10 @@ where
     #[size_of(skip)]
     #[debug(skip)]
     factories: FileValBatchFactories<K, V, T, R>,
-    #[size_of(skip)]
+    #[debug(skip)]
     pub file: RawValBatch<K, V, T, R>,
+    #[debug(skip)]
+    filters: BatchFilters<K>,
 }
 
 impl<K, V, T, R> Clone for FileValBatch<K, V, T, R>
@@ -222,6 +231,27 @@ where
         Self {
             factories: self.factories.clone(),
             file: self.file.clone(),
+            filters: self.filters.clone(),
+        }
+    }
+}
+
+impl<K, V, T, R> FileValBatch<K, V, T, R>
+where
+    K: DataTrait + ?Sized,
+    V: DataTrait + ?Sized,
+    T: Timestamp,
+    R: WeightTrait + ?Sized,
+{
+    fn from_parts(
+        factories: FileValBatchFactories<K, V, T, R>,
+        file: RawValBatch<K, V, T, R>,
+        filters: BatchFilters<K>,
+    ) -> Self {
+        Self {
+            factories,
+            file,
+            filters,
         }
     }
 }
@@ -290,7 +320,19 @@ where
     }
 
     fn approximate_byte_size(&self) -> usize {
-        self.file.byte_size().unwrap() as usize
+        self.file.byte_size().unwrap_storage() as usize
+    }
+
+    fn membership_filter_stats(&self) -> FilterStats {
+        self.filters.stats().membership_filter
+    }
+
+    fn membership_filter_kind(&self) -> FilterKind {
+        self.filters.membership_filter_kind()
+    }
+
+    fn range_filter_stats(&self) -> FilterStats {
+        self.filters.stats().range_filter
     }
 
     #[inline]
@@ -306,30 +348,24 @@ where
     where
         RG: Rng,
     {
-        self.factories.factories0.key_factory.with(&mut |key| {
-            let size = self.key_count();
-            let mut cursor = self.file.rows().first().unwrap();
-            if sample_size >= size {
-                output.reserve(size);
-                while let Some(key) = unsafe { cursor.key(key) } {
-                    output.push_ref(key);
-                    cursor.move_next().unwrap();
-                }
-            } else {
-                output.reserve(sample_size);
-
-                let mut indexes = sample(rng, size, sample_size).into_vec();
-                indexes.sort_unstable();
-                for index in indexes {
-                    cursor.move_to_row(index as u64).unwrap();
-                    output.push_ref(unsafe { cursor.key(key) }.unwrap());
-                }
+        let size = self.key_count();
+        let mut cursor = unsafe { self.file.rows().first().unwrap_storage() };
+        if sample_size >= size {
+            output.reserve(size);
+            while let Some(key) = cursor.key() {
+                output.push_ref(key);
+                unsafe { cursor.move_next() }.unwrap_storage();
             }
-        })
-    }
+        } else {
+            output.reserve(sample_size);
 
-    fn maybe_contains_key(&self, key: &Self::Key) -> bool {
-        self.file.maybe_contains_key(key)
+            let mut indexes = sample(rng, size, sample_size).into_vec();
+            indexes.sort_unstable();
+            for index in indexes {
+                unsafe { cursor.move_to_row(index as u64) }.unwrap_storage();
+                output.push_ref(cursor.key().unwrap());
+            }
+        }
     }
 }
 
@@ -340,27 +376,40 @@ where
     T: Timestamp,
     R: WeightTrait + ?Sized,
 {
+    type Timed<T2: Timestamp> = FileValBatch<K, V, T2, R>;
     type Batcher = MergeBatcher<Self>;
     type Builder = FileValBuilder<K, V, T, R>;
 
-    fn checkpoint_path(&self) -> Option<StoragePath> {
+    fn file_reader(&self) -> Option<Arc<dyn FileReader>> {
         self.file.mark_for_checkpoint();
-        Some(self.file.path())
+        Some(self.file.file_handle().clone())
     }
 
     fn from_path(factories: &Self::Factories, path: &StoragePath) -> Result<Self, ReaderError> {
         let any_factory0 = factories.factories0.any_factories();
         let any_factory1 = factories.factories1.any_factories();
-        let file = Arc::new(Reader::open(
+        let (file, membership_filter) = Reader::open_with_filter(
             &[&any_factory0, &any_factory1],
             Runtime::buffer_cache,
-            &*Runtime::storage_backend().unwrap(),
+            &*Runtime::storage_backend().unwrap_storage(),
             path,
-        )?);
-        Ok(Self {
-            factories: factories.clone(),
-            file,
-        })
+        )?;
+        let file = Arc::new(file);
+        let key_range = file.key_range()?.map(Into::into);
+        let filters = BatchFilters::from_file(key_range, membership_filter);
+        Ok(Self::from_parts(factories.clone(), file, filters))
+    }
+
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        self.filters.key_bounds()
+    }
+
+    fn negative_weight_count(&self) -> Option<u64> {
+        None
+    }
+
+    fn touched_window_count(&self) -> TouchedWindowCount {
+        self.file.metadata().touched_window_count
     }
 }
 
@@ -377,10 +426,6 @@ where
     weight_factory: &'static dyn Factory<R>,
     key_cursor: RawKeyCursor<'s, K, V, T, R>,
     val_cursor: RawValCursor<'s, K, V, T, R>,
-    key: Box<K>,
-    key_valid: bool,
-    val: Box<V>,
-    val_valid: bool,
     weight: Box<R>,
 }
 
@@ -394,11 +439,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FileValCursor")
             .field("key_cursor", &self.key_cursor)
-            .field("val_cursor", &self.val)
-            .field("key", &self.key)
-            .field("key_valid", &self.key_valid)
-            .field("val", &self.val)
-            .field("val_valid", &self.val_valid)
+            .field("val_cursor", &self.val_cursor)
             .field("weight", &self.weight)
             .finish()
     }
@@ -418,10 +459,6 @@ where
             weight_factory: self.weight_factory,
             key_cursor: self.key_cursor.clone(),
             val_cursor: self.val_cursor.clone(),
-            key: clone_box(&self.key),
-            key_valid: self.key_valid,
-            val: clone_box(&self.val),
-            val_valid: self.val_valid,
             weight: clone_box(&self.weight),
         }
     }
@@ -435,23 +472,21 @@ where
     R: WeightTrait + ?Sized,
 {
     fn new(batch: &'s FileValBatch<K, V, T, R>) -> Self {
-        let key_cursor = batch.file.rows().first().unwrap();
-        let val_cursor = key_cursor.next_column().unwrap().first().unwrap();
-        let mut key = batch.factories.factories0.key_factory.default_box();
-        let mut val = batch.factories.factories1.key_factory.default_box();
+        let key_cursor = unsafe { batch.file.rows().first().unwrap_storage() };
+        let val_cursor = unsafe {
+            key_cursor
+                .next_column()
+                .unwrap_storage()
+                .first()
+                .unwrap_storage()
+        };
 
-        let key_valid = unsafe { key_cursor.key(&mut key) }.is_some();
-        let val_valid = unsafe { val_cursor.key(&mut val) }.is_some();
         Self {
             batch,
             timediff_factory: batch.factories.timediff_factory,
             weight_factory: batch.factories.weight_factory,
             key_cursor,
             val_cursor,
-            key,
-            key_valid,
-            val,
-            val_valid,
             weight: batch.factories.weight_factory.default_box(),
         }
     }
@@ -460,16 +495,19 @@ where
         F: Fn(&mut RawKeyCursor<'s, K, V, T, R>),
     {
         op(&mut self.key_cursor);
-        self.val_cursor = self.key_cursor.next_column().unwrap().first().unwrap();
-        self.key_valid = unsafe { self.key_cursor.key(&mut self.key) }.is_some();
-        self.val_valid = unsafe { self.val_cursor.key(&mut self.val) }.is_some();
+        self.val_cursor = unsafe {
+            self.key_cursor
+                .next_column()
+                .unwrap_storage()
+                .first()
+                .unwrap_storage()
+        };
     }
     fn move_val<F>(&mut self, op: F)
     where
         F: Fn(&mut RawValCursor<'s, K, V, T, R>),
     {
         op(&mut self.val_cursor);
-        self.val_valid = unsafe { self.val_cursor.key(&mut self.val) }.is_some();
     }
     fn times<'a>(
         &self,
@@ -491,13 +529,11 @@ where
     }
 
     fn key(&self) -> &K {
-        debug_assert!(self.key_valid);
-        &self.key
+        self.key_cursor.key().unwrap()
     }
 
     fn val(&self) -> &V {
-        debug_assert!(self.val_valid);
-        &self.val
+        self.val_cursor.key().unwrap()
     }
 
     fn map_times(&mut self, logic: &mut dyn FnMut(&T, &R)) {
@@ -536,17 +572,26 @@ where
     where
         T: PartialEq<()>,
     {
-        debug_assert!(self.key_valid());
-        debug_assert!(self.val_valid());
-        self.weight.set_zero();
+        self.weight_checked()
+    }
 
-        self.timediff_factory.with(&mut |timediffs| {
-            for timediff in self.times(timediffs).dyn_iter() {
-                self.weight.add_assign(timediff.snd());
-            }
-        });
+    fn weight_checked(&mut self) -> &R {
+        if TypeId::of::<T>() == TypeId::of::<()>() {
+            debug_assert!(self.key_valid());
+            debug_assert!(self.val_valid());
+            self.weight.set_zero();
 
-        &self.weight
+            self.timediff_factory.with(&mut |timediffs| {
+                for timediff in self.times(timediffs).dyn_iter() {
+                    self.weight.add_assign(timediff.snd());
+                }
+            });
+
+            debug_assert!(!self.weight.is_zero());
+            &self.weight
+        } else {
+            panic!("FileValCursor::weight_checked called on non-unit timestamp type");
+        }
     }
 
     fn key_valid(&self) -> bool {
@@ -556,19 +601,21 @@ where
         self.val_cursor.has_value()
     }
     fn step_key(&mut self) {
-        self.move_key(|key_cursor| key_cursor.move_next().unwrap());
+        self.move_key(|key_cursor| unsafe { key_cursor.move_next() }.unwrap_storage());
     }
 
     fn step_key_reverse(&mut self) {
-        self.move_key(|key_cursor| key_cursor.move_prev().unwrap());
+        self.move_key(|key_cursor| unsafe { key_cursor.move_prev() }.unwrap_storage());
     }
 
     fn seek_key(&mut self, key: &K) {
-        self.move_key(|key_cursor| unsafe { key_cursor.advance_to_value_or_larger(key) }.unwrap());
+        self.move_key(|key_cursor| {
+            unsafe { key_cursor.advance_to_value_or_larger(key) }.unwrap_storage()
+        });
     }
 
-    fn seek_key_exact(&mut self, key: &K) -> bool {
-        if !self.batch.maybe_contains_key(key) {
+    fn seek_key_exact(&mut self, key: &K, hash: Option<u64>) -> bool {
+        if !self.batch.filters.maybe_contains_key(key, hash) {
             return false;
         }
         self.seek_key(key);
@@ -576,49 +623,70 @@ where
     }
 
     fn seek_key_with(&mut self, predicate: &dyn Fn(&K) -> bool) {
-        self.move_key(|key_cursor| unsafe { key_cursor.seek_forward_until(predicate) }.unwrap());
+        self.move_key(|key_cursor| {
+            unsafe { key_cursor.seek_forward_until(predicate) }.unwrap_storage()
+        });
     }
 
     fn seek_key_with_reverse(&mut self, predicate: &dyn Fn(&K) -> bool) {
-        self.move_key(|key_cursor| unsafe { key_cursor.seek_backward_until(predicate) }.unwrap());
+        self.move_key(|key_cursor| {
+            unsafe { key_cursor.seek_backward_until(predicate) }.unwrap_storage()
+        });
     }
 
     fn seek_key_reverse(&mut self, key: &K) {
-        self.move_key(|key_cursor| unsafe { key_cursor.rewind_to_value_or_smaller(key) }.unwrap());
+        self.move_key(|key_cursor| {
+            unsafe { key_cursor.rewind_to_value_or_smaller(key) }.unwrap_storage()
+        });
     }
     fn step_val(&mut self) {
-        self.move_val(|val_cursor| val_cursor.move_next().unwrap());
+        self.move_val(|val_cursor| unsafe { val_cursor.move_next() }.unwrap_storage());
     }
     fn seek_val(&mut self, val: &V) {
-        self.move_val(|val_cursor| unsafe { val_cursor.advance_to_value_or_larger(val) }.unwrap());
+        self.move_val(|val_cursor| {
+            unsafe { val_cursor.advance_to_value_or_larger(val) }.unwrap_storage()
+        });
     }
     fn seek_val_with(&mut self, predicate: &dyn Fn(&V) -> bool) {
-        self.move_val(|val_cursor| unsafe { val_cursor.seek_forward_until(&predicate) }.unwrap());
+        self.move_val(|val_cursor| {
+            unsafe { val_cursor.seek_forward_until(&predicate) }.unwrap_storage()
+        });
     }
     fn rewind_keys(&mut self) {
-        self.move_key(|key_cursor| key_cursor.move_first().unwrap());
+        self.move_key(|key_cursor| unsafe { key_cursor.move_first() }.unwrap_storage());
     }
     fn fast_forward_keys(&mut self) {
-        self.move_key(|key_cursor| key_cursor.move_last().unwrap());
+        self.move_key(|key_cursor| unsafe { key_cursor.move_last() }.unwrap_storage());
     }
     fn rewind_vals(&mut self) {
-        self.move_val(|val_cursor| val_cursor.move_first().unwrap());
+        self.move_val(|val_cursor| unsafe { val_cursor.move_first() }.unwrap_storage());
     }
 
     fn step_val_reverse(&mut self) {
-        self.move_val(|val_cursor| val_cursor.move_prev().unwrap());
+        self.move_val(|val_cursor| unsafe { val_cursor.move_prev() }.unwrap_storage());
     }
 
     fn seek_val_reverse(&mut self, val: &V) {
-        self.move_val(|val_cursor| unsafe { val_cursor.rewind_to_value_or_smaller(val) }.unwrap());
+        self.move_val(|val_cursor| {
+            unsafe { val_cursor.rewind_to_value_or_smaller(val) }.unwrap_storage()
+        });
     }
 
     fn seek_val_with_reverse(&mut self, predicate: &dyn Fn(&V) -> bool) {
-        self.move_val(|val_cursor| unsafe { val_cursor.seek_backward_until(&predicate) }.unwrap());
+        self.move_val(|val_cursor| {
+            unsafe { val_cursor.seek_backward_until(&predicate) }.unwrap_storage()
+        });
     }
 
     fn fast_forward_vals(&mut self) {
-        self.move_val(|val_cursor| val_cursor.move_last().unwrap());
+        self.move_val(|val_cursor| unsafe { val_cursor.move_last() }.unwrap_storage());
+    }
+
+    fn position(&self) -> Option<Position> {
+        Some(Position {
+            total: self.key_cursor.len(),
+            offset: self.key_cursor.absolute_position(),
+        })
     }
 }
 
@@ -636,6 +704,11 @@ where
     #[size_of(skip)]
     writer: Writer2<K, DynUnit, V, DynWeightedPairs<DynDataTyped<T>, R>>,
     time_diffs: Box<DynWeightedPairs<DynDataTyped<T>, R>>,
+    num_tuples: usize,
+    #[size_of(skip)]
+    stats: BatchMetadata,
+    #[size_of(skip)]
+    touched_window_counter: Option<TouchedWindowCounter>,
 }
 
 impl<K, V, T, R> Builder<FileValBatch<K, V, T, R>> for FileValBuilder<K, V, T, R>
@@ -646,41 +719,104 @@ where
     T: Timestamp,
     R: WeightTrait + ?Sized,
 {
-    fn with_capacity(factories: &FileValBatchFactories<K, V, T, R>, capacity: usize) -> Self {
+    fn with_capacity(
+        factories: &FileValBatchFactories<K, V, T, R>,
+        key_capacity: usize,
+        _value_capacity: usize,
+    ) -> Self {
         Self {
             factories: factories.clone(),
             writer: Writer2::new(
                 &factories.factories0,
                 &factories.factories1,
                 Runtime::buffer_cache,
-                &*Runtime::storage_backend().unwrap(),
+                &*Runtime::storage_backend().unwrap_storage(),
                 Runtime::file_writer_parameters(),
-                capacity,
+                FilterPlan::<K>::decide_filter(None, key_capacity),
             )
-            .unwrap(),
+            .unwrap_storage(),
             time_diffs: factories.timediff_factory.default_box(),
+            num_tuples: 0,
+            stats: BatchMetadata::default(),
+            touched_window_counter: collect_roaring_metadata().then(TouchedWindowCounter::default),
         }
     }
 
-    fn done(self) -> FileValBatch<K, V, T, R> {
-        FileValBatch {
-            factories: self.factories,
-            file: Arc::new(self.writer.into_reader().unwrap()),
+    fn for_merge<'a, B, I>(
+        factories: &FileValBatchFactories<K, V, T, R>,
+        batches: I,
+        _location: Option<BatchLocation>,
+    ) -> Self
+    where
+        B: Batch<Key = K, Val = V, Time = T, R = R>,
+        I: IntoIterator<Item = &'a B> + Clone,
+    {
+        let key_capacity = batches.clone().into_iter().map(|b| b.key_count()).sum();
+        let key_filter = if collect_roaring_metadata() {
+            let filter_plan = FilterPlan::from_batches(batches.clone());
+            filter_plan.map_or_else(
+                || FilterPlan::<K>::decide_filter(None, key_capacity),
+                |filter_plan| FilterPlan::decide_filter(Some(&filter_plan), key_capacity),
+            )
+        } else {
+            FilterPlan::<K>::decide_filter(None, key_capacity)
+        };
+        Self {
+            factories: factories.clone(),
+            writer: Writer2::new(
+                &factories.factories0,
+                &factories.factories1,
+                Runtime::buffer_cache,
+                &*Runtime::storage_backend().unwrap_storage(),
+                Runtime::file_writer_parameters(),
+                key_filter,
+            )
+            .unwrap_storage(),
+            time_diffs: factories.timediff_factory.default_box(),
+            num_tuples: 0,
+            stats: BatchMetadata::default(),
+            touched_window_counter: collect_roaring_metadata().then(TouchedWindowCounter::default),
         }
+    }
+
+    fn done(mut self) -> FileValBatch<K, V, T, R> {
+        self.stats.touched_window_count = self
+            .touched_window_counter
+            .map(TouchedWindowCounter::finish)
+            .unwrap_or_default();
+        let (file, filters) = self.writer.into_reader(self.stats).unwrap_storage();
+        let file = Arc::new(file);
+        FileValBatch::from_parts(self.factories, file, filters)
     }
 
     fn push_key(&mut self, key: &K) {
-        self.writer.write0((key, &())).unwrap();
+        if let Some(counter) = self.touched_window_counter.as_mut()
+            && !counter.push_key(key)
+        {
+            self.touched_window_counter = None;
+        }
+        self.writer.write0((key, &())).unwrap_storage();
     }
 
     fn push_time_diff(&mut self, time: &T, weight: &R) {
         debug_assert!(!weight.is_zero());
         self.time_diffs.push_refs((time, weight));
+        self.num_tuples += 1;
     }
 
     fn push_val(&mut self, val: &V) {
-        self.writer.write1((val, &*self.time_diffs)).unwrap();
+        self.writer
+            .write1((val, &*self.time_diffs))
+            .unwrap_storage();
         self.time_diffs.clear();
+    }
+
+    fn num_keys(&self) -> usize {
+        self.writer.n_rows() as usize
+    }
+
+    fn num_tuples(&self) -> usize {
+        self.num_tuples
     }
 }
 

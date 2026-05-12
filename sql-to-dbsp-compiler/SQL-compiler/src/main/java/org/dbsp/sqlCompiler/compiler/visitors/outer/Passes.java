@@ -31,6 +31,7 @@ import org.dbsp.sqlCompiler.ir.DBSPNode;
 import org.dbsp.util.IWritesLogs;
 import org.dbsp.util.Linq;
 import org.dbsp.util.Logger;
+import org.dbsp.util.Utilities;
 
 import java.util.List;
 
@@ -62,16 +63,24 @@ public class Passes implements IWritesLogs, CircuitTransform, ICompilerComponent
         this.passes.add(pass);
     }
 
+    /** Insert a call to dump the current circuit as a png at this point */
+    public void dump(int details) {
+        String fileName = "start";
+        if (!this.passes.isEmpty())
+            fileName = Utilities.last(this.passes).getName().replace(" ", "_");
+        this.add(ToDot.dumper(compiler, fileName + ".png", details));
+    }
+
     @Override
     public DBSPCircuit apply(DBSPCircuit circuit) {
-        int details = this.getDebugLevel();
+        int details = Math.max(0, this.getDebugLevel() - 2);
         if (this.getDebugLevel() >= 3) {
             String name = String.format("%02d-", dumped++) + "before" +
                     this.toString().replace(" ", "_") + ".png";
             ToDot.dump(this.compiler, name, details, "png", circuit);
         }
         long begin = System.currentTimeMillis();
-        Logger.INSTANCE.belowLevel(this, 2)
+        Logger.INSTANCE.belowLevel(this, 1)
                 .append(this.toString())
                 .append(" starting ")
                 .append(this.passes.size())
@@ -81,6 +90,8 @@ public class Passes implements IWritesLogs, CircuitTransform, ICompilerComponent
             long start = System.currentTimeMillis();
             long startId = DBSPNode.outerId;
             circuit = pass.apply(circuit);
+            if (this.compiler.messages.exitCode != 0)
+                break;
             long endId = DBSPNode.outerId;
             long end = System.currentTimeMillis();
             Logger.INSTANCE.belowLevel(this, 1)
@@ -89,7 +100,8 @@ public class Passes implements IWritesLogs, CircuitTransform, ICompilerComponent
                     .append(end - start)
                     .append("ms, created ")
                     .append(String.format("%,d", endId - startId))
-                    .append(" nodes")
+                    .append(" node")
+                    .append((endId - startId != 1) ? "s" : "")
                     .newline();
             if (this.getDebugLevel() >= 3) {
                 String name = String.format("%02d-", dumped++) + pass.toString().replace(" ", "_") + ".png";

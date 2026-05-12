@@ -1,6 +1,7 @@
 package org.dbsp.sqlCompiler.compiler.visitors.inner;
 
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitRewriter;
 import org.dbsp.sqlCompiler.ir.aggregate.DBSPFold;
@@ -24,8 +25,9 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI16Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI64Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPISizeLiteral;
-import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntervalMillisLiteral;
-import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntervalMonthsLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPInternedStringLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPShortIntervalLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLongIntervalLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPKeywordLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPNullLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPRealLiteral;
@@ -40,6 +42,7 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU64Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU8Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPUSizeLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPVariantNullLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPVoidLiteral;
 import org.dbsp.sqlCompiler.ir.statement.DBSPComment;
 import org.dbsp.sqlCompiler.ir.statement.DBSPExpressionStatement;
 import org.dbsp.sqlCompiler.ir.statement.DBSPFunctionItem;
@@ -52,9 +55,8 @@ import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeAny;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeFunction;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDecimal;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeMillisInterval;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeMonthsInterval;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeRuntimeDecimal;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeShortInterval;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeLongInterval;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeVariant;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeBTreeMap;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPComparatorType;
@@ -65,6 +67,7 @@ import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeLazy;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeMap;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeOption;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeSemigroup;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeSqlResult;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeStream;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeStruct;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
@@ -122,7 +125,7 @@ public abstract class InnerRewriteVisitor
      * any of its fields differs. */
     protected void map(IDBSPInnerNode old, IDBSPInnerNode newOp) {
         // noinspection ConstantValue
-        Utilities.enforce(newOp != null);
+        Utilities.enforce(newOp != null, () -> "No replacement computed for " + old);
         if ((old == newOp) || (!this.force && old.sameFields(newOp))) {
             // Ignore new op.
             this.lastResult = old;
@@ -306,19 +309,19 @@ public abstract class InnerRewriteVisitor
     }
 
     @Override
-    public VisitDecision preorder(DBSPTypeMonthsInterval type) {
+    public VisitDecision preorder(DBSPTypeLongInterval type) {
         this.push(type);
         this.pop(type);
-        DBSPType result = new DBSPTypeMonthsInterval(type.getNode(), type.units, type.mayBeNull);
+        DBSPType result = new DBSPTypeLongInterval(type.getNode(), type.units, type.mayBeNull);
         this.map(type, result);
         return VisitDecision.STOP;
     }
 
     @Override
-    public VisitDecision preorder(DBSPTypeMillisInterval type) {
+    public VisitDecision preorder(DBSPTypeShortInterval type) {
         this.push(type);
         this.pop(type);
-        DBSPType result = new DBSPTypeMillisInterval(type.getNode(), type.units, type.mayBeNull);
+        DBSPType result = new DBSPTypeShortInterval(type.getNode(), type.units, type.mayBeNull);
         this.map(type, result);
         return VisitDecision.STOP;
     }
@@ -328,15 +331,6 @@ public abstract class InnerRewriteVisitor
         this.push(type);
         this.pop(type);
         DBSPType result = new DBSPTypeDecimal(type.getNode(), type.getPrecision(), type.scale, type.mayBeNull);
-        this.map(type, result);
-        return VisitDecision.STOP;
-    }
-
-    @Override
-    public VisitDecision preorder(DBSPTypeRuntimeDecimal type) {
-        this.push(type);
-        this.pop(type);
-        DBSPType result = new DBSPTypeRuntimeDecimal(type.getNode(), type.mayBeNull);
         this.map(type, result);
         return VisitDecision.STOP;
     }
@@ -372,7 +366,7 @@ public abstract class InnerRewriteVisitor
             fields.add(field);
         }
         this.pop(type);
-        DBSPType result = new DBSPTypeStruct(type.getNode(), type.name, type.sanitizedName, fields, type.mayBeNull);
+        DBSPType result = new DBSPTypeStruct(type.getNode(), type.name, fields, type.mayBeNull);
         this.map(type, result);
         return VisitDecision.STOP;
     }
@@ -383,6 +377,16 @@ public abstract class InnerRewriteVisitor
         DBSPType elementType = this.transform(type.getElementType());
         this.pop(type);
         DBSPType result = new DBSPTypeArray(elementType, type.mayBeNull);
+        this.map(type, result);
+        return VisitDecision.STOP;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPTypeSqlResult type) {
+        this.push(type);
+        DBSPType elementType = this.transform(type.typeArgs[0]);
+        this.pop(type);
+        DBSPType result = new DBSPTypeSqlResult(elementType);
         this.map(type, result);
         return VisitDecision.STOP;
     }
@@ -545,6 +549,17 @@ public abstract class InnerRewriteVisitor
     }
 
     @Override
+    public VisitDecision preorder(DBSPHandleErrorExpression expression) {
+        this.push(expression);
+        DBSPExpression source = this.transform(expression.source);
+        this.pop(expression);
+        DBSPExpression result = new DBSPHandleErrorExpression(
+                expression.getNode(), expression.index, expression.runtimeBehavior, source, expression.hasSourcePosition);
+        this.map(expression, result);
+        return VisitDecision.STOP;
+    }
+
+    @Override
     public VisitDecision preorder(DBSPI16Literal expression) {
         this.push(expression);
         DBSPType type = this.transform(expression.getType());
@@ -585,21 +600,21 @@ public abstract class InnerRewriteVisitor
     }
 
     @Override
-    public VisitDecision preorder(DBSPIntervalMillisLiteral expression) {
+    public VisitDecision preorder(DBSPShortIntervalLiteral expression) {
         this.push(expression);
         DBSPType type = this.transform(expression.getType());
         this.pop(expression);
-        DBSPExpression result = new DBSPIntervalMillisLiteral(expression.getNode(), type, expression.value);
+        DBSPExpression result = DBSPShortIntervalLiteral.fromMicroseconds(expression.getNode(), type, expression.value);
         this.map(expression, result);
         return VisitDecision.STOP;
     }
 
     @Override
-    public VisitDecision preorder(DBSPIntervalMonthsLiteral expression) {
+    public VisitDecision preorder(DBSPLongIntervalLiteral expression) {
         this.push(expression);
         DBSPType type = this.transform(expression.getType());
         this.pop(expression);
-        DBSPExpression result = new DBSPIntervalMonthsLiteral(expression.getNode(), type, expression.value);
+        DBSPExpression result = new DBSPLongIntervalLiteral(expression.getNode(), type, expression.value);
         this.map(expression, result);
         return VisitDecision.STOP;
     }
@@ -615,6 +630,15 @@ public abstract class InnerRewriteVisitor
     }
 
     @Override
+    public VisitDecision preorder(DBSPInternedStringLiteral expression) {
+        this.push(expression);
+        this.pop(expression);
+        DBSPExpression result = new DBSPInternedStringLiteral();
+        this.map(expression, result);
+        return VisitDecision.STOP;
+    }
+
+    @Override
     public VisitDecision preorder(DBSPKeywordLiteral expression) {
         this.map(expression, expression);
         return VisitDecision.STOP;
@@ -624,7 +648,16 @@ public abstract class InnerRewriteVisitor
     public VisitDecision preorder(DBSPNullLiteral expression) {
         this.push(expression);
         this.pop(expression);
-        DBSPExpression result = DBSPNullLiteral.INSTANCE;
+        DBSPExpression result = new DBSPNullLiteral();
+        this.map(expression, result);
+        return VisitDecision.STOP;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPVoidLiteral expression) {
+        this.push(expression);
+        this.pop(expression);
+        DBSPExpression result = new DBSPVoidLiteral();
         this.map(expression, result);
         return VisitDecision.STOP;
     }
@@ -676,7 +709,7 @@ public abstract class InnerRewriteVisitor
         this.push(expression);
         DBSPType type = this.transform(expression.getType());
         this.pop(expression);
-        DBSPExpression result = new DBSPTimestampLiteral(expression.getNode(), type, expression.value);
+        DBSPExpression result = DBSPTimestampLiteral.fromMicroseconds(expression.getNode(), type, expression.value);
         this.map(expression, result);
         return VisitDecision.STOP;
     }
@@ -868,6 +901,19 @@ public abstract class InnerRewriteVisitor
     }
 
     @Override
+    public VisitDecision preorder(DBSPTimeAddSub expression) {
+        this.push(expression);
+        DBSPExpression left = this.transform(expression.left);
+        DBSPExpression right = this.transform(expression.right);
+        DBSPType type = this.transform(expression.getType());
+        this.pop(expression);
+        DBSPExpression result = new DBSPTimeAddSub(expression.getNode(), type,
+                expression.opcode, left, right);
+        this.map(expression, result);
+        return VisitDecision.STOP;
+    }
+
+    @Override
     public VisitDecision preorder(DBSPBlockExpression expression) {
         this.push(expression);
         List<DBSPStatement> body = Linq.map(expression.contents, this::transform);
@@ -889,11 +935,11 @@ public abstract class InnerRewriteVisitor
     }
 
     @Override
-    public VisitDecision preorder(DBSPLazyCellExpression expression) {
+    public VisitDecision preorder(DBSPLazyExpression expression) {
         this.push(expression);
         DBSPExpression source = this.transform(expression.expression);
         this.pop(expression);
-        DBSPExpression result = new DBSPLazyCellExpression(source);
+        DBSPExpression result = new DBSPLazyExpression(source);
         this.map(expression, result);
         return VisitDecision.STOP;
     }
@@ -939,7 +985,7 @@ public abstract class InnerRewriteVisitor
                 }, DBSPParameter.class);
         DBSPExpression body = this.transform(expression.body);
         this.pop(expression);
-        DBSPExpression result = body.closure(parameters);
+        DBSPExpression result = body.closure(expression.getNode(), parameters);
         this.map(expression, result);
         return VisitDecision.STOP;
     }
@@ -953,6 +999,14 @@ public abstract class InnerRewriteVisitor
                     expression.getNode(), source.to(DBSPComparatorExpression.class),
                     expression.fieldNo, expression.ascending, expression.nullsFirst);
         this.map(expression, result);
+        return VisitDecision.STOP;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPAsymmetricFieldComparatorExpression expression) {
+        this.push(expression);
+        this.pop(expression);
+        this.map(expression, expression);
         return VisitDecision.STOP;
     }
 
@@ -1046,7 +1100,16 @@ public abstract class InnerRewriteVisitor
         this.push(expression);
         DBSPExpression source = this.transform(expression.expression);
         this.pop(expression);
-        DBSPExpression result = new DBSPUnwrapExpression(source);
+        DBSPExpression result = new DBSPUnwrapExpression(expression.getNode(), expression.message, source);
+        this.map(expression, result);
+        return VisitDecision.STOP;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPFailExpression expression) {
+        this.push(expression);
+        this.pop(expression);
+        DBSPExpression result = new DBSPFailExpression(expression.getNode(), expression.type, expression.message);
         this.map(expression, result);
         return VisitDecision.STOP;
     }
@@ -1107,14 +1170,14 @@ public abstract class InnerRewriteVisitor
     }
 
     @Override
-    public VisitDecision preorder(DBSPConditionalAggregateExpression expression) {
+    public VisitDecision preorder(DBSPConditionalIncrementExpression expression) {
         this.push(expression);
         DBSPType type = this.transform(expression.type);
         DBSPExpression left = this.transform(expression.left);
         DBSPExpression right = this.transform(expression.right);
         DBSPExpression cond = this.transformN(expression.condition);
         this.pop(expression);
-        DBSPExpression result = new DBSPConditionalAggregateExpression(
+        DBSPExpression result = new DBSPConditionalIncrementExpression(
                 expression.getNode(), expression.opcode, type, left, right, cond);
         this.map(expression, result);
         return VisitDecision.STOP;
@@ -1174,9 +1237,9 @@ public abstract class InnerRewriteVisitor
         this.push(expression);
         DBSPExpression comparator = this.transform(expression.comparator);
         DBSPType elementType = this.transform(expression.elementType);
-        @Nullable DBSPExpression limit = this.transformN(expression.limit);
         this.pop(expression);
-        DBSPExpression result = new DBSPSortExpression(expression.getNode(), elementType, comparator, limit);
+        DBSPExpression result = new DBSPSortExpression(
+                expression.getNode(), elementType, comparator);
         this.map(expression, result);
         return VisitDecision.STOP;
     }
@@ -1233,7 +1296,12 @@ public abstract class InnerRewriteVisitor
         this.push(expression);
         DBSPExpression source = this.transform(expression.initializer);
         this.pop(expression);
-        DBSPExpression result = new DBSPStaticExpression(expression.getNode(), source);
+        if (source != expression.initializer) {
+            // This is not allowed because the static name
+            // is a hash of its computation.
+            throw new InternalCompilerError("Changing static expression from " + expression.initializer + " to " + source);
+        }
+        DBSPExpression result = new DBSPStaticExpression(expression.getNode(), source, expression.getName());
         this.map(expression, result);
         return VisitDecision.STOP;
     }
@@ -1397,7 +1465,8 @@ public abstract class InnerRewriteVisitor
         DBSPExpression zero = this.transform(implementation.zero);
         DBSPExpression increment = this.transform(implementation.increment);
         DBSPExpression emptySetResult = this.transform(implementation.emptySetResult);
-        DBSPExpression aggregatedValue = this.transform(implementation.aggregatedValue);
+        DBSPExpression aggregatedValue = this.transform(implementation.comparedValue);
+        DBSPExpression postProcessing = this.transformN(implementation.postProcess);
         DBSPTypeUser semiGroup = this.transform(implementation.semigroup).to(DBSPTypeUser.class);
         this.pop(implementation);
 
@@ -1405,7 +1474,8 @@ public abstract class InnerRewriteVisitor
                 implementation.getNode(), zero,
                 increment.to(DBSPClosureExpression.class),
                 emptySetResult, semiGroup, aggregatedValue.to(DBSPClosureExpression.class),
-                implementation.isMin);
+                postProcessing != null ? postProcessing.to(DBSPClosureExpression.class) : null,
+                implementation.operation);
         result.validate();
         this.map(implementation, result);
         return VisitDecision.STOP;

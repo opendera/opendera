@@ -1,6 +1,8 @@
 //! An input adapter that generates Nexmark event input data.
 
-use feldera_adapterlib::transport::{InputReaderCommand, Resume};
+use chrono::{DateTime, Utc};
+use feldera_adapterlib::format::BufferSize;
+use feldera_adapterlib::transport::{InputReaderCommand, Resume, Watermark, parse_resume_info};
 use feldera_types::config::FtModel;
 use std::cmp::min;
 use std::collections::VecDeque;
@@ -11,13 +13,13 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::sync::{Barrier, Weak};
 use std::thread::{self};
-use tokio::sync::broadcast::{channel as broadcast_channel, Receiver as BroadcastReceiver};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::broadcast::{Receiver as BroadcastReceiver, channel as broadcast_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use xxhash_rust::xxh3::Xxh3Default;
 
 use crate::format::InputBuffer;
 use crate::{InputConsumer, InputEndpoint, InputReader, Parser, TransportInputEndpoint};
-use anyhow::{anyhow, Result as AnyResult};
+use anyhow::{Result as AnyResult, anyhow};
 use csv::{Writer as CsvWriter, WriterBuilder as CsvWriterBuilder};
 use dbsp_nexmark::generator::RandomGenerator;
 use dbsp_nexmark::model::Event;
@@ -52,11 +54,13 @@ impl TransportInputEndpoint for NexmarkEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         _schema: Relation,
+        resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(InputGenerator::new(
             &self.config,
             consumer,
             parser,
+            resume_info,
         )?))
     }
 }
@@ -72,7 +76,15 @@ impl InputGenerator {
         config: &NexmarkInputConfig,
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
+        resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Self> {
+        let resume_info = if config.table != NexmarkTable::Bid {
+            None
+        } else if let Some(resume_info) = resume_info {
+            Some(parse_resume_info::<Metadata>(&resume_info)?)
+        } else {
+            None
+        };
         let mut guard = INNER.lock().unwrap();
         let inner = guard.upgrade().unwrap_or_else(|| {
             let inner = Arc::new(Inner::new());
@@ -81,7 +93,7 @@ impl InputGenerator {
         });
         drop(guard);
 
-        inner.configure(config, consumer.clone(), parser)?;
+        inner.configure(config, consumer.clone(), parser, resume_info)?;
 
         Ok(Self {
             table: config.table,
@@ -92,24 +104,28 @@ impl InputGenerator {
 }
 
 impl InputReader for InputGenerator {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         match self.table {
             NexmarkTable::Bid => {
                 let _ = self.inner.command_sender.send(command);
             }
             _ => match command {
-                InputReaderCommand::Seek(_) => (),
-                InputReaderCommand::Replay { .. } => self.consumer.replayed(0, 0),
+                InputReaderCommand::Replay { .. } => self.consumer.replayed(BufferSize::empty(), 0),
                 InputReaderCommand::Extend => (),
                 InputReaderCommand::Pause => (),
                 InputReaderCommand::Queue { .. } => {
                     self.consumer.extended(
-                        0,
+                        BufferSize::empty(),
                         Some(Resume::Replay {
                             seek: serde_json::Value::Null,
                             replay: rmpv::Value::Nil,
                             hash: 0,
                         }),
+                        Vec::new(),
                     );
                 }
                 InputReaderCommand::Disconnect => (),
@@ -179,7 +195,7 @@ impl InnerInit {
     pub fn fully_configured(&self) -> bool {
         self.parsers.values().all(|p| p.is_some())
     }
-    pub fn start_worker(self) {
+    pub fn start_worker(self, resume_info: Option<Metadata>) {
         assert!(self.fully_configured());
 
         let Self {
@@ -197,11 +213,15 @@ impl InnerInit {
             .name(String::from("nexmark"))
             .spawn({
                 move || {
-                    if let Err(error) =
-                        worker_thread(options, parsers, consumers.clone(), command_receiver)
-                    {
+                    if let Err(error) = worker_thread(
+                        options,
+                        parsers,
+                        consumers.clone(),
+                        command_receiver,
+                        resume_info,
+                    ) {
                         for consumer in consumers.values() {
-                            consumer.error(true, anyhow!("{error}"));
+                            consumer.error(true, anyhow!("{error}"), None);
                         }
                     }
                 }
@@ -233,6 +253,7 @@ impl Inner {
         config: &NexmarkInputConfig,
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
+        resume_info: Option<Metadata>,
     ) -> AnyResult<()> {
         let mut status = self.status.lock().unwrap();
         match &mut *status {
@@ -248,7 +269,7 @@ impl Inner {
                     else {
                         unreachable!()
                     };
-                    init.start_worker();
+                    init.start_worker(resume_info);
                 }
                 Ok(())
             }
@@ -269,6 +290,7 @@ fn worker_thread(
     parsers: EnumMap<NexmarkTable, Box<dyn Parser>>,
     consumers: EnumMap<NexmarkTable, Box<dyn InputConsumer>>,
     command_receiver: UnboundedReceiver<InputReaderCommand>,
+    resume_info: Option<Metadata>,
 ) -> AnyResult<()> {
     let mut command_receiver = InputCommandReceiver::<Metadata, ()>::new(command_receiver);
 
@@ -302,7 +324,7 @@ fn worker_thread(
         .collect::<Vec<_>>();
     drop(parsers);
 
-    let mut next_event_id = if let Some(metadata) = command_receiver.blocking_recv_seek()? {
+    let mut next_event_id = if let Some(metadata) = resume_info {
         metadata.event_ids.end
     } else {
         0
@@ -311,9 +333,9 @@ fn worker_thread(
     while let Some((Metadata { event_ids }, ())) = command_receiver.blocking_recv_replay()? {
         let _ = bcast_sender.send(event_ids.clone());
         barrier.wait();
-        let mut total = 0;
+        let mut total = BufferSize::empty();
         let mut hasher = Xxh3Default::new();
-        for (_events, mut buffer) in queue.lock().unwrap().drain(..) {
+        for (_events, mut buffer, _timestamp) in queue.lock().unwrap().drain(..) {
             total += buffer.len();
             buffer.hash(&mut hasher);
             buffer.flush();
@@ -332,23 +354,26 @@ fn worker_thread(
             Some(command_receiver.blocking_recv()?)
         };
         match command {
-            Some(InputReaderCommand::Seek(_)) | Some(InputReaderCommand::Replay { .. }) => {
+            Some(InputReaderCommand::Replay { .. }) => {
                 unreachable!("{command:?} must be at the beginning of the command stream")
             }
             Some(InputReaderCommand::Extend) => running = true,
             Some(InputReaderCommand::Pause) => running = false,
             Some(InputReaderCommand::Queue { .. }) => {
-                let mut total = 0;
+                let mut total = BufferSize::empty();
                 let mut hasher = consumers[NexmarkTable::Bid].hasher();
                 let n = options.max_step_size_per_thread as usize * options.threads;
                 let mut events: Option<Range<u64>> = None;
-                while total < n {
+                let mut watermarks = Vec::new();
+
+                while total.records < n {
                     let mut queue = queue.lock().unwrap();
                     if queue.is_empty() {
                         break;
                     }
                     for _ in 0..3 * options.threads {
-                        let (range, mut buffer) = queue.pop_front().unwrap();
+                        let (range, mut buffer, timestamp) = queue.pop_front().unwrap();
+                        watermarks.push(Watermark::new(timestamp, None));
                         events = match events {
                             Some(events) => Some(events.start..range.end),
                             None => Some(range),
@@ -362,12 +387,12 @@ fn worker_thread(
                 }
                 let resume = Resume::new_metadata_only(
                     serde_json::to_value(Metadata {
-                        event_ids: events.unwrap_or_else(|| next_event_id..next_event_id),
+                        event_ids: events.unwrap_or(next_event_id..next_event_id),
                     })
                     .unwrap(),
-                    hasher,
+                    hasher.map(|h| h.finish()),
                 );
-                consumers[NexmarkTable::Bid].extended(total, Some(resume));
+                consumers[NexmarkTable::Bid].extended(total, Some(resume), watermarks);
             }
             Some(InputReaderCommand::Disconnect) => break,
             None => (),
@@ -402,7 +427,7 @@ fn generate_thread(
     options: NexmarkInputOptions,
     mut parsers: EnumMap<NexmarkTable, Box<dyn Parser>>,
     consumer: Box<dyn InputConsumer>,
-    queue: Arc<Mutex<VecDeque<(Range<u64>, Option<Box<dyn InputBuffer>>)>>>,
+    queue: Arc<Mutex<VecDeque<(Range<u64>, Option<Box<dyn InputBuffer>>, DateTime<Utc>)>>>,
     index: usize,
     barrier: Arc<Barrier>,
     mut command_receiver: BroadcastReceiver<Range<u64>>,
@@ -439,15 +464,18 @@ fn generate_thread(
             .map(|(table, writer)| {
                 let data = writer.into_inner().unwrap().into_inner();
                 let parser = &mut parsers[table];
-                let (buffer, _errors) = parser.parse(data.as_slice());
-                consumer.buffered(buffer.len(), 0);
+                let (buffer, _errors) = parser.parse(data.as_slice(), None);
+                consumer.buffered(buffer.len());
                 buffer
             })
             .collect::<Vec<_>>();
-        queue
-            .lock()
-            .unwrap()
-            .extend(buffers.into_iter().map(|buffer| (events.clone(), buffer)));
+        let timestamp = Utc::now();
+
+        queue.lock().unwrap().extend(
+            buffers
+                .into_iter()
+                .map(|buffer| (events.clone(), buffer, timestamp)),
+        );
         barrier.wait();
     }
 }

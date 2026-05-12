@@ -1,23 +1,27 @@
+use anyhow::{Error as AnyError, Result as AnyResult};
+use chrono::{DateTime, Utc};
+use dyn_clone::DynClone;
+use feldera_types::adapter_stats::ConnectorHealth;
+use feldera_types::config::FtModel;
+use feldera_types::coordination::Completion;
+use feldera_types::program_schema::Relation;
+use rmpv::{Value as RmpValue, ext::Error as RmpDecodeError};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value as JsonValue;
 use std::collections::VecDeque;
 use std::fmt::Display;
-use std::hash::Hasher;
 use std::marker::PhantomData;
-use std::sync::Mutex;
-
-use anyhow::{Error as AnyError, Result as AnyResult};
-use dyn_clone::DynClone;
-use feldera_types::config::FtModel;
-use feldera_types::program_schema::Relation;
-use rmpv::{ext::Error as RmpDecodeError, Value as RmpValue};
-use serde::Deserialize;
-use serde_json::{Error as JsonError, Value as JsonValue};
-use tokio::sync::mpsc::error::TryRecvError;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::error::TryRecvError;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use crate::catalog::InputCollectionHandle;
-use crate::format::{InputBuffer, ParseError, Parser};
 use crate::PipelineState;
+use crate::catalog::InputCollectionHandle;
+use crate::format::{BufferSize, InputBuffer, ParseError, Parser};
+use crate::metrics::ConnectorMetrics;
 
 /// Step number for fault-tolerant circuits.
 ///
@@ -55,19 +59,28 @@ pub trait TransportInputEndpoint: InputEndpoint {
     /// data into records. Returns an [`InputReader`] for reading the endpoint's
     /// data.  The endpoint will use `consumer` to report its progress.
     ///
+    /// The `resume_info` parameter is used when resuming the pipeline from a
+    /// checkpoint. It contains resume metadata that the endpoint returned via the
+    /// [`InputConsumer::extended`] function before suspending. When specified,
+    /// it tells a fault-tolerant input reader to seek past the data already read
+    /// in the step whose metadata is given by the value.
+    ///
     /// The reader is initially paused.
     fn open(
         &self,
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         schema: Relation,
+        resume_info: Option<JsonValue>,
     ) -> AnyResult<Box<dyn InputReader>>;
 }
 
+#[doc(hidden)]
 pub trait IntegratedInputEndpoint: InputEndpoint {
     fn open(
         self: Box<Self>,
         input_handle: &InputCollectionHandle,
+        resume_info: Option<JsonValue>,
     ) -> AnyResult<Box<dyn InputReader>>;
 }
 
@@ -80,9 +93,6 @@ pub trait IntegratedInputEndpoint: InputEndpoint {
 ///
 /// ```text
 ///   ┌─⯇─ (start) ─⯈──┐
-///   │      │         │
-///   │      ▼         │
-///   ├─⯇─ Seek ─⯈─────│
 ///   │      │         │
 ///   │      │  ┌───┐  │
 ///   │      ▼  ▼   │  │
@@ -150,15 +160,6 @@ pub trait IntegratedInputEndpoint: InputEndpoint {
 /// record the step properly and fault tolerance replay will be incorrect.
 #[derive(Debug)]
 pub enum InputReaderCommand {
-    /// Tells a fault-tolerant input reader to seek past the data already read
-    /// in the step whose metadata is given by the value.
-    ///
-    /// # Constraints
-    ///
-    /// Only fault-tolerant input readers need to accept this. If it is given,
-    /// it will be issued only once and before any of the other commands.
-    Seek(JsonValue),
-
     /// Tells the input reader to replay the step described by `metadata` and
     /// `data` by reading and flushing buffers for the data in the step, and
     /// then [InputConsumer::replayed] to signal completion.
@@ -172,18 +173,13 @@ pub enum InputReaderCommand {
     /// # Constraints
     ///
     /// Only fault-tolerant input readers need to accept this. It will be issued
-    /// zero or more times, after [InputReaderCommand::Seek] but before any
-    /// other commands.
+    /// zero or more times, before any other command.
     Replay { metadata: JsonValue, data: RmpValue },
 
     /// Tells the input reader to accept further input. The first time it
-    /// receives this command, the reader should start from:
-    ///
-    /// - If [InputReaderCommand::Seek] or [InputReaderCommand::Replay] was
-    ///   previously issued, then just beyond the end of the data from the last
-    ///   call.
-    ///
-    /// - Otherwise, from the beginning of the input.
+    /// receives this command, the reader should start from the resume point
+    /// passed as `resume_info` when the endpoint was opened, if any, and
+    /// otherwise from the beginning of input.
     ///
     /// The input reader should report the data that it queues to
     /// [InputConsumer::buffered] as it queues it.
@@ -246,7 +242,7 @@ impl InputReaderCommand {
     /// fault-tolerant endpoints).
     pub fn as_nonft(&self) -> Option<NonFtInputReaderCommand> {
         match self {
-            InputReaderCommand::Seek(_) | InputReaderCommand::Replay { .. } => None,
+            InputReaderCommand::Replay { .. } => None,
             InputReaderCommand::Queue { .. } => Some(NonFtInputReaderCommand::Queue),
             InputReaderCommand::Extend => {
                 Some(NonFtInputReaderCommand::Transition(PipelineState::Running))
@@ -278,51 +274,112 @@ pub enum NonFtInputReaderCommand {
     Transition(PipelineState),
 }
 
+#[doc(hidden)]
+pub struct InputQueueEntry<A, B> {
+    /// Data buffer to push to the circuit.
+    buffer: Option<B>,
+
+    /// Time when data in this buffer was received from the transport endpoint.
+    /// It is used to track the processing latency in different stages of the pipeline.
+    timestamp: DateTime<Utc>,
+
+    /// Start a transaction with the given label before pushing the buffer to the circuit
+    /// unless a transaction is already in progress.
+    start_transaction: Option<Option<String>>,
+
+    /// Commit the transaction after pushing the buffer to the circuit if there is a transaction in progress.
+    commit_transaction: bool,
+
+    /// Auxiliary data associated with the buffer.
+    aux: A,
+}
+
+impl<A, B> InputQueueEntry<A, B> {
+    #[doc(hidden)]
+    pub fn new_with_aux(timestamp: DateTime<Utc>, aux: A) -> Self {
+        Self {
+            buffer: None,
+            timestamp,
+            start_transaction: None,
+            commit_transaction: false,
+            aux,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_buffer(self, buffer: Option<B>) -> Self {
+        Self { buffer, ..self }
+    }
+
+    /// Start a transaction with the given label before pushing the buffer to the circuit
+    /// unless a transaction is already in progress.
+    pub fn with_start_transaction(self, start_transaction: Option<Option<String>>) -> Self {
+        Self {
+            start_transaction,
+            ..self
+        }
+    }
+
+    /// Commit the transaction after pushing the buffer to the circuit if there is a transaction in progress.
+    pub fn with_commit_transaction(self, commit_transaction: bool) -> Self {
+        Self {
+            commit_transaction,
+            ..self
+        }
+    }
+}
+
 /// A thread-safe queue for collecting and flushing input buffers.
 ///
 /// Commonly used by `InputReader` implementations for staging buffers from
 /// worker threads.
-pub struct InputQueue<A = ()> {
+pub struct InputQueue<A = (), B = Box<dyn InputBuffer>> {
     #[allow(clippy::type_complexity)]
-    pub queue: Mutex<VecDeque<(Option<Box<dyn InputBuffer>>, A)>>,
+    pub queue: Mutex<VecDeque<InputQueueEntry<A, B>>>,
     pub consumer: Box<dyn InputConsumer>,
+    pub transaction_in_progress: AtomicBool,
 }
 
-impl<A> InputQueue<A> {
+impl<A, B: InputBuffer> InputQueue<A, B> {
     pub fn new(consumer: Box<dyn InputConsumer>) -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
             consumer,
+            transaction_in_progress: AtomicBool::new(false),
         }
     }
 
-    /// Appends `buffer`, to the queue, and associates it with
-    /// `aux`.  Reports to the controller that `num_bytes` have been received
-    /// and at least partially parsed, and that `errors` have occurred during
-    /// parsing.
-    ///
-    /// If `buffer` has no records, then this discards `aux`, even if `buffer`
-    /// is non-`None`.
-    pub fn push_with_aux(
-        &self,
-        (buffer, errors): (Option<Box<dyn InputBuffer>>, Vec<ParseError>),
-        num_bytes: usize,
-        aux: A,
-    ) {
+    pub fn push_entry(&self, entry: InputQueueEntry<A, B>, errors: Vec<ParseError>) {
         self.consumer.parse_errors(errors);
-        let num_records = buffer.len();
+        let len = entry
+            .buffer
+            .as_ref()
+            .map_or(BufferSize::empty(), |buffer| buffer.len());
 
         let mut queue = self.queue.lock().unwrap();
-        queue.push_back((buffer, aux));
-        self.consumer.buffered(num_records, num_bytes);
+        queue.push_back(entry);
+        self.consumer.buffered(len);
 
         // The endpoint pushed an empty buffer. This likely indicates that the accompanying aux data
         // needs to be processed by the endpoint after preceding buffers have been flushed. However,
         // since we didn't report any buffered records, the controller may never perform another step,
         // so we nudge it to do it.
-        if num_records == 0 {
+        if len.records == 0 {
             self.consumer.request_step();
         }
+    }
+
+    /// Appends `buffer`, to the queue, and associates it with `aux`.  Reports
+    /// to the controller that `errors` have occurred during parsing.
+    pub fn push_with_aux(
+        &self,
+        (buffer, errors): (Option<B>, Vec<ParseError>),
+        timestamp: DateTime<Utc>,
+        aux: A,
+    ) {
+        let entry = InputQueueEntry::new_with_aux(timestamp, aux).with_buffer(buffer);
+
+        self.push_entry(entry, errors);
     }
 
     /// Flushes a batch of records to the circuit and returns the auxiliary data
@@ -332,7 +389,8 @@ impl<A> InputQueue<A> {
     /// since auxiliary data is associated with a whole buffer rather than with
     /// individual records. If the auxiliary data type `A` is `()`, then
     /// [InputQueue<()>::flush] avoids that and so is a better choice.
-    pub fn flush_with_aux(&self) -> (usize, Option<Xxh3Default>, Vec<A>) {
+    #[allow(clippy::type_complexity)]
+    pub fn flush_with_aux(&self) -> (BufferSize, Option<Xxh3Default>, Vec<(DateTime<Utc>, A)>) {
         self.flush_with_aux_until(&|_| false)
     }
 
@@ -347,21 +405,33 @@ impl<A> InputQueue<A> {
     /// since auxiliary data is associated with a whole buffer rather than with
     /// individual records. If the auxiliary data type `A` is `()`, then
     /// [InputQueue<()>::flush] avoids that and so is a better choice.
+    #[allow(clippy::type_complexity)]
     pub fn flush_with_aux_until(
         &self,
         stop_at: &dyn Fn(&A) -> bool,
-    ) -> (usize, Option<Xxh3Default>, Vec<A>) {
-        let mut total = 0;
+    ) -> (BufferSize, Option<Xxh3Default>, Vec<(DateTime<Utc>, A)>) {
+        let mut total = BufferSize::empty();
         let mut hasher = self.consumer.hasher();
         let n = self.consumer.max_batch_size();
         let mut consumed_aux = Vec::new();
 
         let mut stop = false;
 
-        while !stop && total < n {
-            let Some((buffer, aux)) = self.queue.lock().unwrap().pop_front() else {
+        while !stop && total.records < n {
+            let Some(InputQueueEntry {
+                buffer,
+                timestamp,
+                aux,
+                start_transaction,
+                commit_transaction,
+            }) = self.queue.lock().unwrap().pop_front()
+            else {
                 break;
             };
+
+            if let Some(label) = start_transaction {
+                self.start_transaction(label.as_deref());
+            }
 
             if let Some(mut buffer) = buffer {
                 total += buffer.len();
@@ -372,18 +442,41 @@ impl<A> InputQueue<A> {
             }
 
             stop = stop_at(&aux);
-            consumed_aux.push(aux);
+            consumed_aux.push((timestamp, aux));
+
+            if commit_transaction && self.commit_transaction() {
+                break;
+            }
         }
 
         // Process any entries with aux data only.
         let mut queue = self.queue.lock().unwrap();
-        while !stop && queue.front().is_some_and(|(buffer, _aux)| buffer.is_none()) {
-            let Some((_buffer, aux)) = queue.pop_front() else {
+        while !stop
+            && queue
+                .front()
+                .is_some_and(|InputQueueEntry { buffer, .. }| buffer.is_none())
+        {
+            let Some(InputQueueEntry {
+                timestamp,
+                aux,
+                start_transaction,
+                commit_transaction,
+                ..
+            }) = queue.pop_front()
+            else {
                 break;
             };
 
+            if let Some(label) = start_transaction {
+                self.start_transaction(label.as_deref());
+            }
+
             stop = stop_at(&aux);
-            consumed_aux.push(aux);
+            consumed_aux.push((timestamp, aux));
+
+            if commit_transaction && self.commit_transaction() {
+                break;
+            }
         }
 
         (total, hasher, consumed_aux)
@@ -396,18 +489,43 @@ impl<A> InputQueue<A> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    fn start_transaction(&self, label: Option<&str>) -> bool {
+        if self
+            .transaction_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.consumer.start_transaction(label);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn commit_transaction(&self) -> bool {
+        if self
+            .transaction_in_progress
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.consumer.commit_transaction();
+            true
+        } else {
+            false
+        }
+    }
 }
 
-impl InputQueue<()> {
+impl InputQueue<(), Box<dyn InputBuffer>> {
     /// Appends `buffer`, if nonempty,` to the queue.  Reports to the controller
-    /// that `num_bytes` have been received and at least partially parsed, and
-    /// that `errors` have occurred during parsing.
+    /// that `errors` occurred during parsing.
     pub fn push(
         &self,
         (buffer, errors): (Option<Box<dyn InputBuffer>>, Vec<ParseError>),
-        num_bytes: usize,
+        timestamp: DateTime<Utc>,
     ) {
-        self.push_with_aux((buffer, errors), num_bytes, ())
+        self.push_with_aux((buffer, errors), timestamp, ())
     }
 
     /// Flushes a batch of records to the circuit and reports to the consumer
@@ -415,25 +533,61 @@ impl InputQueue<()> {
     ///
     /// Only non-fault-tolerant input adapters can use this.
     pub fn queue(&self) {
-        let mut total = 0;
+        let mut total = BufferSize::empty();
         let n = self.consumer.max_batch_size();
-        while total < n {
-            let Some((buffer, ())) = self.queue.lock().unwrap().pop_front() else {
+        let mut consumed = Vec::new();
+
+        while total.records < n {
+            let Some(InputQueueEntry {
+                buffer,
+                timestamp,
+                start_transaction,
+                commit_transaction,
+                ..
+            }) = self.queue.lock().unwrap().pop_front()
+            else {
                 break;
             };
 
+            if let Some(label) = start_transaction
+                && self
+                    .transaction_in_progress
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                self.consumer.start_transaction(label.as_deref());
+            }
+
             if let Some(mut buffer) = buffer {
-                let mut taken = buffer.take_some(n - total);
+                let mut taken = buffer.take_some(n - total.records);
                 total += taken.len();
+                consumed.push(Watermark::new(timestamp, None));
                 taken.flush();
                 drop(taken);
                 if !buffer.is_empty() {
-                    self.queue.lock().unwrap().push_front((Some(buffer), ()));
+                    self.queue.lock().unwrap().push_front(InputQueueEntry {
+                        buffer: Some(buffer),
+                        timestamp,
+                        start_transaction: None,
+                        commit_transaction,
+                        aux: (),
+                    });
                     break;
                 }
             }
+
+            if commit_transaction {
+                if self
+                    .transaction_in_progress
+                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.consumer.commit_transaction();
+                }
+                break;
+            }
         }
-        self.consumer.extended(total, None);
+        self.consumer.extended(total, None, consumed);
     }
 }
 
@@ -441,6 +595,8 @@ impl InputQueue<()> {
 ///
 /// Use [`TransportInputEndpoint::open`] to obtain an [`InputReader`].
 pub trait InputReader: Send + Sync {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync>;
+
     /// Requests the input reader to execute `command`.
     fn request(&self, command: InputReaderCommand);
 
@@ -453,10 +609,6 @@ pub trait InputReader: Send + Sync {
     /// such a case, this can be implemented in terms of `is_closed` on the
     /// channel's sender.
     fn is_closed(&self) -> bool;
-
-    fn seek(&self, metadata: JsonValue) {
-        self.request(InputReaderCommand::Seek(metadata));
-    }
 
     fn replay(&self, metadata: JsonValue, data: RmpValue) {
         self.request(InputReaderCommand::Replay { metadata, data });
@@ -478,6 +630,32 @@ pub trait InputReader: Send + Sync {
 
     fn disconnect(&self) {
         self.request(InputReaderCommand::Disconnect);
+    }
+
+    /// Returns the approximate amount of memory used by the connector's
+    /// underlying implementation.  For the Kafka connectors, for example, this
+    /// is the amount of memory used by librdkafka.  Not all connectors use a
+    /// substantial amount of memory, so the default implementation returns 0.
+    fn memory(&self) -> usize {
+        0
+    }
+}
+
+/// Position in an input stream, including the timestamp when the data was ingested
+/// from the transport endpoint and transport-specific metadata such as delta table
+/// version or Kafka partition offsets.
+#[derive(Clone, Debug)]
+pub struct Watermark {
+    pub timestamp: DateTime<Utc>,
+    pub metadata: Option<JsonValue>,
+}
+
+impl Watermark {
+    pub fn new(timestamp: DateTime<Utc>, metadata: Option<JsonValue>) -> Self {
+        Self {
+            timestamp,
+            metadata,
+        }
     }
 }
 
@@ -523,27 +701,27 @@ pub trait InputConsumer: Send + Sync + DynClone {
     /// Reports `errors` as parse errors.
     fn parse_errors(&self, errors: Vec<ParseError>);
 
-    /// Reports that the input adapter has internally buffered `num_records`
-    /// records comprising `num_bytes` bytes of input data.
+    /// Reports that the input adapter has internally buffered `amt` records and
+    /// bytes.
     ///
     /// Fault-tolerant input adapters should report buffered data during replay
     /// as well as in normal operation.
-    fn buffered(&self, num_records: usize, num_bytes: usize);
+    fn buffered(&self, amt: BufferSize);
 
-    /// Reports that the input adapter has completed flushing `num_records`
-    /// records to the circuit, that hash to `hash`, in response to an
+    /// Reports that the input adapter has completed flushing `amt` data to the
+    /// circuit, that hash to `hash`, in response to an
     /// [InputReaderCommand::Replay] request.
     ///
     /// Only a fault-tolerant input adapter will invoke this.
-    fn replayed(&self, num_records: usize, hash: u64);
+    fn replayed(&self, amt: BufferSize, hash: u64);
 
-    /// Reports that the input adapter has completed flushing `num_records`
-    /// records to the circuit, that hash to `hash`, in response to an
+    /// Reports that the input adapter has completed flushing `amt` data to the
+    /// circuit, that hash to `hash`, in response to an
     /// [InputReaderCommand::Queue] request.
     ///
     /// If the step is one that the input adapter can restart after, or replay,
     /// then it should supply that as `resume` (see [Resume] for details).
-    fn extended(&self, num_records: usize, resume: Option<Resume>);
+    fn extended(&self, amt: BufferSize, resume: Option<Resume>, watermarks: Vec<Watermark>);
 
     /// Reports that the endpoint has reached end of input and that no more data
     /// will be received from the endpoint.
@@ -558,11 +736,61 @@ pub trait InputConsumer: Send + Sync + DynClone {
     /// any records.
     fn request_step(&self);
 
+    /// The connector is initiating a transaction. `label` is an optional label for
+    /// the transaction for debugging purposes.
+    ///
+    /// This function can be invoked in response to a `Queue` command.
+    ///
+    /// Any updates pushed by the connector after this function is invoked will be part
+    /// of the transaction.
+    ///
+    /// The connector _must_ perform a matching call to `commit_transaction` to commit the
+    /// transaction.
+    ///
+    /// Multiple connectors can initiate a transaction concurrently, in which case their
+    /// updates will be combined into a single transaction. The transaction will be committed
+    /// when all the connectors have committed it.
+    fn start_transaction(&self, label: Option<&str>);
+
+    /// The connector is committing a transaction started by a previous `start_transaction` call.
+    ///
+    /// This function can be invoked in response to a `Queue` command after pushing all updates that
+    /// belong to the the transaction, immediately before calling `extended`. The connector cannot
+    /// queue any more updates after this function is invoked, until the next `Queue` command.
+    fn commit_transaction(&self);
+
+    /// Register connector-specific metrics for Prometheus export.
+    ///
+    /// A connector may call this once during [`TransportInputEndpoint::open`]
+    /// to provide an [`Arc<dyn ConnectorMetrics>`] whose [`ConnectorMetrics::metrics`]
+    /// will be polled on every scrape.  The default implementation is a no-op,
+    /// so connectors that have no custom metrics need not override it.
+    fn set_custom_metrics(&self, _metrics: Arc<dyn ConnectorMetrics>) {}
+
+    /// Returns a watch receiver that tracks completion of pipeline steps.
+    ///
+    /// The receiver yields [`Completion`] values whose `total_completed_steps`
+    /// field indicates how many steps have been fully processed (circuit
+    /// execution + all output connectors).
+    ///
+    /// Input adapters that need to defer acknowledgment until data is durably
+    /// processed (e.g., CDC adapters controlling a replication slot) can use
+    /// this to detect when their data has been consumed.
+    ///
+    /// Return `None` if the consumer does not support completion tracking.
+    fn completion_watcher(&self) -> Option<tokio::sync::watch::Receiver<Completion>>;
+
     /// Endpoint failed.
     ///
     /// Reports that the endpoint failed and that it will not queue any more
     /// data.
-    fn error(&self, fatal: bool, error: AnyError);
+    ///
+    /// Optional tag that can be used for additional context
+    /// e.g. for rate limiting
+    fn error(&self, fatal: bool, error: AnyError, tag: Option<&'static str>);
+
+    /// Updates the health status of the connector.
+    fn update_connector_health(&self, health: ConnectorHealth);
 }
 
 /// Information needed to restart after or replay input.
@@ -595,15 +823,40 @@ pub enum Resume {
     /// the step exactly.
     Seek {
         /// Metadata needed for the controller to restart the input adapter from
-        /// just after this input step using [InputReaderCommand::Seek].
+        /// just after this input step.
         seek: JsonValue,
     },
 
     /// The input adapter can replay this step exactly, or resume just after the
     /// step.
+    ///
+    /// Input adapters can use `seek` and `replay` in different combinations:
+    ///
+    /// - Some kinds of input adapters, for example the ones for files, or for
+    ///   Kafka, can reread the input data that they used before.  These will
+    ///   ordinarily just use `seek`, filling it with a pointer just past the
+    ///   end of the data to be read. (Ordinarily, it would already know where
+    ///   the start is from the previous step, so the start pointer isn't
+    ///   usually needed.)
+    ///
+    ///   These input adapters can just set `replay` to [RmpValue::Nil].
+    ///
+    /// - Other kinds of input connectors can't seek back and reread the input
+    ///   data that they used before. The best example is the HTTP input
+    ///   connector, because which can't ask whatever client connected before to
+    ///   repeat the same exact data that it input before.  These input
+    ///   connectors have to save all the input data for replay, by putting into
+    ///   the `replay` field.
+    ///
+    ///   These input adapters can just set `seek` to [JsonValue::Null].
+    ///
+    ///   (In theory, any input connector could substitute data for metadata,
+    ///   but if the data can simply be reread using the metadata, we usually
+    ///   consider that better because it saves time and space saving all the
+    ///   data when in most cases it will never be reread.)
     Replay {
         /// Metadata needed for the controller to restart the input adapter from
-        /// just after this input step using [InputReaderCommand::Seek].
+        /// just after this input step.
         seek: JsonValue,
 
         /// The data needed for the controller to replay exactly this input step
@@ -650,38 +903,39 @@ impl Resume {
         }
     }
 
-    /// If `hasher` is provided, returns `Resume::Replay` with its hash value
-    /// and `seek`; otherwise, returns `Resume::Seek` with `seek`.
+    /// If `hash` is provided, returns `Resume::Replay` with its hash value and
+    /// `seek`; otherwise, returns `Resume::Seek` with `seek`.
     ///
     /// This is convenient for endpoints that only need to use metadata to
-    /// support journaling.  Use [InputConsumer::hasher] to get the hasher.
-    pub fn new_metadata_only(seek: JsonValue, hasher: Option<Xxh3Default>) -> Self {
-        match hasher {
-            Some(hasher) => Self::Replay {
+    /// support journaling. [InputConsumer::hasher] can be a convenient way to
+    /// get a hasher.
+    pub fn new_metadata_only(seek: JsonValue, hash: Option<u64>) -> Self {
+        match hash {
+            Some(hash) => Self::Replay {
                 seek,
                 replay: RmpValue::Nil,
-                hash: hasher.finish(),
+                hash,
             },
             None => Self::Seek { seek },
         }
     }
 
-    /// If `hasher` is provided, returns `Resume::Replay` with its hash value
-    /// and whatever `replay` returns; otherwise, returns `Resume::Seek`.
+    /// If `hash` is provided, returns `Resume::Replay` with its hash value and
+    /// whatever `replay` returns; otherwise, returns `Resume::Seek`.
     ///
     /// This is convenient for endpoints that support journaling by journaling
-    /// all the data (and that don't need to journal any metadata).  Use
-    /// [InputConsumer::hasher] to get the hasher.
-    pub fn new_data_only<F>(replay: F, hasher: Option<Xxh3Default>) -> Self
+    /// all the data (and that don't need to journal any metadata).
+    /// [InputConsumer::hasher] can be a convenient way to get a hasher.
+    pub fn new_data_only<F>(replay: F, hash: Option<u64>) -> Self
     where
         F: FnOnce() -> RmpValue,
     {
         let seek = JsonValue::Null;
-        match hasher {
-            Some(hasher) => Self::Replay {
+        match hash {
+            Some(hash) => Self::Replay {
                 seek,
                 replay: replay(),
-                hash: hasher.finish(),
+                hash,
             },
             None => Self::Seek { seek },
         }
@@ -690,7 +944,38 @@ impl Resume {
 
 dyn_clone::clone_trait_object!(InputConsumer);
 
-pub type AsyncErrorCallback = Box<dyn Fn(bool, AnyError) + Send + Sync>;
+/// Helper function to parse resume info passed to [`InputConsumer::extended`].
+pub fn parse_resume_info<M>(metadata: &JsonValue) -> AnyResult<M>
+where
+    M: DeserializeOwned,
+{
+    serde_json_path_to_error::from_value::<M>(metadata.clone())
+            .map_err(|e| anyhow::anyhow!("unable to parse checkpointed connector state (checkpointed state: {metadata}; parse error: {e})"))
+}
+
+#[doc(hidden)]
+pub type AsyncErrorCallback = Box<dyn Fn(bool, AnyError, Option<&'static str>) + Send + Sync>;
+
+/// Command handler API exposed by connectors.
+///
+/// Connectors can support arbitrary connector-specific commands that can be
+/// invoked via the `/command` endpoint. These commands take and return arbitrary
+/// JSON values.
+///
+/// This API is not part of trait `Output[Input]Endpoint` because it can be invoked
+/// from any thread, and requires `Send + Sync`, while the `OutputEndpoint` API is
+/// not `Sync` and is meant to be called from the controller thread only.
+///
+/// The idea is that connectors that support custom commands create separate command
+/// handler objects that implement this trait and are returned by
+/// `OutputEndpoint::command_handler`.
+pub trait CommandHandler: Send + Sync {
+    /// Handle a command specified by the JSON objest.
+    ///
+    /// Fails if the connector does not support the command, the command is invalid,
+    /// or command execution fails.
+    fn command(&self, command: serde_json::Value) -> AnyResult<serde_json::Value>;
+}
 
 /// A configured output transport endpoint.
 ///
@@ -709,6 +994,10 @@ pub type AsyncErrorCallback = Box<dyn Fn(bool, AnyError) + Send + Sync>;
 /// * A non-fault-tolerant endpoint does not have a concept of steps and ignores
 ///   them.
 pub trait OutputEndpoint: Send {
+    fn command_handler(&self) -> Option<Arc<dyn CommandHandler>> {
+        None
+    }
+
     /// Finishes establishing the connection to the output endpoint.
     ///
     /// If the endpoint encounters any errors during output, now or later, it
@@ -771,13 +1060,19 @@ pub trait OutputEndpoint: Send {
 
     /// Whether this endpoint is [fault tolerant](crate#fault-tolerance).
     fn is_fault_tolerant(&self) -> bool;
+
+    /// Returns the approximate amount of memory used by the connector's
+    /// underlying implementation.  For the Kafka connectors, for example, this
+    /// is the amount of memory used by librdkafka.  Not all connectors use a
+    /// substantial amount of memory, so the default implementation returns 0.
+    fn memory(&self) -> usize {
+        0
+    }
 }
 
 /// An [UnboundedReceiver] wrapper for [InputReaderCommand] for fault-tolerant connectors.
 ///
 /// A fault-tolerant connector wants to receive, in order:
-///
-/// - Zero or one [InputReaderCommand::Seek]s.
 ///
 /// - Zero or more [InputReaderCommand::Replay]s.
 ///
@@ -797,7 +1092,7 @@ pub struct InputCommandReceiver<M, D> {
 #[derive(Debug)]
 pub enum InputCommandReceiverError {
     Disconnected,
-    JsonDecodeError(JsonError),
+    JsonDecodeError(serde_json_path_to_error::Error),
     RmpDecodeError(RmpDecodeError),
 }
 
@@ -819,8 +1114,8 @@ impl From<RmpDecodeError> for InputCommandReceiverError {
     }
 }
 
-impl From<JsonError> for InputCommandReceiverError {
-    fn from(value: JsonError) -> Self {
+impl From<serde_json_path_to_error::Error> for InputCommandReceiverError {
+    fn from(value: serde_json_path_to_error::Error) -> Self {
         Self::JsonDecodeError(value)
     }
 }
@@ -835,40 +1130,7 @@ impl<M, D> InputCommandReceiver<M, D> {
         }
     }
 
-    pub fn blocking_recv_seek(&mut self) -> Result<Option<M>, InputCommandReceiverError>
-    where
-        M: for<'a> Deserialize<'a>,
-    {
-        let command = self.blocking_recv()?;
-        self.take_seek(command)
-    }
-
-    pub async fn recv_seek(&mut self) -> Result<Option<M>, InputCommandReceiverError>
-    where
-        M: for<'a> Deserialize<'a>,
-    {
-        let command = self.recv().await?;
-        self.take_seek(command)
-    }
-
-    fn take_seek(
-        &mut self,
-        command: InputReaderCommand,
-    ) -> Result<Option<M>, InputCommandReceiverError>
-    where
-        M: for<'a> Deserialize<'a>,
-    {
-        debug_assert!(self.buffer.is_none());
-        match command {
-            InputReaderCommand::Seek(metadata) => Ok(Some(serde_json::from_value::<M>(metadata)?)),
-            InputReaderCommand::Disconnect => Err(InputCommandReceiverError::Disconnected),
-            other => {
-                self.put_back(other);
-                Ok(None)
-            }
-        }
-    }
-
+    #[doc(hidden)]
     pub fn blocking_recv_replay(&mut self) -> Result<Option<(M, D)>, InputCommandReceiverError>
     where
         M: for<'a> Deserialize<'a>,
@@ -878,6 +1140,7 @@ impl<M, D> InputCommandReceiver<M, D> {
         self.take_replay(command)
     }
 
+    #[doc(hidden)]
     pub async fn recv_replay(&mut self) -> Result<Option<(M, D)>, InputCommandReceiverError>
     where
         M: for<'a> Deserialize<'a>,
@@ -896,9 +1159,8 @@ impl<M, D> InputCommandReceiver<M, D> {
         D: for<'a> Deserialize<'a>,
     {
         match command {
-            InputReaderCommand::Seek(_) => unreachable!(),
             InputReaderCommand::Replay { metadata, data } => Ok(Some((
-                serde_json::from_value::<M>(metadata)?,
+                serde_json_path_to_error::from_value::<M>(metadata)?,
                 rmpv::ext::from_value::<D>(data)?,
             ))),
             other => {
@@ -908,6 +1170,7 @@ impl<M, D> InputCommandReceiver<M, D> {
         }
     }
 
+    #[doc(hidden)]
     pub async fn recv(&mut self) -> Result<InputReaderCommand, InputCommandReceiverError> {
         match self.buffer.take() {
             Some(value) => Ok(value),
@@ -919,6 +1182,7 @@ impl<M, D> InputCommandReceiver<M, D> {
         }
     }
 
+    #[doc(hidden)]
     pub fn blocking_recv(&mut self) -> Result<InputReaderCommand, InputCommandReceiverError> {
         match self.buffer.take() {
             Some(value) => Ok(value),
@@ -929,6 +1193,7 @@ impl<M, D> InputCommandReceiver<M, D> {
         }
     }
 
+    #[doc(hidden)]
     pub fn try_recv(&mut self) -> Result<Option<InputReaderCommand>, InputCommandReceiverError> {
         if let Some(command) = self.buffer.take() {
             Ok(Some(command))
@@ -941,6 +1206,7 @@ impl<M, D> InputCommandReceiver<M, D> {
         }
     }
 
+    #[doc(hidden)]
     pub fn put_back(&mut self, value: InputReaderCommand) {
         assert!(self.buffer.is_none());
         self.buffer = Some(value);

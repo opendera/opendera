@@ -29,8 +29,10 @@ import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
+import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPIfExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPTupleExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPVariablePath;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
@@ -45,6 +47,8 @@ import static org.dbsp.sqlCompiler.ir.type.DBSPTypeCode.TUPLE;
 
 /** Our own version of a tuple */
 public class DBSPTypeTuple extends DBSPTypeTupleBase {
+    public static final DBSPTypeTuple EMPTY = new DBSPTypeTuple();
+
     /** If the type is produced from a struct type, keep here original type.
      * WARNING: this field is ignored by sameType! */
     @Nullable
@@ -148,7 +152,7 @@ public class DBSPTypeTuple extends DBSPTypeTupleBase {
     /** Returns a lambda which casts every field of a tuple
      * to the corresponding field of this type. */
     @Override
-    public DBSPClosureExpression caster(DBSPType to, boolean safe) {
+    public DBSPClosureExpression caster(DBSPType to, DBSPCastExpression.CastType safe) {
         if (!to.is(DBSPTypeTuple.class))
             return super.caster(to, safe);  // throw
         DBSPTypeTuple tuple = to.to(DBSPTypeTuple.class);
@@ -160,7 +164,10 @@ public class DBSPTypeTuple extends DBSPTypeTupleBase {
             casts[i] = this.tupFields[i].caster(tuple.tupFields[i], safe);
             casts[i] = casts[i].call(var.deepCopy().deref().field(i).borrow());
         }
-        return new DBSPTupleExpression(to.mayBeNull, casts).closure(var);
+        DBSPExpression result = new DBSPTupleExpression(to.mayBeNull, casts);
+        if (this.mayBeNull)
+            result = new DBSPIfExpression(CalciteObject.EMPTY, var.deref().is_null(), to.none(), result);
+        return result.closure(var);
     }
 
     @Override

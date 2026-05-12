@@ -4,7 +4,7 @@ You can run ad-hoc SQL queries on a running or paused pipeline. Unlike Feldera S
 are evaluated incrementally, ad-hoc queries are evaluated in batch mode,
 using the [datafusion engine](https://datafusion.apache.org).
 
-Ad-hoc queries provide a way to query the state of a [materialized](/sql/materialized) tables and views. They are designed to aid
+Ad-hoc queries provide a way to query the state of [materialized](/sql/materialized) tables and views. They are designed to aid
 development and debugging, so you need to be aware of their limitations to avoid potential confusion.
 
 ## Limitations
@@ -19,8 +19,7 @@ As of now, there are differences between the SQL dialects of Feldera SQL program
 This is because they use different engines (Apache Calcite for Feldera SQL vs. Apache Datafusion for ad-hoc queries).
 See below for some examples.
 
-Currently, only `SELECT` and `INSERT` statements are supported. You can not create or alter tables and views using
-ad-hoc SQL.
+Currently, only `SELECT` and `INSERT` statements are supported. You cannot create or alter tables and views using ad-hoc SQL.
 
 ### Differences between Feldera SQL and Ad-hoc Queries
 
@@ -38,7 +37,7 @@ ad-hoc queries that need to be taken into account:
   in Feldera SQL.
   (`SELECT 1729595568::TIMESTAMP;` will yield `2024-10-22T11:12:48` in ad-hoc queries and
   `1970-01-21 00:26:35` in Feldera SQL).
-- Ad-hoc SQL can not perform as-of joins.
+- Ad-hoc SQL cannot perform as-of joins.
 
 We will continue to improve the consistency between the two engines in future releases.
 
@@ -51,8 +50,9 @@ Ad-hoc queries can be executed via different Feldera tools both when the pipelin
 You can issue ad-hoc queries by opening the "Ad-hoc query" tab of the pipeline and typing a SQL `SELECT` or `INSERT`
 query in the input text field. To submit the query, press `Enter` or the Play <icon icon="bx:play" /> button next
 to the query. To start a new line, press `Shift + Enter`. After successful execution of the query you will see a table
-containing the results. You can abort a long-running query by clicking the Stop <icon icon="bx:play" /> button or
+containing the results. You can abort a long-running query by clicking the Stop <icon icon="bx:stop" /> button or
 pressing `Ctrl + C`.
+
 
 ![Browsing a materialized view in the Web Console](materialized-1.png)
 
@@ -76,7 +76,7 @@ Refer to [CLI docs](/interface/cli) for more details.
 
 ### Feldera Python SDK
 
-You can execute adhoc queries via the Python SDK using the [.query](pathname:///python/feldera.html#feldera.pipeline.Pipeline.query) method, which returns a generator of Python Dictionaries:
+You can execute ad-hoc queries via the Python SDK using the [.query](pathname:///python/feldera.html#feldera.pipeline.Pipeline.query) method, which returns a generator of Python Dictionaries:
 ```py
 gen_obj = pipeline.query("SELECT * FROM materialized_view;")
 output = list(gen_obj)
@@ -96,7 +96,7 @@ pipeline.execute("INSERT INTO tbl VALUES(1, 2, 3);")
 
 ### REST API
 
-Consult the [query endpoint](/api/execute-an-ad-hoc-sql-query-in-a-running-or-paused-pipeline) reference to run ad-hoc queries directly through the API.
+Consult the [query endpoint](/api/execute-ad-hoc-sql) reference to run ad-hoc queries directly through the API.
 
 ## Architecture
 
@@ -137,6 +137,23 @@ An ad-hoc query to insert data into the `complex_types` table would look like th
 ```sql
 insert into complex_types values ([1,2,3], struct(2, 'b'), '{"field": 3}', MAP(['answer'], [42]), struct(2, 3));
 ```
+
+### Parameterized Queries with PREPARE / EXECUTE
+
+Ad-hoc requests accept a `PREPARE` statement followed by a single
+`EXECUTE` that binds positional parameters (`$1`, `$2`, ...) to literal
+values. The two statements must be submitted together in the same
+request, separated by a semicolon:
+
+```sql
+PREPARE q AS SELECT * FROM materialized_view WHERE v = $1;
+EXECUTE q('2');
+```
+
+Only the final `EXECUTE` produces the result set; the preceding
+`PREPARE` is consumed during planning. Prepared statement names do not
+persist across requests, and `EXECUTE` parameters must be literal
+values.
 
 ## See also
 

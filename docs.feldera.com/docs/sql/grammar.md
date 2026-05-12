@@ -26,7 +26,9 @@ statement
   |   createFunctionStatement
   |   createTypeStatement
   |   createIndexStatement
+  |   createAggregateStatement
   |   latenessStatement
+  |   setOptionStatement
 
 columnDecl
   :   column generalType [ INTERNED ]
@@ -126,11 +128,55 @@ CREATE TABLE empsalary (
 
 ### Table properties that impact the program semantics
 
+#### `DEFAULT` column values
+
+A table column can have an attached `DEFAULT` expression.  Currently
+only deterministic expressions are allowed; this precludes expressions
+that call the `NOW` function.
+
+<a id="connector_metadata"></a> The `CONNECTOR_METADATA()` function
+is a built-in function which returns a nullable value of a `VARIANT`
+type.  This function can be used in a `DEFAULT` expression to obtain
+connector-specific values.  For example, when a table is attached to a
+Kafka connector, the following expression can be used to extract the
+kafka topic name as a column default value:
+
+```sql
+CREATE TABLE T(
+  kafka_partition VARCHAR DEFAULT CAST(CONNECTOR_METADATA()['kafka_topic'] AS VARCHAR),
+  ...
+)
+WITH (
+   'connectors': '[{
+      "transport": {
+          "name": "kafka_input",
+          "config": {
+              "topic": "book-fair-sales",
+              "start_from": "earliest",
+              "bootstrap.servers": "example.com:9092",
+              "include_topic": true
+          }
+      },
+      "format": {
+          "name": "json",
+          "config": {
+              "update_format": "insert_delete",
+              "array": false
+          }
+      }
+   }]'
+);
+```
+
+For the available metadata properties that can be extracted, see the
+documentation for each connector.
+
 #### Materialized tables
 
 Unlike a database, Feldera does not normally maintain the contents of
 tables; it will only store as much data as necessary to compute future
-outputs.  By specifying the property `'materialized' = 'true'` a user
+outputs.  By specifying the property `'materialized' = 'true'` or by
+adding a primary key constraint to the table, a user
 instructs Feldera to also maintain the complete contents of the table.
 Such materialized tables can be browsed and queried at runtime.
 See [Materialized Tables and Views](materialized.md) for more details.
@@ -162,6 +208,49 @@ The property `expected_size` can be used to pass information to the
 SQL compiler about the expected size of a table in steady state
 operation.  The value of this property should be an integer value.
 
+<a id="skip-unused-columns"></a>
+#### Ignoring unused columns
+
+The `skip_unused_columns` is an optional Boolean property that can be
+applied to tables.  Pipelines can ingest data from external persistent
+sources, such as databases or data lakes, where the Feldera pipeline
+is not the only consumer of the data.  In some circumstances, the
+views defined may not need all the columns present in the data
+sources.
+
+When set to `true`, this option instructs the connector to avoid
+reading columns from the input that are not used in any view
+definitions. To be skipped, the columns must be either nullable or
+have default values. This can improve ingestion performance,
+especially for wide tables.  Not all connectors support this feature;
+currently only the Delta table connectors can take advantage of this
+feature.
+
+Note: The simplest way to exclude unused columns is to omit them from
+the Feldera SQL table declaration. The connector never reads columns
+that aren't declared in the SQL schema. Additionally, the SQL compiler
+emits warnings for declared but unused columns—use these as a guide to
+optimize your schema.
+
+Why not always skip unused columns?  When a table is materialized, the
+pipeline stores internally the contents of the table ingested so far.
+Pipelines can be stopped, modified, and restarted; future versions of
+a pipeline may actually process columns that are unused in the current
+version.
+
+Note that changing the value of this attribute for a paused pipeline
+is considered a change to the table, and will cause the entire table
+to be re-ingested from scratch:
+https://docs.feldera.com/pipelines/modifying/#limitation-3-table-evolution-is-not-yet-supported
+
+Example:
+
+```sql
+CREATE TABLE T(x INT, unused INT DEFAULT 0)
+WITH ('skip_unused_columns' = 'true');
+```
+
+
 ### LATENESS
 
 ```
@@ -183,6 +272,15 @@ See [Streaming SQL Extensions, WATERMARKS](streaming.md#watermark-expressions)
 createFunctionStatement
   :   CREATE FUNCTION name '(' [ columnDecl [, columnDecl ]* ] ')' RETURNS generalType
       [ AS expression ]
+```
+
+## Creating user-defined aggregates.
+
+`CREATE AGGREGATE` is used to declare [user-defined aggregates](udf.md#user-defined-aggregates).
+
+```
+createAggregateStatement
+  :   CREATE [ LINEAR ] AGGREGATE name '(' [ columnDecl [, columnDecl ]* ] ')' RETURNS generalType
 ```
 
 ## Creating views
@@ -224,12 +322,14 @@ query
           select
       |   selectWithoutFrom
       |   query UNION [ ALL | DISTINCT ] query
-      |   query EXCEPT [ ALL | DISTINCT ] query
-      |   query MINUS [ ALL | DISTINCT ] query
-      |   query INTERSECT [ ALL | DISTINCT ] query
+      |   query EXCEPT [ DISTINCT ] query
+      |   query MINUS [ DISTINCT ] query
+      |   query INTERSECT [ DISTINCT ] query
       }
       [ ORDER BY orderItem [, orderItem ]* ]
-      [ LIMIT { count | ALL } ]
+      [ LIMIT [ start, ] { count | ALL } ]
+      [ OFFSET start [ { ROW | ROWS } ] ]
+      [ FETCH { FIRST | NEXT } [ count ] { ROW | ROWS } ONLY ]
 
 
 withItem
@@ -238,6 +338,9 @@ withItem
       AS '(' query ')'
 ```
 
+`MINUS` is equivalent to `EXCEPT`.  Note that `EXCEPT ALL` and
+`INTERSECT ALL` are currently not implemented.
+
 <a id="values"></a>
 ```
 values
@@ -245,11 +348,12 @@ values
 
 select
   :   SELECT [ ALL | DISTINCT ]
-          { * | projectItem [, projectItem ]* }
+          { projectItem [, projectItem ]* }
       FROM tableExpression
       [ WHERE booleanExpression ]
       [ GROUP BY [ ALL | DISTINCT ] { groupItem [, groupItem ]* } ]
       [ HAVING booleanExpression ]
+      [ QUALIFY booleanExpression ]
 ```
 
 <a id="lateral"></a>
@@ -286,6 +390,8 @@ orderItem
 ```
 projectItem
   :   expression [ [ AS ] columnAlias ]
+  | [ tableName '.' ] '*' [ 'EXCLUDE' parensColumnList ]
+  |   ROW(*) [ [ AS ] columnAlias ]
   |   tableAlias . *
 ```
 
@@ -399,8 +505,6 @@ it may refer to tables in the `FROM` clause of an enclosing query.
 `GROUP BY GROUPING SETS ((a), (a, b))`); `GROUP BY ALL` is equivalent
 to `GROUP BY`.
 
-`MINUS` is equivalent to `EXCEPT`.
-
 ### Grouping functions
 
 <table>
@@ -484,6 +588,9 @@ Currently we require window ranges to have constant values.  This
 precludes ranges such as `INTERVAL 1 YEAR`, which have variable sizes.
 The window bounds must be non-negative constant values.
 
+The `QUALIFY` clause is applicable only to window aggregates, and it
+filters the result produced by the window aggregate.
+
 ## Table functions
 
 Table functions are invoked using the syntax `TABLE(function(arguments))`.
@@ -533,3 +640,43 @@ Here is an example:
 ```sql
 SELECT EXISTS(ARRAY[1, -12, 3], x -> x > 0)
 ```
+
+## Setting options
+
+```
+setOptionStatement:
+   'SET' identifier = 'ON' | 'OFF' | literal
+```
+
+The SQL statement `SET VARIABLE = value;` can be used to control
+various options that influence the processing of the program.  The
+`value` can be either a SQL literal, or one of the identifiers `ON` or
+`OFF`.  The case of the variable names is ignored.
+
+These options apply globally across the entire SQL program,
+irrespective of their position in the SQL program.
+
+### Supported options
+
+- `FELDERA_WARNINGS_ARE_ERRORS` - setting this option will convert all
+  warnings into errors
+
+- `FELDERA_IGNORE_WARNING_<name>` - for every type of warning there is
+  a corresponding variable which can silence it.  The variable name is
+  obtained by converting the warning name by replacing all spaces with
+  underscores.  Example `SET FELDERA_IGNORE_WARNING_UNUSED_COLUMN = ON`.
+
+### Experimental options
+
+In addition, various "temporary" variables may be introduced (and
+subsequently removed) to enable or disable compiler features that are
+still considered experimental.  Possible example: `SET
+FELDERA_USE_MULTI_JOINS = OFF`.
+
+Currently the following options are available:
+
+`FELDERA_AVOID_STAR_JOINS` if set to true the compiler will not
+generate code using the new feature of "star joins", which are a
+simple form of multi-joins.  We expect that option will be removed in
+the near future.
+

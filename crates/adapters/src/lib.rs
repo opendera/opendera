@@ -155,6 +155,7 @@ mod catalog;
 mod controller;
 pub mod format;
 pub mod integrated;
+pub mod preprocess;
 pub mod server;
 pub mod static_compile;
 pub mod transport;
@@ -163,29 +164,32 @@ pub(crate) mod util;
 #[cfg(test)]
 pub mod test;
 
-pub use integrated::{create_integrated_output_endpoint, IntegratedOutputEndpoint};
+pub use integrated::{IntegratedOutputEndpoint, create_integrated_output_endpoint};
 
 pub use dbsp::DetailedError;
 pub use feldera_adapterlib::PipelineState;
 
-pub use server::{ErrorResponse, PipelineError};
+pub use server::{ErrorResponse, PipelineError, PipelinePhase};
 
 pub use catalog::{
     Catalog, CircuitCatalog, DeCollectionHandle, DeCollectionStream, RecordFormat, SerBatch,
-    SerCollectionHandle, SerCursor,
+    SerCursor,
 };
 pub use feldera_adapterlib::format::{
     Encoder, InputBuffer, InputFormat, OutputConsumer, OutputFormat, ParseError, Parser,
 };
 
 pub use controller::{
-    ConfigError, ConnectorConfig, Controller, ControllerError, ControllerStatus, FormatConfig,
-    InputEndpointConfig, OutputEndpointConfig, PipelineConfig, RuntimeConfig, TransportConfig,
+    ConfigError, ConnectorConfig, Controller, ControllerError, ControllerInner, ControllerStatus,
+    EndpointId, FormatConfig, InputEndpointConfig, OutputEndpointConfig, PipelineConfig,
+    RuntimeConfig, TransportConfig,
 };
 pub use transport::{
     AsyncErrorCallback, InputConsumer, InputEndpoint, InputReader, OutputEndpoint,
     TransportInputEndpoint,
 };
+
+pub mod samply;
 
 /// Some dependencies of this crate use the `rustls` library. This library has two features
 /// `ring` and `aws-lc-rs`. When both are enabled, the library requires a process-wide default

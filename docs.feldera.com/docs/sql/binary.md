@@ -2,8 +2,8 @@
 
 The `BINARY` and `VARBINARY` data types allows storage of binary strings.
 
-A binary string is a sequence of octets (or bytes). Binary strings are
-distinguished from character strings in two ways. First, binary
+A binary string is a sequence of octets (or bytes).  Binary strings
+are distinguished from character strings in two ways.  First, binary
 strings specifically allow storing octets of value zero and other
 “non-printable” octets (usually, octets outside the decimal range 32
 to 126).  Character strings disallow zero octets, and also disallow
@@ -14,6 +14,9 @@ processing of character strings depends on locale settings. In short,
 binary strings are appropriate for storing data that the programmer
 thinks of as “raw bytes”, whereas character strings are appropriate
 for storing text.
+
+Beware that `BINARY` without a scale specified is the same as
+`BINARY(1)`.
 
 ## Binary literals
 
@@ -37,6 +40,11 @@ aggregation functions `BIT_AND`, `BIT_OR`, and `BIT_XOR`.
     <th>Operation</th>
     <th>Description</th>
     <th>Examples</th>
+  </tr>
+  <tr>
+    <td><a id="bin2utf8"></a><code>BIN2UTF8</code></td>
+    <td>Convert a BINARY value into a VARCHAR value by reinterpreting the content as UTF-8 characters; returns NULL on failure</td>
+    <td><code>BIN2UTF8(x'4041')</code> => <code>'@A'</code></td>
   </tr>
   <tr>
     <td><a id="concat"></a><code>||</code></td>
@@ -64,7 +72,7 @@ aggregation functions `BIT_AND`, `BIT_OR`, and `BIT_XOR`.
         Calculates an MD5 128-bit checksum of the argument and returns it as a hex <code>VARCHAR</code> value.
         If the input is NULL, NULL is returned.
     </td>
-    <td><code>SELECT md5(x'0123456789ABCDEF')</code> => <code></code></td>
+    <td><code>SELECT md5(x'0123456789ABCDEF')</code> => <code>a1cd1d1fc6491068d91007283ed84489</code></td>
   </tr>
   <tr>
     <td><a id="octet_length"></a><code>OCTET_LENGTH</code>(binary)</td>
@@ -103,12 +111,17 @@ aggregation functions `BIT_AND`, `BIT_OR`, and `BIT_XOR`.
   </tr>
   <tr>
     <td><a id="to_hex"></a><code>TO_HEX</code>(binary)</td>
-    <td>Generate a `VARCHAR` string describing the value in hexadecimal</td>
-    <td><code>TO_HEX(x'0abc')</code> => <code>'0ABC'</code></td>
+    <td>Generate a `VARCHAR` string describing the value in hexadecimal (lowercase)</td>
+    <td><code>TO_HEX(x'0abc')</code> => <code>'0abc'</code></td>
   </tr>
   <tr>
     <td><a id="to_int"></a><a id="to_int"></a><code>TO_INT</code>(binary)</td>
     <td>Generate an `INT` value from the first 4 bytes of the `binary`, where the 0-th byte is the MSB</td>
     <td><code>TO_INT(x'0abc')</code> => <code>2748</code></td>
+  </tr>
+  <tr>
+    <td><a id="xxhash"></a><code>XXHASH ( binary, seed )</code></td>
+    <td>Computes the hash of the specified binary with the specified seed.</td>
+    <td><code>xxhash(x'010203', 2397937360598948438)</code> => <code>10</code></td>
   </tr>
 </table>

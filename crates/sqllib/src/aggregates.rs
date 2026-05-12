@@ -4,11 +4,11 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::{ByteArray, FromInteger, SqlDecimal, ToInteger, Weight};
-use dbsp::algebra::{FirstLargeValue, HasOne, HasZero, SignedPrimInt, UnsignedPrimInt, F32, F64};
+use dbsp::algebra::{F32, F64, FirstLargeValue, HasOne, HasZero, SignedPrimInt, UnsignedPrimInt};
 use num::PrimInt;
 use num_traits::CheckedAdd;
 use std::cmp::Ord;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::marker::Copy;
 
 /// Holds some methods for wrapping values into unsigned values
@@ -32,7 +32,7 @@ impl UnsignedWrapper {
         S: PrimInt,
         I: SignedPrimInt + From<S>,
         U: UnsignedPrimInt + TryFrom<I> + Debug,
-        <U as TryFrom<I>>::Error: std::fmt::Debug,
+        <U as TryFrom<I>>::Error: Debug,
     {
         let s = <O as ToInteger<S>>::to_integer(&value);
         let i = <I as From<S>>::from(s);
@@ -53,7 +53,7 @@ impl UnsignedWrapper {
         S: SignedPrimInt,
         I: SignedPrimInt + From<S>,
         U: UnsignedPrimInt + TryFrom<I> + HasZero + Debug,
-        <U as TryFrom<I>>::Error: std::fmt::Debug,
+        <U as TryFrom<I>>::Error: Debug,
     {
         match value {
             None => {
@@ -78,8 +78,8 @@ impl UnsignedWrapper {
         S: SignedPrimInt + TryFrom<I> + Debug,
         I: SignedPrimInt + From<S> + TryFrom<U>,
         U: UnsignedPrimInt + TryFrom<I>,
-        <I as TryFrom<U>>::Error: std::fmt::Debug,
-        <S as TryFrom<I>>::Error: std::fmt::Debug,
+        <I as TryFrom<U>>::Error: Debug,
+        <S as TryFrom<I>>::Error: Debug,
     {
         let i = <I as TryFrom<U>>::try_from(value).unwrap();
         let i = i + <I as From<S>>::from(S::min_value()) - <I as HasOne>::one();
@@ -98,8 +98,8 @@ impl UnsignedWrapper {
         S: SignedPrimInt + TryFrom<U> + TryFrom<I>,
         I: SignedPrimInt + From<S> + TryFrom<U>,
         U: UnsignedPrimInt + TryFrom<I> + Debug,
-        <I as TryFrom<U>>::Error: std::fmt::Debug,
-        <S as TryFrom<I>>::Error: std::fmt::Debug,
+        <I as TryFrom<U>>::Error: Debug,
+        <S as TryFrom<I>>::Error: Debug,
     {
         if nullsLast {
             if <U as FirstLargeValue>::large() == value {
@@ -122,15 +122,15 @@ impl UnsignedWrapper {
 // And 4 more functions:
 // f_t_t_conditional(left: T, right: T, predicate: bool) -> T
 macro_rules! some_aggregate {
-    ($base_name: ident, $func_name:ident, $short_name: ident, $arg_type: ty) => {
+    ($base_name: ident $(< $( const $var:ident : $ty: ty),* >)?, $func_name:ident, $short_name: ident, $arg_type: ty) => {
         ::paste::paste! {
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name _ $short_name>]( left: $arg_type, right: $arg_type ) -> $arg_type {
+            pub fn [<$func_name _ $short_name _ $short_name>] $(< $( const $var : $ty ),* >)? ( left: $arg_type, right: $arg_type ) -> $arg_type {
                 $base_name(left, right)
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name N _ $short_name>]( left: Option<$arg_type>, right: $arg_type ) -> Option<$arg_type> {
+            pub fn [<$func_name _ $short_name N _ $short_name>] $(< $( const $var : $ty ),* >)? ( left: Option<$arg_type>, right: $arg_type ) -> Option<$arg_type> {
                 match left {
                     None => Some(right.clone()),
                     Some(left) => Some($base_name(left, right)),
@@ -138,7 +138,7 @@ macro_rules! some_aggregate {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name _ $short_name N>]( left: $arg_type, right: Option<$arg_type> ) -> Option<$arg_type> {
+            pub fn [<$func_name _ $short_name _ $short_name N>] $(< $( const $var : $ty ),* >)? ( left: $arg_type, right: Option<$arg_type> ) -> Option<$arg_type> {
                 match right {
                     None => Some(left.clone()),
                     Some(right) => Some($base_name(left, right)),
@@ -146,7 +146,7 @@ macro_rules! some_aggregate {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name N _ $short_name N>]( left: Option<$arg_type>, right: Option<$arg_type> ) -> Option<$arg_type> {
+            pub fn [<$func_name _ $short_name N _ $short_name N>] $(< $( const $var : $ty ),* >)? ( left: Option<$arg_type>, right: Option<$arg_type> ) -> Option<$arg_type> {
                 match (left.clone(), right.clone()) {
                     (None, _) => right.clone(),
                     (_, None) => left.clone(),
@@ -155,7 +155,7 @@ macro_rules! some_aggregate {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name _ $short_name _conditional>]( left: $arg_type, right: $arg_type, predicate: bool ) -> $arg_type {
+            pub fn [<$func_name _ $short_name _ $short_name _conditional>] $(< $( const $var : $ty ),* >)? ( left: $arg_type, right: $arg_type, predicate: bool ) -> $arg_type {
                 if predicate {
                     $base_name(left, right)
                 } else {
@@ -164,7 +164,7 @@ macro_rules! some_aggregate {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name N _ $short_name _conditional>]( left: Option<$arg_type>, right: $arg_type, predicate: bool ) -> Option<$arg_type> {
+            pub fn [<$func_name _ $short_name N _ $short_name _conditional>] $(< $( const $var : $ty ),* >)? ( left: Option<$arg_type>, right: $arg_type, predicate: bool ) -> Option<$arg_type> {
                 match (left.clone(), right.clone(), predicate) {
                     (_, _, false) => left.clone(),
                     (None, _, _) => Some(right.clone()),
@@ -173,7 +173,7 @@ macro_rules! some_aggregate {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name _ $short_name N _conditional>]( left: $arg_type, right: Option<$arg_type>, predicate: bool ) -> Option<$arg_type> {
+            pub fn [<$func_name _ $short_name _ $short_name N _conditional>] $(< $( const $var : $ty ),* >)? ( left: $arg_type, right: Option<$arg_type>, predicate: bool ) -> Option<$arg_type> {
                 match (left.clone(), right.clone(), predicate) {
                     (_, _, false) => Some(left.clone()),
                     (_, None, _) => Some(left.clone()),
@@ -182,7 +182,7 @@ macro_rules! some_aggregate {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name N _ $short_name N _conditional>]( left: Option<$arg_type>, right: Option<$arg_type>, predicate: bool ) -> Option<$arg_type> {
+            pub fn [<$func_name _ $short_name N _ $short_name N _conditional>] $(< $( const $var : $ty ),* >)? ( left: Option<$arg_type>, right: Option<$arg_type>, predicate: bool ) -> Option<$arg_type> {
                 match (left.clone(), right.clone(), predicate) {
                     (_, _, false) => left.clone(),
                     (None, _, _) => right.clone(),
@@ -193,7 +193,6 @@ macro_rules! some_aggregate {
         }
     };
 }
-pub(crate) use some_aggregate;
 
 // Macro to create variants of an aggregation function
 // There must exist a function f(left: T, right: T) -> T ($base_name is f)
@@ -204,15 +203,15 @@ pub(crate) use some_aggregate;
 // f_t_t_conditional(left: T, right: T, predicate: bool) -> T
 // Only the right value can be null
 macro_rules! some_aggregate_non_null {
-    ($base_name: ident, $func_name:ident, $short_name: ident, $arg_type: ty) => {
+    ($base_name: ident $(< $( const $var:ident : $ty: ty),* >)?, $func_name:ident, $short_name: ident, $arg_type: ty) => {
         ::paste::paste! {
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name _ $short_name>]( left: $arg_type, right: $arg_type ) -> $arg_type {
+            pub fn [<$func_name _ $short_name _ $short_name>] $(< $( const $var : $ty ),* >)? ( left: $arg_type, right: $arg_type ) -> $arg_type {
                 $base_name(left, right)
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name _ $short_name N>]( left: $arg_type, right: Option<$arg_type> ) -> $arg_type {
+            pub fn [<$func_name _ $short_name _ $short_name N>] $(< $( const $var : $ty ),* >)? ( left: $arg_type, right: Option<$arg_type> ) -> $arg_type {
                 match right {
                     None => left.clone(),
                     Some(right) => $base_name(left, right),
@@ -220,7 +219,7 @@ macro_rules! some_aggregate_non_null {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name _ $short_name _conditional>]( left: $arg_type, right: $arg_type, predicate: bool ) -> $arg_type {
+            pub fn [<$func_name _ $short_name _ $short_name _conditional>] $(< $( const $var : $ty ),* >)? ( left: $arg_type, right: $arg_type, predicate: bool ) -> $arg_type {
                 if predicate {
                     $base_name(left, right)
                 } else {
@@ -229,7 +228,7 @@ macro_rules! some_aggregate_non_null {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name _ $short_name N _conditional>]( left: $arg_type, right: Option<$arg_type>, predicate: bool ) -> $arg_type {
+            pub fn [<$func_name _ $short_name _ $short_name N _conditional>] $(< $( const $var : $ty ),* >)? ( left: $arg_type, right: Option<$arg_type>, predicate: bool ) -> $arg_type {
                 match (left.clone(), right.clone(), predicate) {
                     (_, _, false) => left.clone(),
                     (_, None, _) => left.clone(),
@@ -239,8 +238,6 @@ macro_rules! some_aggregate_non_null {
         }
     };
 }
-pub(crate) use some_aggregate_non_null;
-
 macro_rules! for_all_int_aggregate {
     ($base_name: ident, $func_name: ident) => {
         some_aggregate!($base_name, $func_name, i8, i8);
@@ -264,16 +261,16 @@ macro_rules! for_all_int_aggregate_non_null {
 // Macro to create variants of an aggregation function
 // There must exist a function f__(left: T, right: T) -> T
 // This creates 3 more functions
-// f_N_(left: Option<T>, right: T) -> Option<T>
+// f_N_<T>(left: Option<T>, right: T) -> Option<T>
 // etc.
 // And 4 more functions:
-// f_N_N_conditional(left: T, right: T, predicate: bool) -> T
+// f_N_N_conditional<T>(left: T, right: T, predicate: bool) -> T
 macro_rules! universal_aggregate {
-    ($func:ident) => {
+    ($func:ident, $t: ty where $($bounds:tt)*) => {
         ::paste::paste! {
             #[doc(hidden)]
-            pub fn [<$func _N_ >]<T>( left: Option<T>, right: T ) -> Option<T>
-                where T: Ord + Clone,
+            pub fn [<$func _N_ >]<$t>( left: Option<$t>, right: $t ) -> Option<$t>
+                where $($bounds)*
             {
                 match left {
                     None => Some(right.clone()),
@@ -282,8 +279,8 @@ macro_rules! universal_aggregate {
             }
 
             #[doc(hidden)]
-            pub fn [<$func __N>]<T>( left: T, right: Option<T> ) -> Option<T>
-                where T: Ord + Clone,
+            pub fn [<$func __N>]<$t>( left: $t, right: Option<$t> ) -> Option<$t>
+                where $($bounds)*
             {
                 match right {
                     None => Some(left.clone()),
@@ -292,19 +289,19 @@ macro_rules! universal_aggregate {
             }
 
             #[doc(hidden)]
-            pub fn [<$func _N_N>]<T>( left: Option<T>, right: Option<T> ) -> Option<T>
-                where T: Ord + Clone,
+            pub fn [<$func _N_N>]<$t>( left: Option<$t>, right: Option<$t> ) -> Option<$t>
+                where $($bounds)*
             {
                 match (left.clone(), right.clone()) {
-                    (None, _) => right.clone(),
-                    (_, None) => left.clone(),
+                    (None, right) => right,
+                    (left, None) => left,
                     (Some(left), Some(right)) => Some([<$func __>](left, right)),
                 }
             }
 
             #[doc(hidden)]
-            pub fn [<$func ___conditional>]<T>( left: T, right: T, predicate: bool ) -> T
-                where T: Ord + Clone,
+            pub fn [<$func ___conditional>]<$t>( left: $t, right: $t, predicate: bool ) -> $t
+                where $($bounds)*
             {
                 if predicate {
                     [<$func __>](left, right)
@@ -314,62 +311,174 @@ macro_rules! universal_aggregate {
             }
 
             #[doc(hidden)]
-            pub fn [<$func _N__conditional>]<T>( left: Option<T>, right: T, predicate: bool ) -> Option<T>
-                where T: Ord + Clone,
+            pub fn [<$func _N__conditional>]<$t>( left: Option<$t>, right: $t, predicate: bool ) -> Option<$t>
+                where $($bounds)*
             {
                 match (left.clone(), right.clone(), predicate) {
-                    (_, _, false) => left.clone(),
-                    (None, _, _) => Some(right.clone()),
+                    (left, _, false) => left,
+                    (None, right, _) => Some(right),
                     (Some(x), _, _) => Some([<$func __>](x, right)),
                 }
             }
 
             #[doc(hidden)]
-            pub fn [<$func __N_conditional>]<T>( left: T, right: Option<T>, predicate: bool ) -> Option<T>
-                where T: Ord + Clone,
+            pub fn [<$func __N_conditional>]<$t>( left: $t, right: Option<$t>, predicate: bool ) -> Option<$t>
+                where $($bounds)*
             {
                 match (left.clone(), right.clone(), predicate) {
-                    (_, _, false) => Some(left.clone()),
-                    (_, None, _) => Some(left.clone()),
+                    (left, _, false) => Some(left),
+                    (left, None, _) => Some(left),
                     (_, Some(y), _) => Some([<$func __>](left, y)),
                 }
             }
 
             #[doc(hidden)]
-            pub fn [<$func _N_N_conditional>]<T>( left: Option<T>, right: Option<T>, predicate: bool ) -> Option<T>
-                where T: Ord + Clone,
+            pub fn [<$func _N_N_conditional>]<$t>( left: Option<$t>, right: Option<$t>, predicate: bool ) -> Option<$t>
+                where $($bounds)*
             {
                 match (left.clone(), right.clone(), predicate) {
-                    (_, _, false) => left.clone(),
-                    (None, _, _) => right.clone(),
-                    (_, None, _) => left.clone(),
+                    (left, _, false) => left,
+                    (None, right, _) => right,
+                    (left, None, _) => left,
                     (Some(x), Some(y), _) => Some([< $func __ >](x, y)),
                 }
             }
         }
     };
 }
-pub(crate) use universal_aggregate;
-
-#[doc(hidden)]
-pub fn agg_max__<T>(left: T, right: T) -> T
-where
-    T: Ord + Clone,
-{
-    left.max(right)
-}
-
-universal_aggregate!(agg_max);
-
 #[doc(hidden)]
 pub fn agg_min__<T>(left: T, right: T) -> T
 where
-    T: Ord + Clone,
+    T: Ord + Clone + Debug,
 {
     left.min(right)
 }
 
-universal_aggregate!(agg_min);
+universal_aggregate!(agg_min, T where T: Ord + Clone + Debug);
+
+#[doc(hidden)]
+pub fn agg_max__<T>(left: T, right: T) -> T
+where
+    T: Ord + Clone + Debug,
+{
+    left.max(right)
+}
+
+universal_aggregate!(agg_max, T where T: Ord + Clone + Debug);
+
+fn o0<L, R>(t: (L, R)) -> (Option<L>, R) {
+    (Some(t.0), t.1)
+}
+
+// Macro to create variants of an aggregation function
+// There must exist a function f__(left: (L, R), right: (L, R)) -> (L, R)
+// This creates 3 more functions
+// f_N_<L, R>(left: (<Option<L>, R), right: (L, R)) -> (Option<L>, R)
+// etc.
+// And 4 more functions:
+// f_N_N_conditional<L, R>(left: (L, R), right: (L, R), predicate: bool) -> (L, R)
+macro_rules! universal_aggregate2 {
+    ($func:ident, $l: ty, $r: ty where $($bounds:tt)*) => {
+        ::paste::paste! {
+            #[doc(hidden)]
+            pub fn [<$func _N_ >]<$l, $r>( left: (Option<$l>, $r), right: ($l, $r)) -> (Option<$l>, $r)
+                where $($bounds)*
+            {
+                match left {
+                    (None, _) => o0(right),
+                    (Some(left), r) => o0([<$func __>]((left, r), right)),
+                }
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func __N>]<$l, $r>( left: ($l, $r), right: (Option<$l>, $r) ) -> (Option<$l>, $r)
+                where $($bounds)*
+            {
+                match right {
+                    (None, _) => o0(left),
+                    (Some(right), r) => o0([<$func __>](left, (right, r))),
+                }
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func _N_N>]<$l, $r>( left: (Option<$l>, $r), right: (Option<$l>, $r) ) -> (Option<$l>, $r)
+                where $($bounds)*
+            {
+                match (left.clone(), right.clone()) {
+                    ((None, _), right) => right,
+                    (left, (None, _)) => left,
+                    ((Some(left), l1), (Some(right), r1)) => o0([<$func __>]((left, l1), (right, r1))),
+                }
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func ___conditional>]<$l, $r>( left: ($l, $r), right: ($l, $r), predicate: bool ) -> ($l, $r)
+                where $($bounds)*
+            {
+                if predicate {
+                    [<$func __>](left, right)
+                } else {
+                    left.clone()
+                }
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func _N__conditional>]<$l, $r>( left: (Option<$l>, $r), right: ($l, $r), predicate: bool ) -> (Option<$l>, $r)
+                where $($bounds)*
+            {
+                match (left.clone(), right.clone(), predicate) {
+                    (left, _, false) => left,
+                    ((None, _), right, _) => o0(right),
+                    ((Some(x), r), _, _) => o0([<$func __>]((x, r), right)),
+                }
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func __N_conditional>]<$l, $r>( left: ($l, $r), right: (Option<$l>, $r), predicate: bool ) -> (Option<$l>, $r)
+                where $($bounds)*
+            {
+                match (left.clone(), right.clone(), predicate) {
+                    (left, _, false) => o0(left),
+                    (left, (None, _), _) => o0(left),
+                    (_, (Some(y), r), _) => o0([<$func __>](left, (y, r))),
+                }
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func _N_N_conditional>]<$l, $r>( left: (Option<$l>, $r), right: (Option<$l>, $r), predicate: bool ) -> (Option<$l>, $r)
+                where $($bounds)*
+            {
+                match (left.clone(), right.clone(), predicate) {
+                    (left, _, false) => left,
+                    ((None, _), right, _) => right,
+                    (left, (None, _), _) => left,
+                    ((Some(x), l), (Some(y), r), _) => o0([< $func __ >]((x, l), (y, r))),
+                }
+            }
+        }
+    };
+}
+#[doc(hidden)]
+pub fn agg_max1__<L, R>(left: (L, R), right: (L, R)) -> (L, R)
+where
+    L: Ord + Clone + Debug,
+    R: Ord + Clone + Debug,
+{
+    left.max(right)
+}
+
+universal_aggregate2!(agg_max1, L, R where L: Ord + Clone + Debug, R: Ord + Clone + Debug);
+
+#[doc(hidden)]
+pub fn agg_min1__<L, R>(left: (L, R), right: (L, R)) -> (L, R)
+where
+    L: Ord + Clone + Debug,
+    R: Ord + Clone + Debug,
+{
+    left.min(right)
+}
+
+universal_aggregate2!(agg_min1, L, R where L: Ord + Clone + Debug, R: Ord + Clone + Debug);
 
 #[doc(hidden)]
 pub fn agg_plus<T>(left: T, right: T) -> T
@@ -389,23 +498,32 @@ pub fn agg_plus_f64(left: F64, right: F64) -> F64 {
     left + right
 }
 
-#[doc(hidden)]
-pub fn agg_plus_SqlDecimal(left: SqlDecimal, right: SqlDecimal) -> SqlDecimal {
-    left + right
-}
-
 some_aggregate!(agg_plus_f32, agg_plus, f, F32);
 some_aggregate!(agg_plus_f64, agg_plus, d, F64);
-some_aggregate!(agg_plus_SqlDecimal, agg_plus, SqlDecimal, SqlDecimal);
-
 for_all_int_aggregate!(agg_plus, agg_plus);
+
+#[doc(hidden)]
+pub fn agg_plus_SqlDecimal<const P: usize, const S: usize>(
+    left: SqlDecimal<P, S>,
+    right: SqlDecimal<P, S>,
+) -> SqlDecimal<P, S> {
+    left.checked_add(&right).unwrap_or_else(|| {
+        panic!(
+            "Overflow during aggregation {}+{} cannot be represented as DECIMAL({P}, {S})",
+            left, right
+        )
+    })
+}
+
+some_aggregate!(agg_plus_SqlDecimal<const P: usize, const S: usize>, agg_plus, SqlDecimal, SqlDecimal<P, S>);
 
 #[doc(hidden)]
 pub fn agg_plus_non_null<T>(left: T, right: T) -> T
 where
-    T: CheckedAdd + Copy,
+    T: CheckedAdd + Copy + Display,
 {
-    left.checked_add(&right).expect("Addition overflow")
+    left.checked_add(&right)
+        .unwrap_or_else(|| panic!("Overflow during aggregation {}+{}", left, right))
 }
 
 #[doc(hidden)]
@@ -418,21 +536,24 @@ pub fn agg_plus_f64_non_null(left: F64, right: F64) -> F64 {
     left + right
 }
 
+some_aggregate_non_null!(agg_plus_f32_non_null, agg_plus_non_null, f, F32);
+some_aggregate_non_null!(agg_plus_f64_non_null, agg_plus_non_null, d, F64);
+for_all_int_aggregate_non_null!(agg_plus_non_null, agg_plus_non_null);
+
 #[doc(hidden)]
-pub fn agg_plus_SqlDecimal_non_null(left: SqlDecimal, right: SqlDecimal) -> SqlDecimal {
-    left + right
+pub fn agg_plus_SqlDecimal_non_null<const P: usize, const S: usize>(
+    left: SqlDecimal<P, S>,
+    right: SqlDecimal<P, S>,
+) -> SqlDecimal<P, S> {
+    left.checked_add(&right).unwrap_or_else(|| {
+        panic!(
+            "Overflow during aggregation {}+{} cannot be represented as DECIMAL({P}, {S})",
+            left, right
+        )
+    })
 }
 
-some_aggregate_non_null!(agg_plus_f32_non_null, agg_plus_non_null, f, F32);
-some_aggregate_non_null!(agg_plus_f64, agg_plus_non_null, d, F64);
-some_aggregate_non_null!(
-    agg_plus_SqlDecimal_non_null,
-    agg_plus_non_null,
-    SqlDecimal,
-    SqlDecimal
-);
-
-for_all_int_aggregate_non_null!(agg_plus_non_null, agg_plus_non_null);
+some_aggregate_non_null!(agg_plus_SqlDecimal_non_null<const P: usize, const S: usize>, agg_plus_non_null, SqlDecimal, SqlDecimal<P, S>);
 
 #[doc(hidden)]
 #[inline(always)]

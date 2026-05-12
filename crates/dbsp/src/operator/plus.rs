@@ -3,8 +3,8 @@
 use crate::{
     algebra::{AddAssignByRef, AddByRef, NegByRef},
     circuit::{
-        operator_traits::{BinaryOperator, Operator},
         Circuit, OwnershipPreference, Scope, Stream,
+        operator_traits::{BinaryOperator, Operator},
     },
 };
 use std::{borrow::Cow, marker::PhantomData, ops::Neg};
@@ -49,7 +49,7 @@ where
     /// .0;
     ///
     /// # for _ in 0..5 {
-    /// #     circuit.step().unwrap();
+    /// #     circuit.transaction().unwrap();
     /// # }
     /// ```
     #[track_caller]
@@ -234,11 +234,12 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
+        Circuit, RootCircuit,
         algebra::HasZero,
         circuit::OwnershipPreference,
         operator::{Generator, Inspect},
         typed_batch::OrdZSet,
-        zset, Circuit, RootCircuit,
+        zset,
     };
 
     #[test]
@@ -263,7 +264,7 @@ mod test {
         .0;
 
         for _ in 0..100 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 
@@ -317,7 +318,7 @@ mod test {
         .0;
 
         for _ in 0..100 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
 
         // Only consume source2 by value.
@@ -340,7 +341,7 @@ mod test {
         .0;
 
         for _ in 0..100 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
 
         // Only consume source1 by value.
@@ -364,7 +365,7 @@ mod test {
         .0;
 
         for _ in 0..100 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
 
         // Consume both streams by reference.
@@ -398,7 +399,7 @@ mod test {
         .0;
 
         for _ in 0..100 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 }

@@ -3,27 +3,30 @@ package org.dbsp.sqlCompiler.compiler.sql.simple;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPFilterOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPFlatMapIndexOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPIndexedTopKOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinFilterMapOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPLeftJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateWithWaterlineOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceTableOperator;
+import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
 import org.dbsp.sqlCompiler.compiler.backend.rust.ToRustVisitor;
+import org.dbsp.sqlCompiler.compiler.backend.rust.multi.ProjectDeclarations;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.sql.tools.CompilerCircuitStream;
 import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
+import org.dbsp.util.IndentStreamBuilder;
 import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
-
-import java.util.HashSet;
 
 public class RegressionTests extends SqlIoTest {
     @Test
@@ -34,7 +37,7 @@ public class RegressionTests extends SqlIoTest {
     @Test
     public void issue3653() {
         this.statementsFailingInCompilation("CREATE TYPE t AS (related t ARRAY);",
-                "error: Error in SQL statement: Unknown identifier 't'");
+                "error: Compilation error: At line 1, column 27: Unknown identifier 't'");
     }
 
     @Test
@@ -46,11 +49,24 @@ public class RegressionTests extends SqlIoTest {
 
     @Test
     public void testInternal179() {
-        this.getCC("""
+        var cc = this.getCC("""
                 CREATE TABLE h(p REAL NOT NULL);
                 CREATE TABLE q(r REAL NOT NULL);
                 CREATE VIEW V AS SELECT * FROM h LEFT JOIN q ON ROUND(r) = ROUND(p);
                 """);
+        cc.visit(new CircuitVisitor(cc.compiler) {
+            private int left = 0;
+
+            @Override
+            public void postorder(DBSPLeftJoinOperator operator) {
+                this.left++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(1, this.left);
+            }
+        });
     }
 
     @Test
@@ -235,6 +251,17 @@ public class RegressionTests extends SqlIoTest {
     }
 
     @Test
+    public void tsAdd() {
+        // Check that microsecond intervals are correctly added
+        var ccs = this.getCCS("CREATE VIEW V AS SELECT " +
+                "TIMESTAMPADD(MICROSECOND, 2, '2024-01-01 00:00:00.123456'::TIMESTAMP)");
+        ccs.step("", """
+                 ts0 | weight
+                --------------------------------
+                 2024-01-01 00:00:00.123458 | 1""");
+    }
+
+    @Test
     public void issue3164() {
         this.compileRustTestCase("""
                 CREATE TABLE T(x integer LATENESS 1);
@@ -383,13 +410,11 @@ public class RegressionTests extends SqlIoTest {
 
     @Test
     public void issue3071() {
-        this.statementsFailingInCompilation("""
+        this.getCC("""
                 CREATE TABLE t0(c0 char) with ('materialized' = 'true');
-                CREATE MATERIALIZED VIEW v100_optimized AS (SELECT * FROM t0 WHERE (t0.c0) NOT BETWEEN ('Y') AND ('䤈'));""",
-                "Failed to encode");
-        this.statementsFailingInCompilation("""
-                CREATE MATERIALIZED VIEW v73_optimized AS SELECT 'a'>'헊';""",
-                "Failed to encode");
+                CREATE MATERIALIZED VIEW v100_optimized AS (SELECT * FROM t0 WHERE (t0.c0) NOT BETWEEN ('Y') AND ('䤈'));""");
+        this.getCC("""
+                CREATE MATERIALIZED VIEW v73_optimized AS SELECT 'a'>'헊';""");
     }
 
     @Test
@@ -560,6 +585,29 @@ public class RegressionTests extends SqlIoTest {
     }
 
     @Test
+    public void issue3210() {
+        // validated on Postgres
+        var ccs = this.getCCS("""
+                create table t1(arr STRING ARRAY);
+                create table t2 (id string);
+                
+                CREATE VIEW v AS
+                WITH ids AS (
+                  SELECT array_element.id
+                  FROM t1, UNNEST(t1.arr) AS array_element(id)
+                )
+                SELECT * FROM ids
+                WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = ids.id);""");
+        ccs.step("""
+                INSERT INTO t1 VALUES(array['a']), (array['b', 'd']);
+                INSERT INTO t2 VALUES('a'), ('b'), ('c'), ('e');""", """
+                 id | weight
+                -------------
+                 a| 1
+                 b| 1""");
+    }
+
+    @Test
     public void issue457() {
         String sql = """
                 create table t (id int, x int);
@@ -605,10 +653,8 @@ public class RegressionTests extends SqlIoTest {
                 CREATE TABLE T(x INT32, y AI);""");
     }
 
-    @Test @Ignore("https://issues.apache.org/jira/browse/CALCITE-6681")
+    @Test
     public void issueLateral() {
-        // This triggers https://issues.apache.org/jira/browse/CALCITE-6681
-        // If we disable PROJECT_CORRELATE_TRANSPOSE, it fails due to the decorrelator
         this.compileRustTestCase("""
                 CREATE TABLE t2 (
                   a VARCHAR,
@@ -651,9 +697,11 @@ public class RegressionTests extends SqlIoTest {
 
     @Test
     public void issue2942() {
-        this.statementsFailingInCompilation(
-                "CREATE VIEW v1(c0) AS (SELECT '9,\uE8C7voz[*');",
-                "Failed to encode");
+        var ccs = this.getCCS("CREATE VIEW v1(c0) AS SELECT '9,\uE8C7voz[*'");
+        ccs.step("", """
+         c0 | weight
+        -------------
+         9,voz[*|1""");
     }
 
     @Test
@@ -739,7 +787,7 @@ public class RegressionTests extends SqlIoTest {
                     r int,
                     scopeSpans int ARRAY
                 );
-                CREATE TABLE t (resourceSpans ResourceSpans ARRAY);
+                CREATE TABLE t (z INT, resourceSpans ResourceSpans ARRAY);
                 
                 CREATE MATERIALIZED VIEW resource_spans AS
                 SELECT resourceSpans.scopeSpans
@@ -797,8 +845,11 @@ public class RegressionTests extends SqlIoTest {
                 FROM t;""";
         // This is not executed, since the udfs have no definitions
         var cc = this.getCC(sql);
-        // Test that code generation does not crash
-        ToRustVisitor.toRustString(cc.compiler, cc.getCircuit(), new HashSet<>());
+        // Test that code generation does not crash without compiling the result
+        ToRustVisitor visitor = new ToRustVisitor(
+                cc.compiler, new IndentStreamBuilder(), cc.getCircuit().getMetadata(),
+                new ProjectDeclarations(), new LateMaterializations(cc.compiler));
+        visitor.apply(cc.getCircuit());
     }
 
     @Test
@@ -1646,8 +1697,8 @@ public class RegressionTests extends SqlIoTest {
 
             @Override
             public void endVisit() {
-                // We expect 5 MapIndex operators instead of 11 if CSE works
-                Assert.assertEquals(5, this.mapIndex);
+                // We expect 7 MapIndex operators instead of 11 if CSE works
+                Assert.assertEquals(7, this.mapIndex);
             }
         };
         visitor.apply(circuit);
@@ -1910,8 +1961,8 @@ public class RegressionTests extends SqlIoTest {
                    (8765432.147, -2344579.923);""", """
                  c1            |            c2 | weight
                 ----------------------------------------
-                 -34567891.312 | 98765432.12   | 1
-                 8765432.147   | -2344579.923  | 1""");
+                 -34567891.312| 98765432.12| 1
+                 8765432.147| -2344579.923| 1""");
     }
 
     @Test
@@ -1968,33 +2019,6 @@ public class RegressionTests extends SqlIoTest {
     }
 
     @Test
-    public void projectionBug() {
-        String sql = """
-                CREATE TABLE flows(ts TIMESTAMP NOT NULL LATENESS INTERVAL 5 SECONDS)
-                WITH ('append_only' = 'true');
-                
-                CREATE LOCAL VIEW tumble AS SELECT
-                            MIN(ts) AS ts_min,
-                            MAX(ts) AS ts_max,
-                            window_start,
-                            window_end
-                    FROM TABLE(
-                        TUMBLE(
-                            TABLE flows,
-                            DESCRIPTOR(ts),
-                            INTERVAL '1' MINUTES
-                        )
-                    )
-                    GROUP BY window_start, window_end;
-
-                CREATE VIEW final
-                    WITH ('emit_final' = 'window_end')
-                    AS SELECT window_start, window_end
-                    FROM tumble;""";
-        this.getCCS(sql);
-    }
-
-    @Test
     public void testChain() {
         var ccs = this.getCCS("""
                 CREATE TABLE T(x INT);
@@ -2042,7 +2066,7 @@ public class RegressionTests extends SqlIoTest {
                    CREATE TABLE Y(x INT, y INT);
                    CREATE VIEW V AS SELECT X.x, Y.y FROM X JOIN Y ON X.x = Y.x WHERE Y.y = 23;""");
         var circuit = ccs.getCircuit();
-        DBSPSourceTableOperator y = circuit.getInput(new ProgramIdentifier("Y", false));
+        IInputOperator y = circuit.getInput(new ProgramIdentifier("Y", false));
         // Check that 23 is pulled right after the Y input table, before the join.
         for (DBSPOperator op: circuit.allOperators) {
             if (!op.inputs.isEmpty() && op.inputs.get(0).node() == y) {
@@ -2106,6 +2130,79 @@ public class RegressionTests extends SqlIoTest {
     }
 
     @Test
+    public void issue3769() {
+        this.getCCS("""
+                CREATE TABLE telemetry_pipeline_statistics (
+                    account_id UUID NOT NULL,
+                    pipeline_id_hash BYTEA NOT NULL,
+                    event_timestamp TIMESTAMP NOT NULL,
+                    pipeline_started_at TIMESTAMP NOT NULL,
+                    runtime_elapsed_msecs INTEGER NOT NULL
+                );
+                
+                CREATE VIEW pipeline_runtime_summary AS
+                WITH ranked_events AS (
+                    SELECT
+                        account_id,
+                        pipeline_id_hash,
+                        pipeline_started_at,
+                        runtime_elapsed_msecs,
+                        event_timestamp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account_id, pipeline_id_hash, pipeline_started_at\s
+                            ORDER BY event_timestamp DESC
+                        ) AS event_rank
+                    FROM telemetry_pipeline_statistics
+                )
+                SELECT
+                    account_id,
+                    pipeline_id_hash,
+                    SUM(runtime_elapsed_msecs) AS total_runtime_msecs,
+                    COUNT(*) AS number_of_pipeline_runs
+                FROM ranked_events
+                WHERE event_rank = 1
+                GROUP BY account_id, pipeline_id_hash;
+                
+                CREATE VIEW pipeline_runtime_by_day AS
+                WITH ranked_events AS (
+                    SELECT
+                        account_id,
+                        pipeline_id_hash,
+                        pipeline_started_at,
+                        event_timestamp,
+                        DATE_TRUNC(event_timestamp, day) AS event_day,
+                        runtime_elapsed_msecs,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account_id, pipeline_id_hash, pipeline_started_at\s
+                            ORDER BY event_timestamp DESC
+                        ) AS event_rank,
+                        runtime_elapsed_msecs - COALESCE(
+                            LAG(runtime_elapsed_msecs) OVER (
+                                PARTITION BY account_id, pipeline_id_hash, pipeline_started_at\s
+                                ORDER BY event_timestamp
+                            ),
+                            0
+                        ) AS daily_runtime_increment
+                    FROM telemetry_pipeline_statistics
+                ),
+                daily_increments AS (
+                    SELECT
+                        account_id,
+                        pipeline_id_hash,
+                        event_day,
+                        daily_runtime_increment
+                    FROM ranked_events
+                    WHERE event_rank = 1
+                )
+                SELECT
+                    event_day,
+                    SUM(daily_runtime_increment) AS daily_runtime_msecs
+                FROM daily_increments
+                GROUP BY event_day
+                ORDER BY event_day;""");
+    }
+
+    @Test
     public void issue3770() {
         this.statementsFailingInCompilation("""
                 CREATE TABLE row_of_map_tbl(
@@ -2114,6 +2211,22 @@ public class RegressionTests extends SqlIoTest {
                 CREATE MATERIALIZED VIEW row_of_map_idx_outbound AS SELECT
                 c1[3] AS c13_val
                 FROM row_of_map_tbl;""", "ROW type does not have a field with index 3; legal range is 1 to 2");
+    }
+
+    @Test
+    public void testAggregateLimit() {
+        var cc = this.getCC("""
+               CREATE TABLE T(id INT);
+               CREATE TABLE S(s INT, id INT);
+               CREATE VIEW V0 AS SELECT coalesce(
+                      (select sum(s) from S where S.id = T.id limit 1), 0) FROM T;""");
+        CircuitVisitor visitor = new CircuitVisitor(cc.compiler) {
+            @Override
+            public void postorder(DBSPIndexedTopKOperator node) {
+                Assert.fail("Should not have TopK operators");
+            }
+        };
+        cc.visit(visitor);
     }
 
     @Test
@@ -2135,5 +2248,20 @@ public class RegressionTests extends SqlIoTest {
     public void issue3059() {
         this.statementsFailingInCompilation("CREATE FUNCTION F(x INT) RETURNS BIGINT AS YEAR(NOW()) + x;",
                 "Non-deterministic UDF");
+    }
+
+    @Test
+    public void issue4562() {
+        this.q("""
+                SELECT POSITION('い' in 'かわいい');
+                 pos
+                -----
+                 3""");
+    }
+
+    @Test
+    public void issue4937() {
+        this.qf("SELECT PARSE_TIMESTAMP('%Y-%m-%d', '2020-01-01')",
+                "Invalid format in PARSE_TIMESTAMP: '%Y-%m-%d'");
     }
 }

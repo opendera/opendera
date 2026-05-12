@@ -1,20 +1,20 @@
 use crate::{
+    Circuit, DBData, DynZWeight, NumEntries, RootCircuit, Stream, ZWeight,
     algebra::{IndexedZSet, IndexedZSetReader, OrdIndexedZSet, OrdIndexedZSetFactories, OrdZSet},
     circuit::{
-        operator_traits::{BinaryOperator, Operator},
         Scope,
+        operator_traits::{BinaryOperator, Operator},
     },
     declare_trait_object,
     dynamic::{Data, DataTrait, DynDataTyped, DynPair, Erase},
     trace::{
-        ord::fallback::indexed_wset::{FallbackIndexedWSet, FallbackIndexedWSetFactories},
         Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, Spine,
         TupleBuilder,
+        ord::fallback::indexed_wset::{FallbackIndexedWSet, FallbackIndexedWSetFactories},
     },
     utils::Tup2,
-    Circuit, DBData, DynZWeight, NumEntries, RootCircuit, Stream, ZWeight,
 };
-use minitrace::trace;
+use feldera_macros::IsNone;
 use rkyv::Archive;
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
@@ -91,6 +91,7 @@ pub type DynNeighborhood<K, V> = OrdZSet<DynPair<DynDataTyped<i64>, DynPair<K, V
     Eq,
     Hash,
     SizeOf,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(
@@ -354,7 +355,6 @@ impl<T>
 where
     T: IndexedZSetReader,
 {
-    #[trace]
     async fn eval(
         &mut self,
         input_trace: &T,
@@ -380,15 +380,14 @@ where
             };
             while cursor.keyval_valid() && offset <= descr.after() {
                 let w = **cursor.weight();
+                debug_assert!(w != 0);
 
-                if !cursor.weight().is_zero() {
-                    let (kv, weight) = item.split_mut();
-                    kv.from_refs(cursor.key(), cursor.val());
-                    **weight = w;
+                let (kv, weight) = item.split_mut();
+                kv.from_refs(cursor.key(), cursor.val());
+                **weight = w;
 
-                    after.push_val(item.as_mut());
-                    offset += 1;
-                }
+                after.push_val(item.as_mut());
+                offset += 1;
                 cursor.step_keyval();
             }
 
@@ -409,15 +408,14 @@ where
 
                 while cursor.keyval_valid() && offset <= descr.before() {
                     let w = **cursor.weight();
+                    debug_assert!(w != 0);
 
-                    if !cursor.weight().is_zero() {
-                        let (kv, weight) = item.split_mut();
-                        kv.from_refs(cursor.key(), cursor.val());
-                        **weight = w;
+                    let (kv, weight) = item.split_mut();
+                    kv.from_refs(cursor.key(), cursor.val());
+                    **weight = w;
 
-                        before.push_val(item.as_mut());
-                        offset += 1;
-                    }
+                    before.push_val(item.as_mut());
+                    offset += 1;
                     cursor.step_keyval_reverse();
                 }
             }
@@ -425,6 +423,7 @@ where
             // Assemble final result.
             let builder = <<OrdIndexedZSet<_, _> as Batch>::Builder>::with_capacity(
                 &self.output_factories,
+                before.len() + after.len(),
                 before.len() + after.len(),
             );
             let mut builder = TupleBuilder::new(&self.output_factories, builder);
@@ -487,7 +486,6 @@ impl<T>
 where
     T: IndexedZSetReader + Clone,
 {
-    #[trace]
     async fn eval(
         &mut self,
         input_trace: &T,
@@ -511,19 +509,18 @@ where
             }
             while cursor.keyval_valid() && offset <= descr.after() {
                 let w = **cursor.weight();
+                debug_assert!(w != 0);
 
-                if !cursor.weight().is_zero() {
-                    let (kv, weight) = item.split_mut();
-                    let (k, _unit) = kv.split_mut();
-                    let (idx, vals) = k.split_mut();
+                let (kv, weight) = item.split_mut();
+                let (k, _unit) = kv.split_mut();
+                let (idx, vals) = k.split_mut();
 
-                    **idx = offset as i64;
-                    vals.from_refs(cursor.key(), cursor.val());
-                    **weight = w;
+                **idx = offset as i64;
+                vals.from_refs(cursor.key(), cursor.val());
+                **weight = w;
 
-                    after.push_val(item.as_mut());
-                    offset += 1;
-                }
+                after.push_val(item.as_mut());
+                offset += 1;
                 cursor.step_keyval();
             }
 
@@ -543,25 +540,25 @@ where
 
                 while cursor.keyval_valid() && offset <= descr.before() {
                     let w = **cursor.weight();
+                    debug_assert!(w != 0);
 
-                    if !cursor.weight().is_zero() {
-                        let (kv, weight) = item.split_mut();
-                        let (k, _unit) = kv.split_mut();
-                        let (idx, vals) = k.split_mut();
+                    let (kv, weight) = item.split_mut();
+                    let (k, _unit) = kv.split_mut();
+                    let (idx, vals) = k.split_mut();
 
-                        **idx = -(offset as i64);
-                        vals.from_refs(cursor.key(), cursor.val());
-                        **weight = w;
+                    **idx = -(offset as i64);
+                    vals.from_refs(cursor.key(), cursor.val());
+                    **weight = w;
 
-                        before.push_val(item.as_mut());
-                        offset += 1;
-                    }
+                    before.push_val(item.as_mut());
+                    offset += 1;
                     cursor.step_keyval_reverse();
                 }
             }
 
             let builder = <<DynNeighborhood<T::Key, T::Val> as Batch>::Builder>::with_capacity(
                 &self.output_factories,
+                before.len() + after.len(),
                 before.len() + after.len(),
             );
             let mut builder = TupleBuilder::new(&self.output_factories, builder);
@@ -583,22 +580,23 @@ where
 #[allow(clippy::type_complexity)]
 mod test {
     use crate::{
+        DBData, DynZWeight, RootCircuit, Runtime, Stream, ZWeight,
         dynamic::{DowncastTrait, DynData, Erase},
         operator::{
             IndexedZSetHandle, InputHandle, NeighborhoodDescr, NeighborhoodDescrBox, OutputHandle,
         },
         trace::{
-            test::test_batch::{
-                assert_batch_eq, batch_to_tuples, typed_batch_to_tuples, TestBatch,
-                TestBatchFactories,
-            },
             BatchReaderFactories, Trace,
+            test::test_batch::{
+                TestBatch, TestBatchFactories, assert_batch_eq, batch_to_tuples,
+                typed_batch_to_tuples,
+            },
         },
         typed_batch::{BatchReader, DynOrdIndexedZSet, OrdIndexedZSet, TypedBox},
         utils::Tup2,
-        DBData, DynZWeight, RootCircuit, Runtime, Stream, ZWeight,
     };
     use anyhow::Result as AnyResult;
+    use feldera_storage::tokio::TOKIO;
     use proptest::{collection::vec, prelude::*};
     use std::cmp::{max, min};
 
@@ -697,13 +695,13 @@ mod test {
             5,
         ))));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert!(typed_batch_to_tuples(&output_handle.consolidate()).is_empty());
 
         descr_handle.set_for_all(Some(TypedBox::new(NeighborhoodDescr::new(None, 10, 3, 5))));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert!(typed_batch_to_tuples(&output_handle.consolidate()).is_empty());
 
@@ -715,7 +713,7 @@ mod test {
         ))));
         input_handle.push(9, (0, 1));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
@@ -723,7 +721,7 @@ mod test {
         );
 
         descr_handle.set_for_all(Some(TypedBox::new(NeighborhoodDescr::new(None, 10, 3, 5))));
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
             &[((0, Tup2(9, 0), ()), 1)]
@@ -737,7 +735,7 @@ mod test {
         ))));
         input_handle.push(9, (1, 1));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
@@ -752,7 +750,7 @@ mod test {
         ))));
         input_handle.push(8, (1, 1));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
@@ -771,7 +769,7 @@ mod test {
         ))));
         input_handle.push(7, (1, 1));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
@@ -790,7 +788,7 @@ mod test {
         ))));
         input_handle.push(10, (10, 1));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
@@ -811,7 +809,7 @@ mod test {
         input_handle.push(10, (11, 1));
         input_handle.push(12, (0, 1));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
@@ -833,7 +831,7 @@ mod test {
         ))));
         input_handle.push(10, (10, -1));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
@@ -858,7 +856,7 @@ mod test {
         input_handle.push(14, (2, 1));
         input_handle.push(14, (3, 1));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
@@ -877,7 +875,7 @@ mod test {
 
         descr_handle.set_for_all(Some(TypedBox::new(NeighborhoodDescr::new(None, 10, 3, 5))));
 
-        dbsp.step().unwrap();
+        dbsp.transaction().unwrap();
 
         assert_eq!(
             &typed_batch_to_tuples(&output_handle.consolidate()),
@@ -923,7 +921,7 @@ mod test {
                 let records = batch.iter().map(|(k, v, r)| ((*k, *v, ()), *r)).collect::<Vec<_>>();
 
                 let ref_batch = TestBatch::from_typed_data(&records);
-                ref_trace.insert(ref_batch);
+                TOKIO.block_on(ref_trace.insert(ref_batch));
 
                 for (k, v, r) in batch.into_iter() {
                     input_handle.push(k, (v, r));
@@ -931,7 +929,7 @@ mod test {
                 let descr = NeighborhoodDescr::new(Some(start_key), start_val, before, after);
                 descr_handle.set_for_all(Some(TypedBox::new(descr.clone())));
 
-                dbsp.step().unwrap();
+                dbsp.transaction().unwrap();
 
                 let output = output_handle.consolidate();
                 let ref_output = ref_trace.neighborhood(&Some(descr));
@@ -941,7 +939,7 @@ mod test {
                 let descr = NeighborhoodDescr::new(None, start_val, before, after);
                 descr_handle.set_for_all(Some(TypedBox::new(descr.clone())));
 
-                dbsp.step().unwrap();
+                dbsp.transaction().unwrap();
 
                 let output = output_handle.consolidate();
                 let ref_output = ref_trace.neighborhood(&Some(descr));

@@ -3,14 +3,17 @@
 use std::collections::BTreeMap;
 
 use apache_avro::{
+    Schema as AvroSchema,
     schema::{
         ArraySchema, DecimalSchema, MapSchema, Name, RecordField, RecordFieldOrder, RecordSchema,
         UnionSchema,
     },
-    Schema as AvroSchema,
 };
+use feldera_adapterlib::catalog::AvroSchemaRefs;
 use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier, SqlType};
 use tracing::warn;
+
+use crate::format::avro::resolve_ref;
 
 /// Indicates whether the field has an optional type (`["null", T]`) and,
 /// if so, whether the non-null element of the union is at position 0 or 1.
@@ -52,8 +55,12 @@ fn lookup_field<'a>(fields: &'a [RecordField], field: &'a Field) -> Option<&'a R
 /// specified field.
 pub fn validate_struct_schema(
     avro_schema: &AvroSchema,
+    refs: &AvroSchemaRefs,
     struct_schema: &[Field],
 ) -> Result<(), String> {
+    let avro_schema = resolve_ref(avro_schema, refs)
+        .map_err(|name| format!("error resolving Avro schema reference: {}", name))?;
+
     let AvroSchema::Record(record_schema) = avro_schema else {
         return Err(format!(
             "expected schema of type 'record', but found {}",
@@ -75,14 +82,18 @@ pub fn validate_struct_schema(
             }
         };
 
-        validate_field_schema(&avro_field.name, &avro_field.schema, &field.columntype).map_err(
-            |e| {
-                format!(
-                    "error validating schema for column '{}': {e}",
-                    field.name.name()
-                )
-            },
-        )?;
+        validate_field_schema(
+            &avro_field.name,
+            &avro_field.schema,
+            refs,
+            &field.columntype,
+        )
+        .map_err(|e| {
+            format!(
+                "error validating schema for column '{}': {e}",
+                field.name.name()
+            )
+        })?;
     }
 
     Ok(())
@@ -93,6 +104,7 @@ pub fn validate_struct_schema(
 fn validate_array_schema(
     name: &str,
     avro_schema: &AvroSchema,
+    refs: &AvroSchemaRefs,
     component_schema: &ColumnType,
 ) -> Result<(), String> {
     let AvroSchema::Array(array_schema) = avro_schema else {
@@ -102,7 +114,7 @@ fn validate_array_schema(
         ));
     };
 
-    validate_field_schema(name, &array_schema.items, component_schema)
+    validate_field_schema(name, &array_schema.items, refs, component_schema)
         .map_err(|e| format!("error validating array element schema: {e}"))?;
 
     Ok(())
@@ -113,6 +125,7 @@ fn validate_array_schema(
 fn validate_map_schema(
     name: &str,
     avro_schema: &AvroSchema,
+    refs: &AvroSchemaRefs,
     value_schema: &ColumnType,
 ) -> Result<(), String> {
     let AvroSchema::Map(map_schema) = avro_schema else {
@@ -122,10 +135,43 @@ fn validate_map_schema(
         ));
     };
 
-    validate_field_schema(name, &map_schema.types, value_schema)
+    validate_field_schema(name, &map_schema.types, refs, value_schema)
         .map_err(|e| format!("error validating map value schema: {e}"))?;
 
     Ok(())
+}
+
+/// Check that Avro schema can be deserialized as SQL `BIGINT` type.
+fn validate_bigint_schema(avro_schema: &AvroSchema) -> Result<(), String> {
+    match avro_schema {
+        AvroSchema::Long | AvroSchema::Int => Ok(()),
+        _ => Err(format!(
+            "invalid Avro schema for a column of type 'BIGINT': expected 'long' or 'int', but found {}",
+            schema_json(avro_schema)
+        )),
+    }
+}
+
+/// Check that Avro schema can be deserialized as SQL `INT UNSIGNED` type.
+fn validate_uint_schema(avro_schema: &AvroSchema) -> Result<(), String> {
+    match avro_schema {
+        AvroSchema::Long | AvroSchema::Int => Ok(()),
+        _ => Err(format!(
+            "invalid Avro schema for a column of type 'INT UNSIGNED': expected 'long' or 'int', but found {}",
+            schema_json(avro_schema)
+        )),
+    }
+}
+
+/// Check that Avro schema can be deserialized as SQL `BIGINT UNSIGNED` type.
+fn validate_ubigint_schema(avro_schema: &AvroSchema) -> Result<(), String> {
+    match avro_schema {
+        AvroSchema::Long | AvroSchema::Int | AvroSchema::String => Ok(()),
+        _ => Err(format!(
+            "invalid Avro schema for a column of type 'BIGINT UNSIGNED': expected 'long', 'int', or 'string', but found {}",
+            schema_json(avro_schema)
+        )),
+    }
 }
 
 /// Check that Avro schema can be deserialized as SQL `TIMESTAMP` type.
@@ -138,15 +184,19 @@ fn validate_decimal_schema(
             if decimal_schema.precision as i64 != column_type.precision.unwrap() {
                 return Err(format!(
                     "invalid Avro schema for a column of type 'DECIMAL({},{})': expected precision {}, but found {}",
-                    column_type.precision.unwrap(), column_type.scale.unwrap(),
-                    column_type.precision.unwrap(), decimal_schema.precision
+                    column_type.precision.unwrap(),
+                    column_type.scale.unwrap(),
+                    column_type.precision.unwrap(),
+                    decimal_schema.precision
                 ));
             }
             if decimal_schema.scale as i64 != column_type.scale.unwrap() {
                 return Err(format!(
                     "invalid Avro schema for a column of type 'DECIMAL({},{})': expected scale {}, but found {}",
-                    column_type.precision.unwrap(), column_type.scale.unwrap(),
-                    column_type.scale.unwrap(), decimal_schema.scale
+                    column_type.precision.unwrap(),
+                    column_type.scale.unwrap(),
+                    column_type.scale.unwrap(),
+                    decimal_schema.scale
                 ));
             }
 
@@ -241,11 +291,38 @@ fn validate_date_schema(avro_schema: &AvroSchema) -> Result<(), String> {
     Ok(())
 }
 
+/// Check that Avro schema can be deserialized as SQL `UUID` type.
+fn validate_uuid_schema(avro_schema: &AvroSchema) -> Result<(), String> {
+    if !matches!(avro_schema, AvroSchema::String | AvroSchema::Uuid) {
+        return Err(format!(
+            "invalid Avro schema for a column of type 'UUID': expected 'string' or '{{\"type\": \"string\",\"logicalType\": \"uuid\"}}', but found {}",
+            schema_json(avro_schema)
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_string_schema(avro_schema: &AvroSchema) -> Result<(), String> {
+    if !matches!(
+        avro_schema,
+        AvroSchema::String | AvroSchema::Uuid | AvroSchema::Enum(_)
+    ) {
+        return Err(format!(
+            "invalid Avro schema for a column of type 'STRING': expected 'string', 'enum', or '{{\"type\": \"string\",\"logicalType\": \"uuid\"}}', but found {}",
+            schema_json(avro_schema)
+        ));
+    }
+
+    Ok(())
+}
+
 /// Check that Avro schema can be deserialized a SQL column with the given
 /// column type.
 pub fn validate_field_schema(
     name: &str,
     avro_schema: &AvroSchema,
+    refs: &AvroSchemaRefs,
     field_schema: &ColumnType,
 ) -> Result<(), String> {
     let (avro_schema, optional) = schema_unwrap_optional(avro_schema);
@@ -253,13 +330,22 @@ pub fn validate_field_schema(
     let expected = match field_schema.typ {
         SqlType::Boolean => AvroSchema::Boolean,
         SqlType::TinyInt | SqlType::SmallInt | SqlType::Int => AvroSchema::Int,
-        SqlType::BigInt => AvroSchema::Long,
+        SqlType::UTinyInt | SqlType::USmallInt => AvroSchema::Int,
+        SqlType::UInt => {
+            return validate_uint_schema(avro_schema);
+        }
+        SqlType::BigInt => {
+            return validate_bigint_schema(avro_schema);
+        }
+        SqlType::UBigInt => {
+            return validate_ubigint_schema(avro_schema);
+        }
         SqlType::Real => AvroSchema::Float,
         SqlType::Double => AvroSchema::Double,
         SqlType::Decimal => {
             return validate_decimal_schema(avro_schema, field_schema);
         }
-        SqlType::Char | SqlType::Varchar => AvroSchema::String,
+        SqlType::Char | SqlType::Varchar => return validate_string_schema(avro_schema),
         SqlType::Binary => {
             return validate_binary_schema(avro_schema, field_schema);
         }
@@ -291,12 +377,14 @@ pub fn validate_field_schema(
             return validate_array_schema(
                 name,
                 avro_schema,
+                refs,
                 field_schema.component.as_ref().unwrap(),
             );
         }
         SqlType::Struct => {
             return validate_struct_schema(
                 avro_schema,
+                refs,
                 field_schema.fields.as_ref().unwrap_or(&vec![]),
             );
         }
@@ -318,10 +406,10 @@ pub fn validate_field_schema(
                 ));
             }
 
-            return validate_map_schema(name, avro_schema, value_type);
+            return validate_map_schema(name, avro_schema, refs, value_type);
         }
         SqlType::Null => AvroSchema::Null,
-        SqlType::Uuid => AvroSchema::String,
+        SqlType::Uuid => return validate_uuid_schema(avro_schema),
     };
 
     if avro_schema != &expected {
@@ -333,7 +421,9 @@ pub fn validate_field_schema(
     }
 
     if matches!(optional, OptionalField::Optional(_)) && !field_schema.nullable {
-        warn!("Avro schema defines field '{name}' as nullable, but the corresponding SQL column is non-nullable. This may lead to parsing errors if the input data includes null values.");
+        warn!(
+            "Avro schema defines field '{name}' as nullable, but the corresponding SQL column is non-nullable. This may lead to parsing errors if the input data includes null values."
+        );
     }
 
     Ok(())
@@ -468,6 +558,10 @@ impl AvroSchemaBuilder {
             SqlType::SmallInt => AvroSchema::Int,
             SqlType::Int => AvroSchema::Int,
             SqlType::BigInt => AvroSchema::Long,
+            SqlType::UTinyInt => AvroSchema::Int,
+            SqlType::USmallInt => AvroSchema::Int,
+            SqlType::UInt => AvroSchema::Long,
+            SqlType::UBigInt => AvroSchema::String,
             SqlType::Real => AvroSchema::Float,
             SqlType::Double => AvroSchema::Double,
             SqlType::Decimal => {
@@ -493,7 +587,7 @@ impl AvroSchemaBuilder {
             SqlType::Date => AvroSchema::Date,
             SqlType::Timestamp => AvroSchema::TimestampMicros,
             SqlType::Interval(_) => {
-                return Err("not implemented: Avro encoding for the SQL interval type".to_string())
+                return Err("not implemented: Avro encoding for the SQL interval type".to_string());
             }
             SqlType::Variant =>
             // VARIANT is serialized as a JSON-encoded string.
@@ -511,7 +605,7 @@ impl AvroSchemaBuilder {
                 })
             }
             SqlType::Struct => {
-                return Err("not implemented: Avro encoding for user-defined SQL types".to_string())
+                return Err("not implemented: Avro encoding for user-defined SQL types".to_string());
             }
             SqlType::Map => {
                 let key_type = column_type.value.as_ref().ok_or(

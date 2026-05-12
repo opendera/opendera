@@ -1,4 +1,6 @@
+use crate::storage::file::{FilterStats, TouchedWindowCount};
 use crate::{
+    DBData, DBWeight, NumEntries,
     algebra::{NegByRef, ZRingValue},
     circuit::checkpointer::Checkpoint,
     dynamic::{
@@ -6,19 +8,22 @@ use crate::{
         LeanVec, WeightTrait, WeightTraitTyped, WithFactory,
     },
     trace::{
+        Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor, DbspSerializer,
+        Deserializer, Filter, GroupFilter, MergeCursor, VecKeyBatch, WeightedItem,
+        cursor::Position,
         deserialize_wset,
         layers::{Cursor as _, Leaf, LeafCursor, LeafFactories, Trie},
         ord::merge_batcher::MergeBatcher,
-        serialize_wset, Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Cursor,
-        Deserializer, Filter, MergeCursor, Serializer, WeightedItem,
+        serialize_wset,
     },
     utils::Tup2,
-    DBData, DBWeight, NumEntries,
 };
+use crate::{DynZWeight, ZWeight};
 use itertools::{EitherOrBoth, Itertools};
 use rand::Rng;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
+use std::any::TypeId;
 use std::fmt::{self, Debug, Display};
 
 pub struct VecWSetFactories<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> {
@@ -108,7 +113,6 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> BatchFactories<K, DynUnit, 
 }
 
 /// An immutable collection of `(key, weight)` pairs without timing information.
-#[derive(SizeOf)]
 pub struct VecWSet<K, R>
 where
     K: DataTrait + ?Sized,
@@ -116,12 +120,21 @@ where
 {
     #[doc(hidden)]
     pub layer: Leaf<K, R>,
-    #[size_of(skip)]
     factories: VecWSetFactories<K, R>,
-    // #[size_of(skip)]
-    // weighted_item_factory: &'static WeightedFactory<K, R>,
-    // #[size_of(skip)]
-    // batch_item_factory: &'static BatchItemFactory<K, (), K, R>,
+    negative_weight_count: u64,
+    touched_window_count: TouchedWindowCount,
+}
+
+impl<K, R> SizeOf for VecWSet<K, R>
+where
+    K: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+{
+    fn size_of_children(&self, context: &mut size_of::Context) {
+        // This is only approximate but it is *much* cheaper than measuring all
+        // the elements individually.
+        context.add(self.approximate_byte_size());
+    }
 }
 
 impl<K, R> VecWSet<K, R>
@@ -137,6 +150,8 @@ where
         Self {
             layer: Leaf::from_parts(&factories.layer_factories, keys, diffs),
             factories,
+            negative_weight_count: 0,
+            touched_window_count: TouchedWindowCount::default(),
         }
     }
 }
@@ -186,8 +201,8 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Clone for VecWSet<K, R> {
         Self {
             layer: self.layer.clone(),
             factories: self.factories.clone(),
-            //weighted_item_factory: self.weighted_item_factory,
-            //batch_item_factory: self.batch_item_factory,
+            negative_weight_count: self.negative_weight_count,
+            touched_window_count: self.touched_window_count,
         }
     }
 }
@@ -241,11 +256,13 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Archive for VecWSet<K, R> {
         todo!()
     }
 }
-impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Serialize<Serializer> for VecWSet<K, R> {
+impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Serialize<DbspSerializer<'_>>
+    for VecWSet<K, R>
+{
     fn serialize(
         &self,
-        _serializer: &mut Serializer,
-    ) -> Result<Self::Resolver, <Serializer as rkyv::Fallible>::Error> {
+        _serializer: &mut DbspSerializer,
+    ) -> Result<Self::Resolver, <DbspSerializer<'_> as rkyv::Fallible>::Error> {
         todo!()
     }
 }
@@ -292,8 +309,8 @@ where
         Self {
             layer: self.layer.neg_by_ref(),
             factories: self.factories.clone(),
-            //weighted_item_factory: self.weighted_item_factory,
-            //batch_item_factory: self.batch_item_factory,
+            negative_weight_count: self.negative_weight_count,
+            touched_window_count: self.touched_window_count,
         }
     }
 }
@@ -323,7 +340,7 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> BatchReader for VecWSet<K, 
     fn consuming_cursor(
         &mut self,
         key_filter: Option<Filter<Self::Key>>,
-        value_filter: Option<Filter<Self::Val>>,
+        value_filter: Option<GroupFilter<Self::Val>>,
     ) -> Box<dyn crate::trace::MergeCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_>
     {
         if key_filter.is_none() && value_filter.is_none() {
@@ -353,7 +370,11 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> BatchReader for VecWSet<K, 
 
     #[inline]
     fn approximate_byte_size(&self) -> usize {
-        self.size_of().total_bytes()
+        self.layer.approximate_byte_size()
+    }
+
+    fn membership_filter_stats(&self) -> FilterStats {
+        FilterStats::default()
     }
 
     fn sample_keys<RG>(&self, rng: &mut RG, sample_size: usize, sample: &mut DynVec<Self::Key>)
@@ -369,12 +390,21 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> BatchReader for VecWSet<K, 
 }
 
 impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Batch for VecWSet<K, R> {
+    type Timed<T: crate::Timestamp> = VecKeyBatch<K, T, R>;
     type Batcher = MergeBatcher<Self>;
     type Builder = VecWSetBuilder<K, R>;
 
-    /*fn from_keys(time: Self::Time, keys: Vec<(Self::Key, Self::R)>) -> Self {
-        Self::from_tuples(time, keys)
-    }*/
+    fn key_bounds(&self) -> Option<(&Self::Key, &Self::Key)> {
+        Some((self.layer.keys.first()?, self.layer.keys.last()?))
+    }
+
+    fn negative_weight_count(&self) -> Option<u64> {
+        Some(self.negative_weight_count)
+    }
+
+    fn touched_window_count(&self) -> TouchedWindowCount {
+        self.touched_window_count
+    }
 }
 
 /// A cursor for navigating a single layer.
@@ -435,6 +465,10 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Cursor<K, DynUnit, (), R>
         self.cursor.current_diff()
     }
 
+    fn weight_checked(&mut self) -> &R {
+        self.weight()
+    }
+
     fn map_values(&mut self, logic: &mut dyn FnMut(&DynUnit, &R)) {
         if self.val_valid() {
             logic(&(), self.cursor.current_diff())
@@ -464,7 +498,7 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Cursor<K, DynUnit, (), R>
         self.valid = true;
     }
 
-    fn seek_key_exact(&mut self, key: &K) -> bool {
+    fn seek_key_exact(&mut self, key: &K, _hash: Option<u64>) -> bool {
         self.seek_key(key);
         self.key_valid() && self.key().eq(key)
     }
@@ -525,6 +559,13 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Cursor<K, DynUnit, (), R>
     fn fast_forward_vals(&mut self) {
         self.valid = true;
     }
+
+    fn position(&self) -> Option<Position> {
+        Some(Position {
+            total: self.cursor.keys() as u64,
+            offset: self.cursor.position() as u64,
+        })
+    }
 }
 
 /// A builder for creating layers from unsorted update tuples.
@@ -539,6 +580,7 @@ where
     keys: Box<DynVec<K>>,
     val: bool,
     diffs: Box<DynVec<R>>,
+    negative_weight_count: u64,
 }
 
 impl<K, R> VecWSetBuilder<K, R>
@@ -605,6 +647,15 @@ where
             }
         }
     }
+
+    fn update_total_weight(&mut self, weight: &R) {
+        if TypeId::of::<R>() == TypeId::of::<DynZWeight>() {
+            let weight = unsafe { weight.downcast::<ZWeight>() };
+            if !weight.ge0() {
+                self.negative_weight_count += 1;
+            }
+        }
+    }
 }
 
 impl<K, R> Builder<VecWSet<K, R>> for VecWSetBuilder<K, R>
@@ -613,17 +664,22 @@ where
     K: DataTrait + ?Sized,
     R: WeightTrait + ?Sized,
 {
-    fn with_capacity(factories: &VecWSetFactories<K, R>, capacity: usize) -> Self {
+    fn with_capacity(
+        factories: &VecWSetFactories<K, R>,
+        key_capacity: usize,
+        _value_capacity: usize,
+    ) -> Self {
         let mut keys = factories.layer_factories.keys.default_box();
-        keys.reserve_exact(capacity);
+        keys.reserve_exact(key_capacity);
 
         let mut diffs = factories.layer_factories.diffs.default_box();
-        diffs.reserve_exact(capacity);
+        diffs.reserve_exact(key_capacity);
         Self {
             factories: factories.clone(),
             keys,
             val: false,
             diffs,
+            negative_weight_count: 0,
         }
     }
 
@@ -658,12 +714,14 @@ where
 
     fn push_time_diff(&mut self, _time: &(), weight: &R) {
         debug_assert!(!weight.is_zero());
+        self.update_total_weight(weight);
         self.diffs.push_ref(weight);
         self.pushed_diff();
     }
 
     fn push_time_diff_mut(&mut self, _time: &mut (), weight: &mut R) {
         debug_assert!(!weight.is_zero());
+        self.update_total_weight(weight);
         self.diffs.push_val(weight);
         self.pushed_diff();
     }
@@ -673,7 +731,17 @@ where
         VecWSet {
             layer: Leaf::from_parts(&self.factories.layer_factories, self.keys, self.diffs),
             factories: self.factories,
+            negative_weight_count: self.negative_weight_count,
+            touched_window_count: TouchedWindowCount::default(),
         }
+    }
+
+    fn num_keys(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn num_tuples(&self) -> usize {
+        self.diffs.len()
     }
 }
 

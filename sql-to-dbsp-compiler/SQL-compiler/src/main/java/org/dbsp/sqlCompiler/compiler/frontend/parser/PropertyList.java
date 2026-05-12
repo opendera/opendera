@@ -13,7 +13,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.function.BiConsumer;
 
 /** A list of properties and associated values.  Both are just SqlFragments.
  * The list can contain duplicate properties, but there is a utility method
@@ -59,12 +58,6 @@ public class PropertyList implements Iterable<Map.Entry<SqlFragment, SqlFragment
                 continue;
             }
             Utilities.putNew(previous, keyString, p.getKey());
-        }
-    }
-
-    public void checkKnownProperties(BiConsumer<SqlFragment, SqlFragment> validator) {
-        for (Map.Entry<SqlFragment, SqlFragment> p: this.propertyValue) {
-            validator.accept(p.getKey(), p.getValue());
         }
     }
 

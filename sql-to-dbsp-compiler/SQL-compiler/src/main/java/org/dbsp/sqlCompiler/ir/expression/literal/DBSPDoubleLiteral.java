@@ -58,7 +58,7 @@ public final class DBSPDoubleLiteral extends DBSPFPLiteral implements IsNumericL
     }
 
     public DBSPDoubleLiteral(@Nullable Double f, boolean nullable) {
-        this(CalciteObject.EMPTY, new DBSPTypeDouble(CalciteObject.EMPTY,nullable), f);
+        this(CalciteObject.EMPTY, DBSPTypeDouble.create(nullable), f);
         if (f == null && !nullable)
             throw new InternalCompilerError("Null value with non-nullable type", this);
     }
@@ -75,6 +75,14 @@ public final class DBSPDoubleLiteral extends DBSPFPLiteral implements IsNumericL
         visitor.push(this);
         visitor.pop(this);
         visitor.postorder(this);
+    }
+
+    @Override
+    public int compare(IsNumericLiteral other) {
+        DBSPDoubleLiteral oi = other.to(DBSPDoubleLiteral.class);
+        Utilities.enforce(this.value != null);
+        Utilities.enforce(oi.value != null);
+        return this.value.compareTo(oi.value);
     }
 
     @Override
@@ -104,7 +112,7 @@ public final class DBSPDoubleLiteral extends DBSPFPLiteral implements IsNumericL
                     .append(this.type)
                     .append(")null");
         else
-            return builder.append(this.value.toString());
+            return builder.append(this.wrapSome(this.value.toString()));
     }
 
     @Override

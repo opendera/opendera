@@ -45,12 +45,9 @@ public final class DBSPFieldExpression extends DBSPExpression {
         super(node, type);
         this.expression = expression;
         this.fieldNo = fieldNo;
-        Utilities.enforce(fieldNo >= 0, "Negative field index " + fieldNo);
-        Utilities.enforce(!expression.getType().mayBeNull || type.mayBeNull);
-    }
-
-    DBSPFieldExpression(DBSPExpression expression, int fieldNo, DBSPType type) {
-        this(CalciteObject.EMPTY, expression, fieldNo, type);
+        Utilities.enforce(fieldNo >= 0, () -> "Negative field index " + fieldNo);
+        Utilities.enforce(!expression.getType().mayBeNull || type.mayBeNull,
+                () -> "Non-nullable field from nullable struct");
     }
 
     static DBSPType getFieldType(DBSPType type, int fieldNo) {
@@ -74,7 +71,22 @@ public final class DBSPFieldExpression extends DBSPExpression {
 
     public DBSPExpression simplify() {
         if (this.expression.is(DBSPBaseTupleExpression.class)) {
-            return this.expression.to(DBSPBaseTupleExpression.class).get(this.fieldNo);
+            DBSPExpression result = this.expression.to(DBSPBaseTupleExpression.class).get(this.fieldNo);
+            if (this.expression.getType().mayBeNull && !result.getType().mayBeNull)
+                result = result.some();
+            return result;
+        }
+        if (this.expression.is(DBSPUnwrapExpression.class)) {
+            DBSPUnwrapExpression unwrap = this.expression.to(DBSPUnwrapExpression.class);
+            if (unwrap.neverFails()) {
+                DBSPExpression result = unwrap.expression.field(this.fieldNo);
+                if (!result.getType().sameType(this.type))
+                    // The result of x.unwrap().1 may be
+                    // x.1 or x.1.unwrap(), depending on whether the
+                    // field 1 is nullable or not.
+                    result = result.neverFailsUnwrap(this.expression.getNode());
+                return result;
+            }
         }
         return this;
     }

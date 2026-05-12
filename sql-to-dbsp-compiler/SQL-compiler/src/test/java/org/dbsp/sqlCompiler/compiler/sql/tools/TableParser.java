@@ -3,6 +3,7 @@ package org.dbsp.sqlCompiler.compiler.sql.tools;
 import org.apache.calcite.util.ConversionUtil;
 import org.apache.calcite.util.TimeString;
 import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
+import org.dbsp.sqlCompiler.compiler.frontend.TableData;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPTupleExpression;
@@ -15,8 +16,8 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI16Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI64Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI8Literal;
-import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntervalMillisLiteral;
-import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntervalMonthsLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPShortIntervalLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLongIntervalLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPRealLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPStringLiteral;
@@ -36,7 +37,6 @@ import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTupleBase;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeArray;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeString;
 import org.dbsp.util.Linq;
 import org.dbsp.util.Utilities;
 
@@ -67,7 +67,7 @@ public class TableParser {
         return new DateTimeFormatterBuilder()
                 .appendPattern(pattern)
                 .appendLiteral('.')
-                .appendFraction(ChronoField.MILLI_OF_SECOND, 1, 3, false);
+                .appendFraction(ChronoField.MICRO_OF_SECOND, 1, 6, false);
     }
 
     // The first few of these are postgres specific
@@ -87,7 +87,7 @@ public class TableParser {
     static final DateTimeFormatter DATE_OUTPUT_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.ENGLISH);
     static final Pattern YEAR = Pattern.compile("^(\\d+) years?(.*)");
     static final Pattern MONTHS = Pattern.compile("^\\s*(\\d+) months?(.*)");
-    static final Pattern MINUS = Pattern.compile("^-\\s*(.*)");
+    static final Pattern MINUS = Pattern.compile("^([-+])\\s*(.*)");
     static final Pattern DAYS = Pattern.compile("^(\\d+) days?(.*)");
     static final Pattern HOURS = Pattern.compile("^\\s*(\\d+) hours?(.*)");
     static final Pattern MINUTES = Pattern.compile("\\s*(\\d+) mins?(.*)");
@@ -186,7 +186,7 @@ public class TableParser {
         return result;
     }
 
-    public static long shortIntervalToMilliseconds(String interval) {
+    public static long shortIntervalToMicroseconds(String interval) {
         String orig = interval;
         boolean negate = false;
 
@@ -196,14 +196,16 @@ public class TableParser {
         } else {
             Matcher m = MINUS.matcher(interval);
             if (m.matches()) {
-                negate = true;
-                interval = m.group(1);
+                if (m.group(1).equals("-"))
+                    // Do not negate for +
+                    negate = true;
+                interval = m.group(2);
             }
 
             m = DAYS.matcher(interval);
             if (m.matches()) {
                 int d = Integer.parseInt(m.group(1));
-                result += (long) d * 86_400_000;
+                result += (long) d * 86_400_000_000L;
                 interval = m.group(2);
             }
 
@@ -213,30 +215,30 @@ public class TableParser {
                 if (m.group(2) != null)
                     timeString += m.group(2);
                 TimeString time = new TimeString(timeString);
-                result += time.getMillisOfDay();
+                result += time.getMillisOfDay() * 1000L;
                 interval = m.group(3);
             } else {
                 m = HOURS.matcher(interval);
                 if (m.matches()) {
                     long h = Long.parseLong(m.group(1));
-                    result += h * 3600_000;
+                    result += h * 3_600_000_000L;
                     interval = m.group(2);
                 }
 
                 m = MINUTES.matcher(interval);
                 if (m.matches()) {
                     long mm = Long.parseLong(m.group(1));
-                    result += mm * 60_000;
+                    result += mm * 60_000_000;
                     interval = m.group(2);
                 }
 
                 m = SECONDS.matcher(interval);
                 if (m.matches()) {
                     long s = Long.parseLong(m.group(1));
-                    result += s * 1000;
+                    result += s * 1_000_000;
                     if (m.group(3) != null) {
-                        String msec = m.group(3) + "000";
-                        result += Long.parseLong(msec.substring(0, 3));
+                        String usec = m.group(3) + "000000";
+                        result += Long.parseLong(usec.substring(0, 6));
                     }
                     interval = m.group(4);
                 }
@@ -265,7 +267,7 @@ public class TableParser {
                         trimmed.equalsIgnoreCase("null"))) {
             if (!fieldType.mayBeNull)
                 throw new RuntimeException("Null value in non-nullable column " + fieldType);
-            result = fieldType.nullValue();
+            result = fieldType.none();
         } else {
             result = switch (fieldType.code) {
                 case DOUBLE -> {
@@ -292,12 +294,12 @@ public class TableParser {
                 case UINT32 -> new DBSPU32Literal(CalciteObject.EMPTY, fieldType, Long.parseLong(trimmed));
                 case UINT64 -> new DBSPU64Literal(CalciteObject.EMPTY, fieldType, new BigInteger(trimmed));
                 case INTERVAL_SHORT -> {
-                    long value = shortIntervalToMilliseconds(trimmed);
-                    yield new DBSPIntervalMillisLiteral(CalciteObject.EMPTY, fieldType, value);
+                    long value = shortIntervalToMicroseconds(trimmed);
+                    yield DBSPShortIntervalLiteral.fromMicroseconds(CalciteObject.EMPTY, fieldType, value);
                 }
                 case INTERVAL_LONG -> {
                     int months = longIntervalToMonths(trimmed);
-                    yield new DBSPIntervalMonthsLiteral(CalciteObject.EMPTY, fieldType, months);
+                    yield new DBSPLongIntervalLiteral(CalciteObject.EMPTY, fieldType, months);
                 }
                 case STRING -> {
                     // If there is no space in front of the string, we expect a NULL.
@@ -312,9 +314,6 @@ public class TableParser {
                         // replace \\n with \n, otherwise we can't represent it
                         data = data.substring(1);
                         data = data.replace("\\n", "\n");
-                        DBSPTypeString type = fieldType.to(DBSPTypeString.class);
-                        if (!type.fixed)
-                            data = Utilities.trimRight(data);
                         yield new DBSPStringLiteral(CalciteObject.EMPTY, fieldType, data, StandardCharsets.UTF_8);
                     }
                 }
@@ -326,10 +325,10 @@ public class TableParser {
                     yield new DBSPBoolLiteral(CalciteObject.EMPTY, fieldType, isTrue);
                 }
                 case ARRAY -> {
-                    DBSPTypeArray vec = fieldType.to(DBSPTypeArray.class);
+                    DBSPTypeArray array = fieldType.to(DBSPTypeArray.class);
                     // TODO: this does not handle nested arrays
                     if (trimmed.equals("NULL")) {
-                        yield new DBSPArrayExpression(fieldType, true);
+                        yield new DBSPArrayExpression(array, true);
                     } else {
                         if (!trimmed.startsWith("{") || !trimmed.endsWith("}"))
                             throw new UnimplementedException("Expected array constant to be bracketed: " + trimmed);
@@ -339,11 +338,11 @@ public class TableParser {
                             String[] parts = trimmed.split(",");
                             DBSPExpression[] fields;
                             fields = Linq.map(
-                                    parts, p -> parseValue(vec.getElementType(), p), DBSPExpression.class);
+                                    parts, p -> parseValue(array.getElementType(), p), DBSPExpression.class);
                             yield new DBSPArrayExpression(fieldType.mayBeNull, fields);
                         } else {
                             // empty vector
-                            yield new DBSPArrayExpression(vec, false);
+                            yield new DBSPArrayExpression(array, false);
                         }
                     }
                 }
@@ -384,7 +383,8 @@ public class TableParser {
                         Utilities.enforce(!trimmed.isEmpty());
 
                         String[] parts = trimmed.split(",");
-                        Utilities.enforce(parts.length == tuple.size(), "Expected " + tuple.size() + " fields for tuple, got " + parts.length);
+                        Utilities.enforce(parts.length == tuple.size(),
+                                () -> "Expected " + tuple.size() + " fields for tuple, got " + parts.length);
                         List<DBSPExpression> fields = new ArrayList<>(tuple.size());
                         int index = 0;
                         for (DBSPType ft : tuple.tupFields)
@@ -428,7 +428,7 @@ public class TableParser {
         extraFields.add(new DBSPTypeInteger(CalciteObject.EMPTY, 64, true, false));
         DBSPType extraOutputType = new DBSPTypeTuple(extraFields);
         Change change = parseTable(table, new DBSPTypeZSet(extraOutputType), -1);
-        DBSPZSetExpression[] extracted = Linq.map(change.sets, SqlIoTest::extractWeight, DBSPZSetExpression.class);
+        TableData[] extracted = Linq.map(change.sets, SqlIoTest::extractWeight, TableData.class);
         return new Change(extracted);
     }
 
@@ -501,7 +501,7 @@ public class TableParser {
             throw new RuntimeException("Expected " + rowCount + " rows, found " + rowsFound + ": " + table);
         if (inHeader)
             throw new RuntimeException("Could not find end of header for table " + table);
-        return new Change(result);
+        return new Change(table, result);
     }
 
     public static Change fromResultSet(ResultSet data, DBSPType outputType) throws SQLException {

@@ -1,29 +1,48 @@
 package org.dbsp.sqlCompiler.ir.expression;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.backend.MerkleInner;
+import org.dbsp.sqlCompiler.compiler.backend.rust.ToRustInnerVisitor;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.util.IIndentStream;
+import org.dbsp.util.IndentStream;
+import org.dbsp.util.IndentStreamBuilder;
+import org.dbsp.util.Utilities;
 
 /** Represents an expression that is compiled into a
- * LazyLock declaration and a reference to the lazy lock value.
+ * Lazy declaration and a reference to the lazy lock value.
  * The name of the cell is not represented explicitly. */
 public class DBSPStaticExpression extends DBSPExpression {
     public final DBSPExpression initializer;
+    public final String name;
 
-    public DBSPStaticExpression(CalciteObject node, DBSPExpression initializer) {
+    public static final String RUST_IMPLEMENTATION = "StaticLazy";
+
+    public DBSPStaticExpression(CalciteObject node, DBSPExpression initializer, String name) {
         super(node, initializer.getType());
         this.initializer = initializer;
+        this.name = name;
+    }
+
+    public static String generateName(DBSPExpression initializer, DBSPCompiler compiler) {
+        IndentStream stream = new IndentStreamBuilder();
+        ToRustInnerVisitor toRust = new ToRustInnerVisitor(compiler, stream, null, false);
+        initializer.accept(toRust);
+        stream.append(":");
+        initializer.type.accept(toRust);
+        String str = stream.toString();
+        return MerkleInner.hash(str).makeIdentifier("STATIC");
     }
 
     @Override
     public DBSPExpression deepCopy() {
-        return new DBSPStaticExpression(this.getNode(), this.initializer.deepCopy());
+        return new DBSPStaticExpression(this.getNode(), this.initializer.deepCopy(), this.name);
     }
 
     @Override
@@ -56,12 +75,13 @@ public class DBSPStaticExpression extends DBSPExpression {
     }
 
     public String getName() {
-        return MerkleInner.hash(this.type + ":" + this.initializer).makeIdentifier("STATIC");
+        return this.name;
     }
 
     @SuppressWarnings("unused")
     public static DBSPStaticExpression fromJson(JsonNode node, JsonDecoder decoder) {
         DBSPExpression initializer = fromJsonInner(node, "initializer", decoder, DBSPExpression.class);
-        return new DBSPStaticExpression(CalciteObject.EMPTY, initializer);
+        String name = Utilities.getStringProperty(node, "name");
+        return new DBSPStaticExpression(CalciteObject.EMPTY, initializer, name);
     }
 }

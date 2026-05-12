@@ -179,6 +179,32 @@ fn type_replacement() -> Vec<(&'static str, &'static str)> {
             "CheckpointStatusFailure",
             "feldera_types::checkpoint::CheckpointFailure",
         ),
+        (
+            "ConsumerConfig",
+            "feldera_types::transport::nats::ConsumerConfig",
+        ),
+        (
+            "ConnectOptions",
+            "feldera_types::transport::nats::ConnectOptions",
+        ),
+        (
+            "ReplayPolicy",
+            "feldera_types::transport::nats::ReplayPolicy",
+        ),
+        (
+            "DeliverPolicy",
+            "feldera_types::transport::nats::DeliverPolicy",
+        ),
+        ("Credentials", "feldera_types::transport::nats::Credentials"),
+        (
+            "UserAndPassword",
+            "feldera_types::transport::nats::UserAndPassword",
+        ),
+        ("Auth", "feldera_types::transport::nats::Auth"),
+        (
+            "NatsInputConfig",
+            "feldera_types::transport::nats::NatsInputConfig",
+        ),
     ]
 }
 
@@ -197,7 +223,20 @@ fn main() {
 
     let tokens = generator.generate_tokens(&spec).unwrap();
     let ast = syn::parse2(tokens).unwrap();
-    let content = prettyplease::unparse(&ast);
+    let mut content = prettyplease::unparse(&ast);
+    for verb in ["get", "post", "put", "patch", "delete"] {
+        let pattern = format!(".{verb}(url)");
+        let replacement = format!(".{verb}(url)\n                .with_sentry_tracing()");
+        content = content.replace(&pattern, &replacement);
+    }
+    content = content.replace(
+        "pub mod builder {",
+        "pub mod builder {\n    use feldera_observability::ReqwestTracingExt;",
+    );
+    let content = content.replace(
+        "impl Client",
+        "#[rustversion::attr(since(1.89), allow(mismatched_lifetime_syntaxes))]\nimpl Client",
+    );
 
     let mut out_file = Path::new(&env::var("OUT_DIR").unwrap()).to_path_buf();
     out_file.push("codegen.rs");

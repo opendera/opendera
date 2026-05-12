@@ -1,6 +1,9 @@
 use std::marker::PhantomData;
 
-use crate::dynamic::{Factory, WeightTrait};
+use crate::{
+    dynamic::{Factory, WeightTrait},
+    trace::cursor::Position,
+};
 
 use super::Cursor;
 
@@ -74,6 +77,10 @@ where
         self.cursor.weight()
     }
 
+    fn weight_checked(&mut self) -> &R {
+        self.cursor.weight_checked()
+    }
+
     fn map_values(&mut self, logic: &mut dyn FnMut(&V, &R)) {
         self.cursor.map_values(logic)
     }
@@ -90,7 +97,7 @@ where
         self.cursor.seek_key_reverse(key)
     }
 
-    fn seek_key_exact(&mut self, _key: &K) -> bool {
+    fn seek_key_exact(&mut self, _key: &K, _hash: Option<u64>) -> bool {
         todo!()
     }
 
@@ -144,5 +151,14 @@ where
 
     fn fast_forward_vals(&mut self) {
         self.cursor.fast_forward_vals()
+    }
+
+    fn position(&self) -> Option<Position> {
+        let position = self.cursor.position().unwrap();
+
+        Some(Position {
+            total: position.total,
+            offset: position.total - position.offset,
+        })
     }
 }

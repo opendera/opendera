@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import org.dbsp.sqlCompiler.compiler.IConstructor;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
-import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
@@ -17,12 +16,14 @@ import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTupleBase;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBaseType;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeMap;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeArray;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeWeight;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
 import org.dbsp.util.IIndentStream;
 import org.dbsp.util.Linq;
 import org.dbsp.util.ToIndentableString;
 import org.dbsp.util.Utilities;
 
+import javax.annotation.CheckReturnValue;
 import javax.annotation.Nullable;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -31,6 +32,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
 
+/** An expression that evaluates to a ZSet.
+ * Most such expressions are constants, but not always. */
 public final class DBSPZSetExpression extends DBSPExpression
         implements IDBSPContainer, ToIndentableString, ISameValue, IConstructor {
     public final Map<DBSPExpression, Long> data;
@@ -45,6 +48,11 @@ public final class DBSPZSetExpression extends DBSPExpression
 
     public boolean isConstant() {
         return Linq.all(this.data.keySet(), DBSPExpression::isCompileTimeConstant);
+    }
+
+    @Override
+    public boolean isNull() {
+        return false;
     }
 
     /**
@@ -113,20 +121,31 @@ public final class DBSPZSetExpression extends DBSPExpression
     }
 
     public void append(DBSPExpression expression, long weight) {
-        // We expect the expression to be a constant value (a literal)
+        // We expect the expression to be a constant value (implements ISameValue)
+        // This produces a canonical representation if all keys are also constant.
         if (!expression.getType().sameType(this.getElementType()))
             throw new InternalCompilerError("Added element type " +
                     expression.getType() + " does not match zset type " + this.getElementType(), expression);
-        if (this.data.containsKey(expression)) {
-            long oldWeight = this.data.get(expression);
-            long newWeight = weight + oldWeight;
-            if (newWeight == 0)
-                this.data.remove(expression);
-            else
-                this.data.put(expression, weight + oldWeight);
-        } else {
-            this.data.put(expression, weight);
+        var it = this.data.entrySet().iterator();
+        ISameValue sv = expression.as(ISameValue.class);
+        while (it.hasNext()) {
+            var entry = it.next();
+            var key = entry.getKey();
+            // This test is more precise than Java equals; that's also
+            // why we need to scan all the keys
+            if (sv != null &&
+                    key.is(ISameValue.class) &&
+                    key.to(ISameValue.class).sameValue(sv)) {
+                long oldWeight = entry.getValue();
+                long newWeight = weight + oldWeight;
+                if (newWeight == 0)
+                    it.remove();
+                else
+                    entry.setValue(weight + oldWeight);
+                return;
+            }
         }
+        this.data.put(expression, weight);
     }
 
     public void append(DBSPZSetExpression other) {
@@ -144,28 +163,27 @@ public final class DBSPZSetExpression extends DBSPExpression
 
     public DBSPExpression castRecursive(DBSPExpression expression, DBSPType type) {
         if (type.is(DBSPTypeBaseType.class)) {
-            return expression.cast(expression.getNode(), type, false);
+            return expression.cast(expression.getNode(), type, DBSPCastExpression.CastType.SqlUnsafe);
         } else if (type.is(DBSPTypeArray.class)) {
-            DBSPTypeArray vec = type.to(DBSPTypeArray.class);
+            DBSPTypeArray array = type.to(DBSPTypeArray.class);
             DBSPArrayExpression vecLit = expression.to(DBSPArrayExpression.class);
             if (vecLit.data == null) {
-                return new DBSPArrayExpression(type, type.mayBeNull);
+                return new DBSPArrayExpression(array, type.mayBeNull);
             }
-            List<DBSPExpression> fields = Linq.map(vecLit.data, e -> castRecursive(e, vec.getElementType()));
+            List<DBSPExpression> fields = Linq.map(vecLit.data, e -> castRecursive(e, array.getElementType()));
             return new DBSPArrayExpression(expression.getNode(), type, fields);
         } else if (type.is(DBSPTypeTupleBase.class)) {
             DBSPTypeTupleBase tuple = type.to(DBSPTypeTupleBase.class);
             DBSPExpression[] fields = new DBSPExpression[tuple.size()];
             if (expression.is(DBSPBaseTupleExpression.class)) {
                 DBSPBaseTupleExpression te = expression.to(DBSPBaseTupleExpression.class);
-                if (te.fields == null) {
+                if (te.isNull()) {
                     return tuple.none();
                 }
             }
             for (int i = 0; i < tuple.size(); i++) {
-                DBSPFieldExpression expr = expression.field(i);
-                DBSPExpression simple = expr.simplify();
-                fields[i] = this.castRecursive(simple, tuple.tupFields[i]);
+                DBSPExpression expr = expression.field(i);
+                fields[i] = this.castRecursive(expr, tuple.tupFields[i]);
             }
             return tuple.makeTuple(fields);
         } else if (type.is(DBSPTypeMap.class)) {
@@ -188,6 +206,7 @@ public final class DBSPZSetExpression extends DBSPExpression
         this.append(toAdd, weight);
     }
 
+    @CheckReturnValue
     public DBSPZSetExpression negate() {
         DBSPZSetExpression result = DBSPZSetExpression.emptyWithElementType(this.elementType);
         for (Map.Entry<DBSPExpression, Long> entry : data.entrySet()) {
@@ -200,6 +219,7 @@ public final class DBSPZSetExpression extends DBSPExpression
         return this.data.size();
     }
 
+    @CheckReturnValue
     public DBSPZSetExpression minus(DBSPZSetExpression sub) {
         DBSPZSetExpression result = this.clone();
         result.append(sub.negate());
@@ -261,7 +281,10 @@ public final class DBSPZSetExpression extends DBSPExpression
 
     @Override
     public boolean equivalent(EquivalenceContext context, DBSPExpression other) {
-        throw new UnimplementedException();
+        DBSPZSetExpression z = other.as(DBSPZSetExpression.class);
+        if (z == null)
+            return false;
+        return this.sameValue(z);
     }
 
     @Override
@@ -276,6 +299,8 @@ public final class DBSPZSetExpression extends DBSPExpression
     @Override
     public IIndentStream toString(IIndentStream builder) {
         builder.append("zset!(");
+        if (this.data.size() > 1)
+            builder.increase();
         boolean first = true;
         // Do this for a deterministic result
         List<Map.Entry<DBSPExpression, Long>> entries = Linq.list(this.data.entrySet());
@@ -286,9 +311,11 @@ public final class DBSPZSetExpression extends DBSPExpression
             first = false;
             builder.append(e.getKey());
             builder.append(" => ")
-                    .append(e.getValue())
+                    .append(DBSPTypeWeight.makeWeight(e.getValue()))
                     .append(",");
         }
+        if (this.data.size() > 1)
+            builder.decrease().newline();
         return builder.append(")");
     }
 

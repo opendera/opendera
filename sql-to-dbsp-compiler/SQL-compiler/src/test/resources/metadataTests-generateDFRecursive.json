@@ -77,6 +77,39 @@
         },
         {
           "id": 3,
+          "relOp": "LogicalFilter",
+          "condition": {
+            "pos": {
+              "line": 20,
+              "column": 27,
+              "end_line": 20,
+              "end_column": 37
+            },
+            "op": {
+              "name": "<",
+              "kind": "LESS_THAN",
+              "syntax": "BINARY"
+            },
+            "operands": [
+              {
+                "input": 0,
+                "name": "$0"
+              },
+              {
+                "literal": 10,
+                "type": {
+                  "type": "INTEGER",
+                  "nullable": false
+                }
+              }
+            ]
+          },
+          "inputs": [
+            2
+          ]
+        },
+        {
+          "id": 4,
           "relOp": "LogicalProject",
           "fields": [
             "n",
@@ -93,6 +126,12 @@
               "name": "$1"
             },
             {
+              "pos": {
+                "line": 19,
+                "column": 17,
+                "end_line": 19,
+                "end_column": 26
+              },
               "op": {
                 "name": "-",
                 "kind": "CHECKED_MINUS",
@@ -118,36 +157,15 @@
           ]
         },
         {
-          "id": 4,
-          "relOp": "LogicalFilter",
-          "condition": {
-            "op": {
-              "name": "<",
-              "kind": "LESS_THAN",
-              "syntax": "BINARY"
-            },
-            "operands": [
-              {
-                "input": 0,
-                "name": "$0"
-              },
-              {
-                "literal": 10,
-                "type": {
-                  "type": "INTEGER",
-                  "nullable": false
-                }
-              }
-            ]
-          },
-          "inputs": [
-            3
-          ]
-        },
-        {
           "id": 5,
           "relOp": "LogicalFilter",
           "condition": {
+            "pos": {
+              "line": 20,
+              "column": 11,
+              "end_line": 20,
+              "end_column": 21
+            },
             "op": {
               "name": "<",
               "kind": "LESS_THAN",
@@ -168,13 +186,19 @@
             ]
           },
           "inputs": [
-            2
+            4
           ]
         },
         {
           "id": 6,
           "relOp": "LogicalJoin",
           "condition": {
+            "pos": {
+              "line": 19,
+              "column": 8,
+              "end_line": 19,
+              "end_column": 26
+            },
             "op": {
               "name": "=",
               "kind": "EQUALS",
@@ -182,18 +206,18 @@
             },
             "operands": [
               {
-                "input": 3,
-                "name": "$3"
+                "input": 0,
+                "name": "$0"
               },
               {
-                "input": 2,
-                "name": "$2"
+                "input": 4,
+                "name": "$4"
               }
             ]
           },
           "joinType": "inner",
           "inputs": [
-            4,
+            3,
             5
           ]
         },
@@ -201,11 +225,84 @@
           "id": 7,
           "relOp": "LogicalProject",
           "fields": [
+            "n0",
+            "value0",
+            "$f2",
             "n",
             "value"
           ],
           "exprs": [
             {
+              "input": 2,
+              "name": "$2"
+            },
+            {
+              "input": 3,
+              "name": "$3"
+            },
+            {
+              "input": 4,
+              "name": "$4"
+            },
+            {
+              "input": 0,
+              "name": "$0"
+            },
+            {
+              "input": 1,
+              "name": "$1"
+            }
+          ],
+          "inputs": [
+            6
+          ]
+        },
+        {
+          "id": 8,
+          "relOp": "LogicalProject",
+          "fields": [
+            "n",
+            "value",
+            "n0",
+            "value0"
+          ],
+          "exprs": [
+            {
+              "input": 0,
+              "name": "$0"
+            },
+            {
+              "input": 1,
+              "name": "$1"
+            },
+            {
+              "input": 3,
+              "name": "$3"
+            },
+            {
+              "input": 4,
+              "name": "$4"
+            }
+          ],
+          "inputs": [
+            7
+          ]
+        },
+        {
+          "id": 9,
+          "relOp": "LogicalProject",
+          "fields": [
+            "n",
+            "value"
+          ],
+          "exprs": [
+            {
+              "pos": {
+                "line": 15,
+                "column": 9,
+                "end_line": 15,
+                "end_column": 18
+              },
               "op": {
                 "name": "+",
                 "kind": "CHECKED_PLUS",
@@ -213,8 +310,8 @@
               },
               "operands": [
                 {
-                  "input": 3,
-                  "name": "$3"
+                  "input": 2,
+                  "name": "$2"
                 },
                 {
                   "literal": 1,
@@ -226,6 +323,12 @@
               ]
             },
             {
+              "pos": {
+                "line": 16,
+                "column": 9,
+                "end_line": 16,
+                "end_column": 33
+              },
               "op": {
                 "name": "+",
                 "kind": "CHECKED_PLUS",
@@ -233,8 +336,8 @@
               },
               "operands": [
                 {
-                  "input": 4,
-                  "name": "$4"
+                  "input": 3,
+                  "name": "$3"
                 },
                 {
                   "input": 1,
@@ -244,16 +347,16 @@
             }
           ],
           "inputs": [
-            6
+            8
           ]
         },
         {
-          "id": 8,
+          "id": 10,
           "relOp": "LogicalUnion",
           "all": true,
           "inputs": [
             1,
-            7
+            9
           ]
         }
       ]
@@ -264,145 +367,161 @@
       "operation": "constant",
       "inputs": [],
       "calcite": {
-        "partial": 0
-      },
-      "positions": [],
-      "persistent_id": "8b384059bdb44ad811ab341cc5e2a59697f39aac7b463cab027b185db8105e73"
-    }, "s1": {
-      "operation": "constant",
-      "inputs": [],
-      "calcite": {
         "final": 1
       },
       "positions": [],
-      "persistent_id": "e73ff3a99b79e183950befaecd56f0c670c143c7de584496df348fbea40732e4"
-    }, "s2": {
+      "persistent_id": "62ce603a01af7e712aaebdd9b81c3691b1293c14071e805d8aabe46b3d659d74"
+    }, "s1": {
       "operation": "nested",
       "outputs": [
-        { "node": "s9", "output": 0 }
+        { "node": "s7", "output": 0 }
       ],
-      "s3": {
-        "operation": "Z fibonacci-decl",
+      "s2": {
+        "operation": "Z",
         "inputs": [],
-        "backedges": [{ "node": "s9", "output": 0 }],
+        "table": "fibonacci-decl",
+        "backedges": [{ "node": "s7", "output": 0 }],
         "calcite": {
           "final": 2
         },
         "positions": [],
         "persistent_id": "1cad9022fb9400950c4b4a4d9aaf96ca4433f989b896a5147b0e3335d900fe21"
       },
-      "s4": {
+      "s3": {
         "operation": "flat_map_index",
         "inputs": [
-          { "node": "s3", "output": 0 }
-        ],
-        "calcite": {
-          "seq": [
-            {
-              "final": 5
-            },{
-              "partial": 6
-            }]
-        },
-        "positions": [
-          {"start_line_number":1,"start_column":1,"end_line_number":1,"end_column":50},
-          {"start_line_number":20,"start_column":27,"end_line_number":20,"end_column":37}
-        ],
-        "persistent_id": "22ae2d2dc36ff77445d36efbe51db9bf67289a01039d3c01319783983e31634a"
-      },
-      "s5": {
-        "operation": "flat_map_index",
-        "inputs": [
-          { "node": "s3", "output": 0 }
+          { "node": "s2", "output": 0 }
         ],
         "calcite": {
           "seq": [
             {
               "final": 3
             },{
+              "partial": 6
+            }]
+        },
+        "positions": [
+          {"start_line_number":19,"start_column":8,"end_line_number":19,"end_column":26},
+          {"start_line_number":20,"start_column":27,"end_line_number":20,"end_column":37}
+        ],
+        "persistent_id": "1d55e90bf29e3f19e1986f4d01fa7ac67549ea1345bd04d223f43ff4694927f6"
+      },
+      "s4": {
+        "operation": "flat_map_index",
+        "inputs": [
+          { "node": "s2", "output": 0 }
+        ],
+        "calcite": {
+          "seq": [
+            {
               "final": 4
+            },{
+              "final": 5
             },{
               "partial": 6
             }]
         },
         "positions": [
-          {"start_line_number":1,"start_column":1,"end_line_number":1,"end_column":50},
-          {"start_line_number":19,"start_column":17,"end_line_number":19,"end_column":26},
+          {"start_line_number":19,"start_column":8,"end_line_number":19,"end_column":26},
           {"start_line_number":20,"start_column":11,"end_line_number":20,"end_column":21}
         ],
-        "persistent_id": "367a1b0f8fa55ef8277af3bbc38dde52e3efd4c7925e86fe96b066f73e1e4771"
+        "persistent_id": "532b61244e3f6ecac6e439489956f24fb4bdfedc3708b4dd7601e06c20c5ffc2"
       },
-      "s6": {
+      "s5": {
         "operation": "delta0",
         "inputs": [
-          { "node": "s1", "output": 0 }
+          { "node": "s0", "output": 0 }
         ],
         "calcite": {
-          "final": 8
+          "final": 10
         },
         "positions": [],
-        "persistent_id": "9d4f3c90c0f1919bb42ef761cd64a6f0467bd5999cb42dfda612bd126183a99d"
+        "persistent_id": "af7a20a52ece7365a3b1440e05c39292ac5a55c6c641581b350a01ef95f65dc8"
       },
-      "s7": {
-        "operation": "map",
-        "inputs": [
-          { "node": "s6", "output": 0 }
-        ],
-        "calcite": {
-          "partial": 8
-        },
-        "positions": [
-          {"start_line_number":4,"start_column":1,"end_line_number":21,"end_column":1}
-        ],
-        "persistent_id": "b385a5f14dc040c7e00a50cd64215f27b588b27de3b27c3cde65b7b0e3ca130d"
-      },
-      "s8": {
+      "s6": {
         "operation": "join",
         "inputs": [
-          { "node": "s5", "output": 0 },
+          { "node": "s3", "output": 0 },
           { "node": "s4", "output": 0 }
         ],
         "calcite": {
           "partial": 6
         },
         "positions": [
+          {"start_line_number":15,"start_column":9,"end_line_number":15,"end_column":18},
           {"start_line_number":16,"start_column":9,"end_line_number":16,"end_column":33},
-          {"start_line_number":15,"start_column":9,"end_line_number":15,"end_column":18}
+          {"start_line_number":19,"start_column":8,"end_line_number":19,"end_column":26}
         ],
-        "persistent_id": "de9ef9705dbd23ecebb057d78c4b03b40f821a9da8d20ddfdaaf494b95d67ce3"
+        "persistent_id": "81b49d948c1c4a6d4e863722062a57fc85c42a70bbb799f2d4a00dc990d03e18"
       },
-      "s9": {
+      "s7": {
         "operation": "sum",
         "inputs": [
-          { "node": "s7", "output": 0 },
-          { "node": "s8", "output": 0 }
+          { "node": "s5", "output": 0 },
+          { "node": "s6", "output": 0 }
         ],
         "calcite": {
-          "final": 8
+          "final": 10
         },
         "positions": [],
-        "persistent_id": "471e8a9432d0cc1c7450b1706c034682324ac317a3ffe72ac24b0a55d27b6059"
+        "persistent_id": "34a1b540135f85b90260d5a595eac0de35e34b0bef4ca4e4467cf721a09b62b9"
       }
+    }, "s8": {
+      "operation": "inspect",
+      "inputs": [
+        { "node": "s1", "output": 0 }
+      ],
+      "view": "fibonacci",
+      "calcite": {
+        "final": 10
+      },
+      "positions": [
+        {"start_line_number":4,"start_column":1,"end_line_number":21,"end_column":1},
+        {"start_line_number":4,"start_column":1,"end_line_number":21,"end_column":1}
+      ],
+      "persistent_id": "0ad92ba0ff858d83b7356b3a91040ce921e4a81ec92647aad112549d5d6620d8"
+    }, "s9": {
+      "operation": "constant",
+      "inputs": [],
+      "calcite": {
+        "partial": 0
+      },
+      "positions": [],
+      "persistent_id": "dabdc0517fb639de8ebd480cb4350e3b2054b584a8c9c42515f268f99294f72c"
     }, "s10": {
       "operation": "inspect",
       "inputs": [
-        { "node": "s2", "output": 0 }
+        { "node": "s9", "output": 0 }
       ],
-      "calcite": {
-        "final": 8
-      },
-      "positions": [],
-      "persistent_id": "cfc631b61f390ed48b7486c9fb8ad669434679a314c614330d226181583a1f1e"
-    }, "s11": {
-      "operation": "inspect",
-      "inputs": [
-        { "node": "s0", "output": 0 }
-      ],
+      "view": "error_view",
       "calcite": {
         "final": 0
       },
       "positions": [],
-      "persistent_id": "933ebf782e1fe804fe85c4d0f3688bdb5234b386c2834892776e692acd9781d9"
+      "persistent_id": "42bb786d35654abe048f3d4cedb08308c085b652304d4902765d81d8afda529c"
     }
-  }
+  },
+  "sources": [
+    "DECLARE RECURSIVE view fibonacci(n INT, value INT);",
+    "create table input (x int);",
+    "",
+    "create view fibonacci AS",
+    "(",
+    "    -- Base case: first two Fibonacci numbers",
+    "    select 0 as n, 0 as value",
+    "    union all",
+    "    select 1 as n, 1 as value",
+    ")",
+    "union all",
+    "(",
+    "    -- Compute F(n)=F(n-1)+F(n-2)",
+    "    select",
+    "        prev.n + 1 as n,",
+    "        (prev.value + curr.value) as value",
+    "    from fibonacci as curr",
+    "    join fibonacci as prev",
+    "    on prev.n = curr.n - 1",
+    "    where curr.n < 10 and prev.n < 10",
+    ");"
+  ]
 }

@@ -1,34 +1,34 @@
 
 package org.dbsp.simulator.operators;
 
-import org.dbsp.simulator.collections.BaseCollection;
-import org.dbsp.simulator.types.WeightType;
+import org.dbsp.simulator.types.CollectionType;
+import org.dbsp.simulator.util.ICastable;
 
-import javax.annotation.Nullable;
-import java.util.Objects;
+/** Base class for operators */
+public abstract class BaseOperator implements ICastable {
+    final Stream[] inputs;
+    final Stream output;
 
-public abstract class BaseOperator<Weight> {
-    final WeightType<Weight> weightType;
-    final BaseOperator<Weight>[] inputs;
-    @Nullable
-    BaseCollection<Weight> nextOutput;
-
-    @SafeVarargs
-    protected BaseOperator(WeightType<Weight> weightType, BaseOperator<Weight>... inputs) {
-        this.weightType = weightType;
+    protected BaseOperator(CollectionType outputType, Stream... inputs) {
         this.inputs = inputs;
-        this.nextOutput = null;
+        this.output = new Stream(outputType);
     }
 
     /** Execute one computation step: gather data from the inputs,
      * and compute the current output. */
     public abstract void step();
 
-    public BaseCollection<Weight> getOutput() {
-        return Objects.requireNonNull(this.nextOutput);
+    public void reset() {}
+
+    public Stream getOutput() {
+        return this.output;
     }
 
     public int getInputCount() {
         return this.inputs.length;
+    }
+
+    public CollectionType getOutputType() {
+        return this.getOutput().getType();
     }
 }

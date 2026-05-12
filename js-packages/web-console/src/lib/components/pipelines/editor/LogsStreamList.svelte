@@ -1,0 +1,60 @@
+<script lang="ts">
+  import stripANSI from 'strip-ansi'
+  import { Virtualizer, type VirtualizerHandle } from 'virtua/svelte'
+  import AnsiDecoratedText from '$lib/components/logs/ANSIDecoratedText.svelte'
+  import ScrollDownFab from '$lib/components/other/ScrollDownFab.svelte'
+  import WarningBanner from '$lib/components/pipelines/editor/WarningBanner.svelte'
+  import { useReverseScrollContainer } from '$lib/compositions/common/useReverseScrollContainer.svelte'
+  import { virtualSelect } from '$lib/compositions/common/userSelect'
+  import { useSkeletonTheme } from '$lib/compositions/useSkeletonTheme.svelte'
+  import { humanSize } from '$lib/functions/common/string'
+
+  const theme = useSkeletonTheme()
+
+  const { logs }: { logs: { rows: string[]; totalSkippedBytes: number; firstRowIndex: number } } =
+    $props()
+
+  const reverseScroll = useReverseScrollContainer({
+    observeContentElement: (e) => e.firstElementChild!
+  })
+  let virtualizer: VirtualizerHandle = $state()!
+</script>
+
+{#if logs.totalSkippedBytes}
+  <WarningBanner>
+    Receiving logs faster than can be displayed. Skipping some logs to keep up, {humanSize(
+      logs.totalSkippedBytes
+    )} in total.
+  </WarningBanner>
+{/if}
+<div
+  role="textbox"
+  class="bg-white-dark scrollbar h-full w-full overflow-y-auto rounded pl-2 whitespace-pre-wrap"
+  style="font-family: {theme.config.monospaceFontFamily}; user-select: contain;"
+  tabindex={-1}
+  use:reverseScroll.action
+  use:virtualSelect={{
+    getRoot: (node) => node.firstElementChild!,
+    getCopyContent(slice) {
+      if (slice === 'all') {
+        return logs.rows.map(stripANSI).join('')
+      }
+      const result = logs.rows.slice(slice.start.row, slice.end.row + 1).map(stripANSI)
+      result[0] = result[0].slice(slice.start.col)
+      result[result.length - 1] = result[result.length - 1].slice(
+        0,
+        slice.end.col - (slice.start.row === slice.end.row ? slice.start.col : 0)
+      )
+      return result.join('')
+    }
+  }}
+>
+  <Virtualizer data={logs.rows} getKey={(_, i) => i + logs.firstRowIndex} bind:this={virtualizer}>
+    {#snippet children(value, index)}
+      <div data-rowindex={index}>
+        <AnsiDecoratedText {value}></AnsiDecoratedText>
+      </div>
+    {/snippet}
+  </Virtualizer>
+</div>
+<ScrollDownFab {reverseScroll}></ScrollDownFab>

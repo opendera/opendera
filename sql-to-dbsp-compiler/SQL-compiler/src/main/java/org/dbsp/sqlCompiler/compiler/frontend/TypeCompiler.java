@@ -25,6 +25,8 @@ package org.dbsp.sqlCompiler.compiler.frontend;
 
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.rel.type.RelDataTypeFieldImpl;
+import org.apache.calcite.rel.type.RelRecordType;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.ICompilerComponent;
@@ -34,10 +36,10 @@ import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
 import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.RelColumnMetadata;
-import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.RelStruct;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.DBSPTypeCode;
+import org.dbsp.sqlCompiler.ir.type.IsDateType;
 import org.dbsp.sqlCompiler.ir.type.IsNumericType;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTupleBase;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeAny;
@@ -59,8 +61,8 @@ import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDouble;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeGeoPoint;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeKeyword;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeMillisInterval;
-import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeMonthsInterval;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeShortInterval;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeLongInterval;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeNull;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeReal;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeString;
@@ -73,6 +75,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 public class TypeCompiler implements ICompilerComponent {
     final DBSPCompiler compiler;
@@ -97,17 +100,23 @@ public class TypeCompiler implements ICompilerComponent {
      * @param left       Left operand type.
      * @param right      Right operand type.
      * @param error      Extra message to show in case of error.
+     * @param acceptStrings  If true accept string types as left and/or right.
      * @return           Common type operands must be cast to.
      */
     public static DBSPType reduceType(CalciteObject node, DBSPType left, DBSPType right,
                                       String error, boolean acceptStrings) {
-        if (left.is(DBSPTypeNull.class))
+        if (left.code == DBSPTypeCode.NULL)
             return right.withMayBeNull(true);
-        if (right.is(DBSPTypeNull.class))
+        if (right.code == DBSPTypeCode.NULL)
             return left.withMayBeNull(true);
         boolean anyNull = left.mayBeNull || right.mayBeNull;
         if (left.sameTypeIgnoringNullability(right))
             return left.withMayBeNull(anyNull);
+
+        if (left.is(DBSPTypeTimestamp.class) && right.is(IsDateType.class))
+            return left.withMayBeNull(anyNull);
+        if (right.is(DBSPTypeTimestamp.class) && left.is(IsDateType.class))
+            return right.withMayBeNull(anyNull);
 
         if (left.is(DBSPTypeTupleBase.class)) {
             if (!right.is(DBSPTypeTupleBase.class))
@@ -125,8 +134,31 @@ public class TypeCompiler implements ICompilerComponent {
             return lTuple.makeRelatedTupleType(fields);
         }
 
+        if (left.is(DBSPTypeArray.class)) {
+            if (!right.is(DBSPTypeArray.class)) {
+                throw new CompilationError(error + "Implicit conversion between " +
+                        left.asSqlString() + " and " + right.asSqlString() + " not supported", node);
+            }
+            DBSPTypeArray lArr = left.to(DBSPTypeArray.class);
+            DBSPTypeArray rArr = right.to(DBSPTypeArray.class);
+            DBSPType common = reduceType(node, lArr.getElementType(), rArr.getElementType(), error, true);
+            return new DBSPTypeArray(common, anyNull);
+        }
+
+        if (left.is(DBSPTypeMap.class)) {
+            if (!right.is(DBSPTypeMap.class)) {
+                throw new CompilationError(error + "Implicit conversion between " +
+                        left.asSqlString() + " and " + right.asSqlString() + " not supported", node);
+            }
+            DBSPTypeMap lMap = left.to(DBSPTypeMap.class);
+            DBSPTypeMap rMap = right.to(DBSPTypeMap.class);
+            DBSPType commonKey = reduceType(node, lMap.getKeyType(), rMap.getKeyType(), error, true);
+            DBSPType commonValue = reduceType(node, lMap.getValueType(), rMap.getValueType(), error, true);
+            return new DBSPTypeMap(commonKey, commonValue, anyNull);
+        }
+
         if (acceptStrings) {
-            if (left.is(DBSPTypeString.class) && right.is(DBSPTypeString.class)) {
+            if (left.code == DBSPTypeCode.STRING && right.code == DBSPTypeCode.STRING) {
                 DBSPTypeString ls = left.to(DBSPTypeString.class);
                 DBSPTypeString rs = right.to(DBSPTypeString.class);
                 boolean fixed = ls.fixed && rs.fixed;
@@ -135,6 +167,16 @@ public class TypeCompiler implements ICompilerComponent {
                         rs.precision == IHasPrecision.UNLIMITED_PRECISION)
                     precision = IHasPrecision.UNLIMITED_PRECISION;
                 return DBSPTypeString.create(left.getNode(), precision, fixed, anyNull);
+            }
+            if (left.code == DBSPTypeCode.BYTES && right.code == DBSPTypeCode.BYTES) {
+                DBSPTypeBinary ls = left.to(DBSPTypeBinary.class);
+                DBSPTypeBinary rs = right.to(DBSPTypeBinary.class);
+                boolean fixed = ls.fixed && rs.fixed;
+                int precision = Math.max(ls.precision, rs.precision);
+                if (ls.precision == IHasPrecision.UNLIMITED_PRECISION ||
+                        rs.precision == IHasPrecision.UNLIMITED_PRECISION)
+                    precision = IHasPrecision.UNLIMITED_PRECISION;
+                return new DBSPTypeBinary(left.getNode(), precision, fixed, anyNull);
             }
         }
 
@@ -202,28 +244,62 @@ public class TypeCompiler implements ICompilerComponent {
                 // DECIMAL op FLOAT, convert to DOUBLE
                 return new DBSPTypeDouble(right.getNode(), anyNull);
             }
-            // DECIMAL op DECIMAL does not convert to a common type.
+
+            if (rd != null) {
+                int scale = Math.max(ld.scale, rd.scale);
+                int before = Math.max(ld.precision - ld.scale, rd.precision - rd.scale);
+                int precision = before + scale;
+                if (precision < DBSPTypeDecimal.MAX_PRECISION) {
+                    return new DBSPTypeDecimal(ld.getNode(), precision, scale, anyNull);
+                } else {
+                    throw new CompilationError(error + "Could not derive a common type between " +
+                            left.asSqlString() + " and " + right.asSqlString() + "; please use explicit casts", node);
+                }
+            }
         }
         throw new UnimplementedException("Cast from " + right + " to " + left, left.getNode());
+    }
+
+    public static RelDataType removeDuplicateFields(RelDataType rowType) {
+        FreshName names = new FreshName(new HashSet<>());
+        List<RelDataTypeField> fields = new ArrayList<>();
+        boolean duplicates = false;
+        if (rowType.isStruct()) {
+            for (RelDataTypeField field: rowType.getFieldList()) {
+                String name = field.getName();
+                if (names.isUsed(name)) {
+                    duplicates = true;
+                    name = names.freshName(name, true);
+                    fields.add(new RelDataTypeFieldImpl(name, field.getIndex(), field.getType()));
+                } else {
+                    fields.add(field);
+                    names.add(name);
+                }
+            }
+        }
+        if (!duplicates)
+            return rowType;
+        Utilities.enforce(rowType.getFieldCount() == fields.size());
+        return new RelRecordType(rowType.getStructKind(), fields, rowType.isNullable());
     }
 
     public DBSPType convertType(
             CalciteObject node, ProgramIdentifier name,
             List<RelColumnMetadata> columns, boolean asStruct, boolean mayBeNull) {
+        SourcePositionRange range = node.getPositionRange();
         List<DBSPTypeStruct.Field> fields = new ArrayList<>();
         int index = 0;
         for (RelColumnMetadata col : columns) {
-            DBSPType fType = this.convertType(col.getType(), true);
+            DBSPType fType = this.convertType(range, col.getType(), true);
             fields.add(new DBSPTypeStruct.Field(col.node, col.getName(), index++, fType));
         }
-        String saneName = this.compiler.generateStructName(name, fields);
-        DBSPTypeStruct struct = new DBSPTypeStruct(node, name, saneName, fields, mayBeNull);
+        DBSPTypeStruct struct = new DBSPTypeStruct(node, name, fields, mayBeNull);
         if (asStruct) {
             return struct;
         } else {
             List<DBSPType> typeFields = new ArrayList<>();
             for (RelColumnMetadata col : columns) {
-                DBSPType fType = this.convertType(col.getType(), false);
+                DBSPType fType = this.convertType(range, col.getType(), false);
                 typeFields.add(fType);
             }
             return new DBSPTypeTuple(node, mayBeNull, struct, typeFields);
@@ -231,7 +307,6 @@ public class TypeCompiler implements ICompilerComponent {
     }
 
     public static DBSPTypeStruct asStruct(
-            DBSPCompiler compiler,
             CalciteObject node, ProgramIdentifier name,
             List<ViewColumnMetadata> columns, boolean mayBeNull) {
         List<DBSPTypeStruct.Field> fields = new ArrayList<>();
@@ -239,9 +314,11 @@ public class TypeCompiler implements ICompilerComponent {
         for (ViewColumnMetadata col : columns) {
             fields.add(new DBSPTypeStruct.Field(col.node, col.getName(), index++, col.getType()));
         }
-        String saneName = compiler.generateStructName(name, fields);
-        return new DBSPTypeStruct(node, name, saneName, fields, mayBeNull);
+        return new DBSPTypeStruct(node, name, fields, mayBeNull);
     }
+
+    final Set<Integer> timePrecisionsWarned = new HashSet<>();
+    final Set<Integer> timestampPrecisionsWarned = new HashSet<>();
 
     /**
      * Convert a Calcite RelDataType to an equivalent DBSP type.
@@ -249,41 +326,32 @@ public class TypeCompiler implements ICompilerComponent {
      * @param asStruct   If true convert a Struct type to a DBSPTypeStruct, otherwise
      *                   convert it to a DBSPTypeTuple.
      */
-    public DBSPType convertType(RelDataType dt, boolean asStruct) {
+    public DBSPType convertType(SourcePositionRange context, RelDataType dt, boolean asStruct) {
         CalciteObject node = CalciteObject.create(dt);
         boolean nullable = dt.isNullable();
         DBSPTypeStruct struct;
         if (dt.isStruct()) {
-            boolean isNamedStruct = dt instanceof RelStruct;
-            if (isNamedStruct) {
-                RelStruct rs = (RelStruct) dt;
-                ProgramIdentifier simpleName = Utilities.toIdentifier(rs.typeName);
-                // Struct must be already declared
-                struct = Objects.requireNonNull(this.compiler.getStructByName(simpleName));
-            } else {
-                List<DBSPTypeStruct.Field> fields = new ArrayList<>();
-                FreshName fieldNameGen = new FreshName(new HashSet<>());
-                int index = 0;
-                for (RelDataTypeField field : dt.getFieldList()) {
-                    DBSPType type = this.convertType(field.getType(), true);
-                    String fieldName = field.getName();
-                    if (this.compiler().options.languageOptions.lenient)
-                        // If we are not lenient and names are duplicated
-                        // we will get an exception below where we create the struct.
-                        fieldName = fieldNameGen.freshName(fieldName, true);
-                    fields.add(new DBSPTypeStruct.Field(
-                            CalciteObject.create(dt), new ProgramIdentifier(fieldName), index++, type));
-                }
-                String saneName = this.compiler.generateStructName(new ProgramIdentifier("*", false), fields);
-                struct = new DBSPTypeStruct(node, new ProgramIdentifier(saneName, false), saneName, fields, nullable);
+            List<DBSPTypeStruct.Field> fields = new ArrayList<>();
+            FreshName fieldNameGen = new FreshName(new HashSet<>());
+            int index = 0;
+            for (RelDataTypeField field : dt.getFieldList()) {
+                DBSPType type = this.convertType(context, field.getType(), asStruct);
+                String fieldName = field.getName();
+                if (this.compiler().options.languageOptions.lenient)
+                    // If we are not lenient and names are duplicated
+                    // we will get an exception below where we create the struct.
+                    fieldName = fieldNameGen.freshName(fieldName, true);
+                fields.add(new DBSPTypeStruct.Field(
+                        CalciteObject.create(dt), new ProgramIdentifier(fieldName), index++, type));
             }
+            struct = new DBSPTypeStruct(node, new ProgramIdentifier("", false), fields, nullable);
             if (asStruct) {
                 return struct.withMayBeNull(dt.isNullable());
             } else {
                 DBSPType[] fieldTypes = new DBSPType[dt.getFieldCount()];
                 int i = 0;
                 for (RelDataTypeField field : dt.getFieldList()) {
-                    DBSPType type = this.convertType(field.getType(), asStruct);
+                    DBSPType type = this.convertType(context, field.getType(), asStruct);
                     fieldTypes[i++] = type;
                 }
                 return new DBSPTypeTuple(node, nullable, struct, fieldTypes);
@@ -332,10 +400,10 @@ public class TypeCompiler implements ICompilerComponent {
                     return new DBSPTypeDecimal(node, precision, scale, nullable);
                 }
                 case REAL:
-                    return new DBSPTypeReal(CalciteObject.EMPTY, nullable);
+                    return DBSPTypeReal.create(nullable);
                 case FLOAT:
                 case DOUBLE:
-                    return new DBSPTypeDouble(CalciteObject.EMPTY, nullable);
+                    return DBSPTypeDouble.create(nullable);
                 case CHAR:
                 case VARCHAR: {
                     int precision = dt.getPrecision();
@@ -346,11 +414,12 @@ public class TypeCompiler implements ICompilerComponent {
                 }
                 case VARBINARY:
                 case BINARY: {
+                    boolean fixed = tn == SqlTypeName.BINARY;
                     int precision = dt.getPrecision();
                     if (precision == RelDataType.PRECISION_NOT_SPECIFIED)
                         //noinspection ReassignedVariable,DataFlowIssue
                         precision = DBSPTypeBinary.UNLIMITED_PRECISION;
-                    return new DBSPTypeBinary(node, precision, nullable);
+                    return new DBSPTypeBinary(node, precision, fixed, nullable);
                 }
                 case NULL:
                     return DBSPTypeNull.INSTANCE;
@@ -358,7 +427,7 @@ public class TypeCompiler implements ICompilerComponent {
                     return DBSPTypeKeyword.INSTANCE;
                 case ARRAY: {
                     RelDataType ct = Objects.requireNonNull(dt.getComponentType());
-                    DBSPType elementType = this.convertType(ct, asStruct);
+                    DBSPType elementType = this.convertType(context, ct, asStruct);
                     return new DBSPTypeArray(elementType, dt.isNullable());
                 }
                 case UNKNOWN:
@@ -367,9 +436,15 @@ public class TypeCompiler implements ICompilerComponent {
                     return DBSPTypeAny.getDefault();
                 case MAP: {
                     RelDataType kt = Objects.requireNonNull(dt.getKeyType());
-                    DBSPType keyType = this.convertType(kt, asStruct);
+                    DBSPType keyType = this.convertType(context, kt, asStruct);
+                    if (keyType.code == DBSPTypeCode.NULL) {
+                        throw new CompilationError("MAP key type cannot be NULL", context);
+                    }
+                    if (keyType.code == DBSPTypeCode.MAP) {
+                        throw new CompilationError("MAP key type cannot be MAP", context);
+                    }
                     RelDataType vt = Objects.requireNonNull(dt.getValueType());
-                    DBSPType valueType = this.convertType(vt, asStruct);
+                    DBSPType valueType = this.convertType(context, vt, asStruct);
                     return new DBSPTypeMap(keyType, valueType, dt.isNullable());
                 }
                 case MULTISET:
@@ -385,38 +460,52 @@ public class TypeCompiler implements ICompilerComponent {
                     throw new UnimplementedException("Support for SQL type " + Utilities.singleQuote(tn.getName())
                             + " not yet implemented", node);
                 case INTERVAL_YEAR:
-                    return new DBSPTypeMonthsInterval(node, DBSPTypeMonthsInterval.Units.YEARS, nullable);
+                    return new DBSPTypeLongInterval(node, DBSPTypeLongInterval.Units.YEARS, nullable);
                 case INTERVAL_YEAR_MONTH:
-                    return new DBSPTypeMonthsInterval(node, DBSPTypeMonthsInterval.Units.YEARS_TO_MONTHS, nullable);
+                    return new DBSPTypeLongInterval(node, DBSPTypeLongInterval.Units.YEARS_TO_MONTHS, nullable);
                 case INTERVAL_MONTH:
-                    return new DBSPTypeMonthsInterval(node, DBSPTypeMonthsInterval.Units.MONTHS, nullable);
+                    return new DBSPTypeLongInterval(node, DBSPTypeLongInterval.Units.MONTHS, nullable);
                 case INTERVAL_DAY:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.DAYS, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.DAYS, nullable);
                 case INTERVAL_DAY_HOUR:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.DAYS_TO_HOURS, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.DAYS_TO_HOURS, nullable);
                 case INTERVAL_DAY_MINUTE:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.DAYS_TO_MINUTES, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.DAYS_TO_MINUTES, nullable);
                 case INTERVAL_DAY_SECOND:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.DAYS_TO_SECONDS, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.DAYS_TO_SECONDS, nullable);
                 case INTERVAL_HOUR:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.HOURS, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.HOURS, nullable);
                 case INTERVAL_HOUR_MINUTE:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.HOURS_TO_MINUTES, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.HOURS_TO_MINUTES, nullable);
                 case INTERVAL_HOUR_SECOND:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.HOURS_TO_SECONDS, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.HOURS_TO_SECONDS, nullable);
                 case INTERVAL_MINUTE:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.MINUTES, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.MINUTES, nullable);
                 case INTERVAL_MINUTE_SECOND:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.MINUTES_TO_SECONDS, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.MINUTES_TO_SECONDS, nullable);
                 case INTERVAL_SECOND:
-                    return new DBSPTypeMillisInterval(node, DBSPTypeMillisInterval.Units.SECONDS, nullable);
+                    return new DBSPTypeShortInterval(node, DBSPTypeShortInterval.Units.SECONDS, nullable);
                 case GEOMETRY:
                     return DBSPTypeGeoPoint.create(node, nullable);
                 case TIMESTAMP:
+                    if (dt.getPrecision() != DBSPTypeTimestamp.PRECISION &&
+                            !timestampPrecisionsWarned.contains(dt.getPrecision())) {
+                        this.compiler.reportWarning(context, "TIMESTAMP precision ignored",
+                                "TIMESTAMP precision is always TIMESTAMP(" + DBSPTypeTimestamp.PRECISION +
+                                        "); specified precision " + dt.getPrecision() + " is ignored");
+                        timestampPrecisionsWarned.add(dt.getPrecision());
+                    }
                     return DBSPTypeTimestamp.create(node, nullable);
                 case DATE:
                     return new DBSPTypeDate(node, nullable);
                 case TIME:
+                    if (dt.getPrecision() != DBSPTypeTime.PRECISION &&
+                            !timePrecisionsWarned.contains(dt.getPrecision())) {
+                        this.compiler.reportWarning(context, "TIME precision ignored",
+                                "TIME precision is always TIME(" + DBSPTypeTime.PRECISION +
+                                        "); specified precision " + dt.getPrecision() + " is ignored");
+                        timePrecisionsWarned.add(dt.getPrecision());
+                    }
                     return new DBSPTypeTime(node, nullable);
                 case UUID:
                     return new DBSPTypeUuid(node, nullable);

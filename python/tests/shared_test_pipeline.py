@@ -1,8 +1,24 @@
 import unittest
+from feldera.runtime_config import RuntimeConfig
+from feldera.testutils import (
+    unique_pipeline_name,
+    FELDERA_TEST_NUM_WORKERS,
+    FELDERA_TEST_NUM_HOSTS,
+)
 from tests import TEST_CLIENT
 from feldera import PipelineBuilder, Pipeline
-from feldera.runtime_config import RuntimeConfig
-from feldera.enums import PipelineStatus
+
+
+def sql(text_or_iterable):
+    """
+    Decorator to attach SQL (string or list/tuple of strings) to a test method.
+    """
+
+    def _wrap(fn):
+        fn.SQL = text_or_iterable
+        return fn
+
+    return _wrap
 
 
 class SharedTestPipeline(unittest.TestCase):
@@ -10,21 +26,23 @@ class SharedTestPipeline(unittest.TestCase):
     def setUpClass(cls):
         cls._ddls = []
         cls.client = TEST_CLIENT
-        cls.pipeline_name = cls.__name__
+        cls.pipeline_name = unique_pipeline_name(cls.__name__)
         for attr in dir(cls):
-            if attr.startswith("test_"):
-                func = getattr(cls, attr)
-                ddl = getattr(func, "__doc__", None)
-                # Check for enterprise_only decorator
-                is_enterprise_only = getattr(func, "_enterprise_only", False)
-                if (
-                    is_enterprise_only
-                    and not TEST_CLIENT.get_config().edition.is_enterprise()
-                ):
-                    continue  # Skip DDL for enterprise-only tests if not enterprise
-                if ddl:
-                    if ddl not in cls._ddls:
-                        cls._ddls.append(ddl.strip())
+            if not attr.startswith("test_"):
+                continue
+
+            func = getattr(cls, attr)
+            # Check for enterprise_only decorator
+            is_enterprise_only = getattr(func, "_enterprise_only", False)
+            if (
+                is_enterprise_only
+                and not cls.client.get_config().edition.is_enterprise()
+            ):
+                continue  # Skip DDL for enterprise-only tests if not enterprise
+
+            ddl = getattr(func, "SQL", getattr(func, "__doc__", None))
+            if ddl and ddl.strip() not in cls._ddls:
+                cls._ddls.append(ddl.strip())
 
         if not hasattr(cls, "_pipeline"):
             cls.ddl = "\n".join(cls._ddls)
@@ -32,27 +50,42 @@ class SharedTestPipeline(unittest.TestCase):
                 cls.client,
                 cls.pipeline_name,
                 cls.ddl,
+                runtime_config=RuntimeConfig(
+                    workers=FELDERA_TEST_NUM_WORKERS,
+                    hosts=FELDERA_TEST_NUM_HOSTS,
+                    logging="debug",
+                ),
             ).create_or_replace()
 
-    def set_runtime_config(self, runtime_config: RuntimeConfig):
-        self._pipeline = PipelineBuilder(
-            self.client, self.pipeline_name, self.ddl, runtime_config=runtime_config
+    def setUp(self):
+        p = PipelineBuilder(
+            self.client,
+            unique_pipeline_name(self._testMethodName),
+            sql=self.ddl,
+            runtime_config=RuntimeConfig(
+                workers=FELDERA_TEST_NUM_WORKERS,
+                hosts=FELDERA_TEST_NUM_HOSTS,
+                logging="debug",
+            ),
         ).create_or_replace()
+        self.p = p
 
-    def reset_runtime_config(self):
-        self.set_runtime_config(RuntimeConfig.default())
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls._pipeline is not None:
-            if cls._pipeline.status() != PipelineStatus.STOPPED:
-                cls._pipeline.stop(force=True)
-            cls._pipeline.clear_storage()
-            cls._pipeline = None
-            cls._ddls = []
+    def tearDown(self):
+        self.p.stop(force=True)
+        self.p.clear_storage()
 
     @property
     def pipeline(self) -> Pipeline:
-        p = type(self)._pipeline
-        assert p is not None, "Shared pipeline was not created successfully."
-        return p
+        return self.p
+
+    def new_pipeline_with_suffix(self, suffix: str) -> Pipeline:
+        return PipelineBuilder(
+            self.client,
+            unique_pipeline_name(f"{self._testMethodName}_{suffix}"),
+            sql=self.ddl,
+            runtime_config=RuntimeConfig(
+                workers=FELDERA_TEST_NUM_WORKERS,
+                hosts=FELDERA_TEST_NUM_HOSTS,
+                logging="debug",
+            ),
+        ).create_or_replace()

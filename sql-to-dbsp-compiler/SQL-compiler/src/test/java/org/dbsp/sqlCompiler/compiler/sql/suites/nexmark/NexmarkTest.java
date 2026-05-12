@@ -43,7 +43,7 @@ import java.util.Set;
 public class NexmarkTest extends StreamingTestBase {
     static final String tables = """
 CREATE TABLE person (
-    id BIGINT NOT NULL PRIMARY KEY,
+    id BIGINT NOT NULL,
     name VARCHAR,
     emailAddress VARCHAR,
     creditCard VARCHAR,
@@ -53,20 +53,20 @@ CREATE TABLE person (
     extra  VARCHAR
 );
 CREATE TABLE auction (
-    id  BIGINT NOT NULL PRIMARY KEY,
+    id BIGINT NOT NULL,
     itemName  VARCHAR,
     description  VARCHAR,
     initialBid  BIGINT,
     reserve  BIGINT,
     date_time  TIMESTAMP(3) NOT NULL LATENESS INTERVAL 4 SECONDS,
     expires  TIMESTAMP(3),
-    seller  BIGINT FOREIGN KEY REFERENCES person(id),
+    seller  BIGINT,
     category  BIGINT,
     extra  VARCHAR
 );
 CREATE TABLE bid (
-    auction  BIGINT FOREIGN KEY REFERENCES auction(id),
-    bidder  BIGINT NOT NULL PRIMARY KEY,
+    auction  BIGINT,
+    bidder  BIGINT NOT NULL,
     price  BIGINT,
     channel  VARCHAR,
     url  VARCHAR,
@@ -565,6 +565,7 @@ SELECT
     @Override
     public CompilerOptions testOptions() {
         CompilerOptions options = new CompilerOptions();
+        options.ioOptions.testing = true;
         options.languageOptions.streaming = true;
         options.languageOptions.throwOnError = true;
         options.languageOptions.incrementalize = true;
@@ -837,7 +838,7 @@ INSERT INTO BID VALUES(1, 1, 100, 'my-channel', 'https://example.com', '2020-01-
 """, """
  id | item | description | initialBid | reserve | date_time           | expires             | seller | category | extra | auction | bidder | price | bid_datetime         | bid_extra | weight
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  1 | item-name | description | 5     |      10 | 2020-01-01 00:00:00 | 2020-01-01 00:00:10 |     99 |        1 |       |       1 |      1 |    100 | 2020-01-01 00:00:02 |           | 1""",
+  1 | item-name| description| 5     |      10 | 2020-01-01 00:00:00 | 2020-01-01 00:00:10 |     99 |        1 | |       1 |      1 |    100 | 2020-01-01 00:00:02 | | 1""",
         // The second batch has a new highest bid for the (currently) only auction.
         // And adds a new auction without any bids (empty join).
         """
@@ -846,8 +847,8 @@ INSERT INTO AUCTION VALUES(2, 'item-name', 'description', 5, 10, '2020-01-01 00:
                         """, """
  id | item | description | initialBid | reserve | date_time           | expires             | seller | category | extra | auction | bidder | price | bid_datetime         | bid_extra | weight
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  1 | item-name | description | 5     |      10 | 2020-01-01 00:00:00 | 2020-01-01 00:00:10 |     99 |        1 |       |       1 |      1 |    100 | 2020-01-01 00:00:02 |           | -1
-  1 | item-name | description | 5     |      10 | 2020-01-01 00:00:00 | 2020-01-01 00:00:10 |     99 |        1 |       |       1 |      1 |    200 | 2020-01-01 00:00:09 |           | 1""",
+  1 | item-name| description| 5     |      10 | 2020-01-01 00:00:00 | 2020-01-01 00:00:10 |     99 |        1 | |       1 |      1 |    100 | 2020-01-01 00:00:02 | | -1
+  1 | item-name| description| 5     |      10 | 2020-01-01 00:00:00 | 2020-01-01 00:00:10 |     99 |        1 | |       1 |      1 |    200 | 2020-01-01 00:00:09 | | 1""",
         // The third batch has a new bid, but it's not higher, so no effect to the first
         // auction. A bid added for the second auction, so it is added.
                 """
@@ -856,7 +857,7 @@ INSERT INTO BID VALUES(2, 1, 400, 'my-channel', 'https://example.com', '2020-01-
                 
 id | item | description | initialBid | reserve | date_time           | expires             | seller | category | extra | auction | bidder | price | bid_datetime         | bid_extra | weight
 ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- 2 | item-name | description | 5     |      10 | 2020-01-01 00:00:00 | 2020-01-01 00:00:20 |    101 |        1 |       |       2 |      1 |    400 | 2020-01-01 00:00:19 |           | 1""",
+ 2 | item-name| description| 5     |      10 | 2020-01-01 00:00:00 | 2020-01-01 00:00:20 |    101 |        1 | |       2 |      1 |    400 | 2020-01-01 00:00:19 | | 1""",
         // The fourth and final batch has a new bid for auction 2, but it's
         // come in too late to be valid, so no change.
                 """
@@ -929,7 +930,8 @@ day | total_bids | rank1_bids | rank2_bids | rank3_bids | total_bidders | rank1_
             @Override
             public VisitDecision preorder(DBSPSimpleOperator node) {
                 Assert.assertTrue( !node.operation.contains("aggregate") ||
-                       node.operation.equals("aggregate_linear_postprocess_retain_keys"));
+                        node.operation.equals("aggregate_linear_postprocess_retain_keys") ||
+                        node.operation.equals("chain_aggregate"));
                 return super.preorder(node);
             }
         };

@@ -2,7 +2,10 @@ package org.dbsp.sqlCompiler.compiler.sql.functions;
 
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
+import org.dbsp.util.Utilities;
 import org.junit.Test;
+
+import java.util.function.Function;
 
 public class FunctionsTest extends SqlIoTest {
     @Override
@@ -170,6 +173,57 @@ public class FunctionsTest extends SqlIoTest {
                  2
                  3"""
         );
+    }
+
+    static final String UNICODE_STRING = "éhéllo";
+
+    void createSql(Function<String, String> function, Function<String, String> result) {
+        String sql = "SELECT " + function.apply(UNICODE_STRING) + ";\n";
+        sql += " result\n--------\n";
+        String expected = result.apply(UNICODE_STRING);
+        sql += " " + expected;
+        this.q(sql);
+    }
+
+    @Test
+    public void unicodeStringTests() {
+        int len = UNICODE_STRING.length();
+        for (int i = -2; i < UNICODE_STRING.length() + 2; i++) {
+            int finalI = i;
+
+            Function<String, String> left = s -> "LEFT(" + Utilities.singleQuote(s) + ", " + finalI + ")";
+            Function<String, String> result = s -> s.substring(0, Math.max(Math.min(finalI, len), 0));
+            this.createSql(left, result);
+
+            Function<String, String> right = s -> "RIGHT(" + Utilities.singleQuote(s) + ", " + finalI + ")";
+            Function<String, String> result1 = s -> s.substring(Math.min(s.length(), Math.max(s.length() - finalI, 0)));
+            this.createSql(right, result1);
+
+            Function<String, String> substring2 = s -> "SUBSTRING(" + Utilities.singleQuote(s) + " FROM " + finalI + ")";
+            Function<String, String> result2 = s -> s.substring(Math.max(finalI - 1, 0));
+            this.createSql(substring2, result2);
+
+            Function<String, String> substr2 = s -> "SUBSTR(" + Utilities.singleQuote(s) + ", " + finalI + ")";
+            Function<String, String> result3 = s -> finalI < 0 ?
+                    s.substring(Math.max(0, s.length() + finalI)) :
+                    s.substring(Math.max(finalI - 1, 0));
+            this.createSql(substr2, result3);
+            for (int j = 0; j < UNICODE_STRING.length() + 1; j++) {
+                int finalJ = j;
+
+                Function<String, String> substring3 = s -> "SUBSTRING(" + Utilities.singleQuote(s) + " FROM " + finalI + " FOR " + finalJ + ")";
+                Function<String, String> result4 = s -> s.substring(
+                        Math.max(finalI - 1, 0),
+                        Math.min(Math.max(finalJ + finalI - 1, 0), len));
+                this.createSql(substring3, result4);
+
+                Function<String, String> substr3 = s -> "SUBSTR(" + Utilities.singleQuote(s) + ", " + finalI + ", " + finalJ + ")";
+                Function<String, String> result5 = s -> finalI < 0 ?
+                        s.substring(Math.max(0, s.length() + finalI), Math.min(s.length(), Math.max(0, s.length() + finalI) + finalJ)) :
+                        s.substring(Math.max(finalI - 1, 0), Math.min(s.length(), Math.max(finalI - 1, 0) + finalJ));
+                this.createSql(substr3, result5);
+            }
+        }
     }
 
     @Test
@@ -413,6 +467,12 @@ public class FunctionsTest extends SqlIoTest {
     }
 
     @Test
+    public void timePrecision() {
+        this.shouldWarn("CREATE VIEW V AS SELECT CAST('10:00:00' AS TIME(1))",
+                "TIME precision ignored: TIME precision is always TIME\\(9\\); specified precision 1 is ignored");
+    }
+
+    @Test
     public void testSqrtNull() {
         this.q("""
                 SELECT sqrt(null);
@@ -607,18 +667,18 @@ public class FunctionsTest extends SqlIoTest {
     @Test
     public void testDecimalErrors() {
         this.runtimeConstantFail("select cast(1234.1234 AS DECIMAL(6, 3))",
-                "Cannot represent 1234.123 as DECIMAL(6, 3): precision of DECIMAL type too small to represent value");
+                "Could not convert 1234.123 to DECIMAL(6, 3)");
         this.runtimeConstantFail("select cast(1234.1236 AS DECIMAL(6, 3))",
-                "Cannot represent 1234.123 as DECIMAL(6, 3): precision of DECIMAL type too small to represent value");
+                "Could not convert 1234.123 to DECIMAL(6, 3)");
         this.runtimeConstantFail("select cast(143.481 as decimal(2, 1))",
-                "Cannot represent 143.4 as DECIMAL(2, 1): precision of DECIMAL type too small to represent value");
+                "Could not convert 143.4 to DECIMAL(2, 1)");
         this.q("""
                 select cast(99.6 as decimal(2, 0));
                  result
                 --------
                  99""");
         this.runtimeConstantFail("select cast(-13.4 as decimal(2,1))",
-                "Cannot represent -13.4 as DECIMAL(2, 1)");
+                "Could not convert -13.4 to DECIMAL(2, 1)");
     }
 
     @Test
@@ -826,7 +886,6 @@ public class FunctionsTest extends SqlIoTest {
                 -------
                  4.0000000000000000
                 (1 row)
-
 
                 SELECT power(2, 2.0);
                  power
@@ -1115,7 +1174,6 @@ public class FunctionsTest extends SqlIoTest {
                 ------------
                  -20
                 (1 row)
-
 
                 select round(15.1);
                  round(15.1)
@@ -1537,7 +1595,6 @@ public class FunctionsTest extends SqlIoTest {
                 5678.1
                 (1 row)
 
-
                 select truncate(5678.123451);
                 truncate(5678.123451)
                 -----
@@ -1865,9 +1922,9 @@ public class FunctionsTest extends SqlIoTest {
                 CREATE VIEW V AS SELECT MD5(x), MD5(y) FROM T;""");
         ccs.step("INSERT INTO T VALUES('Feldera', x'0123456789ABCDEF');",
                 """
-                         s                                | binary                           | weight
-                        ------------------------------------------------------------------------------
-                         841afc2f65b5763600818ef42a56d7d1 | a1cd1d1fc6491068d91007283ed84489 | 1""");
+                         s                               | binary                          | weight
+                        ----------------------------------------------------------------------------
+                         841afc2f65b5763600818ef42a56d7d1| a1cd1d1fc6491068d91007283ed84489| 1""");
     }
 
     @Test
@@ -1933,6 +1990,16 @@ public class FunctionsTest extends SqlIoTest {
                 (1 row)
                 """
         );
+        var ccs = this.getCCS("""
+                CREATE TABLE T(x VARCHAR, r VARCHAR);
+                CREATE VIEW V AS SELECT RLIKE(x, r) FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES('string', 's..i.*')", """
+                 r
+                ---
+                 true""");
+
+        this.runtimeConstantFail("SELECT 'x' RLIKE '('",
+                "Invalid regular expression in RLIKE '(': regex parse error:");
     }
 
     @Test
@@ -2187,4 +2254,78 @@ public class FunctionsTest extends SqlIoTest {
                 """
         );
     }
+
+    @Test
+    public void testInitcapSpaces() {
+        this.qs("""
+                SELECT INITCAP_SPACES('hi man');
+                 r
+                ---
+                 Hi Man
+                (1 row)
+               
+                SELECT INITCAP_SPACES('hi THOMAS-SON');
+                 r
+                ---
+                 Hi Thomas-son
+                (1 row)
+                
+                SELECT INITCAP_SPACES(NULL);
+                 r
+                ---
+                NULL
+                (1 row)
+                
+                SELECT INITCAP('ggj12341jhg12341=-012341asdf');
+                 r
+                ---
+                 Ggj12341jhg12341=-012341asdf
+                (1 row)""");
+    }
+
+    @Test
+    public void issue4559() {
+        var ccs = this.getCCS("""
+                CREATE TABLE str_tbl(id INT, str VARCHAR);
+                
+                CREATE MATERIALIZED VIEW trim_legal AS SELECT
+                TRIM(trailing 'い' from str)
+                FROM str_tbl;""");
+        ccs.step("""
+                INSERT INTO str_tbl VALUES(0, '🐍🐍'), (1, 'かわいい'), (2, '¯\\(ツ)/¯'), (3, 'h@pP√ ');
+                """, """
+                 str | weight
+                --------------
+                 🐍🐍|1
+                 ¯\\(ツ)/¯|1
+                 h@pP√ |1
+                 かわ| 1""");
+        this.getCC("""
+                CREATE TABLE str_tbl(id INT, str VARCHAR);
+                CREATE VIEW V0 AS SELECT POSITION('🐍' in str), POSITION('い' in str), POSITION('√ ' in str) FROM str_tbl;
+                CREATE VIEW V1 AS SELECT REGEXP_REPLACE(str, '([🐍い]|/¯|√\\s*)+$', 'i') FROM str_tbl;
+                CREATE VIEW V2 AS SELECT RLIKE(str, '🐍.'), RLIKE(str, '..い.'), RLIKE(str, '....√ ') FROM str_tbl;
+                CREATE VIEW V3 AS SELECT SPLIT(str, '🐍.'), SPLIT(str, '..い.'), SPLIT(str, '....√ ') FROM str_tbl;
+                CREATE VIEW V4 AS SELECT SPLIT_PART(str, '🐍.', 2), SPLIT_PART(str, '..い.', 2), SPLIT_PART(str, '....√ ', 2) FROM str_tbl""");
+    }
+
+    @Test
+    public void issue4539() {
+        this.statementsFailingInCompilation("""
+               CREATE TABLE illegal_tbl(bin BINARY);
+               CREATE VIEW index_illegal AS SELECT
+               bin[2] AS bin
+               FROM illegal_tbl;""", """
+               Cannot apply indexing to arguments of type <BINARY(1)>[<INTEGER>]. Supported form(s): <ARRAY>[<INTEGER>]
+               <MAP>[<ANY>]
+               <ROW>[<CHARACTER>|<INTEGER>]
+               <VARIANT>[<CHARACTER>|<INTEGER>]""");
+        this.statementsFailingInCompilation(
+                "CREATE VIEW map_item_illegal AS SELECT x''['a'];", """
+               Cannot apply indexing to arguments of type <BINARY(0)>[<CHAR(1)>]. Supported form(s): <ARRAY>[<INTEGER>]
+               <MAP>[<ANY>]
+               <ROW>[<CHARACTER>|<INTEGER>]
+               <VARIANT>[<CHARACTER>|<INTEGER>]""");
+    }
 }
+

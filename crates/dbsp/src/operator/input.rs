@@ -1,23 +1,24 @@
 use crate::{
+    Circuit, DBData, DynZWeight, RootCircuit, Runtime, Stream, TypedBox, ZWeight,
     circuit::{
+        LocalStoreMarker, Scope,
         metadata::OperatorLocation,
         operator_traits::{Operator, SourceOperator},
-        LocalStoreMarker, Scope,
     },
-    dynamic::{DowncastTrait, DynBool, DynData, DynPair, DynUnit, Erase, LeanVec},
+    dynamic::{DowncastTrait, DynBool, DynData, DynPair, DynPairs, DynUnit, Erase, LeanVec},
     operator::dynamic::{
         input::{
-            AddInputIndexedZSetFactories, AddInputMapFactories, AddInputSetFactories,
-            AddInputZSetFactories, CollectionHandle, UpsertHandle,
+            AddInputIndexedZSetFactories, AddInputMapFactories, AddInputMapWithWaterlineFactories,
+            AddInputSetFactories, AddInputZSetFactories, CollectionHandle, UpsertHandle,
         },
         input_upsert::DynUpdate,
     },
     typed_batch::{OrdIndexedZSet, OrdZSet},
     utils::Tup2,
-    Circuit, DBData, DynZWeight, RootCircuit, Runtime, Stream, ZWeight,
 };
 use std::{
     borrow::{Borrow, Cow},
+    collections::VecDeque,
     fmt::Debug,
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -32,6 +33,49 @@ pub use crate::operator::dynamic::input_upsert::{PatchFunc, Update};
 
 pub type IndexedZSetStream<K, V> = Stream<RootCircuit, OrdIndexedZSet<K, V>>;
 pub type ZSetStream<K> = Stream<RootCircuit, OrdZSet<K>>;
+
+/// Input prepared for flushing into an input handle.
+///
+/// [ZSetHandle], [IndexedZSetHandle], [SetHandle], and [MapHandle] all support
+/// similar ways to push data into a circuit.  The following discussion just
+/// talks about `ZSetHandle`, for clarity.
+///
+/// There are two ways to push data into a circuit with [ZSetHandle]:
+///
+/// - Immediately, either one data point at a time with
+///   [push](ZSetHandle::push), or a vector at a time with, e.g.,
+///   [append](ZSetHandle::append).
+///
+/// - Preparing data in advance into [StagedBuffers] using
+///   `stage`.  Then, later, calling [StagedBuffers::flush] pushes
+///   the input buffers into the circuit.
+///
+/// Both approaches are equally correct.  They can differ in performance,
+/// because [push](ZSetHandle::push) and [append](ZSetHandle::append) have a
+/// significant cost for a large number of records.  Using [StagedBuffers] has a
+/// similar cost, but it incurs it in the call to `stage` rather
+/// than in [StagedBuffers::flush].  This means that, if the code driving the
+/// circuit can buffer data ahead of the circuit's demand for it, the cost can
+/// be hidden and data processing as a whole runs faster.
+pub trait StagedBuffers: Send + Sync {
+    /// Flushes the data gathered into this buffer to the circuit.
+    fn flush(&mut self);
+}
+
+pub struct ZSetStagedBuffers {
+    input_handle: InputHandle<Vec<Box<DynPairs<DynPair<DynData, DynUnit>, DynZWeight>>>>,
+    vals: Vec<Box<DynPairs<DynPair<DynData, DynUnit>, DynZWeight>>>,
+}
+
+impl StagedBuffers for ZSetStagedBuffers {
+    fn flush(&mut self) {
+        for (worker, vals) in self.vals.drain(..).enumerate() {
+            self.input_handle.update_for_worker(worker, |tuples| {
+                tuples.push(vals);
+            });
+        }
+    }
+}
 
 #[repr(transparent)]
 pub struct ZSetHandle<K> {
@@ -80,6 +124,45 @@ where
 
         self.handle.dyn_append(&mut vals.erase_box())
     }
+
+    pub fn stage(
+        &self,
+        buffers: impl IntoIterator<Item = VecDeque<Tup2<K, ZWeight>>>,
+    ) -> ZSetStagedBuffers {
+        let num_partitions = self.handle.num_partitions();
+        let mut partitions = vec![self.handle.pairs_factory.default_box(); num_partitions];
+        let mut next_worker = 0;
+        for vals in buffers {
+            let mut vec = Vec::from(vals);
+            // SAFETY: `()` is a zero-sized type, more precisely it's a 1-ZST.
+            // According to the Rust spec adding it to a tuple doesn't change
+            // its memory layout.
+            let vals: &mut Vec<Tup2<Tup2<K, ()>, ZWeight>> = unsafe { transmute(&mut vec) };
+            let vals = Box::new(LeanVec::from(take(vals)));
+
+            self.handle
+                .dyn_stage(&mut vals.erase_box(), &mut next_worker, &mut partitions);
+        }
+        ZSetStagedBuffers {
+            input_handle: self.handle.input_handle.clone(),
+            vals: partitions,
+        }
+    }
+}
+
+pub struct IndexedZSetStagedBuffers {
+    input_handle: InputHandle<Vec<Box<DynPairs<DynData, DynPair<DynData, DynZWeight>>>>>,
+    vals: Vec<Box<DynPairs<DynData, DynPair<DynData, DynZWeight>>>>,
+}
+
+impl StagedBuffers for IndexedZSetStagedBuffers {
+    fn flush(&mut self) {
+        for (worker, vals) in self.vals.drain(..).enumerate() {
+            self.input_handle.update_for_worker(worker, |tuples| {
+                tuples.push(vals);
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -108,6 +191,21 @@ where
     pub fn append(&self, vals: &mut Vec<Tup2<K, Tup2<V, ZWeight>>>) {
         let vals = Box::new(LeanVec::from(take(vals)));
         self.handle.dyn_append(&mut vals.erase_box())
+    }
+}
+
+pub struct SetStagedBuffers {
+    input_handle: InputHandle<Vec<Box<DynPairs<DynData, DynBool>>>>,
+    vals: Vec<Box<DynPairs<DynData, DynBool>>>,
+}
+
+impl StagedBuffers for SetStagedBuffers {
+    fn flush(&mut self) {
+        for (worker, vals) in self.vals.drain(..).enumerate() {
+            self.input_handle.update_for_worker(worker, |tuples| {
+                tuples.push(vals);
+            });
+        }
     }
 }
 
@@ -144,6 +242,39 @@ where
     pub fn append(&mut self, vals: &mut Vec<Tup2<K, bool>>) {
         let vals = Box::new(LeanVec::from(take(vals)));
         self.handle.dyn_append(&mut vals.erase_box())
+    }
+
+    pub fn stage(
+        &self,
+        buffers: impl IntoIterator<Item = VecDeque<Tup2<K, bool>>>,
+    ) -> SetStagedBuffers {
+        let num_partitions = self.handle.num_partitions();
+        let mut partitions = vec![self.handle.pairs_factory.default_box(); num_partitions];
+        for vals in buffers {
+            let vec = Vec::from(vals);
+            let vals = Box::new(LeanVec::from(vec));
+            self.handle
+                .dyn_stage(&mut vals.erase_box(), &mut partitions);
+        }
+        SetStagedBuffers {
+            input_handle: self.handle.input_handle.clone(),
+            vals: partitions,
+        }
+    }
+}
+
+pub struct MapStagedBuffers {
+    input_handle: InputHandle<Vec<Box<DynPairs<DynData, DynUpdate<DynData, DynData>>>>>,
+    vals: Vec<Box<DynPairs<DynData, DynUpdate<DynData, DynData>>>>,
+}
+
+impl StagedBuffers for MapStagedBuffers {
+    fn flush(&mut self) {
+        for (worker, vals) in self.vals.drain(..).enumerate() {
+            self.input_handle.update_for_worker(worker, |tuples| {
+                tuples.push(vals);
+            });
+        }
     }
 }
 
@@ -182,6 +313,24 @@ where
     pub fn append(&mut self, vals: &mut Vec<Tup2<K, Update<V, U>>>) {
         let vals = Box::new(LeanVec::from(take(vals)));
         self.handle.dyn_append(&mut vals.erase_box())
+    }
+
+    pub fn stage(
+        &self,
+        buffers: impl IntoIterator<Item = VecDeque<Tup2<K, Update<V, U>>>>,
+    ) -> MapStagedBuffers {
+        let num_partitions = self.handle.num_partitions();
+        let mut partitions = vec![self.handle.pairs_factory.default_box(); num_partitions];
+        for vals in buffers {
+            let vec = Vec::from(vals);
+            let vals = Box::new(LeanVec::from(vec));
+            self.handle
+                .dyn_stage(&mut vals.erase_box(), &mut partitions);
+        }
+        MapStagedBuffers {
+            input_handle: self.handle.input_handle.clone(),
+            vals: partitions,
+        }
     }
 }
 
@@ -491,6 +640,161 @@ impl RootCircuit {
 
         (stream.typed(), MapHandle::new(handle))
     }
+
+    /// Like `add_input_map`, but additionally tracks a waterline of the input collection and
+    /// rejects inputs that are below the waterline.
+    ///
+    /// An input is rejected if the input record itself is below the waterline or if the existing
+    /// record it replaces is below the waterline.
+    ///
+    /// # Type arguments
+    ///
+    /// - `K`: The type of the key.
+    /// - `V`: The type of the value.
+    /// - `U`: The type that represents updates to values.
+    /// - `W`: The type of the waterline.
+    /// - `E`: The type of the error that is reported when the waterline is violated.
+    ///
+    /// # Arguments
+    ///
+    /// - `patch_func`: A function that applies the update to the value.
+    /// - `init`: A function that initializes the waterline.
+    /// - `extract_ts`: A function that extracts the timestamp from the key/value pair.
+    /// - `least_upper_bound`: A function that computes the least upper bound of two waterlines.
+    /// - `filter_func`: A function that filters out records below the waterline.
+    /// - `report_func`: A function that reports errors when the waterline is violated.
+    ///
+    /// # Returns
+    ///
+    /// - Stream of changes to the collection.
+    /// - Error stream that reports waterline violations.
+    /// - Stream of waterline values.
+    /// - Input handle that allows pushing updates to the collection.
+    ///
+    /// # Garbage collection
+    ///
+    /// This function supports waterlines over both key and values components of the tuple.
+    /// In case the waterline is applied to the key component, the internal index maintained
+    /// by this function can be GC'd by calling [`Stream::integrate_trace_retain_keys`]: on
+    /// the output stream returned by this function:
+    /// `stream.integrate_trace_retain_keys(&waterline, |key, wl| *key >= *wl)`, where
+    /// `waterline` is the stream of waterline values returned by this function.
+    #[track_caller]
+    pub fn add_input_map_with_waterline<K, V, U, W, E, PF, IF, WF, LB, FF, RF>(
+        &self,
+        patch_func: PF,
+        init: IF,
+        extract_ts: WF,
+        least_upper_bound: LB,
+        filter_func: FF,
+        report_func: RF,
+    ) -> (
+        Stream<RootCircuit, OrdIndexedZSet<K, V>>,
+        Stream<RootCircuit, OrdZSet<E>>,
+        Stream<RootCircuit, TypedBox<W, DynData>>,
+        MapHandle<K, V, U>,
+    )
+    where
+        K: DBData,
+        V: DBData,
+        U: DBData + Erase<DynData>,
+        W: DBData,
+        E: DBData,
+        PF: Fn(&mut V, &U) + 'static,
+        IF: Fn() -> W + 'static,
+        WF: Fn(&K, &V) -> W + 'static,
+        LB: Fn(&W, &W) -> W + Clone + 'static,
+        FF: Fn(&W, &K, &V) -> bool + 'static,
+        RF: Fn(&W, &K, &V, ZWeight) -> E + 'static,
+    {
+        self.add_input_map_with_waterline_persistent(
+            None,
+            patch_func,
+            init,
+            extract_ts,
+            least_upper_bound,
+            filter_func,
+            report_func,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    pub fn add_input_map_with_waterline_persistent<K, V, U, W, E, PF, IF, WF, LB, FF, RF>(
+        &self,
+        persistent_id: Option<&str>,
+        patch_func: PF,
+        init: IF,
+        extract_ts: WF,
+        least_upper_bound: LB,
+        filter_func: FF,
+        report_func: RF,
+    ) -> (
+        Stream<RootCircuit, OrdIndexedZSet<K, V>>,
+        Stream<RootCircuit, OrdZSet<E>>,
+        Stream<RootCircuit, TypedBox<W, DynData>>,
+        MapHandle<K, V, U>,
+    )
+    where
+        K: DBData,
+        V: DBData,
+        U: DBData + Erase<DynData>,
+        W: DBData + Erase<DynData>,
+        E: DBData + Erase<DynData>,
+        PF: Fn(&mut V, &U) + 'static,
+        IF: Fn() -> W + 'static,
+        WF: Fn(&K, &V) -> W + 'static,
+        LB: Fn(&W, &W) -> W + Clone + 'static,
+        FF: Fn(&W, &K, &V) -> bool + 'static,
+        RF: Fn(&W, &K, &V, ZWeight) -> E + 'static,
+    {
+        let factories = AddInputMapWithWaterlineFactories::new::<K, V, U, E>();
+        let (stream, errors, waterline, handle) = self.dyn_add_input_map_with_waterline_mono(
+            persistent_id,
+            &factories,
+            Box::new(move |v: &mut DynData, u: &DynData| unsafe {
+                patch_func(v.downcast_mut::<V>(), u.downcast::<U>())
+            }),
+            Box::new(move || Box::new(init())),
+            Box::new(move |k: &DynData, v: &DynData, ts: &mut DynData| {
+                let k = unsafe { k.downcast::<K>() };
+                let v = unsafe { v.downcast::<V>() };
+                let w = unsafe { ts.downcast_mut::<W>() };
+
+                *w = extract_ts(k, v);
+            }),
+            Box::new(move |a: &DynData, b: &DynData, ts: &mut DynData| {
+                let a = unsafe { a.downcast::<W>() };
+                let b = unsafe { b.downcast::<W>() };
+                let ts = unsafe { ts.downcast_mut::<W>() };
+                *ts = least_upper_bound(a, b)
+            }),
+            Box::new(move |wl: &DynData, k: &DynData, v: &DynData| {
+                let wl = unsafe { wl.downcast::<W>() };
+                let k = unsafe { k.downcast::<K>() };
+                let v = unsafe { v.downcast::<V>() };
+
+                filter_func(wl, k, v)
+            }),
+            Box::new(
+                move |wl: &DynData, k: &DynData, v: &DynData, w: ZWeight, err: &mut DynData| {
+                    let wl = unsafe { wl.downcast::<W>() };
+                    let k = unsafe { k.downcast::<K>() };
+                    let v = unsafe { v.downcast::<V>() };
+                    let err = unsafe { err.downcast_mut::<E>() };
+
+                    *err = report_func(wl, k, v, w);
+                },
+            ),
+        );
+
+        (
+            stream.typed(),
+            errors.typed(),
+            unsafe { waterline.typed_data() },
+            MapHandle::new(handle),
+        )
+    }
 }
 
 /// `TypedMapKey` entry used to share InputHandle objects across workers in a
@@ -585,7 +889,6 @@ impl<T: Clone> Mailbox<T> {
 
 pub(crate) struct InputHandleInternal<T> {
     pub(crate) mailbox: Vec<Mailbox<T>>,
-    offset: usize,
 }
 
 impl<T> InputHandleInternal<T>
@@ -601,12 +904,7 @@ where
                 .clone()
                 .map(move |_| Mailbox::new(empty_val.clone()))
                 .collect(),
-            offset: workers.start,
         }
-    }
-
-    pub(crate) fn workers(&self) -> Range<usize> {
-        self.offset..self.offset + self.mailbox.len()
     }
 
     fn set_for_worker(&self, worker: usize, v: T) {
@@ -635,7 +933,7 @@ where
     }
 
     fn mailbox(&self, worker: usize) -> &Mailbox<T> {
-        &self.mailbox[worker - self.offset]
+        &self.mailbox[worker]
     }
 }
 
@@ -683,25 +981,25 @@ where
         }
     }
 
-    /// Returns the range of worker indexes that this input handle covers, that
-    /// is, all of the workers on this host (all workers everywhere, for a
-    /// single-host circuit).
-    pub(crate) fn workers(&self) -> Range<usize> {
-        self.0.workers()
-    }
-
+    /// Returns the mailbox for the given `worker`.
+    ///
+    /// A `worker` of 0 is the first worker on the local host.
     fn mailbox(&self, worker: usize) -> &Mailbox<T> {
         self.0.mailbox(worker)
     }
 
     /// Write value `v` to the specified worker's mailbox,
     /// overwriting any previous value in the mailbox.
+    ///
+    /// A `worker` of 0 is the first worker on the local host.
     pub fn set_for_worker(&self, worker: usize, v: T) {
         self.0.set_for_worker(worker, v);
     }
 
     /// Mutate the contents of the specified worker's mailbox
     /// using closure `f`.
+    ///
+    /// A `worker` of 0 is the first worker on the local host.
     pub fn update_for_worker<F>(&self, worker: usize, f: F)
     where
         F: FnOnce(&mut T),
@@ -748,7 +1046,7 @@ where
         default: Arc<dyn Fn() -> IT + Send + Sync>,
     ) -> (Self, InputHandle<IT>) {
         let handle = InputHandle::new(default);
-        let mailbox = handle.mailbox(Runtime::worker_index()).clone();
+        let mailbox = handle.mailbox(Runtime::local_worker_offset()).clone();
 
         let input = Self {
             location,

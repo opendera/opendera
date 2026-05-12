@@ -1,6 +1,7 @@
 package org.dbsp.sqlCompiler.compiler.visitors.unusedFields;
 
 import org.dbsp.sqlCompiler.circuit.operator.DBSPConstantOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPDeindexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNestedOperator;
@@ -24,8 +25,7 @@ import java.util.Objects;
 
 /** Find operators that have multiple outputs that are all projections.
  * Compute for each such operator a projection that is the "largest", and use it
- * as a root of a tree of projections.
- */
+ * as a root of a tree of projections; that replacement is done in {@link ReplaceCommonProjections}. */
 public class FindCommonProjections extends CircuitWithGraphsVisitor {
     /** For each operator that has multiple projection successors, this is the "largest" projection */
     public final Map<DBSPOperator, DBSPClosureExpression> outputProjection;
@@ -54,20 +54,24 @@ public class FindCommonProjections extends CircuitWithGraphsVisitor {
         int depth = operator.outputType(0).is(DBSPTypeZSet.class) ? 1 : 2;
         boolean failed;
         List<FieldUseMap> usage = new ArrayList<>();
-        List<FindUnusedFields> finders = new ArrayList<>();
+        List<ParameterFieldUse> useList = new ArrayList<>();
+        List<DBSPClosureExpression> closures = new ArrayList<>();
         for (Port<DBSPOperator> p: successors) {
-            failed = !p.node().is(DBSPMapOperator.class) && !p.node().is(DBSPMapIndexOperator.class);
+            failed = !p.node().is(DBSPMapOperator.class) &&
+                    !p.node().is(DBSPMapIndexOperator.class) &&
+                    !p.node().is(DBSPDeindexOperator.class);
             if (!failed) {
                 DBSPUnaryOperator unary = p.node().to(DBSPUnaryOperator.class);
                 failed = !unary.getFunction().is(DBSPClosureExpression.class);
                 DBSPClosureExpression closure = unary.getClosureFunction();
                 if (!failed) {
-                    FindUnusedFields finder = new FindUnusedFields(compiler);
-                    finder.findUnusedFields(closure);
-                    finders.add(finder);
-                    failed = !finder.foundUnusedFields(depth);
+                    FindUsedFields finder = new FindUsedFields(compiler);
+                    var useMap = finder.findUsedFields(closure);
+                    useList.add(useMap);
+                    closures.add(closure);
+                    failed = !useMap.hasUnusedFields(depth);
                     if (!failed)
-                        usage.add(finder.get(closure.parameters[0]));
+                        usage.add(useMap.get(closure.parameters[0]));
                 }
             }
             if (failed) {
@@ -82,14 +86,16 @@ public class FindCommonProjections extends CircuitWithGraphsVisitor {
             return;
         }
 
-        int index = 0;
-        for (FindUnusedFields finder: finders) {
+        for (int index = 0; index < useList.size(); index++) {
+            var useMap = useList.get(index);
+
             // There should be just 1 parameter.
-            DBSPParameter param = finder.parameterFieldMap.getParameters().iterator().next();
-            finder.setParameterUseMap(param, reduced);
-            RewriteFields rewriter = finder.getFieldRewriter(depth);
-            DBSPClosureExpression clo = rewriter.rewriteClosure(finder.getClosure());
-            DBSPOperator op = successors.get(index++).node();
+            DBSPParameter param = useMap.getParameters().iterator().next();
+            useMap.updateParameterValue(param, reduced);
+            RewriteFields rewriter = useMap.getFieldRewriter(this.compiler, depth);
+            DBSPClosureExpression original = closures.get(index);
+            DBSPClosureExpression clo = rewriter.rewriteClosure(original);
+            DBSPOperator op = successors.get(index).node();
             Utilities.putNew(this.inputProjection, op, clo);
         }
         DBSPClosureExpression proj = reduced.getProjection(depth);

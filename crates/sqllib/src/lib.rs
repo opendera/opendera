@@ -12,8 +12,8 @@ pub use binary::*;
 pub mod casts;
 pub use casts::*;
 #[doc(hidden)]
-pub mod dec;
-pub use dec::*;
+pub mod decimal;
+pub use decimal::*;
 #[doc(hidden)]
 pub mod error;
 pub use error::*;
@@ -34,6 +34,7 @@ pub mod operators;
 pub use operators::*;
 #[doc(hidden)]
 pub mod source;
+pub use source::*;
 #[doc(hidden)]
 pub mod string;
 pub use string::*;
@@ -46,7 +47,8 @@ pub use uuid::*;
 #[doc(hidden)]
 pub mod variant;
 pub use variant::*;
-
+#[doc(hidden)]
+pub mod rfc3339;
 #[doc(hidden)]
 pub use num_traits::Float;
 pub use regex::Regex;
@@ -56,32 +58,31 @@ pub use source::{SourcePosition, SourcePositionRange};
 mod string_interner;
 pub use string_interner::{build_string_interner, intern_string, unintern_string};
 
-use std::sync::LazyLock;
-
 // Re-export these types, so they can be used in UDFs without having to import the dbsp crate directly.
 // Perhaps they should be defined in sqllib in the first place?
 pub use dbsp::algebra::{F32, F64};
 use dbsp::{
+    DBData, MapHandle, OrdIndexedZSet, OrdZSet, OutputHandle, ZSetHandle, ZWeight,
     algebra::{
         AddByRef, HasOne, HasZero, NegByRef, OrdIndexedZSetFactories, OrdZSetFactories, Semigroup,
         SemigroupValue, ZRingValue,
     },
     circuit::metrics::TOTAL_LATE_RECORDS,
     dynamic::{DowncastTrait, DynData, Erase},
+    operator::Update,
     trace::{
-        ord::{OrdIndexedWSetBuilder, OrdWSetBuilder},
         BatchReader, BatchReaderFactories, Builder, Cursor,
+        ord::{OrdIndexedWSetBuilder, OrdWSetBuilder},
     },
-    typed_batch::TypedBatch,
+    typed_batch::{SpineSnapshot, TypedBatch},
     utils::*,
-    DBData, OrdIndexedZSet, OrdZSet, OutputHandle, SetHandle, ZSetHandle, ZWeight,
 };
-use metrics::{counter, Counter};
 use num::PrimInt;
 use num_traits::Pow;
-use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::ops::{Add, Deref, Neg};
+use std::ops::{Deref, Neg};
+use std::sync::OnceLock;
+use std::{fmt::Debug, sync::atomic::Ordering};
 
 /// Convert a value of a SQL data type to an integer
 /// that preserves ordering.  Used for partitioned_rolling_aggregates
@@ -157,41 +158,18 @@ pub(crate) use some_function1;
 // f_typeN(x: Option<T>) -> Option<S>
 // { let x = x?; Some(f_type(x)) }.
 macro_rules! some_polymorphic_function1 {
-    ($func_name:ident, $type_name: ident, $arg_type:ty, $ret_type:ty) => {
+    ($func_name:ident $(< $( const $var : ident : $ty: ty),* >)?, $type_name: ident, $arg_type:ty, $ret_type:ty) => {
         ::paste::paste! {
             #[doc(hidden)]
-            pub fn [<$func_name _ $type_name N>]( arg: Option<$arg_type> ) -> Option<$ret_type> {
+            pub fn [<$func_name _ $type_name N>] $(< $( const $var : $ty ),* >)? ( arg: Option<$arg_type> ) -> Option<$ret_type> {
                 let arg = arg?;
-                Some([<$func_name _ $type_name >](arg))
+                Some([<$func_name _ $type_name >] $(:: < $($var),* >)? (arg))
             }
         }
     };
 }
 
 pub(crate) use some_polymorphic_function1;
-
-// Macro to create variants of a polymorphic function with 1 argument that is
-// also polymorphic in the return type.
-// If there exists a function is f_type_result(x: T) -> S, this creates a
-// function
-// f_typeN_resultN(x: Option<T>) -> Option<S>
-// { let x = x?; Some(f_type(x)) }.
-#[allow(unused_macros)]
-macro_rules! polymorphic_return_function1 {
-    ($func_name:ident, $type_name: ident, $arg_type:ty, $ret_name: ident, $ret_type:ty) => {
-        ::paste::paste! {
-            #[doc(hidden)]
-            pub fn [<$func_name _ $type_name N _ $ret_name N>]( arg: Option<$arg_type> ) -> Option<$ret_type> {
-                let arg = arg?;
-                Some([<$func_name _ $type_name >](arg))
-            }
-        }
-    };
-}
-
-// Maybe we will need this someday
-#[allow(unused_imports)]
-pub(crate) use polymorphic_return_function1;
 
 // Macro to create variants of a function with 2 arguments
 // If there exists a function is f__(x: T, y: S) -> U, this creates
@@ -227,87 +205,6 @@ macro_rules! some_function2 {
 
 pub(crate) use some_function2;
 
-// Macro to create variants of a function with 2 arguments and
-// a generic trait bound
-// If there exists a function is f__<T: TraitBound>(x: X, y: S) -> U, this
-// creates three functions:
-// - f_N<T: TraitBound>(x: X, y: Option<S>) -> Option<U>
-// - fN_<T: TraitBound>(x: Option<X>, y: S) -> Option<U>
-// - fNN<T: TraitBound>(x: Option<X>, y: Option<S>) -> Option<U>
-// The resulting functions return Some only if all arguments are 'Some'.
-// The generic type may be a part of the type of both parameters, just one of
-// them or even the return type
-macro_rules! some_generic_function2 {
-    ($func_name:ident, $generic_type: ty, $arg_type0: ty, $arg_type1: ty, $bound: tt $(+ $bounds: tt)*, $ret_type: ty) => {
-        ::paste::paste! {
-            #[doc(hidden)]
-            pub fn [<$func_name NN>]<$generic_type>( arg0: Option<$arg_type0>, arg1: Option<$arg_type1> ) -> Option<$ret_type>
-            where
-                $generic_type: $bound $(+ $bounds)*,
-            {
-                let arg0 = arg0?;
-                let arg1 = arg1?;
-                Some([<$func_name __>](arg0, arg1))
-            }
-
-            #[doc(hidden)]
-            pub fn [<$func_name _N>]<$generic_type>( arg0: $arg_type0, arg1: Option<$arg_type1> ) -> Option<$ret_type>
-            where
-                $generic_type: $bound $(+ $bounds)*,
-            {
-                let arg1 = arg1?;
-                Some([<$func_name __>](arg0, arg1))
-            }
-
-            #[doc(hidden)]
-            pub fn [<$func_name N_>]<$generic_type>( arg0: Option<$arg_type0>, arg1: $arg_type1 ) -> Option<$ret_type>
-            where
-                $generic_type: $bound $(+ $bounds)*,
-            {
-                let arg0 = arg0?;
-                Some([<$func_name __>](arg0, arg1))
-            }
-        }
-    };
-}
-
-pub(crate) use some_generic_function2;
-
-// Macro to create variants of a polymorphic function with 2 arguments
-// that is also polymorphic in the return type
-// If there exists a function is f_type1_type2_result(x: T, y: S) -> U, this
-// creates three functions:
-// - f_type1_type2N_resultN(x: T, y: Option<S>) -> Option<U>
-// - f_type1N_type2_resultN(x: Option<T>, y: S) -> Option<U>
-// - f_type1N_type2N_resultN(x: Option<T>, y: Option<S>) -> Option<U>
-// The resulting functions return Some only if all arguments are 'Some'.
-macro_rules! polymorphic_return_function2 {
-    ($func_name:ident, $type_name0: ident, $arg_type0:ty, $type_name1: ident, $arg_type1:ty, $ret_name: ident, $ret_type:ty) => {
-        ::paste::paste! {
-            #[doc(hidden)]
-            pub fn [<$func_name _$type_name0 _ $type_name1 N _ $ret_name N>]( arg0: $arg_type0, arg1: Option<$arg_type1> ) -> Option<$ret_type> {
-                let arg1 = arg1?;
-                Some([<$func_name _ $type_name0 _ $type_name1 _ $ret_name>](arg0, arg1))
-            }
-
-            #[doc(hidden)]
-            pub fn [<$func_name _ $type_name0 N _ $type_name1 _ $ret_name N>]( arg0: Option<$arg_type0>, arg1: $arg_type1 ) -> Option<$ret_type> {
-                let arg0 = arg0?;
-                Some([<$func_name _ $type_name0 _ $type_name1 _ $ret_name>](arg0, arg1))
-            }
-
-            #[doc(hidden)]
-            pub fn [<$func_name _ $type_name0 N _ $type_name1 N _ $ret_name N>]( arg0: Option<$arg_type0>, arg1: Option<$arg_type1> ) -> Option<$ret_type> {
-                let arg0 = arg0?;
-                let arg1 = arg1?;
-                Some([<$func_name _ $type_name0 _ $type_name1 _ $ret_name>](arg0, arg1))
-            }
-        }
-    }
-}
-
-pub(crate) use polymorphic_return_function2;
-
 // Macro to create variants of a polymorphic function with 2 arguments
 // If there exists a function is f_type1_type2(x: T, y: S) -> U, this
 // creates three functions:
@@ -316,25 +213,25 @@ pub(crate) use polymorphic_return_function2;
 // - f_type1N_type2N(x: Option<T>, y: Option<S>) -> Option<U>
 // The resulting functions return Some only if all arguments are 'Some'.
 macro_rules! some_polymorphic_function2 {
-    ($func_name:ident, $type_name0: ident, $arg_type0:ty, $type_name1: ident, $arg_type1:ty, $ret_type:ty) => {
+    ($func_name:ident  $(< $( const $var:ident : $ty: ty),* >)?, $type_name0: ident, $arg_type0:ty, $type_name1: ident, $arg_type1:ty, $ret_type:ty) => {
         ::paste::paste! {
             #[doc(hidden)]
-            pub fn [<$func_name _$type_name0 _ $type_name1 N>]( arg0: $arg_type0, arg1: Option<$arg_type1> ) -> Option<$ret_type> {
+            pub fn [<$func_name _$type_name0 _ $type_name1 N>] $(< $( const $var : $ty),* >)? ( arg0: $arg_type0, arg1: Option<$arg_type1> ) -> Option<$ret_type> {
                 let arg1 = arg1?;
-                Some([<$func_name _ $type_name0 _ $type_name1>](arg0, arg1))
+                Some([<$func_name _ $type_name0 _ $type_name1>] $(:: < $($var),* >)? (arg0, arg1))
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $type_name0 N _ $type_name1>]( arg0: Option<$arg_type0>, arg1: $arg_type1 ) -> Option<$ret_type> {
+            pub fn [<$func_name _ $type_name0 N _ $type_name1>] $(< $( const $var : $ty),* >)? ( arg0: Option<$arg_type0>, arg1: $arg_type1 ) -> Option<$ret_type> {
                 let arg0 = arg0?;
-                Some([<$func_name _ $type_name0 _ $type_name1>](arg0, arg1))
+                Some([<$func_name _ $type_name0 _ $type_name1>] $(:: < $($var),* >)? (arg0, arg1))
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name _ $type_name0 N _ $type_name1 N>]( arg0: Option<$arg_type0>, arg1: Option<$arg_type1> ) -> Option<$ret_type> {
+            pub fn [<$func_name _ $type_name0 N _ $type_name1 N>] $(< $( const $var : $ty),* >)? ( arg0: Option<$arg_type0>, arg1: Option<$arg_type1> ) -> Option<$ret_type> {
                 let arg0 = arg0?;
                 let arg1 = arg1?;
-                Some([<$func_name _ $type_name0 _ $type_name1>](arg0, arg1))
+                Some([<$func_name _ $type_name0 _ $type_name1>] $(:: < $($var),* >)? (arg0, arg1))
             }
         }
     }
@@ -560,7 +457,21 @@ macro_rules! some_function4 {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name N__N>]( arg0: Option<$arg_type0>, arg1: $arg_type1, arg2: Option<$arg_type2>, arg3: Option<$arg_type3> ) -> Option<$ret_type> {
+            pub fn [<$func_name N__N>]( arg0: Option<$arg_type0>, arg1: $arg_type1, arg2: $arg_type2, arg3: Option<$arg_type3> ) -> Option<$ret_type> {
+                let arg0 = arg0?;
+                let arg3 = arg3?;
+                Some([<$func_name ____>](arg0, arg1, arg2, arg3))
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func_name N_N_>]( arg0: Option<$arg_type0>, arg1: $arg_type1, arg2: Option<$arg_type2>, arg3: $arg_type3 ) -> Option<$ret_type> {
+                let arg0 = arg0?;
+                let arg2 = arg2?;
+                Some([<$func_name ____>](arg0, arg1, arg2, arg3))
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func_name N_NN>]( arg0: Option<$arg_type0>, arg1: $arg_type1, arg2: Option<$arg_type2>, arg3: Option<$arg_type3> ) -> Option<$ret_type> {
                 let arg0 = arg0?;
                 let arg2 = arg2?;
                 let arg3 = arg3?;
@@ -568,31 +479,16 @@ macro_rules! some_function4 {
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name N_N_>]( arg0: Option<$arg_type0>, arg1: Option<$arg_type1>, arg2: $arg_type2, arg3: $arg_type3 ) -> Option<$ret_type> {
+            pub fn [<$func_name NN__>]( arg0: Option<$arg_type0>, arg1: Option<$arg_type1>, arg2: $arg_type2, arg3: $arg_type3 ) -> Option<$ret_type> {
                 let arg0 = arg0?;
                 let arg1 = arg1?;
                 Some([<$func_name ____>](arg0, arg1, arg2, arg3))
             }
 
             #[doc(hidden)]
-            pub fn [<$func_name N_NN>]( arg0: Option<$arg_type0>, arg1: Option<$arg_type1>, arg2: Option<$arg_type2>, arg3: Option<$arg_type3> ) -> Option<$ret_type> {
+            pub fn [<$func_name NN_N>]( arg0: Option<$arg_type0>, arg1: Option<$arg_type1>, arg2: $arg_type2, arg3: Option<$arg_type3> ) -> Option<$ret_type> {
                 let arg0 = arg0?;
                 let arg1 = arg1?;
-                let arg2 = arg2?;
-                let arg3 = arg3?;
-                Some([<$func_name ____>](arg0, arg1, arg2, arg3))
-            }
-
-            #[doc(hidden)]
-            pub fn [<$func_name NN__>]( arg0: Option<$arg_type0>, arg1: $arg_type1, arg2: $arg_type2, arg3: $arg_type3 ) -> Option<$ret_type> {
-                let arg0 = arg0?;
-                Some([<$func_name ____>](arg0, arg1, arg2, arg3))
-            }
-
-            #[doc(hidden)]
-            pub fn [<$func_name NN_N>]( arg0: Option<$arg_type0>, arg1: $arg_type1, arg2: Option<$arg_type2>, arg3: Option<$arg_type3> ) -> Option<$ret_type> {
-                let arg0 = arg0?;
-                let arg2 = arg2?;
                 let arg3 = arg3?;
                 Some([<$func_name ____>](arg0, arg1, arg2, arg3))
             }
@@ -628,28 +524,28 @@ pub(crate) use some_function4;
 // - f_tN_tN(x: Option<T>, y: Option<T>) -> Option<U>
 // The resulting functions return Some only if all arguments are 'Some'.
 macro_rules! some_existing_operator {
-    ($func_name: ident, $short_name: ident, $arg_type: ty, $ret_type: ty) => {
+    ($func_name: ident $(< $( const $var:ident : $ty: ty),* >)?, $short_name: ident, $arg_type: ty, $ret_type: ty) => {
         ::paste::paste! {
             #[inline(always)]
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name N _ $short_name N>]( arg0: Option<$arg_type>, arg1: Option<$arg_type> ) -> Option<$ret_type> {
+            pub fn [<$func_name _ $short_name N _ $short_name N>] $(< $( const $var : $ty ),* >)? ( arg0: Option<$arg_type>, arg1: Option<$arg_type> ) -> Option<$ret_type> {
                 let arg0 = arg0?;
                 let arg1 = arg1?;
-                Some([<$func_name _ $short_name _ $short_name>](arg0, arg1))
+                Some([<$func_name _ $short_name _ $short_name>] $(:: < $($var),* >)? (arg0, arg1))
             }
 
             #[inline(always)]
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name _ $short_name N>]( arg0: $arg_type, arg1: Option<$arg_type> ) -> Option<$ret_type> {
+            pub fn [<$func_name _ $short_name _ $short_name N>] $(< $( const $var : $ty ),* >)? ( arg0: $arg_type, arg1: Option<$arg_type> ) -> Option<$ret_type> {
                 let arg1 = arg1?;
-                Some([<$func_name _ $short_name _ $short_name>](arg0, arg1))
+                Some([<$func_name _ $short_name _ $short_name>] $(:: < $($var),* >)? (arg0, arg1))
             }
 
             #[inline(always)]
             #[doc(hidden)]
-            pub fn [<$func_name _ $short_name N _ $short_name>]( arg0: Option<$arg_type>, arg1: $arg_type ) -> Option<$ret_type> {
+            pub fn [<$func_name _ $short_name N _ $short_name>] $(< $( const $var : $ty ),* >)? ( arg0: Option<$arg_type>, arg1: $arg_type ) -> Option<$ret_type> {
                 let arg0 = arg0?;
-                Some([<$func_name _ $short_name _ $short_name>](arg0, arg1))
+                Some([<$func_name _ $short_name _ $short_name>] $(:: < $($var),* >)? (arg0, arg1))
             }
         }
     }
@@ -673,47 +569,32 @@ pub(crate) use some_existing_operator;
 // - Takes the name of the existing function, and the prefix for the generated
 // functions
 macro_rules! some_operator {
-    ($func_name: ident, $short_name: ident, $arg_type: ty, $ret_type: ty) => {
+    ($func_name: ident $(< $( const $var:ident : $ty: ty),* >)?, $short_name: ident, $arg_type: ty, $ret_type: ty) => {
         ::paste::paste! {
             #[doc(hidden)]
             #[inline(always)]
-            pub fn [<$func_name _ $short_name _ $short_name >]( arg0: $arg_type, arg1: $arg_type ) -> $ret_type {
-                $func_name(arg0, arg1)
+            pub fn [<$func_name _ $short_name _ $short_name >] $(< $(const $var : $ty),* >)?  ( arg0: $arg_type, arg1: $arg_type ) -> $ret_type {
+                $func_name $(:: < $($var),* >)? (arg0, arg1)
             }
 
-            some_existing_operator!($func_name, $short_name, $arg_type, $ret_type);
+            some_existing_operator!($func_name $(< $( const $var : $ty),* >)?, $short_name, $arg_type, $ret_type);
         }
     };
 
-    ($func_name: ident, $new_func_name: ident, $short_name: ident, $arg_type: ty, $ret_type: ty) => {
+    ($func_name: ident $(< $( const $var:ident : $ty: ty),* >)?, $new_func_name: ident, $short_name: ident, $arg_type: ty, $ret_type: ty) => {
         ::paste::paste! {
             #[doc(hidden)]
             #[inline(always)]
-            pub fn [<$new_func_name _ $short_name _ $short_name >]( arg0: $arg_type, arg1: $arg_type ) -> $ret_type {
-                $func_name(arg0, arg1)
+            pub fn [<$new_func_name _ $short_name _ $short_name >] $(< $(const $var : $ty ),* >)? ( arg0: $arg_type, arg1: $arg_type ) -> $ret_type {
+                $func_name $(:: < $($var),* >)? (arg0, arg1)
             }
 
-            some_existing_operator!($new_func_name, $short_name, $arg_type, $ret_type);
+            some_existing_operator!($new_func_name $(< $( const $var : $ty),* >)?, $short_name, $arg_type, $ret_type);
         }
     }
 }
 
 pub(crate) use some_operator;
-
-macro_rules! for_all_int_operator {
-    ($func_name: ident) => {
-        some_operator!($func_name, i8, i8, i8);
-        some_operator!($func_name, i16, i16, i16);
-        some_operator!($func_name, i32, i32, i32);
-        some_operator!($func_name, i64, i64, i64);
-        some_operator!($func_name, i128, i128, i128);
-        some_operator!($func_name, u8, u8, u8);
-        some_operator!($func_name, u16, u16, u16);
-        some_operator!($func_name, u32, u32, u32);
-        some_operator!($func_name, u64, u64, u64);
-    };
-}
-pub(crate) use for_all_int_operator;
 
 #[doc(hidden)]
 #[inline(always)]
@@ -892,8 +773,32 @@ pub fn abs_d(left: F64) -> F64 {
 
 #[doc(hidden)]
 #[inline(always)]
-pub fn abs_SqlDecimal(left: SqlDecimal) -> SqlDecimal {
-    left.abs()
+pub fn abs_u8(left: u8) -> u8 {
+    left
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn abs_u16(left: u16) -> u16 {
+    left
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn abs_u32(left: u32) -> u32 {
+    left
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn abs_u64(left: u64) -> u64 {
+    left
+}
+
+#[doc(hidden)]
+#[inline(always)]
+pub fn abs_u128(left: u128) -> u128 {
+    left
 }
 
 some_polymorphic_function1!(abs, i8, i8, i8);
@@ -903,7 +808,82 @@ some_polymorphic_function1!(abs, i64, i64, i64);
 some_polymorphic_function1!(abs, i128, i128, i128);
 some_polymorphic_function1!(abs, f, F32, F32);
 some_polymorphic_function1!(abs, d, F64, F64);
-some_polymorphic_function1!(abs, SqlDecimal, SqlDecimal, SqlDecimal);
+some_polymorphic_function1!(abs, u8, u8, u8);
+some_polymorphic_function1!(abs, u16, u16, u16);
+some_polymorphic_function1!(abs, u32, u32, u32);
+some_polymorphic_function1!(abs, u64, u64, u64);
+some_polymorphic_function1!(abs, u128, u128, u128);
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_i8(x: i8) -> i8 {
+    if x == 0 { x } else { x.signum() }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_i16(x: i16) -> i16 {
+    if x == 0 { x } else { x.signum() }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_i32(x: i32) -> i32 {
+    if x == 0 { x } else { x.signum() }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_i64(x: i64) -> i64 {
+    if x == 0 { x } else { x.signum() }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_i128(x: i128) -> i128 {
+    if x == 0 { x } else { x.signum() }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_u8(x: u8) -> u8 {
+    if x == 0 { x } else { 1 }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_u16(x: u16) -> u16 {
+    if x == 0 { x } else { 1 }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_u32(x: u32) -> u32 {
+    if x == 0 { x } else { 1 }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_u64(x: u64) -> u64 {
+    if x == 0 { x } else { 1 }
+}
+
+#[inline(always)]
+#[doc(hidden)]
+pub fn sign_u128(x: u128) -> u128 {
+    if x == 0 { x } else { 1 }
+}
+
+some_polymorphic_function1!(sign, i8, i8, i8);
+some_polymorphic_function1!(sign, i16, i16, i16);
+some_polymorphic_function1!(sign, i32, i32, i32);
+some_polymorphic_function1!(sign, i64, i64, i64);
+some_polymorphic_function1!(sign, i128, i128, i128);
+some_polymorphic_function1!(sign, u8, u8, u8);
+some_polymorphic_function1!(sign, u16, u16, u16);
+some_polymorphic_function1!(sign, u32, u32, u32);
+some_polymorphic_function1!(sign, u64, u64, u64);
+some_polymorphic_function1!(sign, u128, u128, u128);
 
 #[doc(hidden)]
 #[inline(always)]
@@ -1070,11 +1050,7 @@ where
 
 #[doc(hidden)]
 pub fn late() {
-    static TOTAL_LATE_RECORDS_COUNTER: LazyLock<Counter> =
-        LazyLock::new(|| counter!(TOTAL_LATE_RECORDS));
-
-    // println!("Late record");
-    TOTAL_LATE_RECORDS_COUNTER.increment(1);
+    TOTAL_LATE_RECORDS.fetch_add(1, Ordering::Relaxed);
 }
 
 #[doc(hidden)]
@@ -1086,7 +1062,7 @@ where
 {
     let factories = OrdZSetFactories::new::<D, (), ZWeight>();
 
-    let mut builder = OrdWSetBuilder::with_capacity(&factories, data.len());
+    let mut builder = OrdWSetBuilder::with_capacity(&factories, data.len(), data.len());
 
     let mut cursor = data.cursor();
     while cursor.key_valid() {
@@ -1116,7 +1092,8 @@ where
     F: Fn((&K, &D), &T) -> bool,
 {
     let factories = OrdIndexedZSetFactories::new::<K, D, ZWeight>();
-    let mut builder = OrdIndexedWSetBuilder::with_capacity(&factories, data.len());
+    let mut builder =
+        OrdIndexedWSetBuilder::with_capacity(&factories, data.key_count(), data.len());
 
     let mut cursor = data.cursor();
     while cursor.key_valid() {
@@ -1142,22 +1119,27 @@ where
 }
 
 #[doc(hidden)]
-pub fn append_to_upsert_handle<K>(data: &WSet<K>, handle: &SetHandle<K>)
-where
+pub fn append_to_map_handle<K, V, U>(
+    data: &WSet<V>,
+    handle: &MapHandle<K, V, U>,
+    key_f: fn(&V) -> K,
+) where
     K: DBData,
+    V: DBData,
+    U: DBData,
 {
     let mut cursor = data.cursor();
     while cursor.key_valid() {
-        let mut w = *cursor.weight().deref();
-        let mut insert = true;
-        if !w.ge0() {
-            insert = false;
-            w = w.neg();
+        let w = *cursor.weight().deref();
+        if w.is_zero() {
+            continue;
         }
-        while !w.le0() {
-            let key = unsafe { cursor.key().downcast::<K>() };
-            handle.push(key.clone(), insert);
-            w = w.add(Weight::neg(Weight::one()));
+        if !w.ge0() {
+            let key = unsafe { cursor.key().downcast::<V>() };
+            handle.push(key_f(&key.clone()), Update::Delete);
+        } else {
+            let key = unsafe { cursor.key().downcast::<V>() };
+            handle.push(key_f(&key.clone()), Update::Insert(key.clone()));
         }
         cursor.step_key();
     }
@@ -1186,6 +1168,14 @@ where
     handle.consolidate()
 }
 
+#[doc(hidden)]
+pub fn read_output_spine<K>(handle: &OutputHandle<SpineSnapshot<WSet<K>>>) -> WSet<K>
+where
+    K: DBData,
+{
+    handle.concat().consolidate()
+}
+
 // Check that two zsets are equal.  If yes, returns true.
 // If not, print a diff of the zsets and returns false.
 // Assumes that the zsets are positive (all weights are positive).
@@ -1200,17 +1190,42 @@ where
         return true;
     }
     let mut cursor = diff.cursor();
+    let mut shown = 0;
+    let mut left = 0;
+    let mut right = 0;
     while cursor.key_valid() {
         let weight = **cursor.weight();
         let key = cursor.key();
-        if weight.le0() {
-            println!("R: {:?}x{:?}", key, weight.neg());
+        if shown < 50 {
+            if weight.le0() {
+                println!("R: {:?}x{:?}", key, weight.neg());
+            } else {
+                println!("L: {:?}x{:?}", key, weight);
+            }
+        } else if weight.le0() {
+            right += weight.neg();
         } else {
-            println!("L: {:?}x{:?}", key, weight);
+            left += weight;
         }
         cursor.step_key();
+        shown += 1;
+    }
+    if left > 0 || right > 0 {
+        println!("Additional L:{left} and R:{right} rows not shown");
     }
     false
+}
+
+#[doc(hidden)]
+pub fn zset_size<K>(set: &WSet<K>) -> i64 {
+    let mut w = 0;
+    let mut cursor = set.cursor();
+    while cursor.key_valid() {
+        let weight = **cursor.weight();
+        w += weight;
+        cursor.step_key();
+    }
+    w
 }
 
 //////////////////////// Semigroup implementations
@@ -1302,4 +1317,126 @@ where
             },
         )
     }
+}
+
+// Semigroup for the an aggregate which computes nothing
+// Useful when the compiler removes all aggregates from an aggregate operator
+// (This is currently never used, because the compiler generates a linear aggregate
+// for this case)
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct EmptySemigroup;
+
+#[doc(hidden)]
+impl Semigroup<Tup0> for EmptySemigroup {
+    #[doc(hidden)]
+    fn combine(_left: &Tup0, _right: &Tup0) -> Tup0 {
+        Tup0::new()
+    }
+}
+
+/// A lazily initialized static value, where the initialized can be a capturing
+/// closure.
+///
+/// This struct is supposed to do the same thing as some other lazy
+/// Rust types, like std::sync::Lazy, or std::cell::LazyCell: it holds
+/// a constant value, but which needs to be initialized only on demand
+/// (because it could panic).  Unfortunately I could not use an
+/// off-the-shelf struct like the ones mentioned, because the
+/// initializer is not always `const`.  This implementation separates
+/// the creation (`new`) from the initialization (`init`).  This
+/// enables us to use this class to declare `static` Rust values,
+/// which nevertheless are initialized on first use.  In the
+/// initializers we actually always use static constant values to, but
+/// they are sometimes passed through function arguments, so the Rust
+/// compiler cannot recognize them as such.  For example:
+/// ```ignore
+/// // In the main crate:
+/// pub static SOURCE_MAP_STATIC: OnceLock<SourceMap> = OnceLock::new();
+/// SOURCE_MAP_STATIC.get_or_init(|| {
+///      let mut m = SourceMap::new();
+///           m.insert("0ee9907f", 0, SourcePosition::new(222, 2));
+///           m.insert("0ee9907f", 1, SourcePosition::new(223, 2));
+///           m
+///       });
+/// let sourceMap = SOURCE_MAP_STATIC.get().unwrap();
+/// let s3 = create_operator_x(&circuit, Some("0ee9907f"), &sourceMap, &mut catalog, s2);
+/// ...
+/// // In the operator crate
+/// pub fn create_operator_x(
+///         circuit: &RootCircuit,
+///         hash: Option<&'static str>,
+///         sourceMap: &'static SourceMap,  // static lifetime, but not const
+///         catalog: &mut Catalog,
+///         i0: &Stream<RootCircuit, WSet<...>>) -> Stream<RootCircuit, ...> {
+///    static STATIC_4dbc5aebe9c4edea: StaticLazy<Option<SqlDecimal<38, 6>>> = StaticLazy::new();
+///    STATIC_4dbc5aebe9c4edea.init(move || handle_error_with_position(
+///               "global", 25, &sourceMap, cast_to_SqlDecimalN_i32N::<38, 6>(Some(1i32));
+///    ...
+/// };
+/// ```
+/// The function `handle_error_with_position` may panic, so it needs to be lazily evaluated.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct StaticLazy<T: 'static> {
+    cell: OnceLock<T>,
+    init: OnceLock<&'static (dyn Fn() -> T + Send + Sync)>,
+}
+
+#[doc(hidden)]
+impl<T> StaticLazy<T> {
+    #[doc(hidden)]
+    pub const fn new() -> Self {
+        Self {
+            cell: OnceLock::new(),
+            init: OnceLock::new(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn init<F>(&'static self, f: F)
+    where
+        F: Fn() -> T + Send + Sync + 'static,
+    {
+        if self.cell.get().is_some() {
+            return;
+        }
+        let leaked: &'static (dyn Fn() -> T + Send + Sync) = Box::leak(Box::new(f));
+        self.init.set(leaked).unwrap_or(());
+    }
+
+    #[doc(hidden)]
+    fn get(&self) -> &T {
+        self.cell.get_or_init(|| {
+            let f = self
+                .init
+                .get()
+                .unwrap_or_else(|| panic!("Initializer not set"));
+            f()
+        })
+    }
+}
+
+#[doc(hidden)]
+impl<T> Deref for StaticLazy<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+#[doc(hidden)]
+// If the data is Ok(None), convert it to Err, other leave it unchanged
+pub fn unwrap_sql_result<T>(data: SqlResult<Option<T>>) -> SqlResult<T> {
+    match data {
+        Err(e) => Err(e),
+        Ok(None) => Err(SqlRuntimeError::from_strng("NULL result produced")),
+        Ok(Some(data)) => Ok(data),
+    }
+}
+
+#[doc(hidden)]
+pub fn wrap_sql_result<T>(data: T) -> SqlResult<T> {
+    Ok(data)
 }

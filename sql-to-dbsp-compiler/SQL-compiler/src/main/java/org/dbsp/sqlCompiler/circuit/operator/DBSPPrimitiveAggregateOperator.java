@@ -17,11 +17,12 @@ import java.util.List;
 
 /** This is a primitive operator that corresponds to the Rust AggregateIncremental node. */
 @NonCoreIR
-public final class DBSPPrimitiveAggregateOperator extends DBSPBinaryOperator {
+public final class DBSPPrimitiveAggregateOperator extends DBSPBinaryOperator
+        implements INonLinearAggregate, IIncremental {
     public DBSPPrimitiveAggregateOperator(
             CalciteRelNode node, @Nullable DBSPExpression function, DBSPType outputType,
             OutputPort delta, OutputPort integral) {
-        super(node, "AggregateIncremental", function, outputType, false, delta, integral, true);
+        super(node, "AggregateIncremental", function, outputType, false, delta, integral);
         Utilities.enforce(delta.getOutputIndexedZSetType().sameType(integral.getOutputIndexedZSetType()));
     }
 
@@ -30,7 +31,7 @@ public final class DBSPPrimitiveAggregateOperator extends DBSPBinaryOperator {
             @Nullable DBSPExpression function, DBSPType outputType,
             List<OutputPort> newInputs, boolean force) {
         if (this.mustReplace(force, function, newInputs, outputType)) {
-            Utilities.enforce(newInputs.size() == 2, "Expected 2 inputs");
+            Utilities.enforce(newInputs.size() == 2, () -> "Expected 2 inputs");
             if (force || this.inputsDiffer(newInputs))
                 return new DBSPPrimitiveAggregateOperator(this.getRelNode(), function,
                         outputType, newInputs.get(0), newInputs.get(1)).copyAnnotations(this);

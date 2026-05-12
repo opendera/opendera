@@ -111,19 +111,6 @@ public class WinAggPostTests extends PostBaseTests {
                 +--------+--------+-------+----+---+-----+
                 (8 rows)
 
-                select *, first_value(ename) over (partition by deptno order by gender range unbounded preceding) from emp;
-                 ename | deptno | gender | first_value
-                -------+--------+--------+-------------
-                 Jane  |     10 | F      | Jane
-                 Bob   |     10 | M      | Jane
-                 Eric  |     20 | M      | Eric
-                 Alice |     30 | F      | Alice
-                 Susan |     30 | F      | Alice
-                 Eve   |     50 | F      | Eve
-                 Adam  |     50 | M      | Eve
-                 Grace |     60 | F      | Grace
-                (8 rows)
-
                 -- [CALCITE-6011] Add the planner rule that pushes the Filter past a Window
                 -- Get the initial result which not push filter past window.
                 select gender, count(*) over(partition by gender order by ename) as count1 from emp;
@@ -161,7 +148,21 @@ public class WinAggPostTests extends PostBaseTests {
     public void test0() {
         // Constant argument to aggregate, issue 4010
         // validated on Postgres
-        this.qs("""
+        this.qs(""" 
+                select *, first_value(ename) over (partition by deptno order by gender range unbounded preceding) from emp;
+                 ename | deptno | gender | first_value
+                -------+--------+--------+-------------
+                 Jane|       10 | F| Jane
+                 Bob|        10 | M| Jane
+                 Eric|       20 | M| Eric
+                 Alice|      30 | F| Alice
+                 Susan|      30 | F| Alice
+                 Eve|        50 | F| Eve
+                 Adam|       50 | M| Eve
+                 Grace|      60 | F| Grace
+                 Wilma|         | F| Wilma
+                (9 rows)
+                
                 select gender,deptno,
                 sum(1) over (partition by gender,deptno) as count1
                 from emp;
@@ -230,43 +231,43 @@ public class WinAggPostTests extends PostBaseTests {
                 select *, first_value(deptno) over () from emp;
                  ename | deptno | gender | first_value
                 -------+--------+--------+-------------
-                 Jane  |     10 | F|                50
-                 Bob   |     10 | M|                50
-                 Eric  |     20 | M|                50
-                 Susan |     30 | F|                50
-                 Alice |     30 | F|                50
-                 Adam  |     50 | M|                50
-                 Eve   |     50 | F|                50
-                 Grace |     60 | F|                50
-                 Wilma |        | F|                50
+                 Jane|       10 | F|                50
+                 Bob|        10 | M|                50
+                 Eric|       20 | M|                50
+                 Susan|      30 | F|                50
+                 Alice|      30 | F|                50
+                 Adam|       50 | M|                50
+                 Eve|        50 | F|                50
+                 Grace|      60 | F|                50
+                 Wilma|         | F|                50
                 (9 rows)""");
         this.qs("""
                 select *, first_value(ename) over () from emp;
                  ename | deptno | gender | first_value
                 -------+--------+--------+-------------
-                 Jane  |     10 | F| Adam
-                 Bob   |     10 | M| Adam
-                 Eric  |     20 | M| Adam
-                 Susan |     30 | F| Adam
-                 Alice |     30 | F| Adam
-                 Adam  |     50 | M| Adam
-                 Eve   |     50 | F| Adam
-                 Grace |     60 | F| Adam
-                 Wilma |        | F| Adam
+                 Jane|       10 | F| Adam
+                 Bob|        10 | M| Adam
+                 Eric|       20 | M| Adam
+                 Susan|      30 | F| Adam
+                 Alice|      30 | F| Adam
+                 Adam|       50 | M| Adam
+                 Eve|        50 | F| Adam
+                 Grace|      60 | F| Adam
+                 Wilma|         | F| Adam
                 (9 rows)
 
                 select *, first_value(ename) over (partition by deptno) from emp;
                  ename | deptno | gender | first_value
                 -------+--------+--------+-------------
-                 Jane  |     10 | F| Bob
-                 Bob   |     10 | M| Bob
-                 Eric  |     20 | M| Eric
-                 Susan |     30 | F| Alice
-                 Alice |     30 | F| Alice
-                 Adam  |     50 | M| Adam
-                 Eve   |     50 | F| Adam
-                 Grace |     60 | F| Grace
-                 Wilma |        | F| Wilma
+                 Jane|       10 | F| Bob
+                 Bob|        10 | M| Bob
+                 Eric|       20 | M| Eric
+                 Susan|      30 | F| Alice
+                 Alice|      30 | F| Alice
+                 Adam|       50 | M| Adam
+                 Eve|        50 | F| Adam
+                 Grace|      60 | F| Grace
+                 Wilma|         | F| Wilma
                 (9 rows)""");
     }
 
@@ -298,15 +299,15 @@ public class WinAggPostTests extends PostBaseTests {
                 +-------+--------+--------+---+
                 | ENAME | DEPTNO | GENDER | C |
                 +-------+--------+--------+---+
-                | Adam  |     50 | M| 2       |
-                | Alice |     30 | F| 2       |
-                | Bob   |     10 | M| 2       |
-                | Eric  |     20 | M| 1       |
-                | Eve   |     50 | F| 2       |
-                | Grace |     60 | F| 1       |
-                | Jane  |     10 | F| 2       |
-                | Susan |     30 | F| 2       |
-                | Wilma |        | F| 1       |
+                | Adam|       50 | M| 2       |
+                | Alice|      30 | F| 2       |
+                | Bob|        10 | M| 2       |
+                | Eric|       20 | M| 1       |
+                | Eve|        50 | F| 2       |
+                | Grace|      60 | F| 1       |
+                | Jane|       10 | F| 2       |
+                | Susan|      30 | F| 2       |
+                | Wilma|         | F| 1       |
                 +-------+--------+--------+---+
                 (9 rows)
 
@@ -344,15 +345,15 @@ public class WinAggPostTests extends PostBaseTests {
                 +-------+--------+-------------+--------------+-------------+--------------+-------------+
                 | ENAME | DEPTNO | first_value | second_value | fifth_value | eighth_value | tenth_value |
                 +-------+--------+-------------+--------------+-------------+--------------+-------------+
-                | Adam  |     50 |          10 |           10 |          30 |           60 |             |
-                | Alice |     30 |          10 |           10 |          30 |           60 |             |
-                | Bob   |     10 |          10 |           10 |          30 |           60 |             |
-                | Eric  |     20 |          10 |           10 |          30 |           60 |             |
-                | Eve   |     50 |          10 |           10 |          30 |           60 |             |
-                | Grace |     60 |          10 |           10 |          30 |           60 |             |
-                | Jane  |     10 |          10 |           10 |          30 |           60 |             |
-                | Susan |     30 |          10 |           10 |          30 |           60 |             |
-                | Wilma |        |          10 |           10 |          30 |           60 |             |
+                | Adam|       50 |          10 |           10 |          30 |           60 |             |
+                | Alice|      30 |          10 |           10 |          30 |           60 |             |
+                | Bob|        10 |          10 |           10 |          30 |           60 |             |
+                | Eric|       20 |          10 |           10 |          30 |           60 |             |
+                | Eve|        50 |          10 |           10 |          30 |           60 |             |
+                | Grace|      60 |          10 |           10 |          30 |           60 |             |
+                | Jane|       10 |          10 |           10 |          30 |           60 |             |
+                | Susan|      30 |          10 |           10 |          30 |           60 |             |
+                | Wilma|         |          10 |           10 |          30 |           60 |             |
                 +-------+--------+-------------+--------------+-------------+--------------+-------------+
                 (9 rows)
 
@@ -505,82 +506,111 @@ public class WinAggPostTests extends PostBaseTests {
                 select *, count(*) over (order by deptno) as c from emp;
                  ENAME | DEPTNO | GENDER | C
                 -------+--------+--------+---
-                 Jane  |     10 | F| 3
-                 Bob   |     10 | M| 3
-                 Eric  |     20 | M| 4
-                 Susan |     30 | F| 6
-                 Alice |     30 | F| 6
-                 Adam  |     50 | M| 8
-                 Eve   |     50 | F| 8
-                 Grace |     60 | F| 9
-                 Wilma |        | F| 1
+                 Jane|       10 | F| 3
+                 Bob|        10 | M| 3
+                 Eric|       20 | M| 4
+                 Susan|      30 | F| 6
+                 Alice|      30 | F| 6
+                 Adam|       50 | M| 8
+                 Eve|        50 | F| 8
+                 Grace|      60 | F| 9
+                 Wilma|         | F| 1
                 (9 rows)""");
     }
 
-    @Test @Ignore("RANK not supported")
-    public void testWindows2() {
+    @Test
+    public void testRank() {
         this.qs("""
-                select *, rank() over (order by deptno) as c from emp;
+                select *, rank() over (order by deptno NULLS LAST) as c from emp;
                 +-------+--------+--------+---+
                 | ENAME | DEPTNO | GENDER | C |
                 +-------+--------+--------+---+
-                | Adam  |     50 | M      | 6 |
-                | Alice |     30 | F      | 4 |
-                | Bob   |     10 | M      | 1 |
-                | Eric  |     20 | M      | 3 |
-                | Eve   |     50 | F      | 6 |
-                | Grace |     60 | F      | 8 |
-                | Jane  |     10 | F      | 1 |
-                | Susan |     30 | F      | 4 |
-                | Wilma |        | F      | 9 |
+                | Adam|       50 | M|       6 |
+                | Alice|      30 | F|       4 |
+                | Bob|        10 | M|       1 |
+                | Eric|       20 | M|       3 |
+                | Eve|        50 | F|       6 |
+                | Grace|      60 | F|       8 |
+                | Jane|       10 | F|       1 |
+                | Susan|      30 | F|       4 |
+                | Wilma|         | F|       9 |
                 +-------+--------+--------+---+
                 (9 rows)
-
+                
                 -- Calcite does not yet generate tied ranks
-                select *, dense_rank() over (order by deptno) as c from emp;
+                select *, dense_rank() over (order by deptno NULLS LAST) as c from emp;
                 +-------+--------+--------+---+
                 | ENAME | DEPTNO | GENDER | C |
                 +-------+--------+--------+---+
-                | Adam  |     50 | M      | 4 |
-                | Alice |     30 | F      | 3 |
-                | Bob   |     10 | M      | 1 |
-                | Eric  |     20 | M      | 2 |
-                | Eve   |     50 | F      | 4 |
-                | Grace |     60 | F      | 5 |
-                | Jane  |     10 | F      | 1 |
-                | Susan |     30 | F      | 3 |
-                | Wilma |        | F      | 6 |
+                | Adam|       50 | M|       4 |
+                | Alice|      30 | F|       3 |
+                | Bob|        10 | M|       1 |
+                | Eric|       20 | M|       2 |
+                | Eve|        50 | F|       4 |
+                | Grace|      60 | F|       5 |
+                | Jane|       10 | F|       1 |
+                | Susan|      30 | F|       3 |
+                | Wilma|         | F|       6 |
                 +-------+--------+--------+---+
-                (9 rows)
+                (9 rows)""");
+    }
 
-                -- [CALCITE-806] ROW_NUMBER should emit distinct values
-                --
-                -- We only run this test under JDK 1.8 because the results are
-                -- non-deterministic and are different (but still correct) on
-                -- JDK 1.7 and other platforms.
+    @Test
+    public void testRowDifferentPartitions() {
+        // Validated on Postgres by making the query deterministic
+        this.qs("""
                 select *,
-                  row_number() over (order by deptno) as r1,
-                  row_number() over (partition by deptno order by gender desc) as r2,
-                  row_number() over (partition by deptno order by gender) as r3,
-                  row_number() over (partition by gender) as r4,
-                  row_number() over () as r
+                  row_number() over (order by deptno /*, ename, gender */) as r1,
+                  row_number() over (partition by deptno order by gender desc /*, ename */) as r2
+                from emp;
+                +-------+--------+--------+----+----+
+                | ENAME | DEPTNO | GENDER | R1 | R2 |
+                +-------+--------+--------+----+----+
+                | Wilma|         | F|        1 |  1 |
+                | Bob|        10 | M|        2 |  1 |
+                | Jane|       10 | F|        3 |  2 |
+                | Eric|       20 | M|        4 |  1 |
+                | Alice|      30 | F|        5 |  1 |
+                | Susan|      30 | F|        6 |  2 |
+                | Adam|       50 | M|        7 |  1 |
+                | Eve|        50 | F|        8 |  2 |
+                | Grace|      60 | F|        9 |  1 |
+                +-------+--------+--------+----+----+
+                (9 rows)""");
+    }
+
+    @Test
+    public void testWindows2() {
+        // Nondeterministic queries, slightly different result in Feldera from Calcite
+        // Had to adjust results, since sorting is deterministic in Feldera.
+        // Validated on Postgres by making the query deterministic by uncommenting
+        // the commented-out sort helpers
+        this.qs("""
+                -- [CALCITE-806] ROW_NUMBER should emit distinct values
+                select *,
+                  row_number() over (order by deptno /* nulls first, ename, gender */) as r1,
+                  row_number() over (partition by deptno order by gender desc /*, ename */) as r2,
+                  row_number() over (partition by deptno order by gender /*, ename */) as r3,
+                  row_number() over (partition by gender order by ename /*, deptno */) as r4,
+                  row_number() over (/* order by ename, deptno, gender */) as r
                 from emp;
                 +-------+--------+--------+----+----+----+----+---+
                 | ENAME | DEPTNO | GENDER | R1 | R2 | R3 | R4 | R |
                 +-------+--------+--------+----+----+----+----+---+
-                | Adam  |     50 | M      |  6 |  1 |  2 |  1 | 7 |
-                | Alice |     30 | F      |  5 |  2 |  2 |  6 | 6 |
-                | Bob   |     10 | M      |  2 |  1 |  2 |  3 | 9 |
-                | Eric  |     20 | M      |  3 |  1 |  1 |  2 | 8 |
-                | Eve   |     50 | F      |  7 |  2 |  1 |  2 | 2 |
-                | Grace |     60 | F      |  8 |  1 |  1 |  4 | 4 |
-                | Jane  |     10 | F      |  1 |  2 |  1 |  3 | 3 |
-                | Susan |     30 | F      |  4 |  1 |  1 |  5 | 5 |
-                | Wilma |        | F      |  9 |  1 |  1 |  1 | 1 |
+                | Wilma|         | F|        1 |  1 |  1 |  6 | 9 |
+                | Bob|        10 | M|        2 |  1 |  2 |  2 | 3 |
+                | Jane|       10 | F|        3 |  2 |  1 |  4 | 7 |
+                | Eric|       20 | M|        4 |  1 |  1 |  3 | 4 |
+                | Alice|      30 | F|        5 |  1 |  1 |  1 | 2 |
+                | Susan|      30 | F|        6 |  2 |  2 |  5 | 8 |
+                | Adam|       50 | M|        7 |  1 |  2 |  1 | 1 |
+                | Eve|        50 | F|        8 |  2 |  1 |  2 | 5 |
+                | Grace|      60 | F|        9 |  1 |  1 |  3 | 6 |
                 +-------+--------+--------+----+----+----+----+---+
                 (9 rows)
 
                 -- As above, ROW_NUMBER without explicit ORDER BY
+                -- Feldera will order by ename, deptno
                 select deptno,
                   ename,
                   row_number() over (partition by deptno) as r
@@ -589,17 +619,17 @@ public class WinAggPostTests extends PostBaseTests {
                 +--------+-------+---+
                 | DEPTNO | ENAME | R |
                 +--------+-------+---+
-                |     10 | Jane  | 1 |
-                |     30 | Alice | 2 |
-                |     30 | Susan | 1 |
-                |     50 | Eve   | 1 |
-                |     60 | Grace | 1 |
-                |        | Wilma | 1 |
+                |     10 | Jane|   1 |
+                |     30 | Alice|  1 |
+                |     30 | Susan|  2 |
+                |     50 | Eve|    1 |
+                |     60 | Grace|  1 |
+                |        | Wilma|  1 |
                 +--------+-------+---+
                 (6 rows)""");
     }
 
-    @Test @Ignore("MAP not yet supported")
+    @Test
     public void testWindows3() {
         this.qs("""
                 -- [CALCITE-2271] Two windows under a JOIN 2
@@ -607,19 +637,23 @@ public class WinAggPostTests extends PostBaseTests {
                  t1.l, t1.key as key1, t2.key as key2
                 from
                  (
-                  select
-                   dense_rank() over (order by key) l,
-                   key
-                  from
-                   unnest(map[1,1,2,2]) k
+                   select * FROM (
+                    select
+                     dense_rank() over (order by key) AS l,
+                     key
+                    from
+                     unnest(map[1,1,2,2]) k(key, value))
+                   WHERE l <= 10
                  ) t1
                  join
                  (
-                  select
-                   dense_rank() over(order by key) l,
-                   key
-                  from
-                   unnest(map[2,2]) k
+                   select * FROM (
+                    select
+                     dense_rank() over(order by key) AS l,
+                     key
+                    from
+                     unnest(map[2,2]) k(key, value))
+                   WHERE l <= 10
                  ) t2 on (t1.l = t2.l and t1.key + 1 = t2.key);
                 +---+------+------+
                 | L | KEY1 | KEY2 |

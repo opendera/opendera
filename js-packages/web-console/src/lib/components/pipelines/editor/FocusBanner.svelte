@@ -1,0 +1,52 @@
+<script lang="ts">
+  import { slide } from 'svelte/transition'
+  import type { Snippet } from '$lib/types/svelte'
+
+  const {
+    show,
+    isFocused,
+    content
+  }: {
+    show: boolean
+    isFocused: boolean
+    content: Snippet
+  } = $props()
+
+  let isInteracting = $state(false)
+  const shouldShow = $derived(show && (isFocused || isInteracting))
+
+  // Handle clicks outside to hide banner
+  $effect(() => {
+    if (!shouldShow) {
+      return
+    }
+
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as Node
+      const bannerElement = globalThis.document.querySelector('.focus-banner')
+
+      if (bannerElement && !bannerElement.contains(target)) {
+        isInteracting = false
+      }
+    }
+
+    globalThis.document.addEventListener('mousedown', handleClickOutside, true)
+
+    return () => {
+      globalThis.document.removeEventListener('mousedown', handleClickOutside, true)
+    }
+  })
+</script>
+
+{#if shouldShow}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="focus-banner"
+    transition:slide
+    onmousedown={() => {
+      isInteracting = true
+    }}
+  >
+    {@render content()}
+  </div>
+{/if}

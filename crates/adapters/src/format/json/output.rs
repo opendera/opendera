@@ -2,20 +2,22 @@ use crate::catalog::SerBatchReader;
 use crate::format::json::schema::{build_key_schema, build_value_schema};
 use crate::format::{MAX_DUPLICATES, MAX_RECORD_LEN_IN_ERRMSG};
 use crate::{
+    ControllerError, Encoder, OutputConsumer, OutputFormat,
     catalog::{CursorWithPolarity, RecordFormat, SerCursor},
     util::truncate_ellipse,
-    ControllerError, Encoder, OutputConsumer, OutputFormat,
 };
 use actix_web::HttpRequest;
-use anyhow::{bail, Result as AnyResult};
+use anyhow::{Result as AnyResult, bail};
 use erased_serde::Serialize as ErasedSerialize;
 use feldera_types::config::{ConnectorConfig, TransportConfig};
 use feldera_types::format::json::{JsonEncoderConfig, JsonFlavor, JsonUpdateFormat};
-use feldera_types::program_schema::{canonical_identifier, Relation};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use feldera_types::program_schema::{Relation, canonical_identifier};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::Deserialize;
+use serde_json::json;
 use serde_urlencoded::Deserializer as UrlDeserializer;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::{borrow::Cow, io::Write, mem::take};
 
 /// JSON format encoder.
@@ -56,14 +58,17 @@ impl OutputFormat for JsonOutputFormat {
         value_schema: &Relation,
         consumer: Box<dyn OutputConsumer>,
     ) -> Result<Box<dyn Encoder>, ControllerError> {
-        let mut json_config = JsonEncoderConfig::deserialize(
-            &config.format.as_ref().unwrap().config,
-        )
-        .map_err(|e| {
+        let format_config = &config.format.as_ref().unwrap().config;
+        let format_config = if format_config.is_null() {
+            &json!({})
+        } else {
+            format_config
+        };
+        let mut json_config = JsonEncoderConfig::deserialize(format_config).map_err(|e| {
             ControllerError::encoder_config_parse_error(
                 endpoint_name,
                 &e,
-                &serde_yaml::to_string(config).unwrap_or_default(),
+                &serde_json::to_string(config).unwrap_or_default(),
             )
         })?;
 
@@ -226,7 +231,7 @@ impl Encoder for JsonEncoder {
         self.output_consumer.as_mut()
     }
 
-    fn encode(&mut self, batch: &dyn SerBatchReader) -> AnyResult<()> {
+    fn encode(&mut self, batch: Arc<dyn SerBatchReader>) -> AnyResult<()> {
         let mut buffer = take(&mut self.buffer);
         let mut key_buffer = take(&mut self.key_buffer);
 
@@ -255,9 +260,9 @@ impl Encoder for JsonEncoder {
                 let mut key_str = String::new();
                 let _ = cursor.serialize_key(unsafe { key_str.as_mut_vec() });
                 bail!(
-                        "Unable to output record '{}' with very large weight {w}. Consider adjusting your SQL queries to avoid duplicate output records, e.g., using 'SELECT DISTINCT'.",
-                        &key_str
-                    );
+                    "Unable to output record '{}' with very large weight {w}. Consider adjusting your SQL queries to avoid duplicate output records, e.g., using 'SELECT DISTINCT'.",
+                    &key_str
+                );
             }
 
             while w != 0 {
@@ -393,25 +398,20 @@ impl Encoder for JsonEncoder {
                         key_buffer.extend_from_slice(br#"}"#);
 
                         // Encode value.
-                        if w > 0 {
-                            if let Some(schema_str) = &self.value_schema_str {
-                                buffer.extend_from_slice(br#"{"schema":"#);
-                                buffer.extend_from_slice(schema_str.as_bytes());
-                                write!(buffer, r#","payload":{{"op":"c","after":"#)?;
-                            } else {
-                                write!(buffer, r#"{{"payload":{{"op":"c","after":"#)?;
-                            }
-
-                            cursor.serialize_key(&mut buffer)?;
-                            buffer.extend_from_slice(br#"}}"#);
-                        } else if let Some(schema_str) = &self.value_schema_str {
-                            write!(
-                                buffer,
-                                r#"{{"schema":{schema_str},"payload":{{"op":"d"}}}}"#
-                            )?;
+                        let (op, when) = if w > 0 {
+                            ("c", "after")
                         } else {
-                            write!(buffer, r#"{{"payload":{{"op":"d"}}}}"#)?;
+                            ("d", "before")
+                        };
+                        if let Some(schema_str) = &self.value_schema_str {
+                            buffer.extend_from_slice(br#"{"schema":"#);
+                            buffer.extend_from_slice(schema_str.as_bytes());
+                            write!(buffer, r#","payload":{{"op":"{op}","{when}":"#)?;
+                        } else {
+                            write!(buffer, r#"{{"payload":{{"op":"{op}","{when}":"#)?;
                         }
+                        cursor.serialize_key(&mut buffer)?;
+                        buffer.extend_from_slice(br#"}}"#);
                     }
                     _ => {
                         // Should never happen.  Unsupported formats are rejected during
@@ -431,10 +431,12 @@ impl Encoder for JsonEncoder {
                         let record = std::str::from_utf8(&buffer[prev_len..buffer.len()])
                             .unwrap_or_default();
                         // We should be able to fit at least one record in the buffer.
-                        bail!("JSON record exceeds maximum buffer size supported by the output transport. Max supported buffer size is {} bytes, but the following record requires {} bytes: '{}'.",
-                                  self.max_buffer_size,
-                                  buffer.len() - prev_len,
-                                  truncate_ellipse(record, MAX_RECORD_LEN_IN_ERRMSG, "..."));
+                        bail!(
+                            "JSON record exceeds maximum buffer size supported by the output transport. Max supported buffer size is {} bytes, but the following record requires {} bytes: '{}'.",
+                            self.max_buffer_size,
+                            buffer.len() - prev_len,
+                            truncate_ellipse(record, MAX_RECORD_LEN_IN_ERRMSG, "...")
+                        );
                     }
                     buffer.truncate(prev_len);
                 } else {
@@ -511,22 +513,38 @@ mod test {
     use crate::format::json::{DebeziumOp, DebeziumPayload, DebeziumUpdate};
     use crate::{
         catalog::SerBatch,
-        format::{
-            json::{InsDelUpdate, SnowflakeAction, SnowflakeUpdate},
-            Encoder,
-        },
+        format::{Encoder, json::InsDelUpdate},
         static_compile::seroutput::SerBatchImpl,
-        test::{generate_test_batches_with_weights, MockOutputConsumer, TestStruct},
+        test::{MockOutputConsumer, TestStruct, generate_test_batches_with_weights},
     };
-    use dbsp::{utils::Tup2, OrdZSet};
+    use dbsp::typed_batch::IndexedZSetReader;
+    use dbsp::{OrdZSet, utils::Tup2};
     use feldera_types::format::json::JsonUpdateFormat;
     use feldera_types::program_schema::Relation;
     use proptest::prelude::*;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::{cell::RefCell, fmt::Debug, rc::Rc, sync::Arc};
     use tracing::trace;
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum SnowflakeAction {
+        #[serde(rename = "insert")]
+        Insert,
+        #[serde(rename = "delete")]
+        Delete,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    #[serde(deny_unknown_fields)]
+    pub struct SnowflakeUpdate<T> {
+        __stream_id: u64,
+        __seq_number: u64,
+        __action: SnowflakeAction,
+        #[serde(flatten)]
+        value: T,
+    }
 
     trait OutputUpdate: Debug + for<'de> Deserialize<'de> + Eq + Ord {
         type Val;
@@ -600,14 +618,18 @@ mod test {
 
         fn update(insert: bool, value: Self::Val, _stream_id: u64, _sequence_num: u64) -> Self {
             DebeziumUpdate {
-                payload: DebeziumPayload {
-                    op: if insert {
-                        DebeziumOp::Create
-                    } else {
-                        DebeziumOp::Delete
-                    },
-                    before: None,
-                    after: if insert { Some(value) } else { None },
+                payload: if insert {
+                    DebeziumPayload {
+                        op: DebeziumOp::Create,
+                        before: None,
+                        after: Some(value),
+                    }
+                } else {
+                    DebeziumPayload {
+                        op: DebeziumOp::Delete,
+                        before: Some(value),
+                        after: None,
+                    }
                 },
             }
         }
@@ -651,9 +673,9 @@ mod test {
                 Arc::new(<SerBatchImpl<_, TestStruct, ()>>::new(zset)) as Arc<dyn SerBatch>
             })
             .collect::<Vec<_>>();
-        for (step, zset) in zsets.iter().enumerate() {
+        for (step, zset) in zsets.into_iter().enumerate() {
             encoder.consumer().batch_start(step as u64);
-            encoder.encode(zset.as_batch_reader()).unwrap();
+            encoder.encode(zset.arc_as_batch_reader()).unwrap();
             encoder.consumer().batch_end();
         }
 
@@ -840,9 +862,14 @@ mod test {
         let zset = OrdZSet::from_keys((), test_data()[0].clone());
 
         let err = encoder
-            .encode(&SerBatchImpl::<_, TestStruct, ()>::new(zset) as &dyn SerBatchReader)
+            .encode(
+                Arc::new(SerBatchImpl::<_, TestStruct, ()>::new(zset)) as Arc<dyn SerBatchReader>
+            )
             .unwrap_err();
-        assert_eq!(format!("{err}"), "JSON record exceeds maximum buffer size supported by the output transport. Max supported buffer size is 32 bytes, but the following record requires 46 bytes: '{\"delete\":{\"id\":1,\"b\":false,\"i\":10,\"s\":\"bar\"}}'.");
+        assert_eq!(
+            format!("{err}"),
+            "JSON record exceeds maximum buffer size supported by the output transport. Max supported buffer size is 32 bytes, but the following record requires 46 bytes: '{\"delete\":{\"id\":1,\"b\":false,\"i\":10,\"s\":\"bar\"}}'."
+        );
     }
 
     /// Test the `key_fields` option.
@@ -873,7 +900,9 @@ mod test {
         let zset = OrdZSet::from_keys((), test_data()[0].clone());
 
         encoder
-            .encode(&SerBatchImpl::<_, TestStruct, ()>::new(zset) as &dyn SerBatchReader)
+            .encode(
+                Arc::new(SerBatchImpl::<_, TestStruct, ()>::new(zset)) as Arc<dyn SerBatchReader>
+            )
             .unwrap();
 
         let actual_output = consumer_data
@@ -883,7 +912,7 @@ mod test {
             .map(|(k, v, _headers)| {
                 (
                     k.clone()
-                        .map(|k| (serde_json::from_slice::<serde_json::Value>(&k).unwrap())),
+                        .map(|k| serde_json::from_slice::<serde_json::Value>(&k).unwrap()),
                     serde_json::from_slice::<serde_json::Value>(v.as_ref().unwrap()).unwrap(),
                 )
             })
@@ -898,7 +927,7 @@ mod test {
                 })),
                 json!({
                     "schema":{"type":"struct","fields":[{"field":"after","type":"struct","fields":[{"field":"id","type":"int64","optional":false},{"field":"b","type":"boolean","optional":false},{"field":"i","type":"int64","optional":true},{"field":"s","type":"string","optional":false}],"optional":true},{"field":"op","type":"string","optional":false}],"name":"Envelope"},
-                    "payload":{"op":"d"}
+                    "payload":{"op":"d", "before": {"b": false, "i": 10, "id": 1, "s": "bar"}}
                 }),
             ),
             (
@@ -944,7 +973,9 @@ mod test {
         let zset = OrdZSet::from_keys((), test_data()[0].clone());
 
         encoder
-            .encode(&SerBatchImpl::<_, TestStruct, ()>::new(zset) as &dyn SerBatchReader)
+            .encode(
+                Arc::new(SerBatchImpl::<_, TestStruct, ()>::new(zset)) as Arc<dyn SerBatchReader>
+            )
             .unwrap();
 
         let actual_output = consumer_data

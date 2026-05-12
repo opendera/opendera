@@ -73,6 +73,14 @@ public final class DBSPI32Literal extends DBSPIntLiteral implements IsNumericLit
     }
 
     @Override
+    public int compare(IsNumericLiteral other) {
+        DBSPI32Literal oi = other.to(DBSPI32Literal.class);
+        Utilities.enforce(this.value != null);
+        Utilities.enforce(oi.value != null);
+        return this.value.compareTo(oi.value);
+    }
+
+    @Override
     public IsNumericLiteral negate() {
         if (this.value == null)
             return this;
@@ -113,7 +121,7 @@ public final class DBSPI32Literal extends DBSPIntLiteral implements IsNumericLit
                     .append(this.type)
                     .append(")null");
         else
-            return builder.append(this.value.toString());
+            return builder.append(this.wrapSome(this.value.toString()));
     }
 
     @Override

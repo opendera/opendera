@@ -4,7 +4,7 @@ description = "Public API types for Feldera"
 categories = ["database", "api-bindings", "network-programming"]
 readme = "README.md"
 keywords = { workspace = true }
-edition = { workspace = true }
+edition = "2024"
 version = { workspace = true }
 homepage = { workspace = true }
 repository = { workspace = true }
@@ -13,11 +13,11 @@ authors = { workspace = true }
 rust-version = { workspace = true }
 
 [features]
-testing = ["proptest", "proptest-derive"]
+testing = ["proptest", "proptest-derive", "feldera-ir/testing"]
 
 [dependencies]
+arrow-schema = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive", "rc"] }
-serde_yaml = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 anyhow = { workspace = true, features = ["backtrace"] }
 libc = { workspace = true }
@@ -31,6 +31,11 @@ erased-serde = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 thiserror = { workspace = true }
 regex = { workspace = true }
+chrono = { workspace = true, features = ["serde", "alloc"] }
+feldera-ir = { workspace = true }
+time = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
 
 [dev-dependencies]
 csv = { workspace = true }

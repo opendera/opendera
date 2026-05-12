@@ -29,6 +29,14 @@ All parameters are optional:
   By default, a single plan is used that generates rows with incrementing values for
   every type.
 
+* `transaction_size` - By default, the data generator does not request
+  [transactions].  Set this to a nonzero value for the data generator
+  to automatically orchestrate transactions of specified number of
+  rows.  Transactions may overshoot the specified number by up to an
+  input batch.
+
+  [transactions]: /pipelines/transactions
+
 ### Plan
 
 A plan is a list of objects that describe how to generate rows. Each object can have the following, optional
@@ -43,6 +51,10 @@ fields:
   If not specified, the field will be set to `min(rate, 10_000)`. This works well in most situations.
   However, if you're running tests with lateness and many workers you can e.g., reduce the chunk size
   to make sure a smaller range of records is being ingested/generated in parallel.
+
+  This also controls the sizes of input batches.  If, for example, `rate` and `worker_chunk_size` are both 1000,
+  with a single worker, the generator will output 1000 records once a second.  But if we reduce `worker_chunk_size`
+  to 100 without changing `rate`, the generator will instead output 100 records 10 times per second.
 
   Example: Assume datagen generates a total of 125 records with 4 workers and a chunk size of 25. In this case,
   worker A will generate records `0..25`, worker B will generate records `25..50`, etc. A, B, C, and D will
@@ -152,7 +164,7 @@ the `range` parameter.
 CREATE TABLE Stocks (
     symbol VARCHAR NOT NULL,
     price_time BIGINT NOT NULL,  -- UNIX timestamp
-    price DOUBLE NOT NULL
+    price DECIMAL(38, 2) NOT NULL
 ) with (
   'connectors' = '[{
     "transport": {
@@ -183,7 +195,7 @@ Will generate the following data:
 CREATE TABLE Stocks (
     symbol VARCHAR NOT NULL,
     price_time BIGINT NOT NULL,  -- UNIX timestamp
-    price DOUBLE NOT NULL
+    price DECIMAL(38, 2) NOT NULL
 ) with (
   'connectors' = '[{
     "transport": {

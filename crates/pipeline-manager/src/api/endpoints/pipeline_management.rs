@@ -1,4 +1,3 @@
-#[cfg(feature = "feldera-enterprise")]
 use crate::api::error::ApiError;
 use crate::api::examples;
 use crate::api::main::ServerState;
@@ -6,17 +5,19 @@ use crate::api::main::ServerState;
 use crate::common_error::CommonError;
 use crate::db::error::DBError;
 use crate::db::storage::Storage;
+use crate::db::types::combined_status::{combine_since, CombinedDesiredStatus, CombinedStatus};
 use crate::db::types::pipeline::{
-    ExtendedPipelineDescr, ExtendedPipelineDescrMonitoring, PipelineDescr, PipelineDesiredStatus,
-    PipelineId, PipelineStatus,
+    ExtendedPipelineDescr, ExtendedPipelineDescrMonitoring, PipelineDescr, PipelineId,
 };
 use crate::db::types::program::{ProgramConfig, ProgramError, ProgramStatus};
+use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
 use crate::db::types::storage::StorageStatus;
 use crate::db::types::tenant::TenantId;
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
+use crate::has_unstable_feature;
 #[cfg(feature = "feldera-enterprise")]
-use actix_http::body::MessageBody;
+use actix_web::http::Method;
 use actix_web::{
     delete, get,
     http::header::{CacheControl, CacheDirective},
@@ -25,18 +26,23 @@ use actix_web::{
     HttpResponse,
 };
 use chrono::{DateTime, Utc};
+use feldera_types::adapter_stats::PipelineStatsErrorsResponse;
 use feldera_types::config::{InputEndpointConfig, OutputEndpointConfig, RuntimeConfig};
 use feldera_types::error::ErrorResponse;
 use feldera_types::program_schema::ProgramSchema;
-#[cfg(feature = "feldera-enterprise")]
-use feldera_types::suspend::SuspendableResponse;
-use log::info;
+use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+#[cfg(feature = "feldera-enterprise")]
+use std::time::Duration;
+use tracing::{debug, error, info};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
+
+pub mod pipeline_events;
 
 /// Program information is the result of the SQL compilation.
 #[derive(Deserialize, Serialize, ToSchema, Eq, PartialEq, Debug, Clone)]
@@ -65,9 +71,25 @@ fn remove_large_fields_from_program_info(
     program_info
 }
 
+/// Aggregated connector error statistics.
+///
+/// This structure contains the sum of all error counts across all input and output connectors
+/// for a pipeline.
+#[derive(Serialize, Deserialize, ToSchema, Eq, PartialEq, Debug, Clone)]
+pub struct ConnectorStats {
+    /// Total number of errors across all connectors.
+    ///
+    /// This is the sum of:
+    /// - `num_transport_errors` from all input connectors
+    /// - `num_parse_errors` from all input connectors
+    /// - `num_encode_errors` from all output connectors
+    /// - `num_transport_errors` from all output connectors
+    pub num_errors: u64,
+}
+
 /// Pipeline information.
 /// It both includes fields which are user-provided and system-generated.
-#[derive(Serialize, ToSchema, Eq, PartialEq, Debug, Clone)]
+#[derive(Serialize, ToSchema, PartialEq, Debug, Clone)]
 pub struct PipelineInfo {
     pub id: PipelineId,
     pub name: String,
@@ -85,12 +107,26 @@ pub struct PipelineInfo {
     pub program_status_since: DateTime<Utc>,
     pub program_error: ProgramError,
     pub program_info: Option<PartialProgramInfo>,
-    pub deployment_status: PipelineStatus,
-    pub deployment_status_since: DateTime<Utc>,
-    pub deployment_desired_status: PipelineDesiredStatus,
     pub deployment_error: Option<ErrorResponse>,
     pub refresh_version: Version,
     pub storage_status: StorageStatus,
+    pub storage_status_details: Option<serde_json::Value>,
+    pub deployment_id: Option<Uuid>,
+    pub deployment_initial: Option<RuntimeDesiredStatus>,
+    pub deployment_status: CombinedStatus,
+    pub deployment_status_since: DateTime<Utc>,
+    pub deployment_desired_status: CombinedDesiredStatus,
+    pub deployment_desired_status_since: DateTime<Utc>,
+    pub deployment_resources_status: ResourcesStatus,
+    pub deployment_resources_status_details: Option<serde_json::Value>,
+    pub deployment_resources_status_since: DateTime<Utc>,
+    pub deployment_resources_desired_status: ResourcesDesiredStatus,
+    pub deployment_resources_desired_status_since: DateTime<Utc>,
+    pub deployment_runtime_status: Option<RuntimeStatus>,
+    pub deployment_runtime_status_details: Option<serde_json::Value>,
+    pub deployment_runtime_status_since: Option<DateTime<Utc>>,
+    pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
+    pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
 }
 
 /// Pipeline information (internal).
@@ -120,12 +156,26 @@ pub struct PipelineInfoInternal {
     pub program_status_since: DateTime<Utc>,
     pub program_error: ProgramError,
     pub program_info: Option<serde_json::Value>,
-    pub deployment_status: PipelineStatus,
-    pub deployment_status_since: DateTime<Utc>,
-    pub deployment_desired_status: PipelineDesiredStatus,
     pub deployment_error: Option<ErrorResponse>,
     pub refresh_version: Version,
     pub storage_status: StorageStatus,
+    pub storage_status_details: Option<serde_json::Value>,
+    pub deployment_id: Option<Uuid>,
+    pub deployment_initial: Option<RuntimeDesiredStatus>,
+    pub deployment_status: CombinedStatus,
+    pub deployment_status_since: DateTime<Utc>,
+    pub deployment_desired_status: CombinedDesiredStatus,
+    pub deployment_desired_status_since: DateTime<Utc>,
+    pub deployment_resources_status: ResourcesStatus,
+    pub deployment_resources_status_details: Option<serde_json::Value>,
+    pub deployment_resources_status_since: DateTime<Utc>,
+    pub deployment_resources_desired_status: ResourcesDesiredStatus,
+    pub deployment_resources_desired_status_since: DateTime<Utc>,
+    pub deployment_runtime_status: Option<RuntimeStatus>,
+    pub deployment_runtime_status_details: Option<serde_json::Value>,
+    pub deployment_runtime_status_since: Option<DateTime<Utc>>,
+    pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
+    pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
 }
 
 impl PipelineInfoInternal {
@@ -147,12 +197,43 @@ impl PipelineInfoInternal {
             program_status_since: extended_pipeline.program_status_since,
             program_error: extended_pipeline.program_error,
             program_info: remove_large_fields_from_program_info(extended_pipeline.program_info),
-            deployment_status: extended_pipeline.deployment_status,
-            deployment_status_since: extended_pipeline.deployment_status_since,
-            deployment_desired_status: extended_pipeline.deployment_desired_status,
             deployment_error: extended_pipeline.deployment_error,
             refresh_version: extended_pipeline.refresh_version,
             storage_status: extended_pipeline.storage_status,
+            storage_status_details: extended_pipeline.storage_status_details,
+            deployment_id: extended_pipeline.deployment_id,
+            deployment_initial: extended_pipeline.deployment_initial,
+            deployment_status: CombinedStatus::new(
+                extended_pipeline.deployment_resources_status,
+                extended_pipeline.deployment_runtime_status,
+            ),
+            deployment_status_since: combine_since(
+                extended_pipeline.deployment_resources_status_since,
+                extended_pipeline.deployment_runtime_status_since,
+            ),
+            deployment_desired_status: CombinedDesiredStatus::new(
+                extended_pipeline.deployment_resources_desired_status,
+                extended_pipeline.deployment_initial,
+                extended_pipeline.deployment_runtime_desired_status,
+            ),
+            deployment_desired_status_since: combine_since(
+                extended_pipeline.deployment_resources_desired_status_since,
+                extended_pipeline.deployment_runtime_desired_status_since,
+            ),
+            deployment_resources_status: extended_pipeline.deployment_resources_status,
+            deployment_resources_status_details: extended_pipeline
+                .deployment_resources_status_details,
+            deployment_resources_status_since: extended_pipeline.deployment_resources_status_since,
+            deployment_resources_desired_status: extended_pipeline
+                .deployment_resources_desired_status,
+            deployment_resources_desired_status_since: extended_pipeline
+                .deployment_resources_desired_status_since,
+            deployment_runtime_status: extended_pipeline.deployment_runtime_status,
+            deployment_runtime_status_details: extended_pipeline.deployment_runtime_status_details,
+            deployment_runtime_status_since: extended_pipeline.deployment_runtime_status_since,
+            deployment_runtime_desired_status: extended_pipeline.deployment_runtime_desired_status,
+            deployment_runtime_desired_status_since: extended_pipeline
+                .deployment_runtime_desired_status_since,
         }
     }
 }
@@ -160,7 +241,7 @@ impl PipelineInfoInternal {
 /// Pipeline information which has a selected subset of optional fields.
 /// It both includes fields which are user-provided and system-generated.
 /// If an optional field is not selected (i.e., is `None`), it will not be serialized.
-#[derive(Serialize, ToSchema, Eq, PartialEq, Debug, Clone)]
+#[derive(Serialize, ToSchema, PartialEq, Debug, Clone)]
 pub struct PipelineSelectedInfo {
     pub id: PipelineId,
     pub name: String,
@@ -185,12 +266,29 @@ pub struct PipelineSelectedInfo {
     pub program_error: Option<ProgramError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub program_info: Option<Option<PartialProgramInfo>>,
-    pub deployment_status: PipelineStatus,
-    pub deployment_status_since: DateTime<Utc>,
-    pub deployment_desired_status: PipelineDesiredStatus,
     pub deployment_error: Option<ErrorResponse>,
     pub refresh_version: Version,
     pub storage_status: StorageStatus,
+    pub storage_status_details: Option<serde_json::Value>,
+    pub deployment_id: Option<Uuid>,
+    pub deployment_initial: Option<RuntimeDesiredStatus>,
+    pub deployment_status: CombinedStatus,
+    pub deployment_status_since: DateTime<Utc>,
+    pub deployment_desired_status: CombinedDesiredStatus,
+    pub deployment_desired_status_since: DateTime<Utc>,
+    pub deployment_resources_status: ResourcesStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_resources_status_details: Option<Option<serde_json::Value>>,
+    pub deployment_resources_status_since: DateTime<Utc>,
+    pub deployment_resources_desired_status: ResourcesDesiredStatus,
+    pub deployment_resources_desired_status_since: DateTime<Utc>,
+    pub deployment_runtime_status: Option<RuntimeStatus>,
+    pub deployment_runtime_status_details: Option<serde_json::Value>,
+    pub deployment_runtime_status_since: Option<DateTime<Utc>>,
+    pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
+    pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectors: Option<ConnectorStats>,
 }
 
 /// Pipeline information which has a selected subset of optional fields (internal).
@@ -225,12 +323,30 @@ pub struct PipelineSelectedInfoInternal {
     pub program_error: Option<ProgramError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub program_info: Option<Option<serde_json::Value>>,
-    pub deployment_status: PipelineStatus,
-    pub deployment_status_since: DateTime<Utc>,
-    pub deployment_desired_status: PipelineDesiredStatus,
     pub deployment_error: Option<ErrorResponse>,
     pub refresh_version: Version,
     pub storage_status: StorageStatus,
+    pub storage_status_details: Option<serde_json::Value>,
+    pub deployment_id: Option<Uuid>,
+    pub deployment_initial: Option<RuntimeDesiredStatus>,
+    pub deployment_status: CombinedStatus,
+    pub deployment_status_since: DateTime<Utc>,
+    pub deployment_desired_status: CombinedDesiredStatus,
+    pub deployment_desired_status_since: DateTime<Utc>,
+    pub deployment_resources_status: ResourcesStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_resources_status_details: Option<Option<serde_json::Value>>,
+    pub deployment_resources_status_since: DateTime<Utc>,
+    pub deployment_resources_desired_status: ResourcesDesiredStatus,
+    pub deployment_resources_desired_status_since: DateTime<Utc>,
+    pub deployment_runtime_status: Option<RuntimeStatus>,
+    pub deployment_runtime_status_details: Option<serde_json::Value>,
+    pub deployment_runtime_status_since: Option<DateTime<Utc>>,
+    pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
+    pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
+    pub bootstrap_policy: Option<BootstrapPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connectors: Option<ConnectorStats>,
 }
 
 impl PipelineSelectedInfoInternal {
@@ -254,12 +370,46 @@ impl PipelineSelectedInfoInternal {
             program_info: Some(remove_large_fields_from_program_info(
                 extended_pipeline.program_info,
             )),
-            deployment_status: extended_pipeline.deployment_status,
-            deployment_status_since: extended_pipeline.deployment_status_since,
-            deployment_desired_status: extended_pipeline.deployment_desired_status,
             deployment_error: extended_pipeline.deployment_error,
             refresh_version: extended_pipeline.refresh_version,
             storage_status: extended_pipeline.storage_status,
+            storage_status_details: extended_pipeline.storage_status_details,
+            deployment_id: extended_pipeline.deployment_id,
+            deployment_initial: extended_pipeline.deployment_initial,
+            deployment_status: CombinedStatus::new(
+                extended_pipeline.deployment_resources_status,
+                extended_pipeline.deployment_runtime_status,
+            ),
+            deployment_status_since: combine_since(
+                extended_pipeline.deployment_resources_status_since,
+                extended_pipeline.deployment_runtime_status_since,
+            ),
+            deployment_desired_status: CombinedDesiredStatus::new(
+                extended_pipeline.deployment_resources_desired_status,
+                extended_pipeline.deployment_initial,
+                extended_pipeline.deployment_runtime_desired_status,
+            ),
+            deployment_desired_status_since: combine_since(
+                extended_pipeline.deployment_resources_desired_status_since,
+                extended_pipeline.deployment_runtime_desired_status_since,
+            ),
+            deployment_resources_status: extended_pipeline.deployment_resources_status,
+            deployment_resources_status_details: Some(
+                extended_pipeline.deployment_resources_status_details,
+            ),
+            deployment_resources_status_since: extended_pipeline.deployment_resources_status_since,
+            deployment_resources_desired_status: extended_pipeline
+                .deployment_resources_desired_status,
+            deployment_resources_desired_status_since: extended_pipeline
+                .deployment_resources_desired_status_since,
+            deployment_runtime_status: extended_pipeline.deployment_runtime_status,
+            deployment_runtime_status_details: extended_pipeline.deployment_runtime_status_details,
+            deployment_runtime_status_since: extended_pipeline.deployment_runtime_status_since,
+            deployment_runtime_desired_status: extended_pipeline.deployment_runtime_desired_status,
+            deployment_runtime_desired_status_since: extended_pipeline
+                .deployment_runtime_desired_status_since,
+            bootstrap_policy: extended_pipeline.bootstrap_policy,
+            connectors: None,
         }
     }
 
@@ -275,19 +425,60 @@ impl PipelineSelectedInfoInternal {
             program_code: None,
             udf_rust: None,
             udf_toml: None,
-            program_config: None,
+            program_config: Some(extended_pipeline.program_config),
             program_version: extended_pipeline.program_version,
             program_status: extended_pipeline.program_status,
             program_status_since: extended_pipeline.program_status_since,
             program_error: None,
             program_info: None,
-            deployment_status: extended_pipeline.deployment_status,
-            deployment_status_since: extended_pipeline.deployment_status_since,
-            deployment_desired_status: extended_pipeline.deployment_desired_status,
             deployment_error: extended_pipeline.deployment_error,
             refresh_version: extended_pipeline.refresh_version,
             storage_status: extended_pipeline.storage_status,
+            storage_status_details: extended_pipeline.storage_status_details,
+            deployment_id: extended_pipeline.deployment_id,
+            deployment_initial: extended_pipeline.deployment_initial,
+            deployment_status: CombinedStatus::new(
+                extended_pipeline.deployment_resources_status,
+                extended_pipeline.deployment_runtime_status,
+            ),
+            deployment_status_since: combine_since(
+                extended_pipeline.deployment_resources_status_since,
+                extended_pipeline.deployment_runtime_status_since,
+            ),
+            deployment_desired_status: CombinedDesiredStatus::new(
+                extended_pipeline.deployment_resources_desired_status,
+                extended_pipeline.deployment_initial,
+                extended_pipeline.deployment_runtime_desired_status,
+            ),
+            deployment_desired_status_since: combine_since(
+                extended_pipeline.deployment_resources_desired_status_since,
+                extended_pipeline.deployment_runtime_desired_status_since,
+            ),
+            deployment_resources_status: extended_pipeline.deployment_resources_status,
+            deployment_resources_status_details: None,
+            deployment_resources_status_since: extended_pipeline.deployment_resources_status_since,
+            deployment_resources_desired_status: extended_pipeline
+                .deployment_resources_desired_status,
+            deployment_resources_desired_status_since: extended_pipeline
+                .deployment_resources_desired_status_since,
+            deployment_runtime_status: extended_pipeline.deployment_runtime_status,
+            deployment_runtime_status_details: extended_pipeline.deployment_runtime_status_details,
+            deployment_runtime_status_since: extended_pipeline.deployment_runtime_status_since,
+            deployment_runtime_desired_status: extended_pipeline.deployment_runtime_desired_status,
+            deployment_runtime_desired_status_since: extended_pipeline
+                .deployment_runtime_desired_status_since,
+            bootstrap_policy: extended_pipeline.bootstrap_policy,
+            connectors: None,
         }
+    }
+
+    pub(crate) fn new_status_with_connectors(
+        extended_pipeline: ExtendedPipelineDescrMonitoring,
+        connectors: Option<ConnectorStats>,
+    ) -> Self {
+        let mut result = Self::new_status(extended_pipeline);
+        result.connectors = connectors;
+        result
     }
 }
 
@@ -313,11 +504,26 @@ pub enum PipelineFieldSelector {
     /// - `program_status_since`
     /// - `program_error`
     /// - `program_info`
+    /// - `deployment_error`
+    /// - `refresh_version`
+    /// - `storage_status`
+    /// - `storage_status_details`
+    /// - `deployment_id`
+    /// - `deployment_initial`
     /// - `deployment_status`
     /// - `deployment_status_since`
     /// - `deployment_desired_status`
-    /// - `deployment_error`
-    /// - `refresh_version`
+    /// - `deployment_desired_status_since`
+    /// - `deployment_resources_status`
+    /// - `deployment_resources_status_since`
+    /// - `deployment_resources_desired_status`
+    /// - `deployment_resources_desired_status_since`
+    /// - `deployment_runtime_status`
+    /// - `deployment_runtime_status_details`
+    /// - `deployment_runtime_status_since`
+    /// - `deployment_runtime_desired_status`
+    /// - `deployment_runtime_desired_status_since`
+    /// - `bootstrap_policy`
     All,
     /// Select only the fields required to know the status of a pipeline.
     ///
@@ -328,16 +534,39 @@ pub enum PipelineFieldSelector {
     /// - `created_at`
     /// - `version`
     /// - `platform_version`
+    /// - `program_config`
     /// - `program_version`
     /// - `program_status`
     /// - `program_status_since`
-    /// - `program_error`
+    /// - `deployment_error`
+    /// - `refresh_version`
+    /// - `storage_status`
+    /// - `storage_status_details`
+    /// - `deployment_id`
+    /// - `deployment_initial`
     /// - `deployment_status`
     /// - `deployment_status_since`
     /// - `deployment_desired_status`
-    /// - `deployment_error`
-    /// - `refresh_version`
+    /// - `deployment_desired_status_since`
+    /// - `deployment_resources_status`
+    /// - `deployment_resources_status_since`
+    /// - `deployment_resources_desired_status`
+    /// - `deployment_resources_desired_status_since`
+    /// - `deployment_runtime_status`
+    /// - `deployment_runtime_status_details`
+    /// - `deployment_runtime_status_since`
+    /// - `deployment_runtime_desired_status`
+    /// - `deployment_runtime_desired_status_since`
+    /// - `bootstrap_policy`
     Status,
+    /// Select the fields included in `Status` plus aggregated connector error statistics.
+    ///
+    /// In addition to all fields from `Status`, this selector includes:
+    /// - `connectors`: Aggregated error statistics across all input and output connectors
+    ///   - `num_errors`: Sum of `num_transport_errors`, `num_parse_errors`, and `num_encode_errors`
+    ///
+    /// If a pipeline is unavailable, the `connectors` field will be null.
+    StatusWithConnectors,
 }
 
 /// Default for the `selector` query parameter when GET a pipeline or a list of pipelines.
@@ -436,6 +665,29 @@ pub struct PatchPipelineInternal {
     pub program_config: Option<serde_json::Value>,
 }
 
+/// Default for the `initial` query parameter when POST a pipeline start.
+fn default_pipeline_start_desired() -> String {
+    "running".to_string()
+}
+
+/// Default for the `dismiss_error` query parameter when POST a pipeline start.
+fn default_pipeline_start_dismiss_error() -> bool {
+    true
+}
+
+/// Query parameters to POST a pipeline start.
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct PostStartPipelineParameters {
+    /// The `initial` parameter determines whether to after provisioning the pipeline make it
+    /// become `standby`, `paused` or `running` (only valid values).
+    #[serde(default = "default_pipeline_start_desired")]
+    initial: String,
+    #[serde(default)]
+    bootstrap_policy: BootstrapPolicy,
+    #[serde(default = "default_pipeline_start_dismiss_error")]
+    dismiss_error: bool,
+}
+
 /// Default for the `force` query parameter when POST a pipeline stop.
 fn default_pipeline_stop_force() -> bool {
     false
@@ -451,6 +703,8 @@ pub struct PostStopPipelineParameters {
     force: bool,
 }
 
+/// List Pipelines
+///
 /// Retrieve the list of pipelines.
 /// Configure which fields are included using the `selector` query parameter.
 #[utoipa::path(
@@ -464,7 +718,7 @@ pub struct PostStopPipelineParameters {
             , example = json!(examples::list_pipeline_selected_info())),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline management"
+    tag = "Pipeline CRUD"
 )]
 #[get("/pipelines")]
 pub(crate) async fn list_pipelines(
@@ -492,12 +746,144 @@ pub(crate) async fn list_pipelines(
                 .map(PipelineSelectedInfoInternal::new_status)
                 .collect()
         }
+        PipelineFieldSelector::StatusWithConnectors => {
+            let pipelines = state
+                .db
+                .lock()
+                .await
+                .list_pipelines_for_monitoring(*tenant_id)
+                .await?;
+
+            // Fetch connector stats for all pipelines in parallel
+            let stats_futures: Vec<_> = pipelines
+                .iter()
+                .map(|pipeline| {
+                    let state = state.clone();
+                    let tenant_id = *tenant_id;
+                    let pipeline_name = pipeline.name.clone();
+                    async move {
+                        fetch_connector_error_stats(
+                            &state,
+                            tenant_id,
+                            &pipeline_name,
+                            pipeline.deployment_runtime_status,
+                        )
+                        .await
+                    }
+                })
+                .collect();
+
+            let connector_stats = join_all(stats_futures).await;
+
+            pipelines
+                .into_iter()
+                .zip(connector_stats.into_iter())
+                .map(|(pipeline, stats)| {
+                    PipelineSelectedInfoInternal::new_status_with_connectors(pipeline, stats)
+                })
+                .collect()
+        }
     };
     Ok(HttpResponse::Ok()
         .insert_header(CacheControl(vec![CacheDirective::NoCache]))
         .json(returned_pipelines))
 }
 
+/// Aggregate Connector Stats
+///
+/// Fetch and aggregate connector error statistics for a pipeline.
+///
+/// Returns `None` if the pipeline is unavailable, if there's an error fetching stats,
+/// or if the endpoint returns 404 (not implemented on older pipeline versions).
+///
+/// This endpoint is only used by the web-console so it is not published on openapi
+/// and subject to breakage.
+async fn fetch_connector_error_stats(
+    state: &WebData<ServerState>,
+    tenant_id: TenantId,
+    pipeline_name: &str,
+    deployment_runtime_status: Option<RuntimeStatus>,
+) -> Option<ConnectorStats> {
+    // Only forward the request if the pipeline is in a valid runtime status
+    match deployment_runtime_status {
+        Some(RuntimeStatus::Bootstrapping)
+        | Some(RuntimeStatus::Replaying)
+        | Some(RuntimeStatus::Running)
+        | Some(RuntimeStatus::Paused) => {
+            // Pipeline is in a valid state, proceed with the request
+        }
+        _ => {
+            // Pipeline is not in a valid state to fetch connector stats
+            return None;
+        }
+    }
+
+    // Use the existing method to forward the request to the pipeline
+    let client = awc::Client::default();
+    let response = state
+        .runner
+        .forward_http_request_to_pipeline_by_name(
+            &client,
+            tenant_id,
+            pipeline_name,
+            actix_web::http::Method::GET,
+            "stats/errors",
+            "",
+            Some(std::time::Duration::from_millis(500)),
+            None,
+        )
+        .await
+        .ok()?;
+
+    // Check status code - quietly ignore 404 (endpoint not available on older pipelines)
+    if response.status() == actix_web::http::StatusCode::NOT_FOUND {
+        debug!(
+            pipeline = %pipeline_name,
+            pipeline_id = "N/A",
+            "Pipeline does not support /stats/errors endpoint (404), skipping error stats"
+        );
+        return None;
+    }
+
+    // Parse the response body
+    let body = response.into_body();
+    let bytes = actix_web::body::to_bytes(body).await.ok()?;
+    let stats_response: PipelineStatsErrorsResponse = match serde_json::from_slice(&bytes) {
+        Ok(response) => response,
+        Err(e) => {
+            error!(
+                pipeline = %pipeline_name,
+                pipeline_id = "N/A",
+                "Failed to deserialize pipeline stats response: {e}"
+            );
+            return None;
+        }
+    };
+
+    // Extract and aggregate error counts
+    let mut total_errors = 0u64;
+
+    // Aggregate input connector errors
+    for endpoint in stats_response.inputs {
+        total_errors = total_errors
+            .saturating_add(endpoint.metrics.num_transport_errors)
+            .saturating_add(endpoint.metrics.num_parse_errors);
+    }
+
+    // Aggregate output connector errors
+    for endpoint in stats_response.outputs {
+        total_errors = total_errors
+            .saturating_add(endpoint.metrics.num_encode_errors)
+            .saturating_add(endpoint.metrics.num_transport_errors);
+    }
+
+    Some(ConnectorStats {
+        num_errors: total_errors,
+    })
+}
+
+/// Get Pipeline
+///
 /// Retrieve a pipeline.
 /// Configure which fields are included using the `selector` query parameter.
 #[utoipa::path(
@@ -518,7 +904,7 @@ pub(crate) async fn list_pipelines(
             , example = json!(examples::error_unknown_pipeline_name())),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline management"
+    tag = "Pipeline CRUD"
 )]
 #[get("/pipelines/{pipeline_name}")]
 pub(crate) async fn get_pipeline(
@@ -547,52 +933,31 @@ pub(crate) async fn get_pipeline(
                 .await?;
             PipelineSelectedInfoInternal::new_status(pipeline)
         }
+        PipelineFieldSelector::StatusWithConnectors => {
+            let pipeline = state
+                .db
+                .lock()
+                .await
+                .get_pipeline_for_monitoring(*tenant_id, &pipeline_name)
+                .await?;
+            let connector_stats = fetch_connector_error_stats(
+                &state,
+                *tenant_id,
+                &pipeline_name,
+                pipeline.deployment_runtime_status,
+            )
+            .await;
+            PipelineSelectedInfoInternal::new_status_with_connectors(pipeline, connector_stats)
+        }
     };
     Ok(HttpResponse::Ok()
         .insert_header(CacheControl(vec![CacheDirective::NoCache]))
         .json(&returned_pipeline))
 }
 
-/// Retrieve the program info of a pipeline.
-#[utoipa::path(
-    context_path = "/v0",
-    security(("JSON web token (JWT) or API key" = [])),
-    params(
-        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
-    ),
-    responses(
-        (status = OK
-            , description = "Pipeline retrieved successfully"
-            , body = ProgramInfo
-            , example = json!(examples::pipeline_1_selected_info())),
-        (status = NOT_FOUND
-            , description = "Pipeline with that name does not exist"
-            , body = ErrorResponse
-            , example = json!(examples::error_unknown_pipeline_name())),
-        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
-    ),
-    tag = "Pipeline management"
-)]
-#[get("/pipelines/{pipeline_name}/program_info")]
-pub(crate) async fn get_program_info(
-    state: WebData<ServerState>,
-    tenant_id: ReqData<TenantId>,
-    path: web::Path<String>,
-) -> Result<HttpResponse, ManagerError> {
-    let pipeline_name = path.into_inner();
-    log::error!("pipeline_name {:?}", pipeline_name);
-    let pipeline = state
-        .db
-        .lock()
-        .await
-        .get_pipeline(*tenant_id, &pipeline_name)
-        .await?;
-    Ok(HttpResponse::Ok()
-        .insert_header(CacheControl(vec![CacheDirective::NoCache]))
-        .json(&pipeline.program_info))
-}
-
-/// Create a new pipeline.
+/// Create Pipeline
+///
+/// Create a new pipeline with the provided configuration.
 #[utoipa::path(
     context_path = "/v0",
     security(("JSON web token (JWT) or API key" = [])),
@@ -616,7 +981,7 @@ pub(crate) async fn get_program_info(
         ),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline management"
+    tag = "Pipeline CRUD"
 )]
 #[post("/pipelines")]
 pub(crate) async fn post_pipeline(
@@ -639,14 +1004,18 @@ pub(crate) async fn post_pipeline(
     let returned_pipeline = PipelineInfoInternal::new(pipeline);
 
     info!(
-        "Created pipeline {} (tenant: {})",
-        returned_pipeline.id, *tenant_id
+        pipeline = %returned_pipeline.name,
+        pipeline_id = %returned_pipeline.id,
+        tenant = %tenant_id.0,
+        "Created pipeline"
     );
     Ok(HttpResponse::Created()
         .insert_header(CacheControl(vec![CacheDirective::NoCache]))
         .json(returned_pipeline))
 }
 
+/// Upsert Pipeline
+///
 /// Fully update a pipeline if it already exists, otherwise create a new pipeline.
 #[utoipa::path(
     context_path = "/v0",
@@ -679,7 +1048,7 @@ pub(crate) async fn post_pipeline(
         ),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline management"
+    tag = "Pipeline CRUD"
 )]
 #[put("/pipelines/{pipeline_name}")]
 pub(crate) async fn put_pipeline(
@@ -699,6 +1068,7 @@ pub(crate) async fn put_pipeline(
             Uuid::now_v7(),
             &pipeline_name,
             &state.common_config.platform_version,
+            true,
             pipeline_descr,
         )
         .await?;
@@ -706,16 +1076,21 @@ pub(crate) async fn put_pipeline(
 
     if is_new {
         info!(
-            "Created pipeline {} (tenant: {})",
-            returned_pipeline.id, *tenant_id
+            pipeline = %returned_pipeline.name,
+            pipeline_id = %returned_pipeline.id,
+            tenant = %tenant_id.0,
+            "Created pipeline"
         );
         Ok(HttpResponse::Created()
             .insert_header(CacheControl(vec![CacheDirective::NoCache]))
             .json(returned_pipeline))
     } else {
         info!(
-            "Fully updated pipeline {} to version {} (tenant: {})",
-            returned_pipeline.id, returned_pipeline.version, *tenant_id
+            pipeline = %returned_pipeline.name,
+            pipeline_id = %returned_pipeline.id,
+            tenant = %tenant_id.0,
+            version = %returned_pipeline.version,
+            "Fully updated pipeline"
         );
         Ok(HttpResponse::Ok()
             .insert_header(CacheControl(vec![CacheDirective::NoCache]))
@@ -723,6 +1098,8 @@ pub(crate) async fn put_pipeline(
     }
 }
 
+/// Patch Pipeline
+///
 /// Partially update a pipeline.
 #[utoipa::path(
     context_path = "/v0",
@@ -755,7 +1132,7 @@ pub(crate) async fn put_pipeline(
         ),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline management"
+    tag = "Pipeline CRUD"
 )]
 #[patch("/pipelines/{pipeline_name}")]
 pub(crate) async fn patch_pipeline(
@@ -775,6 +1152,7 @@ pub(crate) async fn patch_pipeline(
             &body.name,
             &body.description,
             &state.common_config.platform_version,
+            false,
             &body.runtime_config,
             &body.program_code,
             &body.udf_rust,
@@ -785,15 +1163,110 @@ pub(crate) async fn patch_pipeline(
     let returned_pipeline = PipelineInfoInternal::new(pipeline);
 
     info!(
-        "Partially updated pipeline {} to version {} (tenant: {})",
-        returned_pipeline.id, returned_pipeline.version, *tenant_id
+        pipeline = %returned_pipeline.name,
+        pipeline_id = %returned_pipeline.id,
+        tenant = %tenant_id.0,
+        version = %returned_pipeline.version,
+        "Partially updated pipeline to version {}",
+        returned_pipeline.version
     );
     Ok(HttpResponse::Ok()
         .insert_header(CacheControl(vec![CacheDirective::NoCache]))
         .json(returned_pipeline))
 }
 
-/// Delete a pipeline.
+/// Recompile Pipeline
+///
+/// Recompile a pipeline with the Feldera runtime version included in the
+/// currently installed Feldera platform.
+///
+/// Use this endpoint after upgrading Feldera to rebuild pipelines that were
+/// compiled with older platform versions. In most cases, recompilation is not
+/// required; pipelines compiled with older versions will continue to run on the
+/// upgraded platform.
+///
+/// Situations where recompilation may be necessary:
+/// - To benefit from the latest bug fixes and performance optimizations.
+/// - When backward-incompatible changes are introduced in Feldera. In this case,
+///   attempting to start a pipeline compiled with an unsupported version will
+///   result in an error.
+///
+/// If the pipeline is already compiled with the current platform version,
+/// this operation is a no-op.
+///
+/// Note that recompiling the pipeline with a new platform version may change its
+/// query plan. If the modified pipeline is started from an existing checkpoint,
+/// it may require bootstrapping parts of its state from scratch.  See Feldera
+/// documentation for details on the bootstrapping process.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    params(
+        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+    ),
+    responses(
+        (status = OK
+            , description = "Pipeline successfully updated"
+            , body = PipelineInfo
+            , example = json!(examples::pipeline_1_info())),
+        (status = NOT_FOUND
+            , description = "Pipeline with that name does not exist"
+            , body = ErrorResponse
+            , example = json!(examples::error_unknown_pipeline_name())),
+        (status = BAD_REQUEST
+            , body = ErrorResponse
+            , examples(
+                ("Name does not match pattern" = (value = json!(examples::error_name_does_not_match_pattern()))),
+                ("Cannot update non-stopped pipeline" = (value = json!(examples::error_update_restricted_to_stopped())))
+            )
+        ),
+        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
+    ),
+    tag = "Pipeline Lifecycle"
+)]
+#[post("/pipelines/{pipeline_name}/update_runtime")]
+pub(crate) async fn post_update_runtime(
+    state: WebData<ServerState>,
+    tenant_id: ReqData<TenantId>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, ManagerError> {
+    let pipeline_name = path.into_inner();
+    let pipeline = state
+        .db
+        .lock()
+        .await
+        .update_pipeline(
+            *tenant_id,
+            &pipeline_name,
+            &None,
+            &None,
+            &state.common_config.platform_version,
+            true, // bump platform version.
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        )
+        .await?;
+    let returned_pipeline = PipelineInfoInternal::new(pipeline);
+
+    info!(
+        pipeline = %returned_pipeline.name,
+        pipeline_id = %returned_pipeline.id,
+        tenant = %tenant_id.0,
+        platform_version = %returned_pipeline.platform_version,
+        "Updated pipeline platform_version to {}",
+        returned_pipeline.platform_version
+    );
+    Ok(HttpResponse::Ok()
+        .insert_header(CacheControl(vec![CacheDirective::NoCache]))
+        .json(returned_pipeline))
+}
+
+/// Delete Pipeline
+///
+/// Delete an existing pipeline by name.
 #[utoipa::path(
     context_path = "/v0",
     security(("JSON web token (JWT) or API key" = [])),
@@ -813,7 +1286,7 @@ pub(crate) async fn patch_pipeline(
             , example = json!(examples::error_delete_restricted_to_fully_stopped())),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline management"
+    tag = "Pipeline CRUD"
 )]
 #[delete("/pipelines/{pipeline_name}")]
 pub(crate) async fn delete_pipeline(
@@ -829,25 +1302,35 @@ pub(crate) async fn delete_pipeline(
         .delete_pipeline(*tenant_id, &pipeline_name)
         .await?;
 
-    info!("Deleted pipeline {} (tenant: {})", pipeline_id, *tenant_id);
+    info!(
+        pipeline = %pipeline_name,
+        pipeline_id = %pipeline_id,
+        tenant = %tenant_id.0,
+        "Deleted pipeline"
+    );
     Ok(HttpResponse::Ok().finish())
 }
 
-/// Start the pipeline asynchronously by updating the desired state.
+/// Start Pipeline
 ///
-/// The endpoint returns immediately after setting the desired state to `Running`.
-/// The procedure to get to the desired state is performed asynchronously.
+/// Start the pipeline asynchronously by updating the desired status.
+///
+/// The endpoint returns immediately after setting the desired status.
+/// The procedure to get to the desired status is performed asynchronously.
 /// Progress should be monitored by polling the pipeline `GET` endpoints.
 ///
 /// Note the following:
-/// - A stopped pipeline can be started through calling either `/start` or `/pause`
-/// - Both starting as running and resuming a pipeline is done by calling `/start`
-/// - A pipeline which is in the process of suspending or stopping cannot be started
+/// - A stopped pipeline can be started through calling `/start?initial=running`,
+///   `/start?initial=paused`, or `/start?initial=standby`.
+/// - If the pipeline is already (being) started (provisioned), it will still return success
+/// - It is not possible to call `/start` when the pipeline has already had `/stop` called and is
+///   in the process of suspending or stopping.
 #[utoipa::path(
     context_path = "/v0",
     security(("JSON web token (JWT) or API key" = [])),
     params(
-        ("pipeline_name" = String, Path, description = "Unique pipeline name")
+        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+        PostStartPipelineParameters
     ),
     responses(
         (status = ACCEPTED
@@ -862,79 +1345,83 @@ pub(crate) async fn delete_pipeline(
             , example = json!(examples::error_illegal_pipeline_action())),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline management"
+    tag = "Pipeline Lifecycle"
 )]
 #[post("/pipelines/{pipeline_name}/start")]
 pub(crate) async fn post_pipeline_start(
     state: WebData<ServerState>,
     tenant_id: ReqData<TenantId>,
     path: web::Path<String>,
+    query: web::Query<PostStartPipelineParameters>,
 ) -> Result<HttpResponse, ManagerError> {
     let pipeline_name = path.into_inner();
-    let pipeline_id = state
-        .db
-        .lock()
-        .await
-        .set_deployment_desired_status_running(*tenant_id, &pipeline_name)
-        .await?;
+    let PostStartPipelineParameters {
+        initial,
+        bootstrap_policy,
+        dismiss_error,
+    } = query.into_inner();
+
+    let pipeline_id = match initial.as_str() {
+        "standby" => {
+            state
+                .db
+                .lock()
+                .await
+                .set_deployment_resources_desired_status_provisioned(
+                    *tenant_id,
+                    &pipeline_name,
+                    RuntimeDesiredStatus::Standby,
+                    bootstrap_policy,
+                    dismiss_error,
+                )
+                .await?
+        }
+        "paused" => {
+            state
+                .db
+                .lock()
+                .await
+                .set_deployment_resources_desired_status_provisioned(
+                    *tenant_id,
+                    &pipeline_name,
+                    RuntimeDesiredStatus::Paused,
+                    bootstrap_policy,
+                    dismiss_error,
+                )
+                .await?
+        }
+        "running" => {
+            state
+                .db
+                .lock()
+                .await
+                .set_deployment_resources_desired_status_provisioned(
+                    *tenant_id,
+                    &pipeline_name,
+                    RuntimeDesiredStatus::Running,
+                    bootstrap_policy,
+                    dismiss_error,
+                )
+                .await?
+        }
+        _ => Err(ManagerError::from(ApiError::UnsupportedPipelineAction {
+            action: format!("/start?initial={initial}"),
+            reason: format!("unknown initial runtime desired status: {initial}"),
+        }))?,
+    };
+
     info!(
-        "Accepted action: going to start pipeline {pipeline_id} (tenant: {})",
-        *tenant_id
+        pipeline_id = %pipeline_id,
+        pipeline = %pipeline_name,
+        tenant = %tenant_id.0,
+        "Accepted action: going to start pipeline as {}",
+        initial
     );
-    Ok(HttpResponse::Accepted().finish())
+    Ok(HttpResponse::Accepted().json(json!("Pipeline is starting")))
 }
 
-/// Pause the pipeline asynchronously by updating the desired state.
+/// Stop Pipeline
 ///
-/// The endpoint returns immediately after setting the desired state to `Paused`.
-/// The procedure to get to the desired state is performed asynchronously.
-/// Progress should be monitored by polling the pipeline `GET` endpoints.
-///
-/// Note the following:
-/// - A stopped pipeline can be started through calling either `/start` or `/pause`
-/// - Both starting as paused and pausing a pipeline is done by calling `/pause`
-/// - A pipeline which is in the process of suspending or stopping cannot be paused
-#[utoipa::path(
-    context_path = "/v0",
-    security(("JSON web token (JWT) or API key" = [])),
-    params(
-        ("pipeline_name" = String, Path, description = "Unique pipeline name")
-    ),
-    responses(
-        (status = ACCEPTED
-            , description = "Action is accepted and is being performed"),
-        (status = NOT_FOUND
-            , description = "Pipeline with that name does not exist"
-            , body = ErrorResponse
-            , example = json!(examples::error_unknown_pipeline_name())),
-        (status = BAD_REQUEST
-            , description = "Action could not be performed"
-            , body = ErrorResponse
-            , example = json!(examples::error_illegal_pipeline_action())),
-        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
-    ),
-    tag = "Pipeline management"
-)]
-#[post("/pipelines/{pipeline_name}/pause")]
-pub(crate) async fn post_pipeline_pause(
-    state: WebData<ServerState>,
-    tenant_id: ReqData<TenantId>,
-    path: web::Path<String>,
-) -> Result<HttpResponse, ManagerError> {
-    let pipeline_name = path.into_inner();
-    let pipeline_id = state
-        .db
-        .lock()
-        .await
-        .set_deployment_desired_status_paused(*tenant_id, &pipeline_name)
-        .await?;
-    info!(
-        "Accepted action: going to pause pipeline {pipeline_id} (tenant: {})",
-        *tenant_id
-    );
-    Ok(HttpResponse::Accepted().finish())
-}
-
 /// Stop the pipeline asynchronously by updating the desired state.
 ///
 /// There are two variants:
@@ -965,7 +1452,7 @@ pub(crate) async fn post_pipeline_pause(
     security(("JSON web token (JWT) or API key" = [])),
     params(
         ("pipeline_name" = String, Path, description = "Unique pipeline name"),
-        PostStopPipelineParameters,
+        PostStopPipelineParameters
     ),
     responses(
         (status = ACCEPTED
@@ -995,7 +1482,7 @@ pub(crate) async fn post_pipeline_pause(
         ),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline management"
+    tag = "Pipeline Lifecycle"
 )]
 #[post("/pipelines/{pipeline_name}/stop")]
 pub(crate) async fn post_pipeline_stop(
@@ -1006,13 +1493,20 @@ pub(crate) async fn post_pipeline_stop(
     query: web::Query<PostStopPipelineParameters>,
 ) -> Result<HttpResponse, ManagerError> {
     let pipeline_name = path.into_inner();
-    let pipeline_id = if query.force {
-        state
+    if query.force {
+        let pipeline_id = state
             .db
             .lock()
             .await
-            .set_deployment_desired_status_suspended_or_stopped(*tenant_id, &pipeline_name, true)
-            .await?
+            .set_deployment_resources_desired_status_stopped(*tenant_id, &pipeline_name)
+            .await?;
+        info!(
+            pipeline_id = %pipeline_id,
+            pipeline = %pipeline_name,
+            tenant = %tenant_id.0,
+            "Accepted action: going to forcefully stop pipeline"
+        );
+        Ok(HttpResponse::Accepted().json(json!("Pipeline is forcefully stopping")))
     } else {
         #[cfg(not(feature = "feldera-enterprise"))]
         {
@@ -1022,101 +1516,104 @@ pub(crate) async fn post_pipeline_stop(
         }
         #[cfg(feature = "feldera-enterprise")]
         {
-            use crate::runner::error::RunnerError;
-            // A request to check whether it can be suspended is done only when it is at least
-            // viable to send such a request (i.e., it is either Initializing, Paused, Running,
-            // or Unavailable). If it is in none of those states, then it is either already
-            // Suspending and thus Suspended will remain the target state, or it is Stopping
-            // or Stopped, in which case the target state will become Stopped.
-            let pipeline = state
+            let (was_set, pipeline_id) = state
                 .db
                 .lock()
                 .await
-                .get_pipeline_for_monitoring(*tenant_id, &pipeline_name)
+                .set_deployment_resources_desired_status_stopped_if_not_provisioned(
+                    *tenant_id,
+                    &pipeline_name,
+                )
                 .await?;
-            if matches!(
-                pipeline.deployment_status,
-                PipelineStatus::Initializing
-                    | PipelineStatus::Paused
-                    | PipelineStatus::Running
-                    | PipelineStatus::Unavailable
-            ) {
+            if was_set {
+                info!(
+                    pipeline_id = %pipeline_id,
+                    pipeline = %pipeline_name,
+                    tenant = %tenant_id.0,
+                    "Accepted action: going to forcefully stop pipeline because it is not provisioned"
+                );
+                Ok(HttpResponse::Accepted().json(json!("Pipeline is forcefully stopping")))
+            } else {
                 let response = state
                     .runner
                     .forward_http_request_to_pipeline_by_name(
                         _client.as_ref(),
                         *tenant_id,
                         &pipeline_name,
-                        actix_http::Method::GET,
-                        "suspendable",
+                        Method::POST,
+                        "suspend",
                         "",
+                        Some(Duration::from_secs(120)),
                         None,
                     )
-                    .await?;
-                let suspendable_response = if response.status().is_success() {
-                    let body = response.into_body();
-                    if let Ok(b) = body.try_into_bytes() {
-                        if let Ok(v) = serde_json::from_slice::<SuspendableResponse>(&b) {
-                            v
-                        } else {
-                            Err(RunnerError::PipelineInteractionInvalidResponse { error: format!("Pipeline returned an invalid response to a /suspendable request: {}", String::from_utf8_lossy(&b)) })?
-                        }
-                    } else {
-                        Err(RunnerError::PipelineInteractionInvalidResponse {
-                            error: "Error processing pipelines's response to a /suspendable request: failed to extract response body".to_string()
-                        })?
-                    }
-                } else {
-                    return Ok(response);
-                };
-                if suspendable_response.suspendable {
-                    state
-                        .db
-                        .lock()
-                        .await
-                        .set_deployment_desired_status_suspended_or_stopped(
-                            *tenant_id,
-                            &pipeline_name,
-                            false,
-                        )
-                        .await?
-                } else {
-                    let reasons = suspendable_response
-                        .reasons
-                        .iter()
-                        .map(|reason| format!("   - {reason}"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    Err(ManagerError::from(ApiError::UnsupportedPipelineAction {
-                        action: "stop?force=false".to_string(),
-                        reason: format!(
-                            "this pipeline does not support the stop without force (\"suspend\") operation for the following reason(s):\n{reasons}"
-                        ),
-                    }))?
-                }
-            } else {
+                    .await;
                 state
                     .db
                     .lock()
                     .await
-                    .set_deployment_desired_status_suspended_or_stopped(
-                        *tenant_id,
-                        &pipeline_name,
-                        false,
-                    )
-                    .await?
+                    .increment_notify_counter(*tenant_id, &pipeline_name)
+                    .await?;
+                if response
+                    .as_ref()
+                    .is_ok_and(|v| v.status() == actix_web::http::StatusCode::ACCEPTED)
+                {
+                    info!(
+                        pipeline = %pipeline_name,
+                        pipeline_id = %pipeline_id,
+                        tenant = %tenant_id.0,
+                        "Accepted action: going to non-forcefully stop pipeline"
+                    );
+                }
+                response
             }
         }
-    };
-
-    info!(
-        "Accepted action: going to {}stop pipeline {pipeline_id} (tenant: {})",
-        if query.force { "forcefully " } else { "" },
-        *tenant_id
-    );
-    Ok(HttpResponse::Accepted().finish())
+    }
 }
 
+/// Dismiss Pipeline Deployment Error
+///
+/// Clears the `deployment_error` field of the pipeline, such that a subsequent call to
+/// `/start?dismiss_error=false` succeeds. It will return an error if the pipeline is not fully
+/// stopped (i.e., both current and desired status must be `Stopped`) AND a deployment error
+/// is present.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    params(
+        ("pipeline_name" = String, Path, description = "Unique pipeline name")
+    ),
+    responses(
+        (status = OK
+            , description = "Deployment error has been dismissed"),
+        (status = NOT_FOUND
+            , description = "Pipeline with that name does not exist"
+            , body = ErrorResponse
+            , example = json!(examples::error_unknown_pipeline_name())),
+        (status = BAD_REQUEST
+            , description = "Action could not be performed"
+            , body = ErrorResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
+    ),
+    tag = "Pipeline Lifecycle"
+)]
+#[post("/pipelines/{pipeline_name}/dismiss_error")]
+pub(crate) async fn post_pipeline_dismiss_error(
+    state: WebData<ServerState>,
+    tenant_id: ReqData<TenantId>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, ManagerError> {
+    let pipeline_name = path.into_inner();
+    state
+        .db
+        .lock()
+        .await
+        .dismiss_deployment_error(*tenant_id, &pipeline_name)
+        .await?;
+    Ok(HttpResponse::Ok().json(json!("Pipeline deployment error has been dismissed")))
+}
+
+/// Clear Storage
+///
 /// Clears the pipeline storage asynchronously.
 ///
 /// IMPORTANT: Clearing means disassociating the storage from the pipeline.
@@ -1147,7 +1644,7 @@ pub(crate) async fn post_pipeline_stop(
         ),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline management"
+    tag = "Pipeline Lifecycle"
 )]
 #[post("/pipelines/{pipeline_name}/clear")]
 pub(crate) async fn post_pipeline_clear(
@@ -1160,16 +1657,20 @@ pub(crate) async fn post_pipeline_clear(
         .db
         .lock()
         .await
-        .transit_storage_status_to_clearing(*tenant_id, &pipeline_name)
+        .transit_storage_status_to_clearing_if_not_cleared(*tenant_id, &pipeline_name)
         .await?;
 
     info!(
-        "Accepted storage action: going to clear storage of pipeline {pipeline_id} (tenant: {})",
-        *tenant_id
+        pipeline_id = %pipeline_id,
+        pipeline = %pipeline_name,
+        tenant = %tenant_id.0,
+        "Accepted storage action: going to clear storage of pipeline"
     );
-    Ok(HttpResponse::Accepted().finish())
+    Ok(HttpResponse::Accepted().json(json!("Pipeline storage is being cleared")))
 }
 
+/// Stream Pipeline Logs
+///
 /// Retrieve logs of a pipeline as a stream.
 ///
 /// The logs stream catches up to the extent of the internally configured per-pipeline
@@ -1206,7 +1707,7 @@ pub(crate) async fn post_pipeline_clear(
         ),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
-    tag = "Pipeline interaction"
+    tag = "Metrics & Debugging"
 )]
 #[get("/pipelines/{pipeline_name}/logs")]
 pub(crate) async fn get_pipeline_logs(
@@ -1220,4 +1721,63 @@ pub(crate) async fn get_pipeline_logs(
         .runner
         .http_streaming_logs_from_pipeline_by_name(&client, *tenant_id, &pipeline_name)
         .await
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, IntoParams)]
+pub struct PostPipelineTesting {
+    #[serde(default)]
+    pub set_platform_version: Option<String>,
+}
+
+/// Test Endpoint
+///
+/// This endpoint is used as part of the test harness. Only available if the `testing`
+/// unstable feature is enabled. Do not use in production.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    params(
+        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+        PostPipelineTesting,
+    ),
+    responses(
+        (status = OK
+            , description = "Request successfully processed"),
+        (status = NOT_FOUND
+            , description = "Pipeline with that name does not exist"
+            , body = ErrorResponse
+            , example = json!(examples::error_unknown_pipeline_name())),
+        (status = METHOD_NOT_ALLOWED
+            , description = "Endpoint is disabled. Set FELDERA_UNSTABLE_FEATURES=\"testing\" to enable."
+            , body = ErrorResponse
+        )
+    ),
+    tag = "Metrics & Debugging"
+)]
+#[post("/pipelines/{pipeline_name}/testing")]
+pub(crate) async fn post_pipeline_testing(
+    state: WebData<ServerState>,
+    tenant_id: ReqData<TenantId>,
+    path: web::Path<String>,
+    query: web::Query<PostPipelineTesting>,
+) -> Result<HttpResponse, ManagerError> {
+    if !has_unstable_feature("testing") {
+        Err(ApiError::UnsupportedPipelineAction {
+            action: "/testing".to_string(),
+            reason: "/testing endpoint is disabled. Set FELDERA_UNSTABLE_FEATURES=\"testing\" to enable.".to_string()
+        })?;
+    };
+
+    let pipeline_name = path.into_inner();
+
+    if let Some(platform_version) = &query.set_platform_version {
+        state
+            .db
+            .lock()
+            .await
+            .testing_force_update_platform_version(*tenant_id, &pipeline_name, platform_version)
+            .await?;
+    }
+
+    Ok(HttpResponse::Ok().finish())
 }

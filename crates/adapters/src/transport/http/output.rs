@@ -1,14 +1,14 @@
-use crate::{AsyncErrorCallback, OutputEndpoint, TransportConfig};
-use actix_web::{http::header::ContentType, web::Bytes, HttpResponse};
-use anyhow::{anyhow, bail, Result as AnyResult};
+use crate::{AsyncErrorCallback, OutputEndpoint};
+use actix_web::{HttpResponse, http::header::ContentType, web::Bytes};
+use anyhow::{Result as AnyResult, anyhow, bail};
 use async_stream::stream;
 use crossbeam::sync::ShardedLock;
-use serde::{ser::SerializeStruct, Serializer};
+use serde::{Deserialize, Serializer, ser::SerializeStruct};
 use serde_json::value::RawValue;
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -21,10 +21,11 @@ use tracing::{debug, error, info_span};
 // TODO: make this configurable via endpoint config.
 const MAX_BUFFERS: usize = 100;
 
-enum Format {
-    Binary,
-    Text,
-    #[allow(dead_code)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpOutputFormat {
+    #[default]
+    Csv,
     Json,
 }
 
@@ -36,14 +37,6 @@ enum Format {
 pub(crate) struct HttpOutputTransport;
 
 impl HttpOutputTransport {
-    pub(crate) fn config() -> TransportConfig {
-        TransportConfig::HttpOutput
-    }
-
-    pub(crate) fn default_format() -> String {
-        String::from("csv")
-    }
-
     pub(crate) fn default_max_buffered_records() -> u64 {
         100_000
     }
@@ -68,7 +61,7 @@ type SendRequest = (Buffer, Option<oneshot::Sender<()>>);
 
 struct HttpOutputEndpointInner {
     name: String,
-    format: Format,
+    format: HttpOutputFormat,
 
     // Apply backpressure on the pipeline when the client or the network
     // are not keeping up.
@@ -84,7 +77,7 @@ struct HttpOutputEndpointInner {
 }
 
 impl HttpOutputEndpointInner {
-    pub(crate) fn new(name: &str, format: Format, backpressure: bool) -> Self {
+    pub(crate) fn new(name: &str, format: HttpOutputFormat, backpressure: bool) -> Self {
         Self {
             name: name.to_string(),
             format,
@@ -109,8 +102,7 @@ impl HttpOutputEndpointInner {
 
         if let Some(buffer) = buffer {
             match self.format {
-                Format::Binary => unimplemented!(),
-                Format::Text => {
+                HttpOutputFormat::Csv => {
                     let data_str = std::str::from_utf8(buffer).map_err(|e| {
                         anyhow!("received an invalid UTF8 string from encoder: {e}")
                     })?;
@@ -118,7 +110,7 @@ impl HttpOutputEndpointInner {
                         .serialize_field("text_data", data_str)
                         .map_err(|e| anyhow!("error serializing 'text_data' field: {e}"))?;
                 }
-                Format::Json => {
+                HttpOutputFormat::Json => {
                     let data_str = std::str::from_utf8(buffer).map_err(|e| {
                         anyhow!("received an invalid UTF8 string from encoder: {e}")
                     })?;
@@ -152,10 +144,9 @@ impl HttpOutputEndpointInner {
         // A failure simply means that there are no receivers.
         if let Some(Ok(_)) = self.sender.read().unwrap().as_ref().map(|sender| {
             sender.try_send((Buffer::new(seq_number, Bytes::from(json_buf)), ack_sender))
-        }) {
-            if let Some(ack_receiver) = ack_receiver {
-                let _ = ack_receiver.blocking_recv();
-            }
+        }) && let Some(ack_receiver) = ack_receiver
+        {
+            let _ = ack_receiver.blocking_recv();
         }
 
         Ok(())
@@ -189,12 +180,7 @@ pub(crate) struct HttpOutputEndpoint {
 }
 
 impl HttpOutputEndpoint {
-    pub(crate) fn new(name: &str, format: &str, backpressure: bool) -> Self {
-        let format = match format {
-            "csv" => Format::Text,
-            "json" => Format::Json,
-            _ => Format::Binary,
-        };
+    pub(crate) fn new(name: &str, format: HttpOutputFormat, backpressure: bool) -> Self {
         Self {
             inner: Arc::new(HttpOutputEndpointInner::new(name, format, backpressure)),
         }

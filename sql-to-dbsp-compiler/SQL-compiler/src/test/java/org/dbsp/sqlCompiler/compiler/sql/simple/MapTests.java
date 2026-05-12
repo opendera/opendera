@@ -1,11 +1,13 @@
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.TestUtil;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.sql.tools.BaseSQLTests;
 import org.dbsp.sqlCompiler.compiler.sql.tools.Change;
 import org.dbsp.sqlCompiler.compiler.sql.tools.InputOutputChange;
 import org.dbsp.sqlCompiler.compiler.sql.tools.InputOutputChangeStream;
+import org.dbsp.sqlCompiler.ir.expression.DBSPArrayExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPTupleExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
 import org.dbsp.sqlCompiler.ir.expression.DBSPMapExpression;
@@ -24,6 +26,7 @@ public class MapTests extends BaseSQLTests {
     public DBSPCompiler compileQuery(String statements, String query) {
         DBSPCompiler compiler = this.testCompiler();
         compiler.options.languageOptions.optimizationLevel = 0;
+        compiler.options.ioOptions.quiet = false;
         compiler.submitStatementsForCompilation(statements);
         compiler.submitStatementForCompilation(query);
         return compiler;
@@ -35,10 +38,16 @@ public class MapTests extends BaseSQLTests {
         this.getCCS(compiler, streams);
     }
 
-    private void testQuery(String query, DBSPZSetExpression literal) {
+    private void testQuery(String query, DBSPZSetExpression expression) {
         this.testQuery("", query,
                 new InputOutputChangeStream().addChange(
-                        new InputOutputChange(new Change(), new Change(literal))));
+                        new InputOutputChange(new Change(), new Change("V", expression))));
+    }
+
+    @Test
+    public void testDuplicateKeys() {
+        var compiler = this.compileQuery("", "CREATE VIEW V AS SELECT MAP['hi', 1, 'hi', 2]");
+        TestUtil.assertMessagesContain(compiler, "Duplicate MAP key");
     }
 
     @Test
@@ -111,7 +120,7 @@ public class MapTests extends BaseSQLTests {
                                         new DBSPI32Literal(10, true))
                         )));
         this.testQuery(ddl, query,
-                new InputOutputChangeStream().addPair(new Change(input), new Change(result)));
+                new InputOutputChangeStream().addPair(new Change("T", input), new Change("V", result)));
     }
 
     @Test
@@ -122,7 +131,7 @@ public class MapTests extends BaseSQLTests {
                     new DBSPStringLiteral("a", false),
                     new DBSPI32Literal(12, false)));
         this.testQuery("", sql,
-                new InputOutputChangeStream().addPair(new Change(), new Change(result)));
+                new InputOutputChangeStream().addPair(new Change(), new Change("V", result)));
     }
 
     @Test
@@ -139,7 +148,7 @@ public class MapTests extends BaseSQLTests {
                         new DBSPStringLiteral("c", false),
                         new DBSPI32Literal()));
         this.testQuery("", sql,
-                new InputOutputChangeStream().addPair(new Change(), new Change(result)));
+                new InputOutputChangeStream().addPair(new Change(), new Change("V", result)));
     }
 
     @Test
@@ -161,6 +170,86 @@ public class MapTests extends BaseSQLTests {
                         new DBSPI32Literal(5, false),
                         new DBSPI32Literal()));
         this.testQuery("", sql, new InputOutputChangeStream()
-                .addPair(new Change(), new Change(result)));
+                .addPair(new Change(), new Change("V", result)));
+    }
+
+    @Test
+    public void nullMapKey() {
+        this.statementsFailingInCompilation("CREATE VIEW V AS SELECT MAP[NULL, NULL]",
+                "MAP key type cannot be NULL");
+    }
+
+    @Test
+    public void testMapKeys() {
+        String sql = "SELECT map_keys(map['foo', 1, 'bar', 2])";
+        DBSPZSetExpression result = new DBSPZSetExpression(
+                new DBSPTupleExpression(new DBSPArrayExpression(
+                        false,
+                        new DBSPStringLiteral("bar"),
+                        new DBSPStringLiteral("foo"))));
+        this.testQuery("", sql, new InputOutputChangeStream()
+                .addPair(new Change(), new Change("V", result)));
+    }
+
+    @Test
+    public void mapKeyVariant() {
+        var ccs = this.getCCS("""
+                create table j(j VARCHAR);
+                
+                create LOCAL view user_props AS
+                SELECT PARSE_JSON(j) AS contacts FROM j;
+                
+                create view abc as
+                WITH ref_profile AS (
+                SELECT cast(contacts as MAP<varchar, variant>) contacts
+                    FROM user_props
+                ) SELECT key
+                FROM ref_profile profile_0, UNNEST(MAP_KEYS(profile_0.contacts)) AS t(key)""");
+        ccs.step("""
+                INSERT INTO j VALUES('{ "a": "1", "b": 2, "c": [1, 2, 3], "d": null, "e": { "f": 1 } }');""", """
+                 key | weight
+                ------------------------
+                 a| 1
+                 b| 1
+                 c| 1
+                 d| 1
+                 e| 1""");
+    }
+
+    @Test
+    public void testMapValues() {
+        String sql = "SELECT map_values(map['foo', 1, 'bar', 2])";
+        DBSPZSetExpression result = new DBSPZSetExpression(
+                new DBSPTupleExpression(new DBSPArrayExpression(
+                        false,
+                        new DBSPI32Literal(2),
+                        new DBSPI32Literal(1))));
+        this.testQuery("", sql, new InputOutputChangeStream()
+                .addPair(new Change(), new Change("V", result)));
+    }
+
+    @Test
+    public void mapValuesVariant() {
+        var ccs = this.getCCS("""
+                create table j(j VARCHAR);
+                
+                create LOCAL view user_props AS
+                SELECT PARSE_JSON(j) AS contacts FROM j;
+                
+                create view abc as
+                WITH ref_profile AS (
+                SELECT cast(contacts as MAP<varchar, variant>) contacts
+                    FROM user_props
+                ) SELECT TO_JSON(value)
+                FROM ref_profile profile_0, UNNEST(MAP_VALUES(profile_0.contacts)) AS t(value)""");
+        ccs.step("""
+                INSERT INTO j VALUES('{ "a": "1", "b": 2, "c": [1, 2, 3], "d": null, "e": { "f": 1 } }');""", """
+                 key | weight
+                ------------------------
+                 "1"| 1
+                 2| 1
+                 [1,2,3]| 1
+                 null| 1
+                 {"f":1}| 1""");
     }
 }

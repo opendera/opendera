@@ -26,31 +26,28 @@ package org.dbsp.sqlCompiler;
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.ParameterException;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import org.apache.calcite.adapter.jdbc.JdbcSchema;
-import org.apache.calcite.jdbc.CalciteConnection;
-import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.util.Pair;
-import org.apache.commons.io.output.NullPrintStream;
-import org.codehaus.janino.Compiler;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.backend.ToJsonOuterVisitor;
 import org.dbsp.sqlCompiler.compiler.backend.rust.StubsWriter;
+import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCrates;
 import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCratesWriter;
 import org.dbsp.sqlCompiler.compiler.backend.rust.RustFileWriter;
 import org.dbsp.sqlCompiler.compiler.backend.dot.ToDot;
 import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
 import org.dbsp.sqlCompiler.compiler.errors.CompilerMessages;
 import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.util.IIndentStream;
 import org.dbsp.util.IndentStream;
 import org.dbsp.util.Logger;
+import org.dbsp.util.NullPrintStream;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
-import javax.sql.DataSource;
 import java.io.File;
-import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -58,10 +55,9 @@ import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.Map;
+import java.util.Properties;
 
 /** Main entry point of the SQL compiler. */
 public class CompilerMain {
@@ -72,15 +68,33 @@ public class CompilerMain {
     }
 
     void usage(JCommander commander) {
-        /*
-        // JCommander mistakenly prints this as default value
-        // if it manages to parse it partially.
-        this.options.ioOptions.loggingLevel.clear();
-         */
         commander.usage();
     }
 
-    int parseOptions(String[] argv) {
+    String getVersion() {
+        Properties props = new Properties();
+        try (InputStream input = CompilerMain.class.getResourceAsStream("/version.properties")) {
+            props.load(input);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        return props.getProperty("version", "unknown");
+    }
+
+    void showVersion() {
+        System.out.println("SQL to DBSP compiler version " + this.getVersion());
+    }
+
+    public enum ParseResult {
+        /** Error while parsing options */
+        Error,
+        /** Parsed options ok, continue compilation */
+        OkContinue,
+        /** Parsed options ok, stop compilation */
+        OkStop
+    }
+
+    ParseResult parseOptions(String[] argv) {
         JCommander commander = JCommander.newBuilder()
                 .addObject(this.options)
                 .build();
@@ -94,11 +108,15 @@ public class CompilerMain {
                 }
             }
             System.err.println(ex.getMessage());
-            return 1;
+            return ParseResult.Error;
         }
         if (this.options.help) {
             this.usage(commander);
-            return 1;
+            return ParseResult.OkStop;
+        }
+        if (this.options.ioOptions.showVersion) {
+            this.showVersion();
+            return ParseResult.OkStop;
         }
 
         for (Map.Entry<String, String> entry: options.ioOptions.loggingLevel.entrySet()) {
@@ -107,11 +125,11 @@ public class CompilerMain {
                 Logger.INSTANCE.setLoggingLevel(entry.getKey(), level);
             } catch (NumberFormatException ex) {
                 System.err.println("-T option must be followed by 'class=number'; could not parse " + entry);
-                return 1;
+                return ParseResult.Error;
             }
         }
 
-        return 0;
+        return ParseResult.OkContinue;
     }
 
     PrintStream getOutputStream() throws IOException {
@@ -137,21 +155,9 @@ public class CompilerMain {
     }
 
     /** Run compiler, return exit code. */
-    CompilerMessages run() throws SQLException {
+    CompilerMessages run() {
         DBSPCompiler compiler = new DBSPCompiler(this.options);
         this.options.validate(compiler);
-        String conn = this.options.ioOptions.metadataSource;
-        if (!conn.isEmpty()) {
-            // This requires the JDBC drivers for the respective databases to be loaded
-            DataSource mockDataSource = JdbcSchema.dataSource(conn, null, null, null);
-            Connection executorConnection = DriverManager.getConnection("jdbc:calcite:");
-            CalciteConnection calciteConnection = executorConnection.unwrap(CalciteConnection.class);
-            SchemaPlus rootSchema = calciteConnection.getRootSchema();
-            String schemaName = "schema";
-            JdbcSchema schema = JdbcSchema.create(rootSchema, schemaName, mockDataSource, null, null);
-            compiler.addSchemaSource(schemaName, schema);
-        }
-
         try {
             InputStream input = this.getInputFile(this.options.ioOptions.inputFile);
             compiler.setEntireInput(this.options.ioOptions.inputFile, input);
@@ -169,6 +175,9 @@ public class CompilerMain {
             return compiler.messages;
         // The following runs all compilation stages
         DBSPCircuit circuit = compiler.getFinalCircuit(false);
+        if (options.ioOptions.anonymize)
+            // The front-end has already emitted the output, we are done.
+            return compiler.messages;
         if (compiler.hasErrors())
             return compiler.messages;
         Utilities.enforce(circuit != null);
@@ -224,11 +233,31 @@ public class CompilerMain {
                     this.options.ioOptions.verbosity, dotFormat, circuit);
             return compiler.messages;
         }
+        if (this.options.ioOptions.interpreterJson) {
+            if (this.options.ioOptions.multiCrates()) {
+                compiler.reportError(SourcePositionRange.INVALID,
+                        "Incompatible options", "Option --crates is not compatible with --jit");
+                return compiler.messages;
+            } else {
+                ToJsonOuterVisitor visitor = ToJsonOuterVisitor.create(compiler, 1);
+                visitor.apply(circuit);
+                String str = visitor.getJsonString();
+                try (PrintStream stream = this.getOutputStream()) {
+                    stream.print(str);
+                } catch (IOException e) {
+                    compiler.reportError(SourcePositionRange.INVALID,
+                            "Error writing to output file", e.getMessage());
+                }
+            }
+            return compiler.messages;
+        }
         MultiCratesWriter multiWriter = null;
         try {
             if (!compiler.options.ioOptions.multiCrates()) {
                 PrintStream stream = this.getOutputStream();
-                RustFileWriter writer = new RustFileWriter();
+                LateMaterializations materializations = new LateMaterializations(compiler);
+                materializations.apply(circuit);
+                RustFileWriter writer = new RustFileWriter(materializations);
                 IIndentStream indent = new IndentStream(stream);
                 writer.setOutputBuilder(indent);
                 writer.add(circuit);
@@ -247,29 +276,25 @@ public class CompilerMain {
             return compiler.messages;
         }
 
-        try {
-            // Generate stubs.rs file
-            String outputFile = this.options.ioOptions.outputFile;
-            if (!outputFile.isEmpty() && !this.options.ioOptions.noRust) {
-                Path stubs;
-                Path outputPath = Paths.get(new File(outputFile).getAbsolutePath());
-                if (options.ioOptions.multiCrates()) {
-                    // Generate globals/src/stubs.rs
-                    Utilities.enforce(multiWriter != null);
-                    String globals = multiWriter.getGlobalsName();
-                    stubs = outputPath.resolve(globals).resolve("src").resolve(DBSPCompiler.STUBS_FILE_NAME);
-                } else {
-                    // Generate stubs.rs in the same directory
-                    stubs = outputPath.getParent().resolve(DBSPCompiler.STUBS_FILE_NAME);
-                }
-                StubsWriter writer = new StubsWriter(stubs);
-                writer.add(circuit);
-                writer.write(compiler);
+        // Generate stubs.rs file
+        String outputFile = this.options.ioOptions.outputFile;
+        if (!outputFile.isEmpty() && !this.options.ioOptions.noRust) {
+            Path stubs;
+            Path outputPath;
+            if (options.ioOptions.multiCrates()) {
+                // Generate globals/src/stubs.rs
+                Utilities.enforce(multiWriter != null);
+                String globals = multiWriter.getGlobalsName();
+                outputPath = Paths.get(outputFile, MultiCrates.CRATES_DIRECTORY);
+                stubs = outputPath.resolve(globals).resolve("src").resolve(DBSPCompiler.STUBS_FILE_NAME);
+            } else {
+                // Generate stubs.rs in the same directory
+                outputPath = Paths.get(new File(outputFile).getAbsolutePath());
+                stubs = outputPath.getParent().resolve(DBSPCompiler.STUBS_FILE_NAME);
             }
-        } catch (IOException e) {
-            compiler.reportError(SourcePositionRange.INVALID,
-                    "Error writing to proto.rs file", e.getMessage());
-            return compiler.messages;
+            StubsWriter writer = new StubsWriter(stubs);
+            writer.add(circuit);
+            writer.write(compiler);
         }
 
         return compiler.messages;
@@ -277,15 +302,17 @@ public class CompilerMain {
 
     public static Pair<CompilerMessages, CompilerOptions> run(String... argv) throws SQLException {
         CompilerMain main = new CompilerMain();
-        int exitCode = main.parseOptions(argv);
+        var parseResult = main.parseOptions(argv);
         CompilerOptions options = main.options;
-        if (exitCode != 0) {
+        if (parseResult != ParseResult.OkContinue) {
             // return empty messages
             CompilerMessages result = new CompilerMessages(new DBSPCompiler(new CompilerOptions()));
+            int exitCode = parseResult == ParseResult.Error ? 1 : 0;
             result.setExitCode(exitCode);
             return new Pair<>(result, options);
         }
-        return new Pair<>(main.run(), options);
+        var messages = main.run();
+        return new Pair<>(messages, options);
     }
 
     public static CompilerMessages execute(String... argv) throws SQLException {

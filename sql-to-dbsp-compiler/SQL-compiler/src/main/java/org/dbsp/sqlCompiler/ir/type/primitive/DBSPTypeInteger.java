@@ -92,7 +92,7 @@ public class DBSPTypeInteger extends DBSPTypeBaseType
             return INT32;
         else if (precision < 19)
             return INT64;
-        else if (precision < 38)
+        else if (precision <= 38)
             return INT128;
         return null;
     }
@@ -146,7 +146,7 @@ public class DBSPTypeInteger extends DBSPTypeBaseType
             }
         } else {
             switch (this.width) {
-                case 8: return new DBSPU8Literal(0, this.mayBeNull);
+                case 8: return new DBSPU8Literal(1, this.mayBeNull);
                 case 16: return new DBSPU16Literal(1, this.mayBeNull);
                 case 32: return new DBSPU32Literal(1L, this.mayBeNull);
                 case 64: return new DBSPU64Literal(BigInteger.ONE, this.mayBeNull);
@@ -238,13 +238,13 @@ public class DBSPTypeInteger extends DBSPTypeBaseType
     public DBSPExpression fold(DBSPBinaryExpression expression) {
         try {
             DBSPLiteral ll = expression.left.as(DBSPLiteral.class);
-            DBSPLiteral rl = expression.left.as(DBSPLiteral.class);
+            DBSPLiteral rl = expression.right.as(DBSPLiteral.class);
             if (ll == null || rl == null)
                 return expression;
             if ((ll.isNull()) && expression.opcode.isStrict())
                 return ll;
             if ((rl.isNull()) && expression.opcode.isStrict())
-                return ll;
+                return rl;
             switch (this.width) {
                 case 8: {
                     DBSPI8Literal left = expression.left.as(DBSPI8Literal.class);
@@ -298,12 +298,10 @@ public class DBSPTypeInteger extends DBSPTypeBaseType
         };
     }
 
-    /** Given an integer type, return the signed integer type that is just one size larger if it exists. */
+    /** Given an integer type, return a signed integer type that is larger */
     public static DBSPTypeCode largerSigned(DBSPTypeCode code) {
         return switch (code) {
-            case INT8, UINT8 -> INT16;
-            case INT16, UINT16 -> INT32;
-            case INT32, UINT32 -> INT64;
+            case INT8, UINT8, INT16, UINT16, INT32, UINT32 -> INT64;
             case INT64, UINT64 -> INT128;
             default -> code;
         };

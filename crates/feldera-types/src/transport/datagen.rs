@@ -241,6 +241,12 @@ pub struct GenerationPlan {
     /// running tests with lateness and many workers you can e.g., reduce the
     /// chunk size to make sure a smaller range of records is being ingested in parallel.
     ///
+    /// This also controls the sizes of input batches.  If, for example, `rate`
+    /// and `worker_chunk_size` are both 1000, with a single worker, the
+    /// generator will output 1000 records once a second.  But if we reduce
+    /// `worker_chunk_size` to 100 without changing `rate`, the generator will
+    /// instead output 100 records 10 times per second.
+    ///
     /// # Example
     /// Assume you generate a total of 125 records with 4 workers and a chunk size of 25.
     /// In this case, worker A will generate records 0..25, worker B will generate records 25..50,
@@ -278,6 +284,13 @@ pub struct DatagenInputConfig {
     ///   apart from setting a seed, `workers` also needs to remain unchanged.
     /// - The input will arrive in non-deterministic order if `workers > 1`.
     pub seed: Option<u64>,
+
+    /// By default, the data generator does not request [transactions].  Set
+    /// this to a nonzero value for the data generator to automatically
+    /// orchestrate transactions of approximately the specified number of rows.
+    ///
+    /// [transactions]: https://docs.feldera.com/pipelines/transactions
+    pub transaction_size: Option<usize>,
 }
 
 impl Default for DatagenInputConfig {
@@ -286,6 +299,7 @@ impl Default for DatagenInputConfig {
             plan: vec![GenerationPlan::default()],
             workers: 1,
             seed: None,
+            transaction_size: None,
         }
     }
 }

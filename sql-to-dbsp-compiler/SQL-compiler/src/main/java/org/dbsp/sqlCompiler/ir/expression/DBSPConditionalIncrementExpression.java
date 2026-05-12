@@ -1,0 +1,111 @@
+package org.dbsp.sqlCompiler.ir.expression;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
+import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
+import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
+import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
+import org.dbsp.sqlCompiler.ir.type.DBSPType;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBool;
+import org.dbsp.util.IIndentStream;
+
+import javax.annotation.Nullable;
+
+/** A conditional increment has the form
+ * (accumulator, increment, predicate) -> accumulator.
+ * The predicate is optional, and then this is an "unconditional" increment.
+ * This translates into a function call, which is more efficient than a conditional.*/
+public final class DBSPConditionalIncrementExpression extends DBSPExpression {
+    public final DBSPOpcode opcode;
+    public final DBSPExpression left;
+    public final DBSPExpression right;
+    @Nullable
+    public final DBSPExpression condition;
+
+    public DBSPConditionalIncrementExpression(
+            CalciteObject node, DBSPOpcode opcode, DBSPType resultType, DBSPExpression left,
+            DBSPExpression right, @Nullable DBSPExpression condition) {
+        super(node, resultType);
+        this.opcode = opcode;
+        this.left = left;
+        this.right = right;
+        this.condition = condition;
+        if (this.condition != null && !this.condition.getType().is(DBSPTypeBool.class))
+            throw new InternalCompilerError("Expected a boolean condition type " + left + " got " +
+                    this.left.getType(), this);
+    }
+
+    @Override
+    public DBSPExpression deepCopy() {
+        return new DBSPConditionalIncrementExpression(this.getNode(), this.opcode, this.getType(),
+                this.left.deepCopy(), this.right.deepCopy(), DBSPExpression.nullableDeepCopy(condition));
+    }
+
+    @Override
+    public boolean equivalent(EquivalenceContext context, DBSPExpression other) {
+        DBSPConditionalIncrementExpression otherExpression = other.as(DBSPConditionalIncrementExpression.class);
+        if (otherExpression == null)
+            return false;
+        return this.opcode == otherExpression.opcode &&
+                context.equivalent(this.left, otherExpression.left) &&
+                context.equivalent(this.right, otherExpression.right) &&
+                context.equivalent(this.condition, otherExpression.condition);
+    }
+
+    @Override
+    public void accept(InnerVisitor visitor) {
+        VisitDecision decision = visitor.preorder(this);
+        if (decision.stop()) return;
+        visitor.push(this);
+        visitor.property("type");
+        this.type.accept(visitor);
+        visitor.property("left");
+        this.left.accept(visitor);
+        visitor.property("right");
+        this.right.accept(visitor);
+        if (this.condition != null) {
+            visitor.property("condition");
+            this.condition.accept(visitor);
+        }
+        visitor.pop(this);
+        visitor.postorder(this);
+    }
+
+    @Override
+    public boolean sameFields(IDBSPInnerNode other) {
+        DBSPConditionalIncrementExpression o = other.as(DBSPConditionalIncrementExpression.class);
+        if (o == null)
+            return false;
+        return this.left == o.left &&
+                this.right == o.right &&
+                this.condition == o.condition;
+    }
+
+    @Override
+    public IIndentStream toString(IIndentStream builder) {
+        builder.append(this.opcode.toString())
+                .append("(")
+                .append(this.left)
+                .append(", ")
+                .append(this.right);
+        if (this.condition != null)
+            builder.append(", ")
+                    .append(this.condition);
+        return builder.append(")");
+    }
+
+    @SuppressWarnings("unused")
+    public static DBSPConditionalIncrementExpression fromJson(JsonNode node, JsonDecoder decoder) {
+        DBSPExpression left = fromJsonInner(node, "left", decoder, DBSPExpression.class);
+        DBSPExpression right = fromJsonInner(node, "right", decoder, DBSPExpression.class);
+        DBSPType type = getJsonType(node, decoder);
+        DBSPExpression condition = null;
+        if (node.has("condition"))
+            condition = fromJsonInner(node, "condition", decoder, DBSPExpression.class);
+        DBSPOpcode code = DBSPOpcode.fromJson(node);
+        return new DBSPConditionalIncrementExpression(CalciteObject.EMPTY, code, type, left, right, condition);
+    }
+}

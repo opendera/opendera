@@ -3,16 +3,19 @@ package org.dbsp.sqlCompiler.compiler.sql;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPInputMapWithWaterlineOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainValuesOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
-import org.dbsp.sqlCompiler.compiler.backend.MerkleInner;
-import org.dbsp.sqlCompiler.compiler.backend.MerkleOuter;
+import org.dbsp.sqlCompiler.compiler.backend.rust.ToRustVisitor;
+import org.dbsp.sqlCompiler.compiler.backend.rust.multi.ProjectDeclarations;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.sql.tools.BaseSQLTests;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.Passes;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeStruct;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
@@ -20,8 +23,8 @@ import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeString;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeArray;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
+import org.dbsp.util.IndentStreamBuilder;
 import org.dbsp.util.Linq;
-import org.dbsp.util.Logger;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -36,6 +39,48 @@ public class CatalogTests extends BaseSQLTests {
         result.ioOptions.emitHandles = false;
         result.languageOptions.unrestrictedIOTypes = false;
         return result;
+    }
+
+    @Test
+    public void issue5957() {
+        var ccs = this.getCCS("CREATE TABLE T(used INTEGER, unused INTEGER) with ('skip_unused_columns' = 'true', 'connectors' = '[]');");
+        IndentStreamBuilder builder = new IndentStreamBuilder();
+        ToRustVisitor visitor = new ToRustVisitor(
+                ccs.compiler, builder, ccs.getCircuit().getMetadata(),
+                new ProjectDeclarations(), new LateMaterializations(ccs.compiler));
+        visitor.apply(ccs.getCircuit());
+        Assert.assertTrue(builder.toString().contains("\"skip_unused_columns\":{\"value\":\"true\""));
+    }
+
+    @Test
+    public void issue5350() {
+        this.getCCS("""
+                CREATE TABLE test_data (
+                    username VARCHAR NOT NULL,
+                    kafka_timestamp VARIANT DEFAULT CONNECTOR_METADATA()
+                ) WITH ('connectors' = '[
+                    {
+                        "format":{
+                            "name":"avro",
+                            "config": {
+                                "update_format":"raw",
+                                "registry_urls": ["http://localhost:18081/"]
+                            }
+                        },
+                        "transport":{
+                            "name":"kafka_input",
+                            "config": {
+                                "topic":"test_topic",
+                                "start_from":"latest",
+                                "bootstrap.servers":"localhost:19092",
+                                "include_timestamp": true
+                            }
+                        }
+                    }
+                    ]',
+                    'append_only'='false',
+                    'materialized' = 'true'
+                );""");
     }
 
     @Test
@@ -175,11 +220,57 @@ public class CatalogTests extends BaseSQLTests {
     }
 
     @Test
+    public void testOver() {
+        var ccs = this.getCCS("""
+                CREATE TABLE table_name (
+                    id INT NOT NULL PRIMARY KEY,
+                    customer_id INT NOT NULL,
+                    timestamp_column TIMESTAMP NOT NULL LATENESS INTERVAL 0 DAYS,
+                    column_name DECIMAL(10, 2) NOT NULL
+                );
+
+                CREATE VIEW V AS SELECT
+                    customer_id,
+                    timestamp_column,
+                    column_name,
+                    SUM(column_name) OVER (
+                        PARTITION BY customer_id, DATE_TRUNC(timestamp_column, MONTH)
+                        ORDER BY timestamp_column
+                        RANGE BETWEEN INTERVAL 31 DAYS PRECEDING AND CURRENT ROW
+                    ) AS cumulative_sum
+                FROM
+                    table_name;
+                """);
+        // Note: we compile without -i, so there are fewer GC operators than expected
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            int imww = 0;
+            int retain = 0;
+
+            // Check that InputMapWithWaterline is GC-ed
+            @Override
+            public void postorder(DBSPIntegrateTraceRetainValuesOperator node) {
+                this.retain++;
+            }
+
+            @Override
+            public void postorder(DBSPInputMapWithWaterlineOperator operator) {
+                this.imww++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(1, this.imww);
+                Assert.assertEquals(1, this.retain);
+            }
+        });
+    }
+
+    @Test
     public void issue3615() {
         this.statementsFailingInCompilation("""
                 CREATE TABLE example (
                     inserted_xid BIGINT not null,
-                    deleted_xid BIGINT not null default null -- '9223372036854775807'
+                    deleted_xid BIGINT not null default null
                 );""", "Nullable default value assigned to non-null column 'deleted_xid'");
     }
 
@@ -401,8 +492,7 @@ public class CatalogTests extends BaseSQLTests {
                     pk VARCHAR NOT NULL PRIMARY KEY
                 );
 
-                CREATE VIEW V WITH ('rust' = '//code emitted')
-                AS SELECT * FROM varchar_pk;""";
+                CREATE VIEW V AS SELECT * FROM varchar_pk;""";
         this.compileRustTestCase(sql);
     }
 
@@ -709,6 +799,37 @@ public class CatalogTests extends BaseSQLTests {
     }
 
     @Test
+    public void issue5351() {
+        this.getCCS("""
+                CREATE TABLE test_data (
+                    username VARCHAR NOT NULL PRIMARY KEY,
+                    kafka_timestamp VARIANT DEFAULT CONNECTOR_METADATA()
+                ) WITH ('connectors' = '[
+                    {
+                        "format":{
+                            "name":"avro",
+                            "config": {
+                                "update_format":"raw",
+                                "registry_urls": ["http://localhost:18081"]
+                            }
+                        },
+                        "transport":{
+                            "name":"kafka_input",
+                            "config": {
+                                "topic":"test_topic",
+                                "start_from":"latest",
+                                "bootstrap.servers":"localhost:19092",
+                                "include_timestamp": true
+                            }
+                        }
+                    }
+                    ]',
+                    'append_only'='false',
+                    'materialized' = 'true'
+                );""");
+    }
+
+    @Test
     public void primaryKeyTest2() {
         String sql = """
                 create table t1(
@@ -771,5 +892,31 @@ public class CatalogTests extends BaseSQLTests {
                 create table t0 (id int, s MAP<ty0, int>);
                 create materialized view v1 as select id, s from t0;""";
         this.getCCS(sql);
+    }
+
+    @Test
+    public void defaultValueRow() {
+        this.getCCS("""
+                CREATE TABLE example (
+                    inserted_xid BIGINT not null,
+                    deleted_xid BIGINT not null default '9223372036854775807',
+                    y BIGINT default 0,
+                    w BIGINT default NULL,
+                    z ROW(x INT, y INT) NOT NULL default ROW(1, 2)
+                );""");
+    }
+
+
+    @Test
+    public void issue5390() {
+        this.getCCS("""
+                CREATE TYPE user_def AS(i1 INT);
+                CREATE TYPE user_def_row AS (val ROW(i1 INT));
+                CREATE TYPE user_def_udt AS (val user_def);
+                
+                CREATE MATERIALIZED VIEW v AS SELECT
+                SAFE_CAST(NULL AS user_def_row) AS to_row,
+                SAFE_CAST(NULL AS user_def_udt) AS to_udt
+                ;""");
     }
 }

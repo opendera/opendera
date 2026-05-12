@@ -1,21 +1,19 @@
-use super::{radix_tree_update, DynTreeNode, Prefix, RadixTreeFactories};
+use super::{DynTreeNode, Prefix, RadixTreeFactories, radix_tree_update};
 use crate::{
+    Circuit, DBData, DynZWeight, Stream, ZWeight,
     algebra::{HasOne, IndexedZSet, IndexedZSetReader, OrdIndexedZSet},
     circuit::{
-        operator_traits::{Operator, TernaryOperator},
         Scope,
+        operator_traits::{Operator, TernaryOperator},
     },
     dynamic::{DataTrait, DynDataTyped, Erase},
     operator::dynamic::{
-        aggregate::DynAggregator,
-        time_series::radix_tree::treenode::TreeNode,
-        trace::{TraceBounds, TraceFeedback},
+        accumulate_trace::AccumulateTraceFeedback, aggregate::DynAggregator,
+        time_series::radix_tree::treenode::TreeNode, trace::TraceBounds,
     },
     trace::{Batch, BatchReader, BatchReaderFactories, Builder, Spine, TupleBuilder},
-    Circuit, DBData, DynZWeight, Stream, ZWeight,
 };
 use dyn_clone::clone_box;
-use minitrace::trace;
 use num::PrimInt;
 use size_of::SizeOf;
 use std::{borrow::Cow, cmp::Ordering, marker::PhantomData, ops::Neg};
@@ -154,7 +152,7 @@ where
             //                                                            delayed_trace       └───────┘
             // ```
 
-            let feedback = circuit.add_integrate_trace_feedback::<Spine<O>>(
+            let feedback = circuit.add_accumulate_integrate_trace_feedback::<Spine<O>>(
                 persistent_id,
                 &factories.output_factories,
                 <TraceBounds<O::Key, O::Val>>::unbounded(),
@@ -166,12 +164,12 @@ where
                     &factories.output_factories,
                     aggregator,
                 ),
-                &stream,
-                &stream.dyn_integrate_trace(&factories.input_factories),
+                &stream.dyn_accumulate(&factories.input_factories),
+                &stream.dyn_accumulate_integrate_trace(&factories.input_factories),
                 &feedback.delayed_trace,
             );
 
-            feedback.connect(&output);
+            feedback.connect(&output, &factories.output_factories);
 
             output
         })
@@ -239,7 +237,7 @@ where
     }
 }
 
-impl<Z, TS, IT, OT, Acc, Out, O> TernaryOperator<Z, IT, OT, O>
+impl<Z, TS, IT, OT, Acc, Out, O> TernaryOperator<Option<Spine<Z>>, IT, OT, O>
     for RadixTreeAggregate<Z, TS, IT, OT, Acc, Out, O>
 where
     Z: IndexedZSet<Key = DynDataTyped<TS>>,
@@ -250,13 +248,16 @@ where
     IT: IndexedZSetReader<Key = Z::Key, Val = Z::Val> + Clone,
     OT: RadixTreeReader<TS, Acc> + Clone,
 {
-    #[trace]
     async fn eval(
         &mut self,
-        delta: Cow<'_, Z>,
+        delta: Cow<'_, Option<Spine<Z>>>,
         input_trace: Cow<'_, IT>,
         output_trace: Cow<'_, OT>,
     ) -> O {
+        let Some(delta) = delta.as_ref() else {
+            return O::dyn_empty(&self.output_factories);
+        };
+
         let mut updates = self.radix_tree_factories.node_updates_factory.default_box();
         updates.reserve(delta.key_count());
 
@@ -269,7 +270,8 @@ where
             &mut *updates,
         );
 
-        let builder = O::Builder::with_capacity(&self.output_factories, updates.len() * 2);
+        let builder =
+            O::Builder::with_capacity(&self.output_factories, updates.len(), updates.len() * 2);
         let mut builder = TupleBuilder::new(&self.output_factories, builder);
 
         // `updates` are already ordered by prefix.  All that remains is to order
@@ -327,29 +329,29 @@ where
 mod test {
     use super::super::RadixTreeCursor;
     use crate::{
+        DynZWeight, Runtime, Stream, ZWeight,
         algebra::{AddAssignByRef, DefaultSemigroup},
         dynamic::{DowncastTrait, DynData, DynDataTyped, DynPair, Erase},
         operator::{
+            Fold,
             dynamic::{
                 aggregate::DynAggregatorImpl,
                 input::{AddInputIndexedZSetFactories, CollectionHandle},
                 time_series::{
+                    TreeNode,
                     radix_tree::{
+                        Prefix,
                         test::test_aggregate_range,
                         tree_aggregate::{OrdRadixTree, TreeAggregateFactories},
-                        Prefix,
                     },
-                    TreeNode,
                 },
             },
-            Fold,
         },
         trace::{BatchReader, BatchReaderFactories},
         utils::Tup2,
-        DynZWeight, RootCircuit, Stream, ZWeight,
     };
     use std::{
-        collections::{btree_map::Entry, BTreeMap},
+        collections::{BTreeMap, btree_map::Entry},
         sync::{Arc, Mutex},
     };
 
@@ -384,7 +386,7 @@ mod test {
         let contents = Arc::new(Mutex::new(BTreeMap::new()));
         let contents_clone = contents.clone();
 
-        let (circuit, input) = RootCircuit::build(move |circuit| {
+        let (mut circuit, input) = Runtime::init_circuit(1, move |circuit| {
             let (input, input_handle) =
                 circuit.dyn_add_input_indexed_zset::<DynDataTyped<u64>, DynData/*u64*/>(&AddInputIndexedZSetFactories::new::<u64, u64>());
 
@@ -422,7 +424,7 @@ mod test {
         })
         .unwrap();
 
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -430,7 +432,7 @@ mod test {
             0x1000_0000_0000_0001,
             Tup2(1, 1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -438,7 +440,7 @@ mod test {
             0x1000_0000_0000_0002,
             Tup2(2, 1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -446,7 +448,7 @@ mod test {
             0x1000_1000_0000_0000,
             Tup2(3, 1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -454,7 +456,7 @@ mod test {
             0x1000_0000_0000_0002,
             Tup2(2, -1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -504,7 +506,7 @@ mod test {
             0xf300_1000_1100_1001,
             Tup2(10, -1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -518,7 +520,7 @@ mod test {
             0xf300_1000_0000_0001,
             Tup2(7, -1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -544,7 +546,7 @@ mod test {
             0xf200_0000_0000_0001,
             Tup2(5, -1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -564,7 +566,7 @@ mod test {
             0xf300_1000_1000_1001,
             Tup2(9, -1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -572,7 +574,7 @@ mod test {
             0xf400_1000_1100_1001,
             Tup2(11, -1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
 
         update_key(
             &input,
@@ -610,6 +612,6 @@ mod test {
             0xf300_1000_1000_0001,
             Tup2(11, 1),
         );
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
     }
 }

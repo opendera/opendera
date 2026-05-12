@@ -1,6 +1,6 @@
 //! Support HTTP bearer and API-key authorization to the pipeline manager API.
-//! The plan is to support different providers down the line, but for now, we've
-//! tested against client claims made via AWS Cognito.
+//! This implementation supports multiple OIDC/OAuth2 providers including AWS Cognito,
+//! Google Identity, and Okta.
 
 //! This file implements an actix-web middleware to validate JWT bearer tokens
 //! and API keys.
@@ -14,18 +14,17 @@
 //! a bearer token, users may generate API keys that can be used for
 //! programmatic access (see below).
 //!
-//! Bearer token
-//! validation checks for many things, including signing algorithm, expiry
-//! (exp), whether the client_id and issuers (iss) line up, whether the
-//! signature is valid and whether the token was modified after being
-//! signed. For signature verification, we fetch the provider's JWK keys from a
-//! well known URL and cache them locally. We don't yet refresh JWK keys (e.g.,
-//! when the clients report using a different kid), but for now, a restart of
-//! the pipeline manager suffices.
+//! Bearer token validation follows standard OIDC/OAuth2 protocols including
+//! signing algorithm verification, expiry (exp) validation, client_id and issuer
+//! (iss) validation, signature verification, and tamper detection. For signature
+//! verification, we fetch the provider's JWK keys from their well-known URL
+//! and cache them locally. We don't yet refresh JWK keys automatically, but
+//! a restart of the pipeline manager will refresh the cache.
 //!
-//! To support bearer token workflows, we introduce three environment variables
-//! that the pipeline manager needs for the OAuth protocol: the client ID, the
-//! issuer ID, and the well known URL for fetching JWK keys.
+//! To support bearer token workflows, we require environment variables specific
+//! to each provider. All providers require FELDERA_AUTH_CLIENT_ID and FELDERA_AUTH_ISSUER.
+//! Some providers may require additional configuration (see provider-specific
+//! functions below).
 //!
 //! 2) API-keys:
 //!
@@ -48,7 +47,7 @@
 use std::{collections::HashMap, env};
 
 use actix_web::HttpMessage;
-use actix_web::{dev::ServiceRequest, web::Data};
+use actix_web::{dev::ServiceRequest, error::ErrorUnauthorized, web::Data};
 use actix_web_httpauth::extractors::{
     bearer::{BearerAuth, Config},
     AuthenticationError,
@@ -56,16 +55,18 @@ use actix_web_httpauth::extractors::{
 use awc::error::JsonPayloadError;
 use cached::{Cached, TimedCache};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, TokenData, Validation};
-use log::{error, info};
 use rand::rngs::ThreadRng;
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use static_assertions::assert_impl_any;
+use tracing::{debug, error};
+use url::Url;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::api::main::ServerState;
+use crate::config::ApiServerConfig;
 use crate::db::error::DBError;
 use crate::db::storage::Storage;
 use crate::db::storage_postgres::StoragePostgres;
@@ -79,6 +80,15 @@ pub(crate) fn tag_with_default_tenant_id(req: ServiceRequest) -> ServiceRequest 
     req.extensions_mut()
         .insert(vec![ApiPermission::Read, ApiPermission::Write]);
     req
+}
+
+/// Creates a JSON error response for authentication failures
+fn create_authz_json_error(message: &str) -> actix_web::Error {
+    let error_response = serde_json::json!({
+        "message": message,
+        "error_code": "AuthenticationFailed"
+    });
+    ErrorUnauthorized(error_response.to_string())
 }
 
 /// Authorization using a bearer token. Expects to find either a typical
@@ -102,19 +112,58 @@ async fn bearer_auth(
 ) -> Result<ServiceRequest, (actix_web::error::Error, ServiceRequest)> {
     // Validate bearer token
     let configuration = req.app_data::<AuthConfiguration>().unwrap();
-    let token = match configuration.provider {
-        AuthProvider::AwsCognito(_) => decode_aws_cognito_token(token, &req, configuration).await,
-        AuthProvider::GoogleIdentity(_) => {
-            decode_google_identity_token(token, &req, configuration).await
-        }
-    };
-    match token {
-        Ok(claim) => {
+    // Unified token decoding works for all providers (AWS Cognito, Okta, etc.)
+    // Provider-specific validations happen automatically based on optional fields
+    // TODO: Implement Google Identity flow where Access Token is not a JWT but an opaque token
+    // intended to be decoded with `https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=...`
+    let token_data = decode_token_with_validation(token, &req, configuration).await;
+    match token_data {
+        Ok(token_data) => {
+            // Validate groups authorization (for providers that support groups)
+            let state = req.app_data::<Data<ServerState>>().unwrap();
+            if let Err(AuthError::InsufficientGroups) =
+                validate_groups_authorization(&token_data, &state.config)
+            {
+                return Err((
+                    create_authz_json_error("User does not belong to required groups for access."),
+                    req,
+                ));
+            }
+
+            // Get tenant name using resolution logic with headers
+            let tenant_name = match token_data.tenant_name(&state.config, req.headers()) {
+                Ok(name) => name,
+                Err(AuthError::NoTenantFound) => {
+                    return Err((
+                        create_authz_json_error("You are not authorized to access any Feldera tenant. Contact your administrator if you need access to Feldera."),
+                        req,
+                    ));
+                }
+                Err(AuthError::MissingTenantHeader) => {
+                    return Err((
+                        create_authz_json_error("Feldera-Tenant header is required when your access token contains multiple tenants."),
+                        req,
+                    ));
+                }
+                Err(AuthError::UnauthorizedTenant(tenant)) => {
+                    return Err((
+                        create_authz_json_error(&format!("You are not authorized to access tenant '{}'. Check your access token's tenants claim.", tenant)),
+                        req,
+                    ));
+                }
+                Err(e) => {
+                    error!("Tenant resolution error: {}", e);
+                    return Err((
+                        create_authz_json_error(&format!("Tenant resolution failed: {}", e)),
+                        req,
+                    ));
+                }
+            };
+
             // TODO: Handle tenant deletions at some point
             let tenant = {
-                let ad = req.app_data::<Data<ServerState>>();
-                let db = &ad.unwrap().db.lock().await;
-                db.get_or_create_tenant_id(Uuid::now_v7(), claim.tenant_name(), claim.provider())
+                let db = &state.db.lock().await;
+                db.get_or_create_tenant_id(Uuid::now_v7(), tenant_name, token_data.provider())
                     .await
             };
 
@@ -127,14 +176,14 @@ async fn bearer_auth(
                 }
                 Err(e) => {
                     error!(
-                        "Could not fetch tenant ID for claim {:?}, with error {}",
-                        claim, e
+                        "Could not fetch tenant ID for token_data {:?}, with error {}",
+                        token_data, e
                     );
-                    let config = req.app_data::<Config>().cloned().unwrap_or_default();
                     Err((
-                        AuthenticationError::from(config)
-                            .with_error_description("descr")
-                            .into(),
+                        create_authz_json_error(&format!(
+                            "Database error while fetching tenant: {}",
+                            e
+                        )),
                         req,
                     ))
                 }
@@ -142,15 +191,13 @@ async fn bearer_auth(
         }
         Err(error) => {
             let descr = match error {
-                // Do not bubble up internal errors to the user
                 AuthError::JwkFetch(e) => {
                     error!("JwkFetch: {:?}", e);
-                    "Authentication failed".to_owned()
+                    "Authentication failed - unable to fetch JWT keys".to_owned()
                 }
-                // Do not bubble up internal errors to the user
                 AuthError::JwkShape(e) => {
                     error!("JwkShapeError: {:?}", e);
-                    "Authentication failed".to_owned()
+                    "Authentication failed - JWT key format error".to_owned()
                 }
                 _ => error.to_string(),
             };
@@ -181,14 +228,22 @@ async fn api_key_auth(
             req.extensions_mut().insert(permissions);
             Ok(req)
         }
-        Err(_) => {
-            let config = req.app_data::<Config>().cloned().unwrap_or_default();
-            Err((
-                AuthenticationError::from(config)
-                    .with_error_description("Unauthorized API key")
-                    .into(),
-                req,
-            ))
+        Err(error) => {
+            match error {
+                DBError::InvalidApiKey => {
+                    let ip = req
+                        .peer_addr()
+                        .map(|addr| addr.ip().to_string())
+                        .unwrap_or_else(|| "<unknown IP>".to_owned());
+                    error!(
+                        "authentication attempt using invalid API key from ip: '{}'",
+                        ip
+                    );
+                }
+                e => error!("failed to validate API key: {}", e),
+            };
+
+            Err((create_authz_json_error("Unauthorized API key"), req))
         }
     }
 }
@@ -222,83 +277,232 @@ impl TenantRecord {
     }
 }
 
-#[derive(Debug)]
-enum Claim {
-    AwsCognito(TokenData<AwsCognitoClaim>),
+/// Extension trait for TokenData<OidcClaim> to provide unified claim handling
+trait OidcClaimExt {
+    /// Get the list of authorized tenants for this claim.
+    /// Returns None if tenants should be resolved via other means (issuer/sub).
+    fn authorized_tenants(&self) -> Option<Vec<String>>;
+
+    /// Resolve tenant name based on claim, headers, and configuration.
+    ///
+    /// For multi-tenant claims (tenants array), requires Feldera-Tenant header to select one.
+    /// For single-tenant claims, uses fallback logic: tenant > issuer > sub
+    fn tenant_name(
+        &self,
+        config: &crate::config::ApiServerConfig,
+        headers: &actix_web::http::header::HeaderMap,
+    ) -> Result<String, AuthError>;
+
+    /// Get the provider (issuer) from the claim
+    fn provider(&self) -> String;
 }
 
-impl Claim {
-    fn tenant_name(&self) -> String {
-        match self {
-            Claim::AwsCognito(t) => t.claims.sub.clone(),
+impl OidcClaimExt for TokenData<OidcClaim> {
+    fn authorized_tenants(&self) -> Option<Vec<String>> {
+        // Priority: tenants array > single tenant claim
+        if let Some(ref tenants) = self.claims.tenants {
+            Some(tenants.clone())
+        } else {
+            self.claims.tenant.as_ref().map(|t| vec![t.clone()])
         }
+    }
+
+    fn tenant_name(
+        &self,
+        config: &crate::config::ApiServerConfig,
+        headers: &actix_web::http::header::HeaderMap,
+    ) -> Result<String, AuthError> {
+        let issuer = &self.claims.iss;
+        let sub = &self.claims.sub;
+
+        // Check if we have explicit tenant authorization in the claim
+        if let Some(authorized) = self.authorized_tenants() {
+            if authorized.len() > 1 {
+                // Multi-tenant: require header selection
+                let selected = headers
+                    .get(TENANT_HEADER)
+                    .and_then(|h| h.to_str().ok())
+                    .ok_or(AuthError::MissingTenantHeader)?;
+
+                // Validate selected tenant is authorized
+                if authorized.contains(&selected.to_string()) {
+                    return Ok(selected.to_string());
+                } else {
+                    return Err(AuthError::UnauthorizedTenant(selected.to_string()));
+                }
+            } else if authorized.len() == 1 {
+                // Single tenant in array or single tenant claim
+                return Ok(authorized[0].clone());
+            }
+            // Empty array falls through to fallback logic
+        }
+
+        // Fallback logic when no explicit tenant/tenants claims
+        // Priority: issuer-domain > sub (if enabled)
+
+        if config.issuer_tenant {
+            if let Some(issuer_tenant) = extract_tenant_from_issuer(issuer) {
+                return Ok(issuer_tenant);
+            }
+        }
+
+        if config.individual_tenant {
+            debug!("Using sub claim for tenant resolution: {}", sub);
+            return Ok(sub.clone());
+        }
+
+        // No valid tenant found
+        Err(AuthError::NoTenantFound)
     }
 
     fn provider(&self) -> String {
-        match self {
-            Claim::AwsCognito(t) => t.claims.iss.clone(),
-        }
+        self.claims.iss.clone()
     }
+}
+
+/// Extract tenant identifier from OIDC issuer domain.
+///
+/// Extracts the full hostname from issuer URLs for tenant identification.
+/// This approach avoids tenant name collisions by using the complete domain.
+/// Examples:
+/// - "<https://acme-corp.okta.com/oauth2/default>" → Some("acme-corp.okta.com")
+/// - "<https://company.auth.us-west-2.amazoncognito.com/oauth2>" → Some("company.auth.us-west-2.amazoncognito.com")
+/// - "<https://accounts.google.com>" → Some("accounts.google.com")
+///
+/// Validates that the user belongs to at least one required group (for providers that support groups).
+fn validate_groups_authorization(
+    token: &TokenData<OidcClaim>,
+    config: &ApiServerConfig,
+) -> Result<(), AuthError> {
+    // If no groups are configured, allow access
+    if config.authorized_groups.is_empty() {
+        return Ok(());
+    }
+
+    // Check if user has any of the required groups
+    if let Some(user_groups) = &token.claims.groups {
+        let has_required_group = user_groups
+            .iter()
+            .any(|user_group| config.authorized_groups.contains(user_group));
+
+        if has_required_group {
+            Ok(())
+        } else {
+            Err(AuthError::InsufficientGroups)
+        }
+    } else {
+        // User has no groups but groups are required
+        Err(AuthError::InsufficientGroups)
+    }
+}
+
+/// Extract tenant identifier from issuer claim in OIDC Access token.
+/// The full issuer hostname is used to avoid collisions.
+fn extract_tenant_from_issuer(issuer: &str) -> Option<String> {
+    Url::parse(issuer)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_string()))
+        .filter(|host| !host.is_empty())
 }
 
 #[derive(Clone, Serialize, ToSchema)]
 pub(crate) struct ProviderAwsCognito {
-    pub jwk_uri: String,
+    pub issuer: String,
     pub login_url: String,
     pub logout_url: String,
+    #[serde(skip)]
+    pub(crate) jwk_uri: String,
 }
 
 #[derive(Clone, Serialize, ToSchema)]
-pub(crate) struct ProviderGoogleIdentity {
-    pub jwk_uri: String,
+pub(crate) struct ProviderGenericOidc {
+    pub issuer: String,
     pub client_id: String,
+    pub extra_oidc_scopes: Vec<String>,
+    #[serde(skip)]
+    pub(crate) jwk_uri: String,
+}
+
+#[derive(Deserialize)]
+struct OidcDiscoveryDocument {
+    jwks_uri: String,
+}
+
+/// Fetch OIDC discovery document and extract jwks_uri
+async fn fetch_jwks_uri_from_discovery(issuer: &str) -> Result<String, reqwest::Error> {
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
+    let response = reqwest::get(&discovery_url).await?;
+    let discovery: OidcDiscoveryDocument = response.json().await?;
+    Ok(discovery.jwks_uri)
 }
 
 #[derive(Clone, Serialize, ToSchema)]
 pub(crate) enum AuthProvider {
     AwsCognito(ProviderAwsCognito), // The argument is the URL to use for fetching JWKs
-    GoogleIdentity(ProviderGoogleIdentity),
+    GenericOidc(ProviderGenericOidc),
 }
 
 pub(crate) fn aws_auth_config() -> AuthConfiguration {
     let mut validation = Validation::new(Algorithm::RS256);
-    let client_id =
-        env::var("AUTH_CLIENT_ID").expect("Missing environment variable AUTH_CLIENT_ID");
-    let iss = env::var("AUTH_ISSUER").expect("Missing environment variable AUTH_ISSUER");
+    let client_id = env::var("FELDERA_AUTH_CLIENT_ID")
+        .expect("Missing environment variable FELDERA_AUTH_CLIENT_ID");
+    let iss =
+        env::var("FELDERA_AUTH_ISSUER").expect("Missing environment variable FELDERA_AUTH_ISSUER");
     let jwk_uri = format!("{}/.well-known/jwks.json", iss);
     // We do not validate with set_audience because it is optional,
     // and AWS Cognito doesn't consistently claim it in JWT (e.g. via Hosted UI
     // auth)
-    validation.set_issuer(&[iss]);
+    validation.set_issuer(&[&iss]);
     AuthConfiguration {
         provider: AuthProvider::AwsCognito(ProviderAwsCognito {
-            jwk_uri,
+            issuer: iss.clone(),
             login_url: env::var("AWS_COGNITO_LOGIN_URL")
                 .expect("Missing environment variable AWS_COGNITO_LOGIN_URL"),
             logout_url: env::var("AWS_COGNITO_LOGOUT_URL")
                 .expect("Missing environment variable AWS_COGNITO_LOGOUT_URL"),
+            jwk_uri,
         }),
         validation,
         client_id,
     }
 }
 
-pub(crate) fn google_auth_config() -> AuthConfiguration {
+pub(crate) async fn generic_oidc_auth_config(
+    api_config: &crate::config::ApiServerConfig,
+) -> Result<AuthConfiguration, Box<dyn std::error::Error>> {
     let mut validation = Validation::new(Algorithm::RS256);
-    let client_id =
-        env::var("AUTH_CLIENT_ID").expect("Missing environment variable AUTH_CLIENT_ID");
-    let iss = env::var("AUTH_ISSUER").expect("Missing environment variable AUTH_ISSUER");
-    let jwk_uri = format!("{}/.well-known/jwks.json", iss);
-    validation.set_issuer(&[iss]);
-    AuthConfiguration {
-        provider: AuthProvider::GoogleIdentity(ProviderGoogleIdentity {
+    let client_id = env::var("FELDERA_AUTH_CLIENT_ID")
+        .expect("Missing environment variable FELDERA_AUTH_CLIENT_ID");
+    let iss =
+        env::var("FELDERA_AUTH_ISSUER").expect("Missing environment variable FELDERA_AUTH_ISSUER");
+
+    // Use OIDC discovery to fetch jwks_uri
+    let jwk_uri = fetch_jwks_uri_from_discovery(&iss).await?;
+
+    validation.set_issuer(&[&iss]);
+    // Use configurable audience claim from API server configuration
+    validation.set_audience(&[&api_config.auth_audience]);
+
+    // Add 'groups' scope if authorized_groups is configured
+    let extra_oidc_scopes = if !api_config.authorized_groups.is_empty() {
+        vec!["groups".to_string()]
+    } else {
+        vec![]
+    };
+
+    Ok(AuthConfiguration {
+        provider: AuthProvider::GenericOidc(ProviderGenericOidc {
+            issuer: iss.clone(),
+            client_id: client_id.clone(),
+            extra_oidc_scopes,
             jwk_uri,
-            client_id: env::var("AUTH_CLIENT_ID")
-                .expect("Missing environment variable AUTH_CLIENT_ID"),
         }),
         validation,
         client_id,
-    }
+    })
 }
 
 #[derive(Clone)]
@@ -309,15 +513,16 @@ pub(crate) struct AuthConfiguration {
     pub client_id: String,
 }
 
-///
-/// The shape of a claim provided to clients by AwsCognito, following
-/// the guide below:
-///
-/// <https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-the-access-token.html>
+/// Unified OIDC claim structure that works with all OIDC providers (AWS Cognito, Okta, Google, etc.)
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct AwsCognitoClaim {
-    /// The user pool app client that authenticated the client
-    client_id: String,
+struct OidcClaim {
+    /// The audience for the token (can be string or array of strings)
+    /// Using serde_json::Value to handle both cases, let jsonwebtoken lib handle validation
+    aud: Option<serde_json::Value>,
+
+    /// The client ID that authenticated (may be in aud or separate field)
+    /// AWS Cognito uses this as a required field
+    client_id: Option<String>,
 
     /// The expiration time in Unix time format
     exp: i64,
@@ -332,21 +537,61 @@ struct AwsCognitoClaim {
     sub: String,
 
     /// Unique identifier for the JWT
-    jti: String,
+    jti: Option<String>,
 
-    /// Token revocation identifier associated with the user's refresh token
-    origin_jti: Option<String>,
+    /// OAuth 2.0 scopes (can be string or array)
+    scope: Option<String>,
 
-    /// OAuth 2.0 scopes
-    scope: String,
+    /// Purpose of the token (access, id, refresh)
+    /// AWS Cognito requires this to be "access" for access tokens
+    token_use: Option<String>,
 
-    /// Purpose of the token. For the purpose of bearer authentication,
-    /// this value should always be "access"
-    token_use: String,
+    /// The username (provider-specific)
+    /// AWS Cognito includes this field
+    username: Option<String>,
 
-    /// The username. Note: this may not be unique within a user pool.
-    /// The sub claim is the appropriate identifier for a user.
-    username: String,
+    /// Email address (if available)
+    email: Option<String>,
+
+    /// Tenant identifier for single-tenant deployments
+    /// TODO: Deprecated, remove when no one no longer uses it
+    tenant: Option<String>,
+
+    /// Tenant identifiers for multi-tenant access
+    /// Can be either an array of strings or a comma-separated string
+    /// When present, user can access any of these tenants
+    #[serde(default, deserialize_with = "deserialize_list")]
+    tenants: Option<Vec<String>>,
+
+    /// User groups for authorization (Okta and some other providers)
+    groups: Option<Vec<String>>,
+
+    /// Additional claims for provider-specific data
+    #[serde(flatten)]
+    additional_claims: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Deserialize tenants claim which can be either:
+/// - An array of strings: ["tenant1", "tenant2"]
+/// - A comma-separated string: "tenant1,tenant2"
+fn deserialize_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TenantsValue {
+        Array(Vec<String>),
+        String(String),
+    }
+
+    let value = Option::<TenantsValue>::deserialize(deserializer)?;
+    Ok(value.map(|v| match v {
+        TenantsValue::Array(arr) => arr,
+        TenantsValue::String(s) => s.split(',').map(|t| t.trim().to_string()).collect(),
+    }))
 }
 
 #[derive(Debug)]
@@ -356,6 +601,10 @@ enum AuthError {
     JwkPayload(awc::error::PayloadError),
     JwkContentType,
     JwkShape(String),
+    NoTenantFound,
+    InsufficientGroups,
+    MissingTenantHeader,
+    UnauthorizedTenant(String),
 }
 
 impl std::fmt::Display for AuthError {
@@ -366,6 +615,10 @@ impl std::fmt::Display for AuthError {
             AuthError::JwkPayload(err) => err.fmt(f),
             AuthError::JwkShape(err) => err.fmt(f),
             AuthError::JwkContentType => f.write_str("Content type error"),
+            AuthError::NoTenantFound => f.write_str("You are not authorized to access any Feldera tenant. Contact your administrator if you need access to Feldera."),
+            AuthError::InsufficientGroups => f.write_str("User does not belong to required groups for access."),
+            AuthError::MissingTenantHeader => f.write_str("Feldera-Tenant header is required when access token contains multiple tenants."),
+            AuthError::UnauthorizedTenant(tenant) => write!(f, "You are not authorized to access tenant '{}'. Check your access token's tenants claim.", tenant),
         }
     }
 }
@@ -388,60 +641,78 @@ impl From<jsonwebtoken::errors::ErrorKind> for AuthError {
     }
 }
 
-///
-/// Follows the guidelines in the following links, except that JWK refreshes are
-/// not yet implemented
-///
-/// <https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-the-access-token.html>
+/// Generic OIDC token validation that can be used by all providers
+/// Follows standard JWT validation practices
 /// JWT claims: <https://datatracker.ietf.org/doc/html/rfc7519#section-4>
-async fn decode_aws_cognito_token(
+async fn decode_oidc_token(
     token: &str,
     req: &ServiceRequest,
     configuration: &AuthConfiguration,
-) -> Result<Claim, AuthError> {
+) -> Result<TokenData<OidcClaim>, AuthError> {
     let header = decode_header(token);
     match header {
-        Ok(header) => match header.alg {
-            // AWS Cognito user pools use RS256
-            Algorithm::RS256 => {
-                if header.kid.is_none() {
-                    return Err(jsonwebtoken::errors::ErrorKind::InvalidToken.into());
-                }
-                let state = req.app_data::<Data<ServerState>>().unwrap();
-                let cache = &mut state.jwk_cache.lock().await;
-                let jwk = cache
-                    .get(&header.kid.unwrap(), &configuration.provider)
-                    .await?;
+        Ok(header) => {
+            match header.alg {
+                // Most OIDC providers use RS256
+                Algorithm::RS256 => {
+                    if header.kid.is_none() {
+                        debug!("JWT header missing 'kid' field");
+                        return Err(jsonwebtoken::errors::ErrorKind::InvalidToken.into());
+                    }
 
-                let token_data = decode::<AwsCognitoClaim>(token, &jwk, &configuration.validation);
-                if let Ok(t) = &token_data {
-                    // TODO: aud and client_id may not be the same when using a resource server
-                    if configuration.client_id != t.claims.client_id {
-                        return Err(jsonwebtoken::errors::ErrorKind::InvalidAudience.into());
+                    let kid = header.kid.unwrap();
+
+                    let state = req.app_data::<Data<ServerState>>().unwrap();
+                    let cache = &mut state.jwk_cache.lock().await;
+                    let jwk = cache.get(&kid, &configuration.provider).await?;
+
+                    let token_data = decode::<OidcClaim>(token, &jwk, &configuration.validation);
+                    match token_data {
+                        Ok(data) => Ok(data),
+                        Err(jwt_error) => {
+                            debug!("JWT token validation failed: {:?}", jwt_error.kind());
+                            Err(jwt_error.into())
+                        }
                     }
                 }
-                match token_data {
-                    Ok(data) => {
-                        if data.claims.token_use != "access" {
-                            return Err(jsonwebtoken::errors::ErrorKind::InvalidToken.into());
-                        }
-                        Ok(Claim::AwsCognito(data))
-                    }
-                    Err(jwt_error) => Err(jwt_error.into()),
+                _ => {
+                    debug!("Unsupported JWT algorithm: {:?}", header.alg);
+                    Err(jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into())
                 }
             }
-            _ => Err(jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into()),
-        },
-        Err(e) => Err(e.into()),
+        }
+        Err(e) => {
+            debug!("Failed to decode JWT header: {:?} - {}", e.kind(), e);
+            Err(e.into())
+        }
     }
 }
 
-async fn decode_google_identity_token(
-    _token: &str,
-    _req: &ServiceRequest,
-    _configuration: &AuthConfiguration,
-) -> Result<Claim, AuthError> {
-    todo!("Google Identity authentication not implemented!")
+/// Decode and validate OIDC token with provider-specific validations
+async fn decode_token_with_validation(
+    token: &str,
+    req: &ServiceRequest,
+    configuration: &AuthConfiguration,
+) -> Result<TokenData<OidcClaim>, AuthError> {
+    let token_data = decode_oidc_token(token, req, configuration).await?;
+
+    // Provider-specific validations based on optional fields
+
+    // Validate client_id if present (AWS Cognito puts it in a separate field)
+    if let Some(ref client_id) = token_data.claims.client_id {
+        if configuration.client_id != *client_id {
+            return Err(jsonwebtoken::errors::ErrorKind::InvalidAudience.into());
+        }
+    }
+
+    // Validate token_use if present (AWS Cognito requires "access" for access tokens)
+    if let Some(ref token_use) = token_data.claims.token_use {
+        if token_use != "access" {
+            return Err(jsonwebtoken::errors::ErrorKind::InvalidToken.into());
+        }
+    }
+
+    Ok(token_data)
 }
 
 pub struct JwkCache {
@@ -495,70 +766,77 @@ async fn fetch_jwk_keys(
     provider: &AuthProvider,
 ) -> Result<HashMap<String, DecodingKey>, AuthError> {
     match &provider {
-        AuthProvider::AwsCognito(provider) => fetch_jwk_aws_cognito_keys(&provider.jwk_uri).await,
-        AuthProvider::GoogleIdentity(provider) => {
-            fetch_jwk_google_identity_keys(&provider.jwk_uri).await
-        }
+        AuthProvider::AwsCognito(provider) => fetch_jwk_oidc_keys(&provider.jwk_uri).await,
+        AuthProvider::GenericOidc(provider) => fetch_jwk_oidc_keys(&provider.jwk_uri).await,
     }
 }
 
 // We don't want to fetch keys on every authentication attempt, so cache the
 // results. TODO: implement periodic refresh
-async fn fetch_jwk_aws_cognito_keys(
-    url: &String,
-) -> Result<HashMap<String, DecodingKey>, AuthError> {
+async fn fetch_jwk_oidc_keys(url: &String) -> Result<HashMap<String, DecodingKey>, AuthError> {
     let client = awc::Client::new();
 
     let res = client.get(url).send().await;
+    if let Err(e) = &res {
+        debug!("JWK fetch request failed: {:?}", e);
+    }
+
     let keys_as_json = res?.json::<Value>().await;
 
     match keys_as_json {
         Ok(value) => {
             let filtered = value
                 .get("keys")
-                .ok_or(AuthError::JwkShape("Missing keys field".to_owned()))?
+                .ok_or_else(|| {
+                    debug!("JWK response missing 'keys' field");
+                    AuthError::JwkShape("Missing keys field".to_owned())
+                })?
                 .as_array()
-                .ok_or(AuthError::JwkShape(
-                    "keys field was not an array".to_owned(),
-                ))?
+                .ok_or_else(|| {
+                    debug!("JWK 'keys' field is not an array");
+                    AuthError::JwkShape("keys field was not an array".to_owned())
+                })?
                 .iter()
-                // While the AWS Cognito JWK endpoint shouldn't return keys
-                // that aren't based on RS256 or meant for verifying signatures,
-                // this guard should warn us when used with other auth providers later
+                // Standard OIDC JWK endpoints should return keys for RS256 signature verification.
+                // This filter ensures we only use appropriate keys for our validation
                 .filter_map(|val| check_key_as_str("alg", "RS256", val))
                 .filter_map(|val| check_key_as_str("use", "sig", val));
 
             let mut ret = HashMap::new();
             for json_value in filtered {
-                let kid = validate_field_is_str("kid", json_value).ok_or(AuthError::JwkShape(
-                    "Could not extract 'kid' field".to_owned(),
-                ))?;
-                let n = validate_field_is_str("n", json_value).ok_or(AuthError::JwkShape(
-                    "Could not extract 'n' field".to_owned(),
-                ))?;
-                let e = validate_field_is_str("e", json_value).ok_or(AuthError::JwkShape(
-                    "Could not extract 'e' field".to_owned(),
-                ))?;
-                let decoding_key = DecodingKey::from_rsa_components(n, e)
-                    .map_err(|e| AuthError::JwkShape(format!("Invalid JWK decoding key: {}", e)))?;
+                let kid = validate_field_is_str("kid", json_value).ok_or_else(|| {
+                    debug!("JWK entry missing 'kid' field");
+                    AuthError::JwkShape("Could not extract 'kid' field".to_owned())
+                })?;
+                let n = validate_field_is_str("n", json_value).ok_or_else(|| {
+                    debug!("JWK entry missing 'n' field");
+                    AuthError::JwkShape("Could not extract 'n' field".to_owned())
+                })?;
+                let e = validate_field_is_str("e", json_value).ok_or_else(|| {
+                    debug!("JWK entry missing 'e' field");
+                    AuthError::JwkShape("Could not extract 'e' field".to_owned())
+                })?;
+                let decoding_key = DecodingKey::from_rsa_components(n, e).map_err(|e| {
+                    debug!("Failed to create decoding key: {}", e);
+                    AuthError::JwkShape(format!("Invalid JWK decoding key: {}", e))
+                })?;
                 ret.insert(kid.to_owned(), decoding_key);
             }
             Ok(ret)
         }
         Err(JsonPayloadError::Deserialize(json_error)) => {
+            debug!("Failed to deserialize JWK response: {}", json_error);
             Err(AuthError::JwkShape(json_error.to_string()))
         }
-        Err(JsonPayloadError::Payload(payload)) => Err(AuthError::JwkPayload(payload)),
-        Err(JsonPayloadError::ContentType) => Err(AuthError::JwkContentType),
+        Err(JsonPayloadError::Payload(payload)) => {
+            debug!("JWK payload error: {:?}", payload);
+            Err(AuthError::JwkPayload(payload))
+        }
+        Err(JsonPayloadError::ContentType) => {
+            debug!("JWK response has invalid content type");
+            Err(AuthError::JwkContentType)
+        }
     }
-}
-
-// We don't want to fetch keys on every authentication attempt, so cache the
-// results. TODO: implement periodic refresh
-async fn fetch_jwk_google_identity_keys(
-    _url: &str,
-) -> Result<HashMap<String, DecodingKey>, AuthError> {
-    todo!("Google Identity authentication not implemented!")
 }
 
 fn check_key_as_str<'a>(key: &str, check: &str, json: &'a Value) -> Option<&'a Value> {
@@ -567,7 +845,7 @@ fn check_key_as_str<'a>(key: &str, check: &str, json: &'a Value) -> Option<&'a V
             return Some(json);
         }
     }
-    info!(
+    debug!(
         "Skipping JWK key because it did not match the required shape {} {}",
         key, json
     );
@@ -595,6 +873,9 @@ async fn validate_api_keys(
 
 const API_KEY_LENGTH: usize = 128;
 pub const API_KEY_PREFIX: &str = "apikey:";
+
+/// HTTP header name for tenant selection in multi-tenant deployments
+pub const TENANT_HEADER: &str = "feldera-tenant";
 
 /// Generates a random 128 character API key
 pub fn generate_api_key() -> String {
@@ -627,31 +908,20 @@ mod test {
     use uuid::Uuid;
 
     use super::AuthError;
-    use crate::config::CommonConfig;
     use crate::db::types::api_key::ApiPermission;
     use crate::{
         api::main::ServerState,
-        auth::{
-            self, fetch_jwk_aws_cognito_keys, AuthConfiguration, AuthProvider, AwsCognitoClaim,
-        },
+        auth::{self, AuthConfiguration, AuthProvider, OidcClaim},
         config::ApiServerConfig,
         db::storage::Storage,
+        ensure_default_crypto_provider,
     };
+    use crate::{auth::fetch_jwk_oidc_keys, config::CommonConfig};
 
-    async fn setup(claim: AwsCognitoClaim) -> (String, DecodingKey) {
+    async fn setup(claim: OidcClaim) -> (String, DecodingKey) {
         let rsa = openssl::rsa::Rsa::generate(2048).unwrap();
-        let header = Header {
-            typ: Some("JWT".to_owned()),
-            alg: Algorithm::RS256,
-            cty: None,
-            jku: None,
-            jwk: None,
-            kid: Some("rsa01".to_owned()),
-            x5u: None,
-            x5c: None,
-            x5t: None,
-            x5t_s256: None,
-        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("rsa01".to_owned());
 
         let token_encoded = encode(
             &header,
@@ -671,18 +941,23 @@ mod test {
         validation
     }
 
-    fn default_claim() -> AwsCognitoClaim {
-        AwsCognitoClaim {
-            client_id: "some-client".to_owned(),
+    fn default_claim() -> OidcClaim {
+        OidcClaim {
+            aud: None,
+            client_id: Some("some-client".to_owned()),
             exp: Utc::now().timestamp() + 1000,
             iat: Utc::now().timestamp() + 1000,
             iss: "some-iss".to_owned(),
             sub: "some-sub".to_owned(),
-            jti: "some-jti".to_owned(),
-            origin_jti: Some("some-origin-jti".to_owned()),
-            scope: "".to_owned(),
-            token_use: "access".to_owned(),
-            username: "some-user".to_owned(),
+            jti: Some("some-jti".to_owned()),
+            scope: Some("".to_owned()),
+            token_use: Some("access".to_owned()),
+            username: Some("some-user".to_owned()),
+            email: None,
+            tenant: None,
+            tenants: None,
+            groups: None,
+            additional_claims: serde_json::Map::new(),
         }
     }
 
@@ -702,6 +977,7 @@ mod test {
             .clone();
         let config = AuthConfiguration {
             provider: AuthProvider::AwsCognito(auth::ProviderAwsCognito {
+                issuer: "some-iss".to_string(),
                 jwk_uri: "some-url".to_string(),
                 login_url: "some".to_string(),
                 logout_url: "some".to_string(),
@@ -714,6 +990,7 @@ mod test {
 
         let common_config = CommonConfig {
             bind_address: "127.0.0.1".to_string(),
+            api_host: "127.0.0.1".to_string(),
             api_port: 0,
             compiler_host: "127.0.0.1".to_string(),
             compiler_port: 8085,
@@ -721,6 +998,12 @@ mod test {
             runner_port: 8089,
             platform_version: "v0".to_string(),
             http_workers: 1,
+            unstable_features: None,
+            enable_https: false,
+            https_tls_cert_path: None,
+            https_tls_key_path: None,
+            private_ca_cert_path: None,
+            pipeline_monitor_events_retention: 720,
         };
 
         let manager_config = ApiServerConfig {
@@ -730,10 +1013,16 @@ mod test {
             allowed_origins: None,
             demos_dir: vec![],
             telemetry: "".to_owned(),
+            support_data_collection_frequency: 15,
+            support_data_retention: 3,
+            authorized_groups: vec![],
+            individual_tenant: true,
+            issuer_tenant: false,
+            auth_audience: "feldera-api".to_string(),
         };
 
         let (conn, _temp) = crate::db::test::setup_pg().await;
-        if api_key.is_some() {
+        if let Some(api_key) = api_key {
             let tenant_id = conn
                 .get_or_create_tenant_id(
                     Uuid::now_v7(),
@@ -746,7 +1035,7 @@ mod test {
                 tenant_id,
                 Uuid::now_v7(),
                 "foo",
-                &api_key.unwrap(),
+                &api_key,
                 vec![ApiPermission::Read, ApiPermission::Write],
             )
             .await
@@ -763,13 +1052,13 @@ mod test {
             .await
             .unwrap(),
         );
-        if decoding_key.is_some() {
+        if let Some(decoding_key) = decoding_key {
             state
                 .jwk_cache
                 .lock()
                 .await
                 .cache
-                .cache_set("rsa01".to_owned(), decoding_key.unwrap());
+                .cache_set("rsa01".to_owned(), decoding_key);
         }
         let app = App::new()
             .app_data(state)
@@ -796,8 +1085,9 @@ mod test {
 
     #[actix_web::test]
     async fn invalid_url() {
+        ensure_default_crypto_provider();
         let url = "http://localhost/doesnotexist".to_owned();
-        let res = fetch_jwk_aws_cognito_keys(&url).await;
+        let res = fetch_jwk_oidc_keys(&url).await;
         assert!(matches!(res.err().unwrap(), AuthError::JwkFetch(_)));
     }
 
@@ -835,7 +1125,7 @@ mod test {
     #[tokio::test]
     async fn non_access_use_token() {
         let mut claim = default_claim();
-        claim.token_use = "sig".to_owned();
+        claim.token_use = Some("sig".to_owned());
         let validation = validation("some-client", "some-iss");
         let (token, decoding_key) = setup(claim).await;
         let req = test::TestRequest::get()
@@ -943,5 +1233,100 @@ mod test {
             .to_request();
         let res = run_test(req, None, Some(api_key), validation).await;
         assert_eq!(200, res.status());
+    }
+
+    #[tokio::test]
+    async fn test_extract_tenant_from_issuer() {
+        use super::extract_tenant_from_issuer;
+
+        let test_cases = vec![
+            // Standard Okta domains
+            (
+                "https://acme-corp.okta.com/oauth2/default",
+                Some("acme-corp.okta.com"),
+            ),
+            (
+                "https://dev-123456.okta.com/oauth2/default",
+                Some("dev-123456.okta.com"),
+            ),
+            (
+                "https://my-company.okta.com/oauth2/custom",
+                Some("my-company.okta.com"),
+            ),
+            // AWS Cognito domains
+            (
+                "https://cognito-idp.us-west-2.amazonaws.com/us-west-2_ABCDEFGH",
+                Some("cognito-idp.us-west-2.amazonaws.com"),
+            ),
+            (
+                "https://my-pool.auth.us-east-1.amazoncognito.com/",
+                Some("my-pool.auth.us-east-1.amazoncognito.com"),
+            ),
+            // Google Identity domains
+            ("https://accounts.google.com", Some("accounts.google.com")),
+            (
+                "https://oauth2.googleapis.com/token",
+                Some("oauth2.googleapis.com"),
+            ),
+            // Custom domains
+            (
+                "https://auth.company.com/oauth2/v1",
+                Some("auth.company.com"),
+            ),
+            (
+                "https://login.enterprise.org/oidc",
+                Some("login.enterprise.org"),
+            ),
+            // Domain with hyphen and numbers
+            (
+                "https://tenant-123.auth-provider.com/v2/token",
+                Some("tenant-123.auth-provider.com"),
+            ),
+            (
+                "https://dev-env-staging.example.com/auth",
+                Some("dev-env-staging.example.com"),
+            ),
+            // Edge cases that should return None
+            ("", None),
+            ("invalid-url", None),
+            ("http://", None),
+            ("https://", None),
+            // URLs without protocol
+            ("domain.com/path", None),
+            ("//domain.com/path", None),
+            // IP addresses (should extract full IP as tenant)
+            ("https://192.168.1.100/auth", Some("192.168.1.100")),
+            ("http://127.0.0.1:8080/token", Some("127.0.0.1")),
+            // Localhost
+            ("http://localhost:3000/auth", Some("localhost")),
+            ("https://localhost/oauth2/default", Some("localhost")),
+            // Single word domains
+            ("https://auth/token", Some("auth")),
+            ("http://provider/oauth", Some("provider")),
+            // Domains with ports (port should not be included in hostname)
+            (
+                "https://tenant.example.com:8443/auth",
+                Some("tenant.example.com"),
+            ),
+            (
+                "http://dev-server.local:3000/oauth2",
+                Some("dev-server.local"),
+            ),
+            // Very long subdomain
+            (
+                "https://very-long-tenant-name-with-many-hyphens.auth.example.com/oauth2",
+                Some("very-long-tenant-name-with-many-hyphens.auth.example.com"),
+            ),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = extract_tenant_from_issuer(input);
+            assert_eq!(
+                result,
+                expected.map(|s| s.to_string()),
+                "Failed for input: {}",
+                input
+            );
+        }
     }
 }

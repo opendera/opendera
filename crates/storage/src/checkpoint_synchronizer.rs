@@ -1,66 +1,36 @@
-use std::sync::Arc;
-use std::{error::Error, fmt::Display};
+use std::sync::{Arc, LazyLock};
 
-use feldera_types::{checkpoint::CheckpointMetadata, config::SyncConfig};
+use feldera_types::{
+    checkpoint::{CheckpointMetadata, CheckpointSyncMetrics},
+    config::SyncConfig,
+};
 
-use crate::error::StorageError;
 use crate::StorageBackend;
 
 pub trait CheckpointSynchronizer: Sync {
     fn push(
         &self,
-        checkpoint: &CheckpointMetadata,
+        checkpoint: uuid::Uuid,
         storage: Arc<dyn StorageBackend>,
         remote_config: SyncConfig,
-    ) -> Result<(), SyncError>;
+    ) -> anyhow::Result<Option<CheckpointSyncMetrics>>;
 
     fn pull(
         &self,
         storage: Arc<dyn StorageBackend>,
         remote_config: SyncConfig,
-    ) -> Result<(), SyncError>;
-}
-
-#[derive(Debug)]
-pub enum SyncError {
-    Io(std::io::Error),
-    Serde(serde_json::Error),
-    RcloneExitCode(String),
-    Storage(String),
-}
-
-impl Error for SyncError {}
-
-impl Display for SyncError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SyncError::Io(error) => write!(f, "synchronizer IO err: {error}",),
-            SyncError::Serde(error) => write!(
-                f,
-                "synchronizer: error parsing checkpoint metadata: {error}",
-            ),
-            SyncError::RcloneExitCode(error) => write!(f, "synchronizer: rclone: '{error}'"),
-            SyncError::Storage(error) => write!(f, "synchronizer: storage error: '{error}'"),
-        }
-    }
-}
-
-impl From<std::io::Error> for SyncError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
-impl From<serde_json::Error> for SyncError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Serde(value)
-    }
-}
-
-impl From<StorageError> for SyncError {
-    fn from(value: StorageError) -> Self {
-        Self::Storage(value.to_string())
-    }
+    ) -> anyhow::Result<(CheckpointMetadata, Option<CheckpointSyncMetrics>)>;
 }
 
 inventory::collect!(&'static dyn CheckpointSynchronizer);
+
+/// Lazily resolves the checkpoint synchronizer.
+///
+/// This panic is safe as all enterprise builds must include the checkpoint-sync
+/// crate.
+pub static SYNCHRONIZER: LazyLock<&'static dyn CheckpointSynchronizer> = LazyLock::new(|| {
+    *inventory::iter::<&dyn CheckpointSynchronizer>
+        .into_iter()
+        .next()
+        .expect("no checkpoint synchronizer found; are enterprise features enabled?")
+});

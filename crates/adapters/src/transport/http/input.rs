@@ -1,17 +1,20 @@
+use crate::controller::ApiConnectionGuard;
 use crate::format::StreamSplitter;
 use crate::transport::{InputEndpoint, InputQueue, InputReaderCommand};
 use crate::{
-    server::{PipelineError, MAX_REPORTED_PARSE_ERRORS},
-    transport::InputReader,
     ControllerError, InputConsumer, PipelineState, TransportInputEndpoint,
+    server::{MAX_REPORTED_PARSE_ERRORS, PipelineError},
+    transport::InputReader,
 };
 use crate::{InputBuffer, ParseError, Parser};
 use actix_web::web::Payload;
-use anyhow::{anyhow, Error as AnyError, Result as AnyResult};
+use anyhow::{Error as AnyError, Result as AnyResult, anyhow};
 use atomic::Atomic;
+use chrono::{DateTime, Utc};
 use circular_queue::CircularQueue;
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::transport::Resume;
+use feldera_adapterlib::format::BufferSize;
+use feldera_adapterlib::transport::{Resume, Watermark};
 use feldera_types::config::FtModel;
 use feldera_types::program_schema::Relation;
 use feldera_types::transport::http::HttpInputConfig;
@@ -20,20 +23,13 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::{
     hash::Hasher,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::{sync::watch, time::timeout};
 use tracing::{debug, info_span};
 use xxhash_rust::xxh3::Xxh3Default;
-
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) enum HttpIngressMode {
-    Batch,
-    Stream,
-    Chunks,
-}
 
 /// HTTP input transport.
 ///
@@ -62,7 +58,6 @@ impl HttpInputTransport {
 struct HttpInputEndpointDetails {
     consumer: Box<dyn InputConsumer>,
     parser: Box<dyn Parser>,
-    splitter: StreamSplitter,
     queue: InputQueue<Vec<u8>>,
 }
 
@@ -94,22 +89,22 @@ impl HttpInputEndpointInner {
         let input_span = info_span!("http_input");
         while let Some(message) = receiver.recv().await {
             input_span.in_scope(|| match message {
-                InputReaderCommand::Seek(_) => (),
                 InputReaderCommand::Replay { data, .. } => {
                     let Data { chunks } = rmpv::ext::from_value(data).unwrap();
                     let mut guard = self.details.lock().unwrap();
                     let details = guard.as_mut().unwrap();
-                    let mut num_records = 0;
+                    let mut total = BufferSize::empty();
                     let mut hasher = Xxh3Default::new();
                     for chunk in chunks {
-                        let (mut buffer, errors) = details.parser.parse(&chunk);
-                        details.consumer.buffered(buffer.len(), chunk.len());
+                        let (mut buffer, errors) = details.parser.parse(&chunk, None);
+                        let len = buffer.len();
+                        details.consumer.buffered(len);
                         details.consumer.parse_errors(errors);
-                        num_records += buffer.len();
+                        total += len;
                         buffer.hash(&mut hasher);
                         buffer.flush();
                     }
-                    details.consumer.replayed(num_records, hasher.finish());
+                    details.consumer.replayed(total, hasher.finish());
                 }
                 InputReaderCommand::Extend => self.set_state(PipelineState::Running),
                 InputReaderCommand::Pause => self.set_state(PipelineState::Paused),
@@ -117,6 +112,7 @@ impl HttpInputEndpointInner {
                     let mut guard = self.details.lock().unwrap();
                     let details = guard.as_mut().unwrap();
                     let (num_records, hasher, chunks) = details.queue.flush_with_aux();
+                    let (timestamps, chunks) = chunks.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
                     let resume = Resume::new_data_only(
                         || {
                             rmpv::ext::to_value(Data {
@@ -124,9 +120,16 @@ impl HttpInputEndpointInner {
                             })
                             .unwrap()
                         },
-                        hasher,
+                        hasher.map(|h| h.finish()),
                     );
-                    details.consumer.extended(num_records, Some(resume));
+                    details.consumer.extended(
+                        num_records,
+                        Some(resume),
+                        timestamps
+                            .into_iter()
+                            .map(|t| Watermark::new(t, None))
+                            .collect(),
+                    );
                 }
                 InputReaderCommand::Disconnect => self.set_state(PipelineState::Terminated),
             });
@@ -148,6 +151,7 @@ impl HttpInputEndpointInner {
 pub(crate) struct HttpInputEndpoint {
     inner: Arc<HttpInputEndpointInner>,
     sender: UnboundedSender<InputReaderCommand>,
+    _guard: Option<Arc<ApiConnectionGuard>>,
 }
 
 impl HttpInputEndpoint {
@@ -156,6 +160,14 @@ impl HttpInputEndpoint {
         Self {
             inner: HttpInputEndpointInner::new(config, receiver),
             sender,
+            _guard: None,
+        }
+    }
+
+    pub(crate) fn with_api_connection_guard(self, guard: ApiConnectionGuard) -> Self {
+        Self {
+            _guard: Some(Arc::new(guard)),
+            ..self
         }
     }
 
@@ -167,34 +179,32 @@ impl HttpInputEndpoint {
         &self.inner.name
     }
 
-    fn push(&self, bytes: Option<&[u8]>, errors: &mut CircularQueue<ParseError>) -> usize {
+    fn push(
+        &self,
+        chunk: &[u8],
+        errors: &mut CircularQueue<ParseError>,
+        timestamp: DateTime<Utc>,
+    ) -> usize {
         let mut guard = self.inner.details.lock().unwrap();
         let details = guard.as_mut().unwrap();
-        if let Some(bytes) = bytes {
-            details.splitter.append(bytes);
-        }
         let mut total_errors = 0;
-        while let Some(chunk) = details.splitter.next(bytes.is_none()) {
-            let (buffer, new_errors) = details.parser.parse(chunk);
-            let aux = if details.consumer.pipeline_fault_tolerance() == Some(FtModel::ExactlyOnce) {
-                Vec::from(chunk)
-            } else {
-                Vec::new()
-            };
-            details
-                .queue
-                .push_with_aux((buffer, new_errors.clone()), chunk.len(), aux);
-            total_errors += new_errors.len();
-            for error in new_errors {
-                errors.push(error);
-            }
+        let (buffer, new_errors) = details.parser.parse(chunk, None);
+        let aux = if details.consumer.pipeline_fault_tolerance() == Some(FtModel::ExactlyOnce) {
+            Vec::from(chunk)
+        } else {
+            Vec::new()
+        };
+        details
+            .queue
+            .push_with_aux((buffer, new_errors.clone()), timestamp, aux);
+        total_errors += new_errors.len();
+        for error in new_errors {
+            errors.push(error);
         }
-        drop(guard);
-
         total_errors
     }
 
-    fn error(&self, fatal: bool, error: AnyError) {
+    fn error(&self, fatal: bool, error: AnyError, tag: Option<&'static str>) {
         self.inner
             .details
             .lock()
@@ -202,7 +212,7 @@ impl HttpInputEndpoint {
             .as_mut()
             .unwrap()
             .consumer
-            .error(fatal, error);
+            .error(fatal, error, tag);
     }
 
     fn _queue_len(&self) -> usize {
@@ -232,6 +242,16 @@ impl HttpInputEndpoint {
         let mut num_errors = 0;
         let mut status_watch = self.inner.status_notifier.subscribe();
 
+        let mut splitter = StreamSplitter::new(
+            self.inner
+                .details
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .parser
+                .splitter(),
+        );
         loop {
             let pipeline_state = self.state();
 
@@ -249,25 +269,33 @@ impl HttpInputEndpoint {
                     return Err(PipelineError::Terminating);
                 }
                 PipelineState::Running => {
+                    // Use the time when we started reading the next chunk of the payload as the
+                    // ingestion timestamp.
+                    let timestamp = Utc::now();
+
                     // Check pipeline status at least every second.
-                    match timeout(Duration::from_millis(1_000), payload.next()).await {
-                        Err(_elapsed) => (),
-                        Ok(Some(Ok(bytes))) => {
-                            num_bytes += bytes.len();
-                            num_errors += self.push(Some(&bytes), &mut errors);
-                        }
+                    let eoi = match timeout(Duration::from_millis(1_000), payload.next()).await {
+                        Err(_elapsed) => continue,
                         Ok(Some(Err(e))) => {
-                            self.error(true, anyhow!(e.to_string()));
+                            self.error(true, anyhow!(e.to_string()), None);
                             Err(ControllerError::input_transport_error(
                                 self.name(),
                                 true,
                                 anyhow!(e),
                             ))?
                         }
-                        Ok(None) => {
-                            num_errors += self.push(None, &mut errors);
-                            break;
+                        Ok(Some(Ok(bytes))) => {
+                            num_bytes += bytes.len();
+                            splitter.append(&bytes);
+                            false
                         }
+                        Ok(None) => true,
+                    };
+                    while let Some(chunk) = splitter.next(eoi) {
+                        num_errors += self.push(chunk, &mut errors, timestamp);
+                    }
+                    if eoi {
+                        break;
                     }
                 }
             }
@@ -297,20 +325,23 @@ impl TransportInputEndpoint for HttpInputEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         _schema: Relation,
+        _resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
-        let splitter = StreamSplitter::new(parser.splitter());
         let queue = InputQueue::new(consumer.clone());
         *self.inner.details.lock().unwrap() = Some(HttpInputEndpointDetails {
             consumer,
             parser,
             queue,
-            splitter,
         });
         Ok(Box::new(self.clone()))
     }
 }
 
 impl InputReader for HttpInputEndpoint {
+    fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
+
     fn request(&self, command: InputReaderCommand) {
         let _ = self.sender.send(command);
     }

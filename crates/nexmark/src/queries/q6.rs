@@ -1,10 +1,10 @@
 use super::NexmarkStream;
 use crate::model::Event;
 use dbsp::{
+    OrdIndexedZSet, OrdZSet, RootCircuit, Stream,
     algebra::UnimplementedSemigroup,
     operator::{Fold, Max},
     utils::Tup2,
-    OrdIndexedZSet, OrdZSet, RootCircuit, Stream,
 };
 
 type Q6Stream = Stream<RootCircuit, OrdIndexedZSet<u64, u64>>;
@@ -117,7 +117,7 @@ mod tests {
         generator::tests::{make_auction, make_bid},
         model::{Auction, Bid, Event},
     };
-    use dbsp::{indexed_zset, RootCircuit};
+    use dbsp::indexed_zset;
 
     #[test]
     fn test_q6_single_seller_single_auction() {
@@ -176,7 +176,7 @@ mod tests {
         ]
         .into_iter();
 
-        let (circuit, input_handle) = RootCircuit::build(move |circuit| {
+        let (mut circuit, input_handle) = dbsp::Runtime::init_circuit(1, move |circuit| {
             let (stream, input_handle) = circuit.add_input_zset::<Event>();
 
             let mut expected_output = vec![
@@ -200,7 +200,7 @@ mod tests {
 
         for mut vec in input_vecs {
             input_handle.append(&mut vec);
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 
@@ -253,7 +253,7 @@ mod tests {
         ]
         .into_iter();
 
-        let (circuit, input_handle) = RootCircuit::build(move |circuit| {
+        let (mut circuit, input_handle) = dbsp::Runtime::init_circuit(1, move |circuit| {
             let (stream, input_handle) = circuit.add_input_zset::<Event>();
             let mut expected_output = vec![
                 // First batch has a single auction seller with best bid of 100.
@@ -274,7 +274,7 @@ mod tests {
 
         for mut vec in input_vecs {
             input_handle.append(&mut vec);
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 
@@ -493,7 +493,7 @@ mod tests {
         ]
         .into_iter();
 
-        let (circuit, input_handle) = RootCircuit::build(move |circuit| {
+        let (mut circuit, input_handle) = dbsp::Runtime::init_circuit(1, move |circuit| {
             let (stream, input_handle) = circuit.add_input_zset::<Event>();
             let mut expected_output = vec![
                 // First has 5 auction for person 99, but average is (200 + 100 * 4) / 5.
@@ -516,7 +516,7 @@ mod tests {
 
         for mut vec in input_vecs {
             input_handle.append(&mut vec);
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 
@@ -611,7 +611,7 @@ mod tests {
         ]
         .into_iter();
 
-        let (circuit, input_handle) = RootCircuit::build(move |circuit| {
+        let (mut circuit, input_handle) = dbsp::Runtime::init_circuit(1, move |circuit| {
             let (stream, input_handle) = circuit.add_input_zset::<Event>();
 
             let mut expected_output = vec![
@@ -634,7 +634,7 @@ mod tests {
 
         for mut vec in input_vecs {
             input_handle.append(&mut vec);
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 }

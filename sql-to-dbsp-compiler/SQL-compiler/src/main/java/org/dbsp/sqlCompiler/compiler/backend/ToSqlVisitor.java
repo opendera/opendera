@@ -20,7 +20,7 @@ import org.dbsp.util.Utilities;
 import java.util.Map;
 import java.util.Objects;
 
-/** This visitor can be used to serialize ZSet literals to a SQL representation. */
+/** This visitor can be used to serialize literals to a SQL representation. */
 public class ToSqlVisitor extends InnerVisitor {
     private final StringBuilder appendable;
 
@@ -77,7 +77,7 @@ public class ToSqlVisitor extends InnerVisitor {
     @Override
     public VisitDecision preorder(DBSPStringLiteral literal) {
         if (literal.value != null)
-            this.appendable.append(Utilities.doubleQuote(literal.value));
+            this.appendable.append(Utilities.doubleQuote(literal.value, false));
         else
             this.appendable.append(DBSPNullLiteral.NULL);
         return VisitDecision.STOP;
@@ -116,5 +116,12 @@ public class ToSqlVisitor extends InnerVisitor {
             }
         }
         return VisitDecision.STOP;
+    }
+
+    public static String convert(DBSPCompiler compiler, DBSPExpression expression) {
+        StringBuilder builder = new StringBuilder();
+        ToSqlVisitor toSql = new ToSqlVisitor(compiler, builder);
+        toSql.apply(expression);
+        return builder.toString();
     }
 }

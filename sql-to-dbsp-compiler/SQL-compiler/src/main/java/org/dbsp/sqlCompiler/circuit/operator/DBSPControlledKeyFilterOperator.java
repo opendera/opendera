@@ -31,13 +31,13 @@ import static org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator.commonInf
 
 /**
  * The {@link DBSPControlledKeyFilterOperator} is an operator with 2 outputs, including
- * an error stream.  The left input is a stream of ZSets, while the
+ * an error stream.  The left input is a stream of ZSets/Indexed ZSets, while the
  * right input is a stream of scalars.  {@code function} is a boolean function
  * that takes a scalar and an input element; when the function returns 'true'
  * the input element makes it to the output.  The {@code error} function takes
  * a scalar, and an element and returns an error message with the ERROR_SCHEMA structure.
  * It is invoked only when the function returns 'false'. */
-public final class DBSPControlledKeyFilterOperator extends DBSPOperatorWithError {
+public final class DBSPControlledKeyFilterOperator extends DBSPOperatorWithError implements ILinear {
     public DBSPControlledKeyFilterOperator(
             CalciteRelNode node, DBSPClosureExpression function, DBSPClosureExpression error,
             OutputPort data, OutputPort control) {
@@ -72,7 +72,7 @@ public final class DBSPControlledKeyFilterOperator extends DBSPOperatorWithError
             DBSPType rightType = right.getType();
             Utilities.enforce(leftType.withMayBeNull(true)
                     .sameType(rightType.withMayBeNull(true)),
-                    "Types differ: " + leftType + " vs " + rightType);
+                    () -> "Types differ: " + leftType + " vs " + rightType);
             // Notice the comparison using AGG_GTE, which never returns NULL
             DBSPExpression comparison = new DBSPBinaryExpression(CalciteEmptyRel.INSTANCE,
                     DBSPTypeBool.create(false), opcode, left, right);
@@ -107,8 +107,8 @@ public final class DBSPControlledKeyFilterOperator extends DBSPOperatorWithError
     }
 
     @Override
-    public DBSPOperatorWithError withInputs(List<OutputPort> newInputs, boolean force) {
-        Utilities.enforce(newInputs.size() == 2, "Expected 2 inputs, got " + newInputs.size());
+    public DBSPOperator withInputs(List<OutputPort> newInputs, boolean force) {
+        Utilities.enforce(newInputs.size() == 2, () -> "Expected 2 inputs, got " + newInputs.size());
         if (force || this.inputsDiffer(newInputs))
             return new DBSPControlledKeyFilterOperator(
                     this.getRelNode(), this.function, this.error,

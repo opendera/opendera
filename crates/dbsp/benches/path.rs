@@ -1,13 +1,13 @@
 use dbsp::{
-    mimalloc::MiMalloc, operator::Generator, typed_batch::DynBatchReader, utils::Tup2, Circuit,
-    OrdZSet, RootCircuit, Runtime, Stream,
+    Circuit, OrdZSet, RootCircuit, Runtime, Stream, mimalloc::MiMalloc, operator::Generator,
+    typed_batch::DynBatchReader, utils::Tup2,
 };
 
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc;
 
 fn main() {
-    let hruntime = Runtime::run(16, || {
+    let hruntime = Runtime::run(16, |_parker| {
         let circuit = RootCircuit::build(|circuit| {
             /*
             use dbsp::{
@@ -126,7 +126,7 @@ fn main() {
         //let graph = monitor.visualize_circuit();
         //fs::write("path.dot", graph.to_dot()).unwrap();
 
-        circuit.step().unwrap();
+        circuit.transaction().unwrap();
     })
     .expect("runtime initialization should succeed");
 

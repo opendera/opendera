@@ -23,6 +23,7 @@
 
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
+import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.sql.tools.Change;
@@ -63,7 +64,7 @@ public class CastTests extends SqlIoTest {
     }
 
     public Change createInput() {
-        return new Change(new DBSPZSetExpression(new DBSPTupleExpression(
+        return new Change("T", new DBSPZSetExpression(new DBSPTupleExpression(
                 new DBSPI32Literal(10),
                 new DBSPDoubleLiteral(12.0),
                 new DBSPStringLiteral("100100"),
@@ -74,7 +75,7 @@ public class CastTests extends SqlIoTest {
     public void testQuery(String query, DBSPZSetExpression expectedOutput) {
         query = "CREATE VIEW V AS " + query + ";";
         CompilerCircuitStream ccs = this.getCCS(query);
-        InputOutputChange change = new InputOutputChange(this.createInput(), new Change(expectedOutput));
+        InputOutputChange change = new InputOutputChange(this.createInput(), new Change("V", expectedOutput));
         ccs.addChange(change);
     }
 
@@ -86,7 +87,7 @@ public class CastTests extends SqlIoTest {
     @Test
     public void castFail() {
         this.runtimeConstantFail("SELECT CAST('blah' AS DECIMAL)",
-                "invalid decimal");
+                "While converting 'blah' to DECIMAL: parse error");
     }
 
     @Test
@@ -132,7 +133,7 @@ public class CastTests extends SqlIoTest {
     @Test
     public void decimalOutOfRange() {
         this.runtimeFail("SELECT CAST(100103123 AS DECIMAL(10, 4))",
-                "Cannot represent 100103123 as DECIMAL(10, 4)",
+                "Could not convert 100103123 to DECIMAL(10, 4)",
                 this.streamWithEmptyChanges());
     }
 
@@ -484,7 +485,14 @@ public class CastTests extends SqlIoTest {
                 "Cast function cannot convert value of type DATE NOT NULL to type INTEGER");
 
         this.statementsFailingInCompilation("CREATE VIEW V AS SELECT CAST(X'01' AS TIME)",
-                "Cast function cannot convert BINARY value to ");
+                "CAST cannot be used to convert BINARY(1) to TIME");
+    }
+
+    @Test
+    public void testIntervalCast() {
+        this.getCCS("CREATE VIEW V AS SELECT " +
+                "CAST(CAST('3:4' AS INTERVAL MINUTES TO SECONDS) AS INTERVAL HOURS TO MINUTES)," +
+                "CAST(CAST('3:4' AS INTERVAL MINUTES TO SECONDS) AS INTERVAL HOURS);");
     }
 
     @Test
@@ -581,8 +589,6 @@ public class CastTests extends SqlIoTest {
 
         final CanConvert T = CanConvert.T;
         final CanConvert F = CanConvert.F;
-        // TODO: https://issues.apache.org/jira/browse/CALCITE-6779
-        final CanConvert N = CanConvert.N;
 
         // Rows and columns match the array of types above.
         final CanConvert[][] legal = {
@@ -590,14 +596,14 @@ public class CastTests extends SqlIoTest {
 /*From                                                                                                                    */
 /* N */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F },
 /* B */{ F, T, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F },
-/* I8*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*I16*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*I32*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*I64*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/* U8*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*U16*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*U32*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*U64*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
+/* I8*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
+/*I16*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
+/*I32*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
+/*I64*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
+/* U8*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
+/*U16*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
+/*U32*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
+/*U64*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
 /*Dec*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
 /* r */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F, F, F, F, T, F },
 /* d */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F, F, F, F, T, F },
@@ -625,14 +631,14 @@ public class CastTests extends SqlIoTest {
 /* a */{ F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F, T, F },
 /* m */{ F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F },
 /* V */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T },
-/* U */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, N, N, N, F, F, F, T, T },
+/* U */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T },
         };
 
         Assert.assertEquals(types.length, legal.length);
         Assert.assertEquals(types.length, legal[0].length);
         StringBuilder program = new StringBuilder();
-        program.append("CREATE VIEW V AS SELECT ");
         boolean first = true;
+        program.append("CREATE VIEW V AS SELECT ");
         for (int i = 0; i < types.length; i++) {
             String type = types[i];
             String value = values[i];
@@ -658,7 +664,9 @@ public class CastTests extends SqlIoTest {
                 if (ok == CanConvert.F) {
                     if (!value.equals("NULL") && !from.equals("NULL") && !to.equals("NULL")) {
                         String statement = "CREATE VIEW V AS SELECT CAST(CAST(" + value + " AS " + from + ") AS " + to + ")";
-                        this.statementsFailingInCompilation(statement, "Cast function cannot convert");
+                        // Calcite and our extra validator produce different error messages,
+                        // but they both include the string 'convert'
+                        this.statementsFailingInCompilation(statement, "convert");
                     }
                     continue;
                 }
@@ -677,6 +685,54 @@ public class CastTests extends SqlIoTest {
             }
             program.append(";\n");
         }
-        this.compileRustTestCase(program.toString());
+        // Disable Calcite optimizations so it doesn't do constant-folding
+        CompilerOptions options = this.testOptions();
+        options.languageOptions.optimizationLevel = 0;
+        DBSPCompiler compiler = new DBSPCompiler(options);
+        compiler.submitStatementsForCompilation(program.toString());
+        this.getCCS(compiler);
+    }
+
+    @Test
+    public void issue5894() {
+        this.qs("""
+                SELECT INTERVAL '1' YEAR;
+                 r
+                ---
+                 1 year
+                (1 row)
+                
+                SELECT CAST('1' AS INTERVAL YEAR);
+                 r
+                ---
+                 1 year
+                (1 row)
+                
+                SELECT INTERVAL 1 YEAR;
+                 r
+                ---
+                 1 year
+                (1 row)
+                
+                SELECT CAST(CAST('1' AS INTERVAL YEAR) AS TINYINT);
+                 r
+                ---
+                 1
+                (1 row)
+                
+                SELECT CAST(INTERVAL '1' YEAR AS TINYINT);
+                 r
+                ---
+                 1
+                (1 row)""");
+    }
+
+    @Test
+    public void issue5895() {
+        this.q("""
+                SELECT CAST(INTERVAL '1000' MONTH AS INT);
+                 r
+                -----
+                 1000""");
     }
 }

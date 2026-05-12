@@ -39,7 +39,7 @@ public class Intern extends Passes {
         public String toString() {
             return this.columns.toString();
         }
-    };
+    }
 
     final Map<DBSPSourceTableOperator, InternedColumnList> internedInputs;
 
@@ -48,6 +48,6 @@ public class Intern extends Passes {
         this.internedInputs = new HashMap<>();
         this.add(new FindInternedInputs(compiler, this.internedInputs));
         this.add(new RewriteInternedFields(compiler, this.internedInputs));
-        this.add(new DeadCode(compiler, true, false));
+        this.add(new DeadCode(compiler, true));
     }
 }

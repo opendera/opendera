@@ -47,17 +47,6 @@ All commands below should be run from the root directory of the repository.
   ... after which you can view Prometheus at http://localhost:9090
   and Grafana at http://localhost:3000
 
-- **Demo:**
-  ```bash
-  docker compose -f deploy/docker-compose.yml \
-                 -f deploy/docker-compose-dev.yml \
-                 -f deploy/docker-compose-extra.yml \
-                 -f deploy/docker-compose-demo.yml \
-                 --profile demo-debezium-mysql up --build
-  ```
-
-  The demo profiles can be found within: `deploy/docker-compose-demo.yml`
-
 - **Redpanda:**
   ```bash
   docker compose -f deploy/docker-compose.yml \
@@ -142,6 +131,13 @@ get it included:
 
   At the time of writing these instructions there were 8 files involved, but this
   may change.  You can get the list of files by `grep`-ing for the old hash value.
+
+  A command like the one below will do the trick if you substitute the
+  correct new hash into it:
+
+  ```
+  sed -i 's/feldera-dev:sha-[0-9a-f]*/feldera-dev:sha-a6c448f6eaa832d34bd5d2f6b2b4167245a8de36/' .github/workflows/*.yml
+  ```
 
   * `build-java.yml`
   * `build-rust.yml`

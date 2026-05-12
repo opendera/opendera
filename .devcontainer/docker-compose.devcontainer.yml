@@ -7,7 +7,36 @@ services:
       # array).
       dockerfile: Dockerfile
     tty: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    pids_limit: -1
     environment:
-      - RUST_VERSION=1.87.0
+      - RUST_VERSION=1.93.1
       - RUST_BACKTRACE=1
       - REDPANDA_BROKERS=redpanda:9092
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_add:
+      - PERFMON
+      - IPC_LOCK
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+  postgres-dev:
+    image: postgres:15-alpine
+    restart: always
+    ports:
+      - 5435:5432
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/pg/data
+  db-admin:
+    image: adminer:5-standalone
+    restart: always
+    ports:
+      - 5436:8080

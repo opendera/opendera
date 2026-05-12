@@ -40,6 +40,7 @@ nexmark_comment.txt
 galen_results.csv
 ldbc_results.csv
 benchmark-run-data
+bench_results.csv
 
 # pipeline manager
 manager.db
@@ -49,9 +50,27 @@ cargo_workspace
 # python
 __pycache__
 .ruff_cache
+.coverage
+__pycache__
+test.log
+.idea
+.venv
+venv
+python/docs/_build
+python/docs/make.bat
+python/docs/modules.rst
+python/docs/feldera.rest.rst
+*.egg-info
+.vscode
 
 # clone of the benchmark repo
 gh-pages
+
+# JavaScript
+node_modules/
+
+# Vitest
+.vitest-attachments/
 
 # Playwright
 playwright-artifacts/
@@ -64,3 +83,16 @@ test-results-e2e/
 playwright-report-e2e/
 blob-report/
 playwright/.cache/
+
+# Any TLS related files
+*.pem
+*.crt
+*.key
+
+# pnpm
+.pnpm-store
+
+.vite/
+
+# Claude Code
+/.claude/settings.local.json

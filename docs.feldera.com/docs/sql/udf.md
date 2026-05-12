@@ -270,7 +270,7 @@ crate, which is part of the Feldera SQL runtime.
 | `SMALLINT UNSIGNED`      | `u16`                                   |
 | `INT UNSIGNED`           | `u32`                                   |
 | `BIGINT UNSIGNED`        | `u64`                                   |
-| `DECIMAL(p, s)`          | `feldera_sqllib::SqlDecimal`            |
+| `DECIMAL(p, s)`          | `feldera_sqllib::SqlDecimal<P, S>`      |
 | `REAL`                   | `feldera_sqllib::F32`                   |
 | `DOUBLE`                 | `feldera_sqllib::F64`                   |
 | `CHAR`, `CHAR(n)`        | `feldera_sqllib::SqlString`             |
@@ -358,7 +358,7 @@ In order to implement a complex Rust UDF (or a library of UDFs) using
 a Rust IDE:
 
 * Create a new Rust crate to serve as the container for your UDFs.
-* Add `feldera-sqllib` as a dependency to `Cargo.toml` (use the crate
+* Add `feldera-sqllib` as a dependency to `udf.toml` (use the crate
   version that matches the version of Feldera you are working with).
 * Implement and test your UDFs within this crate.
 * Copy the final Rust code and dependencies to the Feldera Web Console.
@@ -370,7 +370,7 @@ Import this crate to your Feldera pipeline via the `udf.toml` file,
 including only wrapper functions that call the API of this crate in
 `udf.rs`.
 
-## Limitations
+### Limitations
 
 * Currently only limited implicit casts are inserted by the compiler for the
   function arguments and function result in the SQL program.  For
@@ -387,3 +387,499 @@ including only wrapper functions that call the API of this crate in
 * Polymorphic functions are not supported.  For example, in SQL the
   addition operation operates on any numeric types; such an operation
   cannot be implemented as a single user-defined function.
+
+## User-defined aggregates
+
+:::warning Experimental feature
+
+Rust UDA support is currently experimental and may undergo significant
+changes, including non-backward-compatible modifications, in future
+releases of Feldera.
+
+:::
+
+The SQL statement `CREATE AGGREGATE` can be used to extend the set of
+aggregate functions supported by Feldera SQL with user-defined
+aggregation functions.  Such functions need to be implemented in Rust.
+The argument and result of `CREATE AGGREGATE` must be nullable.
+
+### Creating user-defined linear aggregate functions
+
+In general, a function A is linear if it has the following property:
+A(C1 UNION C2) = A(C1) + A(C2), where C1 and C2 are arbitrary
+collections.  The type of the result produced by the function is
+expected to have a + operation, and it must be commutative and
+associative.
+
+To implement a user-defined linear aggregate function the user has to
+define 3 Rust objects:
+
+- a type for the accumulator; the type name is obtained from the
+  aggregate function name with the suffix `_accumulator_type`.
+
+  The actual arithmetic is performed using values of this type.  The
+  accumulator type is thus required to implement several traits
+  defined in the DBSP core library:
+
+  - [`DBWeight`](https://docs.rs/dbsp/latest/dbsp/trace/trait.DBWeight.html)
+    which is a combination of
+    [`DBData`](https://docs.rs/dbsp/latest/dbsp/trace/trait.DBData.html)
+    and
+    [`MonoidValue`](https://docs.rs/dbsp/latest/dbsp/algebra/trait.MonoidValue.html).
+    `DBData` allows accumulators to be stored in relations which may be
+    spilled to disk; amond other traits, it requires `Ord` and
+    `ArchivedDBData`.  `MonoidValue` essentially requires the traits
+    `Zero`, `HasZero`, `Add` (and variants such as `AddByRef`).
+
+  - [`MulByRef`](https://docs.rs/dbsp/latest/dbsp/algebra/trait.MulByRef.html)
+    which allows accumulator values to be multiplied by integer
+    (signed and unsigned) weights.  Negative weights are used when
+    elements are removed from collections; weights larger than 1 are used
+    when multiple copies of an element are updated in one operation.
+    Currently the `Weight` type is `i64`.
+
+- a function which converts a collection value into an accumulator
+  value.  The function's name is obtained from the aggregate function
+  name with the suffix `_map`.
+
+- a function to perform additional post-processing on the aggregation
+  result, returning the expected result.  The function's name is
+  obtained from the aggregate function name with the suffix `_post`.
+
+This use of the post-processing function enables linear
+implementations for aggregates such as "average", where the
+aggregation produces a sum and a count, while the post-processing step
+produces the actual result by computing sum/count.
+
+If the `Add` operation for the accumulator type is not linear, the
+results produced by the program are undefined.  This requirement can
+be subtle; for example, floating point addition is not associative,
+and thus an computing an aggregate like `SUM` on floating-point values
+using standard floating point arithmetic will produce incorrect
+results or runtime crashes.
+
+#### Example user-defined aggregate
+
+We show an example building a user-defined linear aggregate for
+computing sum of 128-bit values.  We use the SQL type `BINARY(16)` to
+represent 128-bit numbers.  The first step requires declaring the
+user-defined aggregate function in SQL:
+
+```sql
+CREATE LINEAR AGGREGATE i128_sum(value BINARY(16)) RETURNS BINARY(16);
+```
+
+Notice that the type of the argument and result are both nullable.  We
+can then use the user-defined aggregate in a SQL program:
+
+```sql
+CREATE TABLE T(value BINARY(16));
+
+CREATE MATERIALIZED VIEW V0 AS SELECT i128_sum(value) FROM T;
+```
+
+In SQL the `SUM` function is polymorphic, since it works for any
+numeric SQL type.  Currently user-defined aggregate functions cannot
+be polymorphic, so one needs to define a new user-defined aggregate
+function for each type of values; moreover, the `SUM` function name
+cannot be used for a user-defined aggregate.
+
+The user needs to add the following 2 dependencies to the `udf.toml`
+file:
+
+```
+i256 = { version = "0.2.2", features = ["num-traits"] }
+num-traits = "0.2.19"
+```
+
+We will use the [I256](https://docs.rs/i256/latest/i256/index.html)
+Rust crate for 256-bit arithmetic.  In our implementation we wrap this
+type into the type `I256Wrapper`, for which we implement the required
+traits.  Most of the code is devoted for this task, and is relatively
+straightforward.
+
+For our example the accumulator type that the user has to define is
+named `i128_sum_accumulator_type`, holding the partial sum computed,
+stored in an I256 value.
+
+The user would add the following implementation to the `udf.rs` file:
+
+```rust
+use i256::I256;
+use feldera_sqllib::*;
+use crate::{AddAssignByRef, AddByRef, HasZero, MulByRef, SizeOf, Tup3};
+use derive_more::Add;
+use num_traits::Zero;
+use rkyv::Fallible;
+use std::ops::{Add, AddAssign};
+
+#[derive(Add, Clone, Debug, Default, PartialOrd, Ord, Eq, PartialEq, Hash)]
+pub struct I256Wrapper {
+    pub data: I256,
+}
+
+impl SizeOf for I256Wrapper {
+    fn size_of_children(&self, context: &mut size_of::Context) {}
+}
+
+impl From<[u8; 32]> for I256Wrapper {
+    fn from(value: [u8; 32]) -> Self {
+        Self { data: I256::from_be_bytes(value) }
+    }
+}
+
+impl From<&[u8]> for I256Wrapper {
+    fn from(value: &[u8]) -> Self {
+        let mut padded = [0u8; 32];
+        // If original value is negative, pad with sign
+        if value[0] & 0x80 != 0 {
+            padded.fill(0xff);
+        }
+        let len = value.len();
+        if len > 32 {
+            panic!("Slice larger than target");
+        }
+        padded[32-len..].copy_from_slice(&value[..len]);
+        Self { data: I256::from_be_bytes(padded) }
+    }
+}
+
+impl MulByRef<Weight> for I256Wrapper {
+    type Output = Self;
+
+    fn mul_by_ref(&self, other: &Weight) -> Self::Output {
+        Self {
+            data: self.data.checked_mul_i64(*other)
+                .expect("Overflow during multiplication"),
+        }
+    }
+}
+
+impl HasZero for I256Wrapper {
+    fn zero() -> Self {
+        Self { data: I256::zero() }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.data.is_zero()
+    }
+}
+
+impl AddByRef for I256Wrapper {
+    fn add_by_ref(&self, other: &Self) -> Self {
+        Self { data: self.data.add(other.data) }
+    }
+}
+
+impl AddAssignByRef<Self> for I256Wrapper {
+    fn add_assign_by_ref(&mut self, other: &Self) {
+        self.data += other.data
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialOrd, Ord, Eq, PartialEq)]
+pub struct ArchivedI256Wrapper {
+    pub bytes: [u8; 32],
+}
+
+impl rkyv::Archive for I256Wrapper {
+    type Archived = ArchivedI256Wrapper;
+    type Resolver = ();
+
+    #[inline]
+    unsafe fn resolve(&self, pos: usize, _: Self::Resolver, out: *mut Self::Archived) {
+        out.write(ArchivedI256Wrapper {
+            bytes: self.data.to_be_bytes(),
+        });
+    }
+}
+
+impl<S: Fallible + ?Sized> rkyv::Serialize<S> for I256Wrapper {
+    #[inline]
+    fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+        Ok(())
+    }
+}
+
+impl<D: Fallible + ?Sized> rkyv::Deserialize<I256Wrapper, D> for ArchivedI256Wrapper {
+    #[inline]
+    fn deserialize(&self, _: &mut D) -> Result<I256Wrapper, D::Error> {
+        Ok(I256Wrapper::from(self.bytes))
+    }
+}
+
+pub type i128_sum_accumulator_type = I256Wrapper;
+
+pub fn i128_sum_map(val: ByteArray) -> i128_sum_accumulator_type {
+    I256Wrapper::from(val.as_slice())
+}
+
+pub fn i128_sum_post(val: i128_sum_accumulator_type) -> ByteArray {
+    // Check for overflow
+    if val.data < I256::from(i128::MIN) || val.data > I256::from(i128::MAX) {
+        panic!("Result of aggregation {} does not fit in 128 bits", val.data);
+    }
+    ByteArray::new(&val.data.to_be_bytes()[16..])
+}
+```
+
+The two functions needed to implement the aggregation are
+`i128_sum_map`, and `i128_sum_post`.
+
+`i128_sum_map` converts a `BINARY(16)` value into an accumulator
+value.  Notice that in the SQL runtime library `BINARY(16)` is
+implemented as a `ByteArray`.  The argument of this function must be
+non-nullable.
+
+`i128_sum_post` converts the accumulator value into the expected
+result type `BINARY(16)`.  The result must be non-nullable.
+
+The handling of `NULL` is dictated by the SQL semantics, and cannot be
+changed: aggregating a collection containing only `NULL` values (or
+empty) produces `NULL`.
+
+### Creating user-defined non-linear aggregate functions
+
+Currently user-defined non-linear aggregation functions are not
+supported.  These may be added in the future.
+
+## User-defined preprocessors
+
+:::warning Experimental feature
+
+Preprocessor support is currently experimental and may undergo significant changes, including
+non-backward-compatible modifications, in future releases of Feldera.
+
+:::
+
+:::danger
+
+* Preprocessors are compiled into native binary code and executed directly within the address
+  space of the pipeline. Therefore, only trusted code should be included in preprocessors. They
+  should not contain panics or invoke undefined behaviors.
+
+:::
+
+A **preprocessor** is a user-defined Rust component that transforms raw bytes produced by an
+input transport endpoint before they reach the format parser:
+
+```text
+[stream of bytes] -> Transport -> [stream of bytes] -> Preprocessor -> [stream of array of bytes] -> Parser -> [stream of records] -> Circuit
+```
+
+Preprocessors are useful for:
+
+- Decrypting or decompressing data produced by the transport
+- Stripping protocol-specific framing or headers
+- Filtering data
+- Re-encoding data from one wire format to another before the standard parsers see it
+
+### Implementing a preprocessor
+
+To add a custom preprocessor, implement three Rust traits:
+
+- `feldera_adapterlib::preprocess::Preprocessor`
+- `feldera_adapterlib::preprocess::PreprocessorFactory`,
+- `feldera_adapterlib::format::Splitter`.
+
+Preprocessors can only be used with certain classes of input
+connectors, which accept raw data as byte arrays and perform their own parsing.
+Preprocessors cannot be combined with input connectors such as
+Delta, Iceberg, Postgres, which read directly structured data.
+An attempt to use a preprocessor with such a connector will lead to a
+runtime error.
+
+#### `PreprocessorConfig`
+
+The configuration for a preprocessor has the following structure in Rust:
+
+```
+pub struct PreprocessorConfig {
+    /// Name of the preprocessor.
+    /// All preprocessors with the same name will perform the same task.
+    pub name: String,
+    /// True if the preprocessor is message-oriented: true if each preprocessor
+    /// output record corresponds to a whole number of of parser records.
+    pub message_oriented: bool,
+    /// Arbitrary additional configuration.
+    pub config: Value,
+}
+```
+
+#### `Preprocessor` trait
+
+```rust
+pub trait Preprocessor: Send + Sync {
+    /// Transform raw input bytes.
+    ///
+    /// Returns the transformed bytes together with any non-fatal parse errors
+    /// encountered during transformation.
+    fn process(&mut self, data: &[u8]) -> (Vec<u8>, Vec<ParseError>);
+
+    /// Create an independent copy of this preprocessor with the same configuration.
+    ///
+    /// Called by multi-threaded transport endpoints to set up parallel input
+    /// pipelines.  Only called once, prior to data processing.
+    fn fork(&self) -> Box<dyn Preprocessor>;
+
+    /// Returns an object that can be used to break a stream of incoming data
+    /// into complete records to pass to [Preprocessor::process].  If the object
+    /// is None, the parser's splitter object will actually be used.
+    fn splitter(&self) -> Option<Box<dyn Splitter>>;
+}
+```
+
+There are two kinds of preprocessors: streaming and message-oriented,
+depending on the "message_oriented" configuration field value.
+
+A message-oriented preprocessor is one which processes input records
+independently of each other.  The parser following the preprocessor
+will split each input record produced by the preprocessor into zero or
+more records that are passed to the pipeline.  A preprocessor that is
+not message-oriented is called a "streaming" preprocessor.  The parser
+following a streaming preprocessor may need to receive multiple
+records from the preprocessor to produce even one record.
+
+Currently only "message-oriented" preprocessors are supported with
+fault-tolerance.
+
+#### `PreprocessorFactory` trait
+
+A factory is responsible for constructing `Preprocessor` instances from a JSON configuration
+object.
+
+```rust
+pub trait PreprocessorFactory: Send + Sync {
+    /// Construct a `Preprocessor` from the supplied configuration.
+    fn create(
+        &self,
+        config: &PreprocessorConfig,
+    ) -> Result<Box<dyn Preprocessor>, PreprocessorCreateError>;
+}
+```
+
+#### `Splitter` trait
+
+The splitter is responsible for breaking the byte stream into frames
+at "object" boundaries.
+
+```rust
+/// Splits a data stream at boundaries between records.
+///
+/// [Parser::parse] or [Preprocessor::process] can only parse complete records.
+/// For a byte stream source, a format-specific [Splitter] allows a transport
+/// to find boundaries.
+pub trait Splitter: Send {
+    /// Looks for a record boundary in `data`. Returns:
+    ///
+    /// - `None`, if `data` does not necessarily complete a record.
+    ///
+    /// - `Some(n)`, if the first `n` bytes of data, plus any data previously
+    ///   presented for which `None` was returned, form one or more complete
+    ///   records. If `n < data.len()`, then the caller should re-present
+    ///   `data[n..]` for further splitting.
+    fn input(&mut self, data: &[u8]) -> Option<usize>;
+
+    /// Clears any state in this splitter and prepares it to start splitting new
+    /// data.
+    fn clear(&mut self);
+}
+```
+
+#### Usage in SQL programs
+
+By declaring a preprocessor in the connector configuration
+the user indicates that a user-defined preprocessor will
+be used for that specific connector.  When declaring a preprocessor with name "example", the user has to provide two
+trait implementations in the udf.rs file:
+
+- `ExamplePreprocessor` that implements the `Preprocessor` trait
+- `ExamplePreprocessorFactory` that implements the `PreprocessorFactory` trait
+
+You will need to add `feldera-adapterlib` to the `udf.toml` file.
+
+### Example: logging preprocessor
+
+The following example shows a minimal preprocessor that returns its
+input unchanged but logs a message for every 1M data bytes processed.
+
+This is the content of the `udf.rs` file:
+
+```rust
+use tracing::info;
+use std::sync::{Arc, Mutex};
+use feldera_adapterlib::format::{ParseError, Splitter};
+use feldera_adapterlib::preprocess::{
+    Preprocessor, PreprocessorCreateError, PreprocessorFactory,
+};
+use feldera_types::preprocess::PreprocessorConfig;
+
+pub struct LoggerPreprocessor {
+   count: Arc<Mutex<u64>>,
+}
+
+impl Preprocessor for LoggerPreprocessor {
+    fn process(&mut self, data: &[u8]) -> (Vec<u8>, Vec<ParseError>) {
+        let mut count = self.count.lock().unwrap();
+        *count += data.len() as u64;
+        // Log a message if the counter has crossed a Megabyte boundary
+        if *count / (1024 * 1024) > (*count - data.len() as u64) / (1024 * 1024) {
+            info!("Processed {} bytes of data", *count);
+        }
+        (data.to_vec(), vec![])
+    }
+
+    fn fork(&self) -> Box<dyn Preprocessor> {
+        Box::new(LoggerPreprocessor { count: Arc::clone(&self.count) })
+    }
+
+    fn splitter(&self) -> Option<Box<dyn Splitter>> {
+        None
+    }
+}
+
+pub struct LoggerPreprocessorFactory;
+
+impl PreprocessorFactory for LoggerPreprocessorFactory {
+    fn create(
+        &self,
+        _config: &PreprocessorConfig,
+    ) -> Result<Box<dyn Preprocessor>, PreprocessorCreateError> {
+        Ok(Box::new(LoggerPreprocessor { count: Arc::new(Mutex::new(0)) }))
+    }
+}
+```
+
+This is the content of the `udf.toml` file:
+
+```
+tracing = { version = "0.1.40" }
+```
+
+### Configuring a preprocessor in a connector
+
+Preprocessors are enabled by adding a `preprocess` field to the connector configuration.
+Each entry has
+- a string `name` (matching a registered factory)
+- a boolean `message_oriented` property
+- a `config` object, passed verbatim to `PreprocessorFactory::create`.
+
+```json
+{
+  "transport": { "...": "..." },
+  "format":    { "...": "..." },
+  "preprocessor": [{
+      "name": "logger",
+      "message_oriented": true,
+      "config": { <logger-specific configuration> }
+  }]
+}
+```
+
+:::note
+
+Currently exactly one preprocessor may be specified per connector.
+
+:::
+

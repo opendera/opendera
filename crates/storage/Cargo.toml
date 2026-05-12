@@ -3,7 +3,7 @@ name = "feldera-storage"
 description = "Storage crate for feldera"
 readme = "README.md"
 
-edition = { workspace = true }
+edition = "2024"
 version = { workspace = true }
 homepage = { workspace = true }
 repository = { workspace = true }
@@ -12,6 +12,8 @@ authors = { workspace = true }
 rust-version = { workspace = true }
 
 [dependencies]
+anyhow = { workspace = true }
+crossbeam = { workspace = true }
 feldera-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 libc = { workspace = true }
@@ -24,6 +26,8 @@ uuid = { workspace = true, features = ["v7"] }
 inventory = { workspace = true }
 tracing = { workspace = true }
 once_cell = { workspace = true }
+itertools = { workspace = true }
+size-of = { workspace = true }
 
 [target.'cfg(target_family = "unix")'.dependencies]
 nix = { version = "0.27.1", features = ["uio", "feature", "fs"] }

@@ -1,8 +1,8 @@
 use anyhow::Result;
-use chrono::NaiveDate;
 use csv::Reader;
 use dbsp::utils::Tup2;
-use dbsp::{OrdZSet, OutputHandle, RootCircuit, ZSet, ZSetHandle};
+use dbsp::{OrdZSet, OutputHandle, RootCircuit, ZSet, ZSetHandle, ZWeight};
+use feldera_macros::IsNone;
 use rkyv::{Archive, Serialize};
 use size_of::SizeOf;
 
@@ -20,11 +20,12 @@ use size_of::SizeOf;
     Serialize,
     rkyv::Deserialize,
     serde::Deserialize,
+    IsNone,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 struct Record {
     location: String,
-    date: NaiveDate,
+    date: i32,
     daily_vaccinations: Option<u64>,
 }
 fn build_circuit(
@@ -34,13 +35,13 @@ fn build_circuit(
     input_stream.inspect(|records| {
         println!("{}", records.weighted_count());
     });
-    let filtered = input_stream.filter(|r| {
+    let subset = input_stream.filter(|r| {
         r.location == "England"
             || r.location == "Northern Ireland"
             || r.location == "Scotland"
             || r.location == "Wales"
     });
-    Ok((input_handle, filtered.output()))
+    Ok((input_handle, subset.output()))
 }
 
 fn main() -> Result<()> {
@@ -55,11 +56,11 @@ fn main() -> Result<()> {
     let mut input_records = Reader::from_path(path)?
         .deserialize()
         .map(|result| result.map(|record| Tup2(record, 1)))
-        .collect::<Result<Vec<Tup2<Record, i64>>, _>>()?;
+        .collect::<Result<Vec<Tup2<Record, ZWeight>>, _>>()?;
     input_handle.append(&mut input_records);
 
     // Execute circuit.
-    circuit.step()?;
+    circuit.transaction()?;
 
     // Read output from circuit.
     println!("{}", output_handle.consolidate().weighted_count());

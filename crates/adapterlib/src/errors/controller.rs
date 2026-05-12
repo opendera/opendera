@@ -11,15 +11,20 @@ use actix_web::body::BoxBody;
 use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, HttpResponseBuilder, ResponseError};
 use anyhow::Error as AnyError;
-use dbsp::{storage::backend::StorageError, Error as DbspError};
+use dbsp::{
+    Error as DbspError,
+    circuit::{LayoutError, circuit_builder::BootstrapInfo},
+    storage::backend::StorageError,
+};
 use feldera_types::{
     error::{DetailedError, ErrorResponse},
+    runtime_status::RuntimeDesiredStatus,
     suspend::SuspendError,
 };
-use serde::{ser::SerializeStruct, Serialize, Serializer};
+use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 use super::journal::StepError;
-use crate::{format::ParseError, transport::Step, DbspDetailedError};
+use crate::{DbspDetailedError, format::ParseError, transport::Step};
 
 /// Controller configuration error.
 #[derive(Debug, Serialize)]
@@ -162,6 +167,8 @@ pub enum ConfigError {
 
     FtRequiresStorage,
     FtRequiresFtInput,
+
+    InvalidLayout(LayoutError),
 }
 
 impl StdError for ConfigError {}
@@ -196,6 +203,7 @@ impl DbspDetailedError for ConfigError {
             Self::FtRequiresFtInput => Cow::from("FtWithNonFtInput"),
             Self::CyclicDependency { .. } => Cow::from("CyclicDependency"),
             Self::EmptyStartAfter { .. } => Cow::from("EmptyStartAfter"),
+            Self::InvalidLayout(_) => Cow::from("LayoutError"),
         }
     }
 }
@@ -236,13 +244,19 @@ impl Display for ConfigError {
                 endpoint_name,
                 format_name,
             } => {
-                write!(f, "Input endpoint '{endpoint_name}' specifies unknown input format '{format_name}'")
+                write!(
+                    f,
+                    "Input endpoint '{endpoint_name}' specifies unknown input format '{format_name}'"
+                )
             }
             Self::UnknownInputTransport {
                 endpoint_name,
                 transport_name,
             } => {
-                write!(f, "Input endpoint '{endpoint_name}' specifies unknown input transport '{transport_name}'")
+                write!(
+                    f,
+                    "Input endpoint '{endpoint_name}' specifies unknown input transport '{transport_name}'"
+                )
             }
             Self::DuplicateOutputEndpoint { endpoint_name } => {
                 write!(f, "Output endpoint '{endpoint_name}' already exists")
@@ -254,13 +268,19 @@ impl Display for ConfigError {
                 endpoint_name,
                 format_name,
             } => {
-                write!(f, "Output endpoint '{endpoint_name}' specifies unknown output format '{format_name}'")
+                write!(
+                    f,
+                    "Output endpoint '{endpoint_name}' specifies unknown output format '{format_name}'"
+                )
             }
             Self::UnknownOutputTransport {
                 endpoint_name,
                 transport_name,
             } => {
-                write!(f, "Output endpoint '{endpoint_name}' specifies unknown output transport '{transport_name}'")
+                write!(
+                    f,
+                    "Output endpoint '{endpoint_name}' specifies unknown output transport '{transport_name}'"
+                )
             }
             Self::UnknownInputStream {
                 endpoint_name,
@@ -275,20 +295,29 @@ impl Display for ConfigError {
                 endpoint_name,
                 stream_name,
             } => {
-                write!(f, "Output endpoint '{endpoint_name}' specifies unknown output table or view '{stream_name}'")
+                write!(
+                    f,
+                    "Output endpoint '{endpoint_name}' specifies unknown output table or view '{stream_name}'"
+                )
             }
             Self::UnknownIndex {
                 endpoint_name,
                 index_name,
             } => {
-                write!(f, "Output endpoint '{endpoint_name}' specifies index name '{index_name}'; however, the '{index_name}' relation is not an index")
+                write!(
+                    f,
+                    "Output endpoint '{endpoint_name}' specifies index name '{index_name}'; however, the '{index_name}' relation is not an index"
+                )
             }
 
             Self::NotAnIndex {
                 endpoint_name,
                 index_name,
             } => {
-                write!(f, "Output endpoint '{endpoint_name}' specifies unknown index '{index_name}'")
+                write!(
+                    f,
+                    "Output endpoint '{endpoint_name}' specifies unknown index '{index_name}'"
+                )
             }
 
             Self::InputFormatNotSupported {
@@ -360,14 +389,35 @@ impl Display for ConfigError {
             Self::CyclicDependency { cycle } => {
                 let mut cycle = cycle.clone();
                 cycle.push(cycle[0].clone());
-                let tail = cycle[1..].iter().map(|(endpoint, label)| format!("waits for endpoint '{endpoint}' with label '{label}'")).collect::<Vec<_>>().join(", which ");
-                write!(f, "cyclic 'start_after' dependency detected: endpoint '{}' with label '{}' {}", cycle[0].0, cycle[0].1, tail)
+                let tail = cycle[1..]
+                    .iter()
+                    .map(|(endpoint, label)| {
+                        format!("waits for endpoint '{endpoint}' with label '{label}'")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", which ");
+                write!(
+                    f,
+                    "cyclic 'start_after' dependency detected: endpoint '{}' with label '{}' {}",
+                    cycle[0].0, cycle[0].1, tail
+                )
             }
             Self::EmptyStartAfter { endpoint_name } => {
-                write!(f, "empty 'start_after' field for input endpoint '{}'", endpoint_name)
+                write!(
+                    f,
+                    "empty 'start_after' field for input endpoint '{}'",
+                    endpoint_name
+                )
             }
-            Self::FtRequiresStorage => write!(f, "Fault tolerance is configured, which requires storage, but storage is not enabled"),
-            Self::FtRequiresFtInput => write!(f, "Fault tolerance is configured, but it cannot be enabled because the pipeline has at least one non-fault-tolerant input adapter"),
+            Self::FtRequiresStorage => write!(
+                f,
+                "Fault tolerance is configured, which requires storage, but storage is not enabled"
+            ),
+            Self::FtRequiresFtInput => write!(
+                f,
+                "Fault tolerance is configured, but it cannot be enabled because the pipeline has at least one non-fault-tolerant input adapter"
+            ),
+            Self::InvalidLayout(e) => write!(f, "Multihost layout error: {e}"),
         }
     }
 }
@@ -629,6 +679,12 @@ pub enum ControllerError {
         endpoint_name: String,
     },
 
+    /// Error creating a user-defined preprocessor
+    PreprocessorCreateError {
+        endpoint_name: String,
+        error: String,
+    },
+
     /// Unknown output endpoint name.
     UnknownOutputEndpoint {
         endpoint_name: String,
@@ -671,6 +727,11 @@ pub enum ControllerError {
         error: AnyError,
     },
 
+    CommandError {
+        endpoint_name: String,
+        error: String,
+    },
+
     /// Error evaluating the DBSP circuit.
     DbspError {
         error: DbspError,
@@ -697,7 +758,7 @@ pub enum ControllerError {
         /// Describes the context where the error occurred.
         context: String,
         error: StorageError,
-        backtrace: Backtrace,
+        backtrace: Box<Backtrace>,
     },
 
     /// Enterprise-only feature.
@@ -731,6 +792,36 @@ pub enum ControllerError {
     CheckpointPushError {
         error: String,
     },
+
+    TransactionInProgress,
+    NoTransactionInProgress,
+
+    /// Invalid initial desired status.
+    InvalidInitialStatus(RuntimeDesiredStatus),
+
+    /// Invalid standby configuration,
+    InvalidStandby(&'static str),
+
+    /// Invalid startup status transition.
+    InvalidStartupTransition {
+        from: RuntimeDesiredStatus,
+        to: RuntimeDesiredStatus,
+    },
+
+    BootstrapRejectedByUser,
+
+    BootstrapNotAllowed {
+        error: String,
+    },
+
+    UnexpectedBootstrap {
+        bootstrap_info: Option<BootstrapInfo>,
+    },
+
+    /// Unexpected runtime version
+    UnexpectedRuntimeVersion {
+        error: String,
+    },
 }
 
 impl ResponseError for ControllerError {
@@ -756,6 +847,12 @@ impl ResponseError for ControllerError {
             Self::BootstrapInProgress => StatusCode::SERVICE_UNAVAILABLE,
             Self::PipelineRestarted { .. } => StatusCode::GONE,
             Self::UnknownEndpointInCompletionToken { .. } => StatusCode::GONE,
+            Self::TransactionInProgress => StatusCode::CONFLICT,
+            Self::NoTransactionInProgress => StatusCode::BAD_REQUEST,
+            Self::InvalidInitialStatus(_) => StatusCode::GONE,
+            Self::BootstrapRejectedByUser => StatusCode::CONFLICT,
+            Self::UnexpectedBootstrap { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::UnexpectedRuntimeVersion { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -851,6 +948,7 @@ impl DbspDetailedError for ControllerError {
     // TODO: attempts to cast `AnyError` to `DetailedError`.
     fn error_code(&self) -> Cow<'static, str> {
         match self {
+            Self::PreprocessorCreateError { .. } => Cow::from("PreprocessorCreateError"),
             Self::IoError { .. } => Cow::from("ControllerIoError"),
             Self::NotSupported { .. } => Cow::from("NotSupported"),
             Self::SchemaParseError { .. } => Cow::from("SchemaParseError"),
@@ -873,6 +971,7 @@ impl DbspDetailedError for ControllerError {
             Self::EncodeError { .. } => Cow::from("EncodeError"),
             Self::InputTransportError { .. } => Cow::from("InputTransportError"),
             Self::OutputTransportError { .. } => Cow::from("OutputTransportError"),
+            Self::CommandError { .. } => Cow::from("CommandError"),
             Self::PrometheusError { .. } => Cow::from("PrometheusError"),
             Self::DbspError { error } => error.error_code(),
             Self::DbspPanic => Cow::from("DbspPanic"),
@@ -888,6 +987,15 @@ impl DbspDetailedError for ControllerError {
             }
             Self::CheckpointFetchError { .. } => Cow::from("CheckpointFetchError"),
             Self::CheckpointPushError { .. } => Cow::from("CheckpointPushError"),
+            Self::TransactionInProgress => Cow::from("TransactionInProgress"),
+            Self::NoTransactionInProgress => Cow::from("NoTransactionInProgress"),
+            Self::InvalidInitialStatus(_) => Cow::from("InvalidInitialStatus"),
+            Self::InvalidStandby(_) => Cow::from("InvalidStandby"),
+            Self::InvalidStartupTransition { .. } => Cow::from("InvalidStartupTransition"),
+            Self::BootstrapRejectedByUser => Cow::from("BootstrapRejected"),
+            Self::BootstrapNotAllowed { .. } => Cow::from("BootstrapNotAllowed"),
+            Self::UnexpectedBootstrap { .. } => Cow::from("UnexpectedBootstrap"),
+            Self::UnexpectedRuntimeVersion { .. } => Cow::from("UnexpectedRuntimeVersion"),
         }
     }
 }
@@ -904,6 +1012,15 @@ impl StdError for ControllerError {}
 impl Display for ControllerError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         match self {
+            Self::PreprocessorCreateError {
+                endpoint_name,
+                error,
+            } => {
+                write!(
+                    f,
+                    "Error creating preprocessor for endpoint {endpoint_name}: {error}"
+                )
+            }
             Self::IoError {
                 context, io_error, ..
             } => {
@@ -922,10 +1039,16 @@ impl Display for ControllerError {
                 write!(f, "Error parsing checkpoint file: {error}")
             }
             Self::CheckpointDoesNotMatchPipeline => {
-                write!(f, "Recovery failed: the pipeline has been recovered from a checkpoint, but the checkpoint does not match the current pipeline definition. This can be caused by a corrupted checkpoint or an internal error.")
+                write!(
+                    f,
+                    "Recovery failed: the pipeline has been recovered from a checkpoint, but the checkpoint does not match the current pipeline definition. This can be caused by a corrupted checkpoint or an internal error."
+                )
             }
             Self::RestoreInProgress => {
-                write!(f, "Operation cannot be initiated now because the pipeline is restoring from a checkpoint.")
+                write!(
+                    f,
+                    "Operation cannot be initiated now because the pipeline is restoring from a checkpoint."
+                )
             }
             Self::BootstrapInProgress => {
                 write!(
@@ -979,6 +1102,15 @@ impl Display for ControllerError {
                     error.root_cause()
                 )
             }
+            Self::CommandError {
+                endpoint_name,
+                error,
+            } => {
+                write!(
+                    f,
+                    "error executing command on output endpoint '{endpoint_name}': {error}"
+                )
+            }
             Self::ParseError {
                 endpoint_name,
                 error,
@@ -1029,7 +1161,10 @@ impl Display for ControllerError {
                 write!(f, "{error}")
             }
             Self::UnknownEndpointInCompletionToken { endpoint_id } => {
-                write!(f, "completion token specifies input endpoint id {endpoint_id}, which doesn't exist; this indicates that the input connector was deleted after the completion token was generated")
+                write!(
+                    f,
+                    "completion token specifies input endpoint id {endpoint_id}, which doesn't exist; this indicates that the input connector was deleted after the completion token was generated"
+                )
             }
             Self::CheckpointFetchError { error } => {
                 write!(f, "Error fetching checkpoint from object store: {error}")
@@ -1037,14 +1172,62 @@ impl Display for ControllerError {
             Self::CheckpointPushError { error } => {
                 write!(f, "Error pushing checkpoint to object store: {error}")
             }
+            Self::TransactionInProgress => {
+                write!(
+                    f,
+                    "Cannot perform this operation while there is a transaction in progress"
+                )
+            }
+            Self::NoTransactionInProgress => {
+                write!(
+                    f,
+                    "This operation requires an active transaction, but none is currently in progress"
+                )
+            }
+            Self::InvalidInitialStatus(status) => {
+                write!(
+                    f,
+                    "Invalid initial status {status:?} provided on command line or read from storage (only coordination, running, paused, and standby are valid)"
+                )
+            }
+            Self::InvalidStandby(standby) => {
+                write!(f, "Cannot enter standby mode: {standby}")
+            }
+            Self::InvalidStartupTransition { from, to } => {
+                write!(
+                    f,
+                    "Invalid pipeline startup transition from {from:?} to {to:?}"
+                )
+            }
+            Self::BootstrapRejectedByUser => {
+                write!(
+                    f,
+                    "Bootstrapping of the modified pipeline was rejected by the user."
+                )
+            }
+            Self::BootstrapNotAllowed { error } => {
+                write!(
+                    f,
+                    "The pipeline has been modified since the last checkpoint; however it cannot be bootstrapped due to the following reasons:\n{error}"
+                )
+            }
+            Self::UnexpectedBootstrap { bootstrap_info } => {
+                write!(
+                    f,
+                    "The pipeline's query plan was modified since the last checkpoint and requires bootstrapping; however we were not able to detect the changes in the pipeline metadata. This is a bug; please report to the developers. Bootstrap info: {bootstrap_info:?}"
+                )
+            }
+            Self::UnexpectedRuntimeVersion { error } => {
+                write!(f, "{error}")
+            }
         }
     }
 }
 
 impl ControllerError {
-    pub fn io_error(context: String, io_error: IoError) -> Self {
+    pub fn io_error(context: impl Display, io_error: IoError) -> Self {
         Self::IoError {
-            context,
+            context: context.to_string(),
             io_error,
             backtrace: Backtrace::capture(),
         }
@@ -1314,6 +1497,13 @@ impl ControllerError {
         }
     }
 
+    pub fn command_error(endpoint_name: &str, error: &str) -> Self {
+        Self::CommandError {
+            endpoint_name: endpoint_name.to_owned(),
+            error: error.to_string(),
+        }
+    }
+
     pub fn parse_error(endpoint_name: &str, error: ParseError) -> Self {
         Self::ParseError {
             endpoint_name: endpoint_name.to_owned(),
@@ -1349,11 +1539,11 @@ impl ControllerError {
         Self::ControllerPanic
     }
 
-    pub fn storage_error(context: impl Into<String>, error: StorageError) -> Self {
+    pub fn storage_error(context: impl Display, error: StorageError) -> Self {
         Self::StorageError {
-            context: context.into(),
+            context: context.to_string(),
             error,
-            backtrace: Backtrace::capture(),
+            backtrace: Box::new(Backtrace::capture()),
         }
     }
 
@@ -1374,7 +1564,8 @@ impl ControllerError {
             Self::StepError(error) => error.kind(),
             Self::RestoreInProgress
             | Self::BootstrapInProgress
-            | Self::SuspendError(SuspendError::Temporary(_)) => ErrorKind::ResourceBusy,
+            | Self::SuspendError(SuspendError::Temporary(_))
+            | Self::TransactionInProgress => ErrorKind::ResourceBusy,
             Self::NotSupported { .. } | Self::SuspendError(SuspendError::Permanent(_)) => {
                 ErrorKind::Unsupported
             }
@@ -1397,6 +1588,7 @@ impl ControllerError {
             | Self::EncodeError { .. }
             | Self::InputTransportError { .. }
             | Self::OutputTransportError { .. }
+            | Self::CommandError { .. }
             | Self::PrometheusError { .. }
             | Self::DbspPanic
             | Self::ControllerPanic
@@ -1406,7 +1598,16 @@ impl ControllerError {
             | Self::UnknownEndpointInCompletionToken { .. }
             | Self::CheckpointFetchError { .. }
             | Self::CheckpointPushError { .. }
-            | Self::PipelineRestarted { .. } => ErrorKind::Other,
+            | Self::PipelineRestarted { .. }
+            | Self::NoTransactionInProgress
+            | Self::InvalidInitialStatus(_)
+            | Self::BootstrapRejectedByUser
+            | Self::BootstrapNotAllowed { .. }
+            | Self::UnexpectedBootstrap { .. }
+            | Self::InvalidStandby(_)
+            | Self::InvalidStartupTransition { .. }
+            | Self::PreprocessorCreateError { .. }
+            | Self::UnexpectedRuntimeVersion { .. } => ErrorKind::Other,
         }
     }
 }

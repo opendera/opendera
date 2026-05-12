@@ -24,6 +24,7 @@
 package org.dbsp.sqlCompiler.compiler.visitors.outer;
 
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainKeysOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainNValuesOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainValuesOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPInternOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNestedOperator;
@@ -31,10 +32,10 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperatorWithError;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMultisetOperator;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
+import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.ir.IDBSPOuterNode;
@@ -55,17 +56,14 @@ public class FindDeadCode extends CircuitVisitor implements IWritesLogs {
     public final Set<DBSPOperator> toKeep = new HashSet<>();
     /** If true all sources are kept, even if they are dead. */
     public final boolean keepAllSources;
-    public final boolean warn;
 
     /**
      * Run the dead code visitor.
      * @param keepAllSources  If true all sources are kept, even if they are not used.
-     * @param warn      If set warn about unused tables.
      */
-    public FindDeadCode(DBSPCompiler compiler, boolean keepAllSources, boolean warn) {
+    public FindDeadCode(DBSPCompiler compiler, boolean keepAllSources) {
         super(compiler);
         this.keepAllSources = keepAllSources;
-        this.warn = warn;
     }
 
     public void keep(DBSPOperator operator) {
@@ -127,6 +125,11 @@ public class FindDeadCode extends CircuitVisitor implements IWritesLogs {
     }
 
     @Override
+    public VisitDecision preorder(DBSPIntegrateTraceRetainNValuesOperator operator) {
+        return this.keepInverseReachable(operator.outputPort());
+    }
+
+    @Override
     public VisitDecision preorder(DBSPSinkOperator operator) {
        return this.keepInverseReachable(operator.outputPort());
     }
@@ -138,10 +141,10 @@ public class FindDeadCode extends CircuitVisitor implements IWritesLogs {
 
     @Override
     public void endVisit() {
-        for (DBSPSourceBaseOperator source: this.getCircuit().sourceOperators.values()) {
-            if (!this.reachable.contains(source) && this.warn && !this.keepAllSources)
+        for (IInputOperator source: this.getCircuit().sourceOperators.values()) {
+            if (!this.reachable.contains(source.asOperator()) && !this.keepAllSources)
                 this.compiler.reportWarning(source.getSourcePosition(),
-                        "Unused", "Table " + source.tableName.singleQuote() +
+                        "Unused", "Table " + source.getTableName().singleQuote() +
                                 " is not used");
         }
         super.endVisit();

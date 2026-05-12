@@ -1,0 +1,50 @@
+package org.dbsp.sqlCompiler.compiler.visitors.outer;
+
+import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.frontend.ExpressionCompiler;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.ExpressionTranslator;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.Simplify;
+import org.dbsp.sqlCompiler.ir.expression.DBSPBinaryExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPOpcode;
+import org.dbsp.sqlCompiler.ir.type.DBSPType;
+import org.dbsp.sqlCompiler.ir.type.IsNumericType;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeISize;
+
+/** Converts a[index] into a[(isize)(index - 1)] */
+public class AdjustSqlIndex extends ExpressionTranslator {
+    public AdjustSqlIndex(DBSPCompiler compiler) {
+        super(compiler);
+    }
+
+    @Override
+    public void postorder(DBSPBinaryExpression expression) {
+        if (expression.opcode != DBSPOpcode.SQL_INDEX &&
+            expression.opcode != DBSPOpcode.SAFE_RUST_INDEX) {
+            super.postorder(expression);
+            return;
+        }
+        if (this.maybeGet(expression) != null) {
+            // Already translated
+            return;
+        }
+
+        DBSPExpression left = this.getE(expression.left);
+        DBSPExpression right = this.getE(expression.right);
+        DBSPType indexType = right.getType();
+
+        if (expression.opcode == DBSPOpcode.SQL_INDEX) {
+            right = ExpressionCompiler.makeBinaryExpression(
+                    expression.getNode(), indexType, DBSPOpcode.SUB,
+                    right, indexType.to(IsNumericType.class).getOne());
+        }
+        right = right.cast(expression.getNode(), DBSPTypeISize.create(indexType.mayBeNull),
+                DBSPCastExpression.CastType.SqlUnsafe);
+        Simplify simplify = new Simplify(this.compiler);
+        DBSPExpression index = simplify.apply(right).to(DBSPExpression.class);
+        DBSPExpression result = new DBSPBinaryExpression(
+                expression.getNode(), expression.type, DBSPOpcode.RUST_INDEX, left, index);
+        this.map(expression, result);
+    }
+}

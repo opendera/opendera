@@ -4,7 +4,9 @@ use std::fmt::Display;
 use std::path::PathBuf;
 
 use crate::make_client;
-use feldera_rest_api::types::{CompilationProfile, ProgramConfig};
+use feldera_rest_api::types::{
+    ClusterMonitorEventFieldSelector, CompilationProfile, PipelineMonitorEventFieldSelector,
+};
 
 /// Autocompletion for pipeline names by trying to fetch them from the server.
 fn pipeline_names(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
@@ -13,7 +15,8 @@ fn pipeline_names(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     // using the `try_parse_from` method.
     let cli = Cli::try_parse_from(["fda", "pipelines"]);
     if let Ok(cli) = cli {
-        let client = make_client(cli.host, cli.auth, cli.timeout).unwrap();
+        let client =
+            make_client(cli.host, cli.insecure, cli.tls_cert, cli.auth, cli.timeout).unwrap();
 
         let r = futures::executor::block_on(async {
             client
@@ -39,6 +42,7 @@ fn pipeline_names(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
 #[command(
     name = "fda",
     about = "A CLI to interact with the Feldera REST API.",
+    after_help = "Commands marked EXPERIMENTAL may change or be removed at any time.",
     version
 )]
 pub struct Cli {
@@ -66,6 +70,32 @@ pub struct Cli {
         default_value_t = String::from("https://try.feldera.com")
     )]
     pub host: String,
+    /// Accept invalid HTTPS certificates.
+    #[arg(
+        short = 'k',
+        long,
+        env = "FELDERA_TLS_INSECURE",
+        global = true,
+        default_value_t = false,
+        help_heading = "Global Options"
+    )]
+    pub insecure: bool,
+    /// Path to a PEM-encoded certificate to trust as an additional root
+    /// certificate authority for HTTPS connections.
+    ///
+    /// Useful when `fda` talks to a Feldera deployment that serves HTTPS with
+    /// a self-signed certificate or a certificate signed by a private CA that
+    /// is not in the system trust store. The file must be readable by the
+    /// current user and contain one or more PEM-encoded certificates.
+    #[arg(
+        long = "tls-cert",
+        env = "FELDERA_HTTPS_TLS_CERT",
+        value_hint = ValueHint::FilePath,
+        global = true,
+        help_heading = "Global Options",
+        conflicts_with = "insecure"
+    )]
+    pub tls_cert: Option<std::path::PathBuf>,
     /// Which API key to use for authentication.
     ///
     /// The provided string should start with "apikey:" followed by the random characters.
@@ -112,6 +142,15 @@ pub enum OutputFormat {
     ///
     /// This format can only be specified for SQL queries.
     Parquet,
+    /// Returns the output in Prometheus format.
+    ///
+    /// This format can only be specified for the `metrics` command.
+    Prometheus,
+    /// Returns a hash of the result instead of the result.
+    ///
+    /// This format can only be specified for ad-hoc SQL queries.
+    /// The output in this case is a single string/line containing a SHA256 hash.
+    Hash,
 }
 
 impl Display for OutputFormat {
@@ -121,6 +160,8 @@ impl Display for OutputFormat {
             OutputFormat::Json => "json",
             OutputFormat::ArrowIpc => "arrow_ipc",
             OutputFormat::Parquet => "parquet",
+            OutputFormat::Prometheus => "prometheus",
+            OutputFormat::Hash => "hash",
         };
         write!(f, "{}", output)
     }
@@ -141,7 +182,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: ApiKeyActions,
     },
-    /// Debugging tools.
+    /// Cluster information and status.
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
+    },
+    /// EXPERIMENTAL: Debugging tools.
     Debug {
         #[command(subcommand)]
         action: DebugActions,
@@ -166,13 +212,48 @@ pub enum ApiKeyActions {
 }
 
 #[derive(Subcommand)]
+pub enum ClusterAction {
+    /// Retrieves all cluster events (status only) and prints them.
+    Events,
+
+    /// Retrieve specific cluster event.
+    Event {
+        /// Identifier (UUID) of the event or `latest`.
+        id: String,
+        /// Either `all` or `status` (default).
+        #[arg(default_value = "status")]
+        selector: ClusterMonitorEventFieldSelector,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum DebugActions {
-    /// Print a MessagePack file, such as `steps.bin` in a checkpoint directory,
+    /// EXPERIMENTAL: Print a MessagePack file, such as `steps.bin` in a checkpoint directory,
     /// to stdout.
     MsgpCat {
         /// The MessagePack file to read.
         #[arg(value_hint = ValueHint::FilePath)]
         path: PathBuf,
+    },
+
+    /// EXPERIMENTAL: Reads metrics from a file and prints them in an easier-to-read form.
+    Metrics {
+        /// The Prometheus metrics file to read.
+        #[arg(value_hint = ValueHint::FilePath)]
+        path: PathBuf,
+    },
+
+    /// EXPERIMENTAL: Re-creates the pipeline(s) found in a support bundle.
+    Unbundle {
+        /// Support Bundle Zip File.
+        #[arg(value_hint = ValueHint::FilePath)]
+        path: PathBuf,
+        /// Only extract and show pipeline information without trying to create the pipelines.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite pipelines if they already exist.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -200,36 +281,7 @@ pub enum RuntimeConfigKey {
     Logging,
     HttpWorkers,
     IoWorkers,
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug)]
-#[value(rename_all = "snake_case")]
-pub enum Profile {
-    Dev,
-    Unoptimized,
-    Optimized,
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<CompilationProfile> for Profile {
-    fn into(self) -> CompilationProfile {
-        match self {
-            Profile::Dev => CompilationProfile::Dev,
-            Profile::Unoptimized => CompilationProfile::Unoptimized,
-            Profile::Optimized => CompilationProfile::Optimized,
-        }
-    }
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<ProgramConfig> for Profile {
-    fn into(self) -> ProgramConfig {
-        ProgramConfig {
-            profile: Some(self.into()),
-            cache: true,
-            runtime_version: None,
-        }
-    }
+    DevTweaks,
 }
 
 #[derive(Subcommand)]
@@ -251,9 +303,17 @@ pub enum PipelineAction {
         /// A path to the TOML file containing the dependencies for the UDF functions.
         #[arg(short = 't', long, value_hint = ValueHint::FilePath, conflicts_with = "stdin")]
         udf_toml: Option<String>,
+        /// Override the runtime version of the pipeline.
+        ///
+        /// If not specified, the default version of the platform will be used.
+        ///
+        /// Note: This feature needs to be enabled in the platform configuration
+        /// and is still in development. Use for testing purposes only.
+        #[arg(long, short = 'r', env = "FELDERA_RUNTIME_VERSION")]
+        runtime_version: Option<String>,
         /// The compilation profile to use.
         #[arg(default_value = "optimized")]
-        profile: Profile,
+        profile: CompilationProfile,
         /// Read the program code from stdin.
         ///
         /// EXAMPLES:
@@ -285,7 +345,25 @@ pub enum PipelineAction {
         /// Don't wait for pipeline to reach the status before returning.
         #[arg(long, short = 'n', default_value_t = false)]
         no_wait: bool,
+        /// Initial desired runtime status once the pipeline is started.
+        #[arg(long, short = 'i', default_value = "running")]
+        initial: String,
+        /// The bootstrap policy to use.
+        // TODO: auto-complete
+        #[arg(long, short = 'b', default_value = "await_approval")]
+        bootstrap_policy: String,
+        /// Do not dismiss any deployment error before starting.
+        #[arg(long, default_value_t = false)]
+        no_dismiss_error: bool,
     },
+    /// Approve pipeline changes. Called in the AwaitingApproval state to allow
+    /// the pipeline to proceed with bootstrapping the modified components.
+    Approve {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+    },
+
     /// Checkpoint a fault-tolerant pipeline.
     Checkpoint {
         /// The name of the pipeline.
@@ -304,9 +382,18 @@ pub enum PipelineAction {
         #[arg(long, short = 'n', default_value_t = false)]
         no_wait: bool,
     },
-    /// Shutdown a pipeline, then restart it.
+    /// Resume a pipeline.
+    Resume {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// Don't wait for pipeline to reach the status before returning.
+        #[arg(long, short = 'n', default_value_t = false)]
+        no_wait: bool,
+    },
+    /// Stop a pipeline, then start it again.
     ///
-    /// This is a shortcut for calling `fda shutdown p1 && fda start p1`.
+    /// This is a shortcut for calling `fda stop p1 && fda start p1`.
     Restart {
         /// The name of the pipeline.
         #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
@@ -322,6 +409,15 @@ pub enum PipelineAction {
         /// Don't wait for pipeline to reach the status before returning.
         #[arg(long, short = 'n', default_value_t = false)]
         no_wait: bool,
+        /// Initial desired runtime status once the pipeline is restarted.
+        #[arg(long, short = 'i', default_value = "running")]
+        initial: String,
+        /// The bootstrap policy to use.
+        #[arg(long, short = 'b', default_value = "await_approval")]
+        bootstrap_policy: String,
+        /// Do not dismiss any deployment error before starting.
+        #[arg(long, default_value_t = false)]
+        no_dismiss_error: bool,
     },
     /// Stop a pipeline.
     #[clap(aliases = &["shutdown"])]
@@ -353,6 +449,14 @@ pub enum PipelineAction {
     /// Retrieve the runtime statistics of a pipeline.
     #[clap(aliases = &["statistics"])]
     Stats {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+    },
+    /// Retrieve the pipeline metrics.
+    ///
+    /// Metrics are available in `json` and `prometheus` output formats.
+    Metrics {
         /// The name of the pipeline.
         #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
         name: String,
@@ -395,6 +499,13 @@ pub enum PipelineAction {
         key: RuntimeConfigKey,
         /// The new value for the configuration.
         value: String,
+    },
+    /// Recompile a pipeline with the Feldera runtime version included in the
+    /// currently installed Feldera platform.
+    UpdateRuntime {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
     },
     /// Delete a pipeline.
     #[clap(aliases = &["del"])]
@@ -455,6 +566,39 @@ pub enum PipelineAction {
         #[arg(value_hint = ValueHint::FilePath, long, short = 'o')]
         output: Option<PathBuf>,
     },
+    /// Download a support bundle which contains debug information about the pipeline.
+    SupportBundle {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// The ZIP file to write the bundle to.
+        #[arg(value_hint = ValueHint::FilePath, long, short = 'o')]
+        output: Option<PathBuf>,
+        /// Skip circuit profile collection.
+        #[arg(long)]
+        no_circuit_profile: bool,
+        /// Skip heap profile collection.
+        #[arg(long)]
+        no_heap_profile: bool,
+        /// Skip metrics collection.
+        #[arg(long)]
+        no_metrics: bool,
+        /// Skip logs collection.
+        #[arg(long)]
+        no_logs: bool,
+        /// Skip stats collection.
+        #[arg(long)]
+        no_stats: bool,
+        /// Skip pipeline configuration collection.
+        #[arg(long)]
+        no_pipeline_config: bool,
+        /// Skip system configuration collection.
+        #[arg(long)]
+        no_system_config: bool,
+        /// Skip dataflow graph collection.
+        #[arg(long)]
+        no_dataflow_graph: bool,
+    },
     /// Enter the ad-hoc SQL shell for a pipeline.
     Shell {
         /// The name of the pipeline.
@@ -463,6 +607,16 @@ pub enum PipelineAction {
         /// Start the pipeline before entering the shell.
         #[arg(long, short = 's', default_value_t = false)]
         start: bool,
+        /// Initial desired runtime status once the pipeline is started
+        /// (ignored unless `--start` is provided).
+        #[arg(long, short = 'i', default_value = "running")]
+        initial: String,
+        /// The bootstrap policy to use.
+        #[arg(long, short = 'b', default_value = "await_approval")]
+        bootstrap_policy: String,
+        /// Do not dismiss any deployment error before starting.
+        #[arg(long, default_value_t = false, requires("start"))]
+        no_dismiss_error: bool,
     },
     /// Execute an ad-hoc query against a pipeline and return the result.
     #[clap(aliases = &["exec"])]
@@ -519,6 +673,36 @@ pub enum PipelineAction {
         /// Or when ingesting data over HTTP.
         token: String,
     },
+    /// Start a new transaction.
+    #[clap(aliases = &["transaction-start"])]
+    StartTransaction {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+    },
+    /// Commit the current transaction.
+    ///
+    /// Commits the currently active transaction for the specified pipeline.
+    /// Optionally waits for the commit to complete.
+    #[clap(aliases = &["commit", "transaction-commit"])]
+    CommitTransaction {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// The transaction ID to verify against the current active transaction.
+        /// If provided, the function verifies that the currently active transaction matches this ID.
+        #[arg(long = "tid", short = 't')]
+        transaction_id: Option<u64>,
+        /// Don't wait for the transaction to commit before returning.
+        #[arg(long, short = 'n', default_value_t = false)]
+        no_wait: bool,
+    },
+    /// Initiate rebalancing.
+    Rebalance {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+    },
     /// Clear the storage resources of a pipeline.
     ///
     /// Note that the pipeline must be stopped before clearing its storage resources.
@@ -541,6 +725,32 @@ pub enum PipelineAction {
         #[command(flatten)]
         args: BenchmarkArgs,
     },
+    /// Dismisses the deployment error of a pipeline.
+    DismissError {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+    },
+    /// Retrieves all pipeline events and prints them.
+    Events {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// Either `all` or `status` (default).
+        #[arg(default_value = "status")]
+        selector: PipelineMonitorEventFieldSelector,
+    },
+    /// Retrieve specific pipeline event.
+    Event {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// Identifier (UUID) of the event or `latest`.
+        event_id: String,
+        /// Either `all` or `status` (default).
+        #[arg(default_value = "status")]
+        selector: PipelineMonitorEventFieldSelector,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -560,6 +770,10 @@ pub(crate) struct BenchmarkArgs {
     /// compiled with the latest feldera runtime.
     #[arg(long, short = 'n', default_value_t = false)]
     pub no_recompile: bool,
+
+    /// Do not wrap the benchmark in a transaction.
+    #[arg(long, default_value_t = false)]
+    pub no_transaction: bool,
 
     /// If set upload results to feldera benchmark host.
     ///
@@ -695,7 +909,7 @@ pub enum ProgramAction {
         ///
         /// If not specified, the optimized profile will be used.
         #[arg(short = 'p', long)]
-        profile: Option<Profile>,
+        profile: Option<CompilationProfile>,
         /// Override the runtime version of the pipeline.
         ///
         /// EXPERIMENTAL:
@@ -721,12 +935,6 @@ pub enum ProgramAction {
         #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
         name: String,
     },
-    /// Return compile-time information about the program.
-    Info {
-        /// The name of the pipeline.
-        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
-        name: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -736,4 +944,18 @@ pub enum ConnectorAction {
     Pause,
     #[clap(aliases = &["status"])]
     Stats,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::Cli;
+    use clap::Parser;
+
+    /// [clap] will panic inside `try_parse` if it finds anything invalid in the
+    /// parser definition, such as a duplicated command name, so this test keeps
+    /// really basic errors from passing through CI.
+    #[test]
+    fn basic_validation() {
+        let _ = Cli::try_parse();
+    }
 }

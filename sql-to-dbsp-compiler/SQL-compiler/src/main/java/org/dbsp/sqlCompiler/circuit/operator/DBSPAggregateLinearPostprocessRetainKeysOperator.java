@@ -17,11 +17,12 @@ import javax.annotation.Nullable;
 import java.util.List;
 import java.util.Objects;
 
-public final class DBSPAggregateLinearPostprocessRetainKeysOperator extends DBSPBinaryOperator {
+public final class DBSPAggregateLinearPostprocessRetainKeysOperator
+        extends DBSPBinaryOperator
+        implements ILinearAggregate, IIncremental {
     public final DBSPClosureExpression postProcess;
     public final DBSPClosureExpression retainKeysFunction;
 
-    // This operator is incremental-only
     public DBSPAggregateLinearPostprocessRetainKeysOperator(
             CalciteRelNode node,
             DBSPTypeIndexedZSet outputType,
@@ -30,7 +31,7 @@ public final class DBSPAggregateLinearPostprocessRetainKeysOperator extends DBSP
             DBSPClosureExpression retainKeysFunction,
             OutputPort left, OutputPort right) {
         super(node, "aggregate_linear_postprocess_retain_keys",
-                function, outputType, false, left, right, true);
+                function, outputType, false, left, right);
         this.postProcess = postProcess;
         this.retainKeysFunction = retainKeysFunction;
     }

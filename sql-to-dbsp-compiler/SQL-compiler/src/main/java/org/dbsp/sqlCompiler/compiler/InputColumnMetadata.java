@@ -9,15 +9,12 @@ import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.ir.DBSPNode;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
-import org.dbsp.sqlCompiler.ir.type.IHasType;
-import org.dbsp.util.IJson;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
 
 /** Metadata describing an input table column. */
-public class InputColumnMetadata
-        implements IHasLateness, IHasWatermark, IHasSourcePositionRange, IHasType, IJson {
+public class InputColumnMetadata implements IColumnMetadata {
     public final CalciteObject node;
     /** Column name. */
     public final ProgramIdentifier name;
@@ -36,8 +33,9 @@ public class InputColumnMetadata
     public final DBSPExpression defaultValue;
     @Nullable
     public final SourcePositionRange defaultValuePosition;
-    @Nullable
     public final boolean interned;
+    /** Set during compilation */
+    boolean unused;
 
     public InputColumnMetadata(CalciteObject node, ProgramIdentifier name, DBSPType type, boolean isPrimaryKey,
                                @Nullable DBSPExpression lateness, @Nullable DBSPExpression watermark,
@@ -53,6 +51,7 @@ public class InputColumnMetadata
         this.defaultValue = defaultValue;
         this.defaultValuePosition = defaultValuePosition;
         this.interned = interned;
+        this.unused = false;
     }
 
     public ProgramIdentifier getName() {
@@ -66,8 +65,7 @@ public class InputColumnMetadata
 
     public CalciteObject getNode() { return this.node; }
 
-    @Nullable
-    @Override
+    @Override @Nullable
     public DBSPExpression getLateness() {
         return this.lateness;
     }
@@ -77,14 +75,31 @@ public class InputColumnMetadata
         return this.getNode().getPositionRange();
     }
 
-    @Nullable
-    @Override
+    @Override @Nullable
     public DBSPExpression getWatermark() {
         return this.watermark;
     }
 
+    @Nullable @Override
+    public DBSPExpression getDefaultValue() {
+        return this.defaultValue;
+    }
+
+    @Override public ProgramIdentifier getColumnName() {
+        return this.name;
+    }
+
     @Override
-    public void asJson(ToJsonInnerVisitor visitor) {
+    public boolean isPrimaryKey() {
+        return this.isPrimaryKey;
+    }
+
+    @Override
+    public boolean isInterned() {
+        return this.interned;
+    }
+
+    public void asJson(ToJsonInnerVisitor visitor, boolean emitUsage) {
         visitor.stream.beginObject()
                 .label("name");
         this.name.asJson(visitor);
@@ -106,6 +121,11 @@ public class InputColumnMetadata
         }
         visitor.stream.label("interned")
                         .append(this.interned);
+        if (emitUsage) {
+            // We do not always emit the "unused" field for backwards compatibility.
+            visitor.stream.label("unused")
+                    .append(this.unused);
+        }
         visitor.stream.endObject();
     }
 
@@ -123,7 +143,17 @@ public class InputColumnMetadata
         if (node.has("defaultValue"))
             defaultValue = DBSPNode.fromJsonInner(node, "defaultValue", decoder, DBSPExpression.class);
         boolean interned = Utilities.getBooleanProperty(node, "interned");
-        return new InputColumnMetadata(CalciteObject.EMPTY, name, type, isPrimaryKey,
+        var result = new InputColumnMetadata(CalciteObject.EMPTY, name, type, isPrimaryKey,
                 lateness, watermark, defaultValue, SourcePositionRange.INVALID, interned);
+        if (node.has("unused")) {
+            boolean unused = Utilities.getBooleanProperty(node, "unused");
+            if (unused)
+                result.setUnused();
+        }
+        return result;
+    }
+
+    public void setUnused() {
+        this.unused = true;
     }
 }

@@ -1,15 +1,25 @@
 use crate::{
+    Controller, PipelineConfig,
+    controller::{ControllerStatusContext, TransactionInfo},
+    preprocess::{DecryptionPreprocessorFactory, PassthroughPreprocessorFactory},
     test::{
-        generate_test_batch, init_test_logger, test_circuit, wait, TestStruct, DEFAULT_TIMEOUT_MS,
+        DEFAULT_TIMEOUT_MS, TestStruct, generate_test_batch, init_test_logger, test_circuit, wait,
     },
     transport::set_barrier,
-    Controller, PipelineConfig,
 };
+use anyhow::anyhow;
 use csv::{ReaderBuilder as CsvReaderBuilder, WriterBuilder as CsvWriterBuilder};
+use feldera_types::{
+    config::{InputEndpointConfig, OutputEndpointConfig},
+    constants::STATE_FILE,
+    memory_pressure::MemoryPressure,
+};
+use serde_json::json;
 use std::{
+    borrow::Cow,
     cmp::min,
-    fmt::Write as _,
-    fs::{create_dir, remove_file, File},
+    collections::BTreeMap,
+    fs::{File, create_dir, remove_file},
     io::Write,
     iter::repeat_n,
     ops::Range,
@@ -22,49 +32,61 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::oneshot;
 use tracing::info;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use proptest::prelude::*;
 
 #[test]
 fn test_start_after_cyclic() {
     init_test_logger();
 
-    let config_str = r#"
-name: test
-workers: 4
-inputs:
-    test_input1.endpoint1:
-        stream: test_input1
-        labels:
-            - label1
-        start_after: label2
-        transport:
-            name: file_input
-            config:
-                path: "file1"
-        format:
-            name: json
-            config:
-                array: true
-                update_format: raw
-    test_input1.endpoint2:
-        stream: test_input1
-        labels:
-            - label2
-        start_after: label1
-        transport:
-            name: file_input
-            config:
-                path: file2
-        format:
-            name: json
-            config:
-                array: true
-                update_format: raw
-    "#
-    .to_string();
-
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
-    let Err(err) = Controller::with_config(
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "inputs": {
+            "test_input1.endpoint1": {
+                "stream": "test_input1",
+                "labels": [
+                    "label1"
+                ],
+                "start_after": "label2",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": "file1"
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "array": true,
+                        "update_format": "raw"
+                    }
+                }
+            },
+            "test_input1.endpoint2": {
+                "stream": "test_input1",
+                "labels": [
+                    "label2"
+                ],
+                "start_after": "label1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": "file2"
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "array": true,
+                        "update_format": "raw"
+                    }
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let Err(err) = Controller::with_test_config(
         |circuit_config| {
             Ok(test_circuit::<TestStruct>(
                 circuit_config,
@@ -73,12 +95,15 @@ inputs:
             ))
         },
         &config,
-        Box::new(|e| panic!("error: {e}")),
+        Box::new(|e, _| panic!("error: {e}")),
     ) else {
         panic!("expected to fail")
     };
 
-    assert_eq!(&err.to_string(), "invalid controller configuration: cyclic 'start_after' dependency detected: endpoint 'test_input1.endpoint1' with label 'label1' waits for endpoint 'test_input1.endpoint2' with label 'label2', which waits for endpoint 'test_input1.endpoint1' with label 'label1'");
+    assert_eq!(
+        &err.to_string(),
+        "invalid controller configuration: cyclic 'start_after' dependency detected: endpoint 'test_input1.endpoint1' with label 'label1' waits for endpoint 'test_input1.endpoint2' with label 'label2', which waits for endpoint 'test_input1.endpoint1' with label 'label1'"
+    );
 }
 
 #[test]
@@ -100,43 +125,51 @@ fn test_start_after() {
 
     // Controller configuration with two input connectors;
     // the second starts after the first one finishes.
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-    test_input1.endpoint1:
-        stream: test_input1
-        transport:
-            name: file_input
-            labels:
-                - backfill
-            config:
-                path: {:?}
-        format:
-            name: json
-            config:
-                array: true
-                update_format: raw
-    test_input1.endpoint2:
-        stream: test_input1
-        start_after: backfill
-        transport:
-            name: file_input
-            config:
-                path: {:?}
-        format:
-            name: json
-            config:
-                array: true
-                update_format: raw
-    "#,
-        temp_input_file1.path().to_str().unwrap(),
-        temp_input_file2.path().to_str().unwrap(),
-    );
+    let config: PipelineConfig = serde_json::from_value(json! ({
+        "name": "test",
+        "workers": 4,
+        "inputs": {
+            "test_input1.endpoint1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "labels": [
+                        "backfill"
+                    ],
+                    "config": {
+                        "path": temp_input_file1.path(),
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "array": true,
+                        "update_format": "raw"
+                    }
+                }
+            },
+            "test_input1.endpoint2": {
+                "stream": "test_input1",
+                "start_after": "backfill",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file2.path(),
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "array": true,
+                        "update_format": "raw"
+                    }
+                }
+            }
+        }
+    }))
+    .unwrap();
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
-    let controller = Controller::with_config(
+    let controller = Controller::with_test_config(
         |circuit_config| {
             Ok(test_circuit::<TestStruct>(
                 circuit_config,
@@ -145,7 +178,7 @@ inputs:
             ))
         },
         &config,
-        Box::new(|e| panic!("error: {e}")),
+        Box::new(|e, _| panic!("error: {e}")),
     )
     .unwrap();
 
@@ -191,46 +224,59 @@ proptest! {
         let output_path = temp_output_path.to_str().unwrap().to_string();
         temp_output_path.close().unwrap();
 
-        let config_str = format!(
-            r#"
-min_batch_size_records: {min_batch_size_records}
-max_buffering_delay_usecs: {max_buffering_delay_usecs}
-name: test
-workers: 4
-inputs:
-    test_input1:
-        stream: test_input1
-        transport:
-            name: file_input
-            config:
-                path: {:?}
-                buffer_size_bytes: {input_buffer_size_bytes}
-                follow: false
-        format:
-            name: csv
-outputs:
-    test_output1:
-        stream: test_output1
-        transport:
-            name: file_output
-            config:
-                path: {:?}
-        format:
-            name: csv
-            config:
-                buffer_size_records: {output_buffer_size_records}
-        "#,
-        temp_input_file.path().to_str().unwrap(),
-        output_path,
-        );
+        let secrets_dir = TempDir::new().unwrap();
+        create_dir(secrets_dir.path().join("kubernetes")).unwrap();
+        create_dir(secrets_dir.path().join("kubernetes/paths")).unwrap();
+        std::fs::write(secrets_dir.path().join("kubernetes/paths/input"), temp_input_file.path().as_os_str().as_encoded_bytes()).unwrap();
+        std::fs::write(secrets_dir.path().join("kubernetes/paths/output"), &output_path).unwrap();
 
-        info!("input file: {}", temp_input_file.path().to_str().unwrap());
+        let config: PipelineConfig = serde_json::from_value(json!({
+            "secrets_dir": secrets_dir.path(),
+            "min_batch_size_records": min_batch_size_records,
+            "max_buffering_delay_usecs": max_buffering_delay_usecs,
+            "name": "test",
+            "workers": 4,
+            "inputs": {
+                "test_input1": {
+                    "stream": "test_input1",
+                    "transport": {
+                        "name": "file_input",
+                        "config": {
+                            "path": "${secret:kubernetes:paths/input}",
+                            "buffer_size_bytes": input_buffer_size_bytes,
+                            "follow": false
+                        }
+                    },
+                    "format": {
+                        "name": "csv"
+                    }
+                }
+            },
+            "outputs": {
+                "test_output1": {
+                    "stream": "test_output1",
+                    "transport": {
+                        "name": "file_output",
+                        "config": {
+                            "path": "${secret:kubernetes:paths/output}"
+                        }
+                    },
+                    "format": {
+                        "name": "csv",
+                        "config": {
+                            "buffer_size_records": output_buffer_size_records,
+                        }
+                    }
+                }
+            }
+        })).unwrap();
+
+        info!("input file: {}", temp_input_file.path().display());
         info!("output file: {output_path}");
-        let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
-        let controller = Controller::with_config(
+        let controller = Controller::with_test_config(
                 |circuit_config| Ok(test_circuit::<TestStruct>(circuit_config, &[], &[None])),
                 &config,
-                Box::new(|e| panic!("error: {e}")),
+                Box::new(|e, _| panic!("error: {e}")),
             )
             .unwrap();
 
@@ -280,7 +326,13 @@ struct FtTestRound {
     n_records: usize,
     do_checkpoint: bool,
     pause_afterward: bool,
-    immedate_checkpoint: bool,
+    immediate_checkpoint: bool,
+
+    /// Apply function to modify pipeline configuration before starting the pipeline.
+    /// Modified config prevents the pipeline from replaying the journal; however it
+    /// should still produce the same result by replaying inputs from the last checkpointed
+    /// offset.
+    modify_config: Option<fn(PipelineConfig) -> PipelineConfig>,
 }
 
 impl FtTestRound {
@@ -289,7 +341,8 @@ impl FtTestRound {
             n_records,
             do_checkpoint: true,
             pause_afterward: false,
-            immedate_checkpoint: false,
+            immediate_checkpoint: false,
+            modify_config: None,
         }
     }
     fn without_checkpoint(n_records: usize) -> Self {
@@ -297,12 +350,20 @@ impl FtTestRound {
             n_records,
             do_checkpoint: false,
             pause_afterward: false,
-            immedate_checkpoint: false,
+            immediate_checkpoint: false,
+            modify_config: None,
         }
     }
     fn with_pause_afterward(self) -> Self {
         Self {
             pause_afterward: true,
+            ..self
+        }
+    }
+
+    fn with_modify_config(self, f: fn(PipelineConfig) -> PipelineConfig) -> Self {
+        Self {
+            modify_config: Some(f),
             ..self
         }
     }
@@ -316,7 +377,8 @@ impl FtTestRound {
             n_records: 0,
             do_checkpoint: false,
             pause_afterward: false,
-            immedate_checkpoint: true,
+            immediate_checkpoint: true,
+            modify_config: None,
         }
     }
 }
@@ -368,6 +430,7 @@ fn collect_endpoint_records(controller: &Controller, n: usize) -> Vec<usize> {
 
 #[track_caller]
 fn wait_for_records(controller: &Controller, expect_n: &[usize]) {
+    println!("waiting for {expect_n:?} records...");
     let n = expect_n.len();
     let mut last_n = repeat_n(0, n).collect::<Vec<_>>();
     wait(
@@ -375,7 +438,7 @@ fn wait_for_records(controller: &Controller, expect_n: &[usize]) {
             let new_n = collect_endpoint_records(controller, n);
             for i in 0..n {
                 if new_n[i] > last_n[i] {
-                    println!("received {n} records on test_output{}", i + 1);
+                    println!("received {} records on test_output{}", new_n[i], i + 1);
                 }
             }
             last_n = new_n;
@@ -403,6 +466,14 @@ fn wait_for_records(controller: &Controller, expect_n: &[usize]) {
 /// pipeline and waits for it to process the data.  If `do_checkpoint` is
 /// true, it creates a new checkpoint. Then it stops the pipeline, checks
 /// that the output is as expected, and goes on to the next round.
+///
+/// This also tests that the controller resolves secrets and that it freshly
+/// resolves them every time it resumes from a checkpoint, by using a secret for
+/// the location of its input and output files and renaming these files before
+/// each round.  If the controller did not re-resolve the secrets when it
+/// resumes, then it would try to read an input file that was no longer there,
+/// or it would try to write output to an old location, and in either case that
+/// would cause an error.
 fn test_ft(rounds: &[FtTestRound]) {
     init_test_logger();
     let tempdir = TempDir::new().unwrap();
@@ -416,47 +487,55 @@ fn test_ft(rounds: &[FtTestRound]) {
 
     let storage_dir = tempdir_path.join("storage");
     create_dir(&storage_dir).unwrap();
-    let input_path = tempdir_path.join("input.csv");
-    let input_file = File::create(&input_path).unwrap();
-    let output_path = tempdir_path.join("output.csv");
 
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-storage_config:
-    path: {storage_dir:?}
-storage: true
-fault_tolerance: {{}}
-clock_resolution_usecs: null
-inputs:
-    test_input1:
-        stream: test_input1
-        transport:
-            name: file_input
-            config:
-                path: {input_path:?}
-                follow: true
-        format:
-            name: csv
-outputs:
-    test_output1:
-        stream: test_output1
-        transport:
-            name: file_output
-            config:
-                path: {output_path:?}
-        format:
-            name: csv
-            config:
-        "#
-    );
+    create_dir(tempdir.path().join("kubernetes")).unwrap();
+    create_dir(tempdir.path().join("kubernetes/paths")).unwrap();
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
+    const INPUT_SECRET_REFERENCE: &str = "${secret:kubernetes:paths/input}";
+    const OUTPUT_SECRET_REFERENCE: &str = "${secret:kubernetes:paths/output}";
 
-    let mut writer = CsvWriterBuilder::new()
-        .has_headers(false)
-        .from_writer(&input_file);
+    let mut config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "storage_config": {
+            "path": storage_dir,
+        },
+        "storage": true,
+        "fault_tolerance": {},
+        "clock_resolution_usecs": null,
+        "secrets_dir": tempdir_path,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": INPUT_SECRET_REFERENCE,
+                        "follow": true
+                    }
+                },
+                "format": {
+                    "name": "csv"
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": OUTPUT_SECRET_REFERENCE,
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                }
+            }
+        }
+    }))
+    .unwrap();
 
     // Number of records written to the input.
     let mut total_records = 0usize;
@@ -467,20 +546,68 @@ outputs:
 
     let mut paused = false;
 
+    let mut prev_input_path = None;
+    let mut prev_output_path = None;
+
+    const TABOO: &str = "TABOO";
+
     for (
         round,
         FtTestRound {
             n_records,
             do_checkpoint,
             pause_afterward,
-            immedate_checkpoint,
+            immediate_checkpoint,
+            modify_config,
         },
     ) in rounds.iter().cloned().enumerate()
     {
+        // Create input file, or move it from its previous location.
+        let input_path = tempdir_path.join(format!("{TABOO}-input{round}.csv"));
+        let input_file = if let Some(prev_input_path) = &prev_input_path {
+            std::fs::rename(prev_input_path, &input_path).unwrap();
+            File::options().append(true).open(&input_path).unwrap()
+        } else {
+            File::create_new(&input_path).unwrap()
+        };
+        let mut writer = CsvWriterBuilder::new()
+            .has_headers(false)
+            .from_writer(&input_file);
+
+        // Move output file from its previous location, if any.
+        let output_path = tempdir_path.join(format!("{TABOO}-output{round}.csv"));
+        if let Some(prev_output_path) = &prev_output_path {
+            std::fs::rename(prev_output_path, &output_path).unwrap();
+        };
+
+        // Update secrets to point to new locations.
+        for (name, path) in [("input", &input_path), ("output", &output_path)] {
+            std::fs::write(
+                tempdir.path().join("kubernetes/paths").join(name),
+                path.as_os_str().as_encoded_bytes(),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            tempdir.path().join("kubernetes/paths/input"),
+            input_path.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            tempdir.path().join("kubernetes/paths/output"),
+            output_path.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+
         println!(
-            "--- round {round}: {}{}add {n_records} records{}, {} --- ",
+            "--- round {round}: {}{}{}add {n_records} records{}, {} --- ",
+            if modify_config.is_some() {
+                "run pipeline with modified config, "
+            } else {
+                ""
+            },
             if paused { "unpause the input, " } else { "" },
-            if immedate_checkpoint {
+            if immediate_checkpoint {
                 "immediately initiate a checkpoint, "
             } else {
                 ""
@@ -494,7 +621,7 @@ outputs:
                 "and checkpoint"
             } else {
                 "no checkpoint"
-            }
+            },
         );
 
         // Write records to the input file.
@@ -512,7 +639,12 @@ outputs:
 
         // Start pipeline.
         println!("start pipeline");
-        let controller = Controller::with_config(
+
+        if let Some(modify_config) = modify_config {
+            config = modify_config(config);
+        }
+
+        let controller = Controller::with_test_config(
             |circuit_config| {
                 Ok(test_circuit::<TestStruct>(
                     circuit_config,
@@ -521,13 +653,13 @@ outputs:
                 ))
             },
             &config,
-            Box::new(|e| panic!("error: {e}")),
+            Box::new(|e, _| panic!("error: {e}")),
         )
         .unwrap();
         controller.start();
 
         let (sender, receiver) = oneshot::channel();
-        if immedate_checkpoint {
+        if immediate_checkpoint {
             println!("start checkpoint in background");
             controller.start_checkpoint(Box::new(move |result| sender.send(result).unwrap()));
         } else {
@@ -551,7 +683,7 @@ outputs:
             "wait for {} records {checkpointed_records}..{total_records}",
             expect_n
         );
-        wait_for_records(&controller, &[expect_n]);
+        wait_for_records(&controller, &[total_records]);
 
         if pause_afterward {
             controller.pause_input_endpoint("test_input1").unwrap();
@@ -575,7 +707,7 @@ outputs:
         }
 
         // Checkpoint, if requested.
-        if immedate_checkpoint {
+        if immediate_checkpoint {
             println!("wait for checkpoint to complete");
             receiver.blocking_recv().unwrap().unwrap();
         } else if do_checkpoint {
@@ -593,59 +725,108 @@ outputs:
         // in `checkpointed_records..total_records`.
         check_file_contents(&output_path, checkpointed_records..total_records);
 
-        if do_checkpoint || immedate_checkpoint {
+        if do_checkpoint || immediate_checkpoint {
             checkpointed_records = total_records;
+
+            // Read the checkpoint file and make sure that:
+            //
+            // - The TABOO string does not appear in it.  It must not be in
+            //   there because it appears only in the expanded version of the
+            //   secret, not in the name of the secret.
+            //
+            // - The INPUT_SECRET_REFERENCE and OUTPUT_SECRET_REFERENCE strings
+            //   do appear in it.  These must be there because they are what
+            //   expands to the secrets.
+            //
+            //   It is valuable to check for these because this gives us some
+            //   confidence that the file isn't encoded in some form such that
+            //   TABOO appears but just not literally.  That is, our check for
+            //   TABOO would fail if TABOO were to be base64-encoded, but in
+            //   that case it's likely that INPUT_SECRET_REFERENCE and
+            //   OUTPUT_SECRET_REFERENCE are also base64-encoded, so that these
+            //   tests would fail.
+            //
+            //   (As of this writing, the checkpoint file is encoded in
+            //   plaintext JSON, but this check will alert us if that changes
+            //   without updating this test.)
+            let checkpoint = std::fs::read(storage_dir.join(STATE_FILE)).unwrap();
+            assert!(!contains_subslice(&checkpoint, TABOO.as_bytes()));
+            assert!(contains_subslice(
+                &checkpoint,
+                INPUT_SECRET_REFERENCE.as_bytes()
+            ));
+            assert!(contains_subslice(
+                &checkpoint,
+                OUTPUT_SECRET_REFERENCE.as_bytes()
+            ));
         }
-        println!();
+
+        prev_input_path = Some(input_path);
+        prev_output_path = Some(output_path);
     }
+}
+
+/// Returns true if `needle` is present as any subslice of `haystack`.
+///
+/// Yes it's appalling that this isn't part of the standard library, see
+/// https://github.com/rust-lang/rust/issues/54961
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn multiple_input_files(
+    n: usize,
+) -> (
+    Vec<NamedTempFile>,
+    BTreeMap<Cow<'static, str>, InputEndpointConfig>,
+) {
+    let mut temp_input_files = Vec::new();
+    let mut inputs: BTreeMap<Cow<'static, str>, InputEndpointConfig> = BTreeMap::new();
+    for i in 0..n {
+        let file = NamedTempFile::new().unwrap();
+        file.as_file()
+            .write_all(&format!(r#"[{{"id": {i}, "b": true, "s": "foo"}}]"#).into_bytes())
+            .unwrap();
+        let config: InputEndpointConfig = serde_json::from_value(json!({
+            "stream": "test_input1",
+            "transport": {
+                "name": "file_input",
+                "config": {
+                    "path": file.path(),
+                }
+            },
+            "format": {
+                "name": "json",
+                "config": {
+                    "array": true,
+                    "update_format": "raw"
+                }
+            }
+        }))
+        .unwrap();
+        inputs.insert(format!("test_input1.endpoint{i}").into(), config);
+        temp_input_files.push(file);
+    }
+    (temp_input_files, inputs)
 }
 
 fn _test_concurrent_init(max_parallel_connector_init: u64) {
     init_test_logger();
 
-    // Two JSON files with a few records each.
-    let (_temp_input_files, connectors): (Vec<_>, Vec<_>) = (0..100)
-        .map(|i| {
-            let file = NamedTempFile::new().unwrap();
-            file.as_file()
-                .write_all(&format!(r#"[{{"id": {i}, "b": true, "s": "foo"}}]"#).into_bytes())
-                .unwrap();
-            let path = file.path().to_str().unwrap();
-            let config = format!(
-                r#"
-    test_input1.endpoint{i}:
-        stream: test_input1
-        transport:
-            name: file_input
-            config:
-                path: {path:?}
-        format:
-            name: json
-            config:
-                array: true
-                update_format: raw"#
-            );
-            (file, config)
-        })
-        .unzip();
-
-    let connectors = connectors.join("\n");
+    let (_temp_input_files, inputs) = multiple_input_files(100);
 
     // Controller configuration with 100 input connectors.
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-max_parallel_connector_init: {max_parallel_connector_init}
-inputs:
-{connectors}
-    "#
-    );
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "max_parallel_connector_init": max_parallel_connector_init,
+        "inputs": inputs,
+    }))
+    .unwrap();
 
-    println!("config: {config_str}");
-
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
-    let controller = Controller::with_config(
+    let controller = Controller::with_test_config(
         |circuit_config| {
             Ok(test_circuit::<TestStruct>(
                 circuit_config,
@@ -654,7 +835,7 @@ inputs:
             ))
         },
         &config,
-        Box::new(|e| panic!("error: {e}")),
+        Box::new(|e, _| panic!("error: {e}")),
     )
     .unwrap();
 
@@ -687,59 +868,38 @@ fn test_concurrent_init() {
 fn test_connector_init_error() {
     init_test_logger();
 
-    // Two JSON files with a few records each.
-    let (_temp_input_files, connectors): (Vec<_>, Vec<_>) = (0..20)
-        .map(|i| {
-            let file = NamedTempFile::new().unwrap();
-            file.as_file()
-                .write_all(&format!(r#"[{{"id": {i}, "b": true, "s": "foo"}}]"#).into_bytes())
-                .unwrap();
-            let path = file.path().to_str().unwrap();
-            let config = format!(
-                r#"
-    test_input1.endpoint{i}:
-        stream: test_input1
-        transport:
-            name: file_input
-            config:
-                path: {path:?}
-        format:
-            name: json
-            config:
-                array: true
-                update_format: raw"#
-            );
-            (file, config)
-        })
-        .unzip();
-
-    let connectors = connectors.join("\n");
+    let (_temp_input_files, mut connectors) = multiple_input_files(20);
+    connectors.insert(
+        Cow::from("test_input1.error_endpoint"),
+        serde_json::from_value(json!({
+            "stream": "test_input1",
+            "transport": {
+                "name": "file_input",
+                "config": {
+                    "path": "path_does_not_exist"
+                }
+            },
+            "format": {
+                "name": "json",
+                "config": {
+                    "array": true,
+                    "update_format": "raw"
+                }
+            }
+        }))
+        .unwrap(),
+    );
 
     // Controller configuration with two input connectors;
     // the second starts after the first one finishes.
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-inputs:
-{connectors}
-    test_input1.error_endpoint:
-        stream: test_input1
-        transport:
-            name: file_input
-            config:
-                path: path_does_not_exist
-        format:
-            name: json
-            config:
-                array: true
-                update_format: raw"#
-    );
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "inputs": connectors,
+    }))
+    .unwrap();
 
-    println!("config: {config_str}");
-
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
-    let result = Controller::with_config(
+    let result = Controller::with_test_config(
         |circuit_config| {
             Ok(test_circuit::<TestStruct>(
                 circuit_config,
@@ -748,7 +908,7 @@ inputs:
             ))
         },
         &config,
-        Box::new(|e| panic!("error: {e}")),
+        Box::new(|e, _| panic!("error: {e}")),
     );
 
     assert!(result.is_err());
@@ -862,6 +1022,74 @@ fn ft_initially_zero_with_checkpoint() {
     ]);
 }
 
+fn add_output(mut config: PipelineConfig) -> PipelineConfig {
+    let tmpfile = NamedTempFile::new().unwrap();
+    println!("adding output to {}", tmpfile.path().display());
+
+    let output_config: OutputEndpointConfig = serde_json::from_value(json!({
+        "stream": "test_output1",
+        "transport": {
+            "name": "file_output",
+            "config": {
+                "path": tmpfile.path(),
+            }
+        },
+        "format": {
+            "name": "csv",
+            "config": {}
+        }
+    }))
+    .unwrap();
+
+    config
+        .outputs
+        .insert(Cow::Borrowed("test_output2"), output_config);
+    config
+}
+
+fn add_input(mut config: PipelineConfig) -> PipelineConfig {
+    let input_config: InputEndpointConfig = serde_json::from_value(json!({
+        "stream": "test_input1",
+        "transport": {
+            "name": "file_input",
+            "config": {
+                "path": "/dev/null",
+                "follow": true
+            }
+        },
+        "format": {
+            "name": "csv"
+        }
+    }))
+    .unwrap();
+
+    config
+        .inputs
+        .insert(Cow::Borrowed("test_input2"), input_config);
+    config
+}
+
+fn remove_output(mut config: PipelineConfig) -> PipelineConfig {
+    config.outputs.remove(&Cow::Borrowed("test_output2"));
+    config
+}
+
+#[test]
+fn ft_modified_connectors() {
+    test_ft(&[
+        FtTestRound::with_checkpoint(2500),
+        FtTestRound::without_checkpoint(2500),
+        FtTestRound::with_checkpoint(2500),
+        FtTestRound::without_checkpoint(2500),
+        FtTestRound::with_checkpoint(2500).with_modify_config(add_output),
+        FtTestRound::without_checkpoint(2500).with_modify_config(remove_output),
+        FtTestRound::with_checkpoint(2500).with_modify_config(add_input),
+        FtTestRound::without_checkpoint(2500),
+        FtTestRound::with_checkpoint(2500),
+        FtTestRound::without_checkpoint(2500),
+    ]);
+}
+
 /// Runs a basic test of suspend and resume, without fault tolerance.
 ///
 /// For each element of `rounds`, the test writes the specified number of
@@ -885,38 +1113,46 @@ fn test_suspend(rounds: &[usize]) {
     let input_file = File::create(&input_path).unwrap();
     let output_path = tempdir_path.join("output.csv");
 
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-storage_config:
-    path: {storage_dir:?}
-storage: true
-clock_resolution_usecs: null
-inputs:
-    test_input1:
-        stream: test_input1
-        transport:
-            name: file_input
-            config:
-                path: {input_path:?}
-                follow: true
-        format:
-            name: csv
-outputs:
-    test_output1:
-        stream: test_output1
-        transport:
-            name: file_output
-            config:
-                path: {output_path:?}
-        format:
-            name: csv
-            config:
-        "#
-    );
-
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "storage_config": {
+            "path": storage_dir,
+        },
+        "storage": true,
+        "clock_resolution_usecs": null,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": input_path,
+                        "follow": true
+                    }
+                },
+                "format": {
+                    "name": "csv"
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": output_path,
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                }
+            }
+        }
+    }))
+    .unwrap();
 
     let mut writer = CsvWriterBuilder::new()
         .has_headers(false)
@@ -947,7 +1183,7 @@ outputs:
 
         // Start pipeline.
         println!("start pipeline");
-        let controller = Controller::with_config(
+        let controller = Controller::with_test_config(
             |circuit_config| {
                 Ok(test_circuit::<TestStruct>(
                     circuit_config,
@@ -956,7 +1192,7 @@ outputs:
                 ))
             },
             &config,
-            Box::new(|e| panic!("error: {e}")),
+            Box::new(|e, _| panic!("error: {e}")),
         )
         .unwrap();
         controller.start();
@@ -965,6 +1201,7 @@ outputs:
         // processed or replayed.
         wait_for_output(
             &controller,
+            checkpointed_records,
             &(checkpointed_records..total_records)
                 .map(|id| TestStruct::for_id(id as u32))
                 .collect::<Vec<_>>(),
@@ -1018,38 +1255,46 @@ fn test_bootstrap(rounds: &[usize]) {
     let input_file = File::create(&input_path).unwrap();
     let output_path = tempdir_path.join("output.csv");
 
-    let config_str = format!(
-        r#"
-name: test
-workers: 4
-storage_config:
-    path: {storage_dir:?}
-storage: true
-clock_resolution_usecs: null
-inputs:
-    test_input1:
-        stream: test_input1
-        transport:
-            name: file_input
-            config:
-                path: {input_path:?}
-                follow: true
-        format:
-            name: csv
-outputs:
-    test_output1:
-        stream: test_output1
-        transport:
-            name: file_output
-            config:
-                path: {output_path:?}
-        format:
-            name: csv
-            config:
-        "#
-    );
-
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "storage_config": {
+            "path": storage_dir,
+        },
+        "storage": true,
+        "clock_resolution_usecs": null,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": input_path,
+                        "follow": true
+                    }
+                },
+                "format": {
+                    "name": "csv"
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": output_path,
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                }
+            }
+        }
+    }))
+    .unwrap();
 
     let mut writer = CsvWriterBuilder::new()
         .has_headers(false)
@@ -1060,7 +1305,7 @@ outputs:
 
     // Start pipeline.
     println!("start pipeline");
-    let mut controller = Controller::with_config(
+    let mut controller = Controller::with_test_config_keep_program_diff(
         |circuit_config| {
             Ok(test_circuit::<TestStruct>(
                 circuit_config,
@@ -1069,11 +1314,12 @@ outputs:
             ))
         },
         &config,
-        Box::new(|e| panic!("error: {e}")),
+        Box::new(|e, _| panic!("error: {e}")),
     )
     .unwrap();
     controller.start();
 
+    let mut prev_output = 0;
     for (round, n_records) in rounds.iter().copied().enumerate() {
         println!("--- round {round}: add {n_records} records and suspend --- ");
 
@@ -1093,11 +1339,13 @@ outputs:
         // Wait for the new records to be processed.
         wait_for_output(
             &controller,
+            prev_output,
             &(0..total_records)
                 .map(|id| TestStruct::for_id(id as u32))
                 .collect::<Vec<_>>(),
             &output_path,
         );
+        prev_output += total_records;
 
         // Suspend.
         println!("suspend");
@@ -1108,7 +1356,7 @@ outputs:
         controller.stop().unwrap();
 
         // Resume modified pipeline.
-        controller = Controller::with_config(
+        controller = Controller::with_test_config_keep_program_diff(
             move |circuit_config| {
                 Ok(test_circuit::<TestStruct>(
                     circuit_config,
@@ -1117,7 +1365,7 @@ outputs:
                 ))
             },
             &config,
-            Box::new(|e| panic!("error: {e}")),
+            Box::new(|e, _| panic!("error: {e}")),
         )
         .unwrap();
         controller.start();
@@ -1125,6 +1373,7 @@ outputs:
         // Wait for the entire input to show up in the output stream.
         wait_for_output(
             &controller,
+            prev_output,
             &(0..total_records)
                 .map(|id| TestStruct::for_id(id as u32))
                 .collect::<Vec<_>>(),
@@ -1135,10 +1384,15 @@ outputs:
     }
 }
 
-fn wait_for_output(controller: &Controller, expected_output: &[TestStruct], csv_file_path: &Path) {
-    let expect_n = expected_output.len();
+fn wait_for_output(
+    controller: &Controller,
+    initial_n_records: usize,
+    expected_output: &[TestStruct],
+    csv_file_path: &Path,
+) {
+    let expect_n = initial_n_records + expected_output.len();
 
-    println!("wait for {expect_n} records");
+    println!("wait for records {initial_n_records}..{}", expect_n);
 
     let mut last_n = 0;
 
@@ -1193,7 +1447,7 @@ fn wait_for_output(controller: &Controller, expected_output: &[TestStruct], csv_
         .collect::<Vec<_>>();
     actual.sort();
 
-    assert_eq!(actual.len(), expect_n);
+    assert_eq!(actual.len(), expected_output.len());
     for (record, expect_record) in actual.into_iter().zip(expected_output.iter().cloned()) {
         assert_eq!(record, expect_record);
     }
@@ -1223,63 +1477,58 @@ fn start_controller(storage_dir: &Path, barriers: &[usize]) -> Controller {
         set_barrier(input_path(storage_dir, i).to_str().unwrap(), barrier);
     }
 
-    let mut config_str = format!(
-        "\
-name: test
-workers: 4
-storage_config:
-    path: {storage_dir:?}
-storage: true
-clock_resolution_usecs: null
-inputs:
-"
-    )
-    .to_string();
+    let mut config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "storage_config": {
+            "path": storage_dir,
+        },
+        "storage": true,
+        "clock_resolution_usecs": null,
+        "inputs": {}
+    }))
+    .unwrap();
 
     for i in 0..n {
-        writeln!(
-            &mut config_str,
-            "    test_input{}:
-        stream: test_input{}
-        transport:
-            name: file_input
-            config:
-                path: {:?}
-                follow: true
-        format:
-            name: csv",
-            i + 1,
-            i + 1,
-            input_path(storage_dir, i).to_str().unwrap()
-        )
-        .unwrap();
-    }
+        config.inputs.insert(
+            format!("test_input{}", i + 1).into(),
+            serde_json::from_value(json!({
+                "stream": format!("test_input{}", i + 1),
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": input_path(storage_dir, i),
+                        "follow": true
+                    }
+                },
+                "format": {
+                    "name": "csv"
+                }
+            }))
+            .unwrap(),
+        );
 
-    writeln!(&mut config_str, "outputs:").unwrap();
-    for i in 0..n {
         let output_path = output_path(storage_dir, i);
         let _ = std::fs::remove_file(&output_path);
-        writeln!(
-            &mut config_str,
-            "    test_output{}:
-        stream: test_output{}
-        transport:
-            name: file_output
-            config:
-                path: {:?}
-        format:
-            name: csv
-            config:",
-            i + 1,
-            i + 1,
-            output_path.to_str().unwrap()
-        )
-        .unwrap();
+        config.outputs.insert(
+            format!("test_output{}", i + 1).into(),
+            serde_json::from_value(json!({
+                "stream": format!("test_output{}", i + 1),
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": output_path,
+                    }
+                },
+                "format": {
+                    "name": "csv"
+                }
+            }))
+            .unwrap(),
+        );
     }
-    println!("{config_str}");
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
-    let controller = Controller::with_config(
+    let controller = Controller::with_test_config(
         move |circuit_config| {
             let persistent_output_ids = (1..=n).map(|i| format!("output{i}")).collect::<Vec<_>>();
             let persistent_strs = persistent_output_ids
@@ -1294,7 +1543,7 @@ inputs:
             ))
         },
         &config,
-        Box::new(|e| panic!("error: {e}")),
+        Box::new(|e, _| panic!("error: {e}")),
     )
     .unwrap();
 
@@ -1387,7 +1636,7 @@ fn suspend_barrier() {
     // Restart the controller.  It should output no records initially
     // because the checkpoint covered all of them.
     let controller = start_controller(&storage_dir, &[5000]);
-    wait_for_records(&controller, &[0]);
+    wait_for_records(&controller, &[5000]);
 
     println!("start suspend");
     let (sender, receiver) = mpsc::channel();
@@ -1404,8 +1653,8 @@ fn suspend_barrier() {
             writer.serialize(TestStruct::for_id(id as u32)).unwrap();
         }
         writer.flush().unwrap();
-        println!("waiting for {} records", (i + 1) * 1000);
-        wait_for_records(&controller, &[(i + 1) * 1000]);
+        println!("waiting for {end} records");
+        wait_for_records(&controller, &[end]);
         check_file_contents(&(output_path(&storage_dir, 0)), 5000..end);
 
         if let Some(sender) = sender.take() {
@@ -1475,22 +1724,31 @@ fn suspend_multiple_barriers(n_inputs: usize) {
     // Start pipeline.
     println!("start pipeline");
 
+    // The barrier for input 0 is record 0,
+    // for input 1 is record 1000,
+    // for input 2 is record 2000,
+    // and so on.
     let barriers = (0..n_inputs).map(|i| i * 1000).collect::<Vec<_>>();
     let controller = start_controller(&storage_dir, &barriers);
 
-    // Wait for the records that are not in the checkpoint to be
-    // processed or replayed.
+    // Wait for the first 1000 records in each file to be read and copied to the
+    // output.
     println!("wait for 1000 records in each file");
     let mut written = repeat_n(1000, n_inputs).collect::<Vec<_>>();
     wait_for_records(&controller, &written);
 
-    // Suspend.
+    // Start a suspend operation.
+    //
+    // If we have 1 or 2 inputs, the suspend will complete quickly, because
+    // we're past all the barriers; otherwise, it will not complete due to
+    // barriers, since each input only has 1000 records so far.
     let (sender, receiver) = mpsc::channel();
     println!("start suspend");
     controller.start_suspend(Box::new(move |result| sender.send(result).unwrap()));
 
-    // Iterate as long as we shouldn't have reached the barrier, adding
-    // records round-robin to one input at a time.
+    // Iterate as long as we shouldn't have reached the barrier, adding records
+    // round-robin to input 0, then to input 1, and so on, 1000 records at a
+    // time.
     fn expectations(written: &[usize], barriers: &[usize]) -> Vec<usize> {
         written
             .iter()
@@ -1509,6 +1767,7 @@ fn suspend_multiple_barriers(n_inputs: usize) {
         receiver.try_recv().unwrap_err();
 
         // Write 1000 more records to the `next` input.
+        println!("writing 1000 more records to test_input{}", next + 1);
         for id in written[next]..written[next] + 1000 {
             writers[next]
                 .serialize(TestStruct::for_id(id as u32))
@@ -1520,6 +1779,11 @@ fn suspend_multiple_barriers(n_inputs: usize) {
 
         // Wait for the records to be written to the output, then check that
         // we got exactly what we expect on output.
+        //
+        // We won't get any more records on output from inputs that have reached
+        // their barrier, so the writes to inputs 0 and 1 won't have any effect
+        // here.
+        println!("total written: {written:?}");
         let expect = expectations(&written, &barriers);
         wait_for_records(&controller, &expect);
         for (i, expectation) in expect.iter().enumerate().take(n_inputs) {
@@ -1538,20 +1802,17 @@ fn suspend_multiple_barriers(n_inputs: usize) {
     controller.stop().unwrap();
 
     // Check output one more time.
+    println!("check output one more time now that controller is stopped");
     let expect = expectations(&written, &barriers);
-    for i in 0..n_inputs {
-        check_file_contents(&output_path(&storage_dir, i), 0..expect[i]);
+    for (i, e) in expect.iter().enumerate().take(n_inputs) {
+        check_file_contents(&output_path(&storage_dir, i), 0..*e);
     }
 
     // Now restart the controller and wait for all the records that we wrote
     // beyond the barriers get copied to output (and nothing else).
+    println!("restart controller and wait for records beyond the barriers");
     let controller = start_controller(&storage_dir, &barriers);
-    let remaining = expect
-        .iter()
-        .zip(written.iter())
-        .map(|(&expect, &written)| written - expect)
-        .collect::<Vec<_>>();
-    wait_for_records(&controller, &remaining);
+    wait_for_records(&controller, &written);
     for i in 0..n_inputs {
         check_file_contents(&output_path(&storage_dir, i), expect[i]..written[i]);
     }
@@ -1586,20 +1847,17 @@ fn bootstrap() {
 fn lir() {
     init_test_logger();
 
-    let config_str = r#"
-name: test
-workers: 4
-storage_config: null
-storage: null
-clock_resolution_usecs: null
-inputs:
-outputs:
-        "#
-    .to_string();
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "storage_config": null,
+        "storage": null,
+        "clock_resolution_usecs": null,
+        "inputs": {},
+    }))
+    .unwrap();
 
-    let config: PipelineConfig = serde_yaml::from_str(&config_str).unwrap();
-
-    let controller = Controller::with_config(
+    let controller = Controller::with_test_config(
         |circuit_config| {
             Ok(test_circuit::<TestStruct>(
                 circuit_config,
@@ -1608,7 +1866,7 @@ outputs:
             ))
         },
         &config,
-        Box::new(|e| panic!("error: {e}")),
+        Box::new(|e, _| panic!("error: {e}")),
     )
     .unwrap();
 
@@ -1638,49 +1896,54 @@ outputs:
       "to": "4"
     },
     {
-      "from": "3",
-      "stream_id": 3,
-      "to": "6"
-    },
-    {
-      "from": "3",
-      "stream_id": 3,
-      "to": "10"
-    },
-    {
-      "from": "5",
+      "from": "4",
       "stream_id": 4,
-      "to": "6"
+      "to": "5"
     },
     {
-      "from": "5",
-      "stream_id": null,
+      "from": "4",
+      "stream_id": 4,
       "to": "7"
     },
     {
-      "from": "6",
-      "stream_id": 7,
-      "to": "7"
-    },
-    {
-      "from": "6",
-      "stream_id": 7,
-      "to": "8"
-    },
-    {
-      "from": "6",
-      "stream_id": 7,
+      "from": "4",
+      "stream_id": 4,
       "to": "11"
     },
     {
-      "from": "8",
+      "from": "6",
+      "stream_id": 5,
+      "to": "7"
+    },
+    {
+      "from": "6",
+      "stream_id": null,
+      "to": "8"
+    },
+    {
+      "from": "7",
+      "stream_id": 8,
+      "to": "8"
+    },
+    {
+      "from": "7",
       "stream_id": 8,
       "to": "9"
     },
     {
-      "from": "11",
-      "stream_id": 9,
+      "from": "7",
+      "stream_id": 8,
       "to": "12"
+    },
+    {
+      "from": "9",
+      "stream_id": 9,
+      "to": "10"
+    },
+    {
+      "from": "12",
+      "stream_id": 10,
+      "to": "13"
     }
   ],
   "nodes": [
@@ -1715,17 +1978,17 @@ outputs:
     {
       "id": "4",
       "implements": [
-        "input.output"
+        "input.output",
+        "output"
       ],
-      "operation": "Output"
+      "operation": "Accumulator"
     },
     {
       "id": "5",
       "implements": [
-        "input.output",
-        "output"
+        "input.output"
       ],
-      "operation": "Z1 (trace)"
+      "operation": "AccumulateOutput"
     },
     {
       "id": "6",
@@ -1733,7 +1996,7 @@ outputs:
         "input.output",
         "output"
       ],
-      "operation": "UntimedTraceAppend"
+      "operation": "Z1 (trace)"
     },
     {
       "id": "7",
@@ -1741,26 +2004,27 @@ outputs:
         "input.output",
         "output"
       ],
-      "operation": "Z1 (trace)"
+      "operation": "AccumulateUntimedTraceAppend"
     },
     {
       "id": "8",
       "implements": [
-        "input.output"
+        "input.output",
+        "output"
       ],
-      "operation": "Apply"
+      "operation": "Z1 (trace)"
     },
     {
       "id": "9",
       "implements": [
         "input.output"
       ],
-      "operation": "Output"
+      "operation": "Apply"
     },
     {
       "id": "10",
       "implements": [
-        "output"
+        "input.output"
       ],
       "operation": "Output"
     },
@@ -1769,10 +2033,17 @@ outputs:
       "implements": [
         "output"
       ],
-      "operation": "Apply"
+      "operation": "AccumulateOutput"
     },
     {
       "id": "12",
+      "implements": [
+        "output"
+      ],
+      "operation": "Apply"
+    },
+    {
+      "id": "13",
       "implements": [
         "output"
       ],
@@ -1785,4 +2056,1381 @@ outputs:
 
     println!("{actual:#}");
     assert_eq!(actual, expected);
+}
+
+/// Test that `ControllerStatus` and its `ExternalControllerStatus` conversion produce identical JSON.
+///
+/// This test verifies that:
+/// 1. A `ControllerStatus` instance with detailed mock data can be serialized to JSON
+/// 2. Converting it to `ExternalControllerStatus` via `to_api_type()` and serializing produces the same JSON
+/// 3. All fields (global metrics, suspend errors, input/output endpoints) are correctly preserved
+///
+/// This ensures consistency between the internal representation (with atomics/mutexes) and
+/// the external API type used for HTTP responses.
+#[test]
+fn test_external_controller_status_serialization() {
+    use crate::controller::stats::InputEndpointStatus;
+    use crate::{ControllerStatus, OutputEndpointConfig, PipelineState};
+    use chrono::{TimeZone, Utc};
+    use feldera_types::suspend::{PermanentSuspendError, SuspendError};
+    use std::sync::atomic::Ordering;
+    use uuid::Uuid;
+
+    // Helper function to create a ControllerStatus with detailed mock values
+    fn create_mock_status() -> ControllerStatus {
+        let config = serde_json::from_value(json!({
+            "name": "test_pipeline",
+            "workers": 4,
+        }))
+        .unwrap();
+
+        let mut status = ControllerStatus::new(config, 998500, None, Uuid::nil());
+
+        // Configure global metrics using available public API
+        status.set_state(PipelineState::Paused);
+        status.set_bootstrap_in_progress(false);
+
+        // Set public atomic fields
+        status.global_metrics.start_time = Utc.timestamp_opt(1700000000, 0).unwrap();
+        status.global_metrics.incarnation_uuid =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        status.global_metrics.initial_start_time = Utc.timestamp_opt(1699999000, 0).unwrap();
+        status
+            .global_metrics
+            .storage_bytes
+            .store(1024 * 1024 * 1024 * 2, Ordering::Relaxed); // 2 GB
+        status
+            .global_metrics
+            .storage_mb_secs
+            .store(500000, Ordering::Relaxed);
+        status
+            .global_metrics
+            .runtime_elapsed_msecs
+            .store(98000, Ordering::Relaxed);
+        status
+            .global_metrics
+            .buffered_input_records
+            .store(1500, Ordering::Relaxed);
+        status
+            .global_metrics
+            .buffered_input_bytes
+            .store(150000, Ordering::Relaxed);
+        status
+            .global_metrics
+            .total_input_records
+            .store(1000000, Ordering::Relaxed);
+        status
+            .global_metrics
+            .total_input_bytes
+            .store(500000000, Ordering::Relaxed);
+        status
+            .global_metrics
+            .total_processed_records
+            .store(998500, Ordering::Relaxed);
+        status
+            .global_metrics
+            .total_processed_bytes
+            .store(499250000, Ordering::Relaxed);
+        status
+            .global_metrics
+            .total_completed_records
+            .store(998000, Ordering::Relaxed);
+
+        // Add input endpoints
+        let mut inputs = status.inputs.write();
+
+        // Input 1: kafka_input with errors and paused
+        let kafka_endpoint = InputEndpointStatus::new(
+            "kafka_input",
+            serde_json::from_value(json!({
+                "stream": "test_stream",
+                "transport": {
+                    "name": "kafka_input",
+                    "config": {
+                        "topics": ["test-topic"],
+                        "bootstrap.servers": "localhost:9092"
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {}
+                }
+            }))
+            .unwrap(),
+            None,
+            None,
+        );
+        kafka_endpoint
+            .metrics
+            .total_bytes
+            .store(250000000, Ordering::Relaxed);
+        kafka_endpoint
+            .metrics
+            .total_records
+            .store(500000, Ordering::Relaxed);
+        kafka_endpoint
+            .metrics
+            .buffered_records
+            .store(750, Ordering::Relaxed);
+        kafka_endpoint
+            .metrics
+            .buffered_bytes
+            .store(75000, Ordering::Relaxed);
+        kafka_endpoint
+            .metrics
+            .num_transport_errors
+            .store(4, Ordering::Relaxed);
+        kafka_endpoint
+            .metrics
+            .num_parse_errors
+            .store(12, Ordering::Relaxed);
+        kafka_endpoint
+            .metrics
+            .end_of_input
+            .store(false, Ordering::Relaxed);
+        kafka_endpoint.set_paused_by_user(true);
+        kafka_endpoint.transport_error(
+            true,
+            None,
+            &anyhow!("Connection refused: Unable to connect to Kafka broker"),
+        );
+        inputs.insert(0, kafka_endpoint);
+
+        // Input 2: file_input with barrier and no errors
+        let file_endpoint = InputEndpointStatus::new(
+            "file_input",
+            serde_json::from_value(json!({
+                "stream": "file_stream",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": "/data/input.csv"
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                }
+            }))
+            .unwrap(),
+            None,
+            None,
+        );
+        file_endpoint
+            .metrics
+            .total_bytes
+            .store(250000000, Ordering::Relaxed);
+        file_endpoint
+            .metrics
+            .total_records
+            .store(500000, Ordering::Relaxed);
+        file_endpoint
+            .metrics
+            .buffered_records
+            .store(750, Ordering::Relaxed);
+        file_endpoint
+            .metrics
+            .buffered_bytes
+            .store(75000, Ordering::Relaxed);
+        file_endpoint
+            .metrics
+            .num_transport_errors
+            .store(0, Ordering::Relaxed);
+        file_endpoint
+            .metrics
+            .num_parse_errors
+            .store(3, Ordering::Relaxed);
+        file_endpoint
+            .metrics
+            .end_of_input
+            .store(true, Ordering::Relaxed);
+        file_endpoint.barrier.store(true, Ordering::Relaxed);
+        inputs.insert(1, file_endpoint);
+
+        drop(inputs);
+
+        // Add output endpoint
+        let output_config: OutputEndpointConfig = serde_json::from_value(json!({
+            "stream": "test_output",
+            "transport": {
+                "name": "http_output",
+                "config": {}
+            },
+            "format": {
+                "name": "json",
+                "config": {}
+            }
+        }))
+        .unwrap();
+        status.add_output(&0, "http_output", &output_config, None);
+
+        // Set output metrics
+        if let Some(output) = status.output_status().get(&0) {
+            output
+                .metrics
+                .transmitted_records
+                .store(998000, Ordering::Relaxed);
+            output
+                .metrics
+                .transmitted_bytes
+                .store(499000000, Ordering::Relaxed);
+            output.metrics.queued_records.store(100, Ordering::Relaxed);
+            output.metrics.queued_batches.store(5, Ordering::Relaxed);
+            output.metrics.buffered_records.store(50, Ordering::Relaxed);
+            output.metrics.buffered_batches.store(2, Ordering::Relaxed);
+            output.metrics.num_encode_errors.store(8, Ordering::Relaxed);
+            output
+                .metrics
+                .num_transport_errors
+                .store(3, Ordering::Relaxed);
+            output
+                .metrics
+                .total_processed_input_records
+                .store(998500, Ordering::Relaxed);
+            output
+                .metrics
+                .memory
+                .store(1024 * 1024 * 10, Ordering::Relaxed); // 10 MB
+        }
+
+        status
+    }
+
+    // Create ControllerStatus with mock values
+    let controller_status = create_mock_status();
+
+    // Convert to ExternalControllerStatus using the to_api_type method
+    let mut external_status = controller_status.to_api_type(ControllerStatusContext {
+        suspend_error: Err(SuspendError::Permanent(vec![
+            PermanentSuspendError::StorageRequired,
+            PermanentSuspendError::UnsupportedInputEndpoint("kafka_input".to_string()),
+        ])),
+        checkpoint_activity: feldera_types::checkpoint::CheckpointActivity::Idle,
+        permanent_checkpoint_errors: None,
+        pipeline_complete: false,
+        transaction_info: TransactionInfo::default(),
+        memory_pressure: MemoryPressure::default(),
+        memory_pressure_epoch: 0,
+        include_connector_errors: false,
+    });
+    external_status.global_metrics.rss_bytes = 1024 * 1024 * 512; // 512 MB
+    external_status.global_metrics.cpu_msecs = 45_000;
+    external_status.global_metrics.uptime_msecs = 120_000;
+
+    // Serialize the ExternalControllerStatus to JSON
+    let external_json = serde_json::to_value(&external_status)
+        .expect("Failed to serialize ExternalControllerStatus");
+
+    // Verify specific fields to ensure they were properly converted
+    assert_eq!(
+        external_json["global_metrics"]["state"],
+        json!("Paused"),
+        "Pipeline state should be Paused"
+    );
+    assert_eq!(
+        external_json["global_metrics"]["rss_bytes"],
+        json!(1024 * 1024 * 512),
+        "RSS bytes should match"
+    );
+    assert_eq!(
+        external_json["global_metrics"]["total_input_records"],
+        json!(1000000),
+        "Total input records should match"
+    );
+
+    // Verify suspend error
+    assert!(
+        external_json["suspend_error"].is_object(),
+        "Suspend error should be present"
+    );
+    assert_eq!(
+        external_json["suspend_error"]["Permanent"][0]["StorageRequired"],
+        json!(null),
+        "Should have StorageRequired error"
+    );
+
+    // Verify inputs array
+    let inputs = external_json["inputs"]
+        .as_array()
+        .expect("inputs should be an array");
+    assert_eq!(inputs.len(), 2, "Should have 2 input endpoints");
+
+    // Verify first input (kafka_input)
+    assert_eq!(
+        inputs[1]["endpoint_name"],
+        json!("kafka_input"),
+        "First input should be kafka_input"
+    );
+    assert_eq!(
+        inputs[1]["metrics"]["total_records"],
+        json!(500000),
+        "kafka_input should have 500000 total records"
+    );
+    assert_eq!(
+        inputs[1]["paused"],
+        json!(true),
+        "kafka_input should be paused"
+    );
+    assert_eq!(
+        inputs[1]["fatal_error"],
+        json!("Connection refused: Unable to connect to Kafka broker"),
+        "kafka_input should have fatal error"
+    );
+
+    // Verify second input (file_input)
+    assert_eq!(
+        inputs[0]["endpoint_name"],
+        json!("file_input"),
+        "Second input should be file_input"
+    );
+    assert_eq!(
+        inputs[0]["barrier"],
+        json!(true),
+        "file_input should have barrier"
+    );
+    assert_eq!(
+        inputs[0]["metrics"]["end_of_input"],
+        json!(true),
+        "file_input should have end_of_input"
+    );
+
+    // Verify outputs array
+    let outputs = external_json["outputs"]
+        .as_array()
+        .expect("outputs should be an array");
+    assert_eq!(outputs.len(), 1, "Should have 1 output endpoint");
+
+    // Verify output (http_output)
+    assert_eq!(
+        outputs[0]["endpoint_name"],
+        json!("http_output"),
+        "Output should be http_output"
+    );
+    assert_eq!(
+        outputs[0]["metrics"]["transmitted_records"],
+        json!(998000),
+        "http_output should have 998000 transmitted records"
+    );
+    assert_eq!(
+        outputs[0]["metrics"]["num_encode_errors"],
+        json!(8),
+        "http_output should have 8 encode errors"
+    );
+}
+
+/// Test that custom connector metrics registered via `set_custom_metrics` are
+/// included in the Prometheus output produced by the custom-metrics loop in
+/// `write_metrics`.
+#[test]
+fn test_custom_connector_metrics_prometheus_output() {
+    use crate::{
+        ControllerStatus,
+        controller::{stats::InputEndpointStatus, write_custom_metrics},
+        server::metrics::{LabelStack, MetricsWriter, PrometheusFormatter},
+    };
+    use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    struct MockMetrics;
+
+    impl ConnectorMetrics for MockMetrics {
+        fn metrics(&self) -> Vec<(&'static str, &'static str, ValueType, f64)> {
+            vec![
+                (
+                    "kafka_consumer_lag",
+                    "Consumer lag for the Kafka topic partition.",
+                    ValueType::Gauge,
+                    42.0,
+                ),
+                (
+                    "kafka_messages_fetched_total",
+                    "Total number of messages fetched from Kafka.",
+                    ValueType::Counter,
+                    1000.0,
+                ),
+            ]
+        }
+    }
+
+    let config = serde_json::from_value(json!({
+        "name": "test_custom_metrics",
+        "workers": 1,
+    }))
+    .unwrap();
+
+    let status = ControllerStatus::new(config, 0, None, Uuid::nil());
+
+    let endpoint = InputEndpointStatus::new(
+        "kafka_in",
+        serde_json::from_value(json!({
+            "stream": "s",
+            "transport": { "name": "kafka_input", "config": { "topics": ["t"], "bootstrap.servers": "localhost:9092" } },
+            "format": { "name": "json", "config": {} }
+        }))
+        .unwrap(),
+        None,
+        None,
+    );
+    status.inputs.write().insert(0, endpoint);
+
+    // Register custom metrics on the endpoint.
+    status.set_custom_metrics(0, Arc::new(MockMetrics));
+
+    let mut writer = MetricsWriter::<PrometheusFormatter>::new();
+    let labels = LabelStack::new();
+    write_custom_metrics(&status, &mut writer, &labels);
+    let output = writer.into_output();
+
+    // Verify custom metric names and values appear with the endpoint label.
+    assert!(
+        output.contains("kafka_consumer_lag"),
+        "output missing kafka_consumer_lag:\n{output}"
+    );
+    assert!(
+        output.contains("kafka_messages_fetched_total"),
+        "output missing kafka_messages_fetched_total:\n{output}"
+    );
+    assert!(
+        output.contains(r#"endpoint="kafka_in""#),
+        "output missing endpoint label:\n{output}"
+    );
+    assert!(
+        output.contains("42"),
+        "output missing gauge value 42:\n{output}"
+    );
+    assert!(
+        output.contains("1000"),
+        "output missing counter value 1000:\n{output}"
+    );
+}
+
+/// Test that when two endpoints register the same custom metric name, the
+/// grouping logic emits a single `# TYPE` header for that metric (Prometheus
+/// format violation fix).
+#[test]
+fn test_custom_connector_metrics_prometheus_grouping() {
+    use crate::{
+        ControllerStatus,
+        controller::{stats::InputEndpointStatus, write_custom_metrics},
+        server::metrics::{LabelStack, MetricsWriter, PrometheusFormatter},
+    };
+    use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    struct MockMetrics;
+
+    impl ConnectorMetrics for MockMetrics {
+        fn metrics(&self) -> Vec<(&'static str, &'static str, ValueType, f64)> {
+            vec![(
+                "kafka_consumer_lag",
+                "Consumer lag for the Kafka topic partition.",
+                ValueType::Gauge,
+                42.0,
+            )]
+        }
+    }
+
+    let config = serde_json::from_value(json!({
+        "name": "test_grouping",
+        "workers": 1,
+    }))
+    .unwrap();
+
+    let status = ControllerStatus::new(config, 0, None, Uuid::nil());
+
+    for (id, name) in [(0u64, "kafka_in_1"), (1u64, "kafka_in_2")] {
+        let endpoint = InputEndpointStatus::new(
+            name,
+            serde_json::from_value(json!({
+                "stream": "s",
+                "transport": { "name": "kafka_input", "config": { "topics": ["t"], "bootstrap.servers": "localhost:9092" } },
+                "format": { "name": "json", "config": {} }
+            }))
+            .unwrap(),
+            None,
+            None,
+        );
+        status.inputs.write().insert(id, endpoint);
+        status.set_custom_metrics(id, Arc::new(MockMetrics));
+    }
+
+    let mut writer = MetricsWriter::<PrometheusFormatter>::new();
+    let labels = LabelStack::new();
+    write_custom_metrics(&status, &mut writer, &labels);
+    let output = writer.into_output();
+
+    // `# TYPE kafka_consumer_lag gauge` must appear exactly once.
+    let type_header = "# TYPE kafka_consumer_lag gauge";
+    let occurrences = output.matches(type_header).count();
+    assert_eq!(
+        occurrences, 1,
+        "expected exactly one '# TYPE kafka_consumer_lag gauge', got {occurrences}:\n{output}"
+    );
+
+    // Both endpoint labels must appear in the output.
+    assert!(
+        output.contains(r#"endpoint="kafka_in_1""#),
+        "output missing kafka_in_1 label:\n{output}"
+    );
+    assert!(
+        output.contains(r#"endpoint="kafka_in_2""#),
+        "output missing kafka_in_2 label:\n{output}"
+    );
+
+    // There must be no second `# TYPE` header between the two endpoint values.
+    let first_pos = output.find(r#"endpoint="kafka_in_1""#).unwrap();
+    let second_pos = output.find(r#"endpoint="kafka_in_2""#).unwrap();
+    let between = &output[first_pos.min(second_pos)..first_pos.max(second_pos)];
+    assert!(
+        !between.contains("# TYPE"),
+        "unexpected '# TYPE' header between endpoint values:\n{output}"
+    );
+}
+
+#[test]
+fn test_preprocessor() {
+    init_test_logger();
+
+    // Create test JSON data with various strings that will be filtered and transformed
+    let temp_input_file = NamedTempFile::new().unwrap();
+    temp_input_file
+        .as_file()
+        .write_all(
+            br#"[
+            {"id": 1, "b": true, "s": "one"},
+            {"id": 2, "b": false, "s": "two"}
+        ]"#,
+        )
+        .unwrap();
+
+    // Controller configuration with a preprocessor :
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_preprocessor",
+        "workers": 1,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": false
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "array": true,
+                        "update_format": "raw"
+                    }
+                },
+                "preprocessor": [
+                    {
+                        "name": "passthrough",
+                        "message_oriented": true,
+                        "config": {}
+                    }
+                ]
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            let (circuit, catalog) =
+                test_circuit::<TestStruct>(circuit_config, &TestStruct::schema(), &[None]);
+            // Register the factory before connectors are initialized.
+            catalog
+                .preprocessor_registry()
+                .lock()
+                .unwrap()
+                .register("passthrough", Box::new(PassthroughPreprocessorFactory));
+            Ok((circuit, catalog))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+    wait(|| controller.pipeline_complete(), DEFAULT_TIMEOUT_MS).unwrap();
+
+    let result = controller
+        .execute_query_text_sync("select * from test_output1 order by id")
+        .unwrap();
+
+    let expected = r#"+----+-------+---+-----+
+| id | b     | i | s   |
++----+-------+---+-----+
+| 1  | true  |   | one |
+| 2  | false |   | two |
++----+-------+---+-----+"#;
+
+    assert_eq!(&result, expected);
+    controller.stop().unwrap();
+}
+
+#[test]
+fn test_decryption_preprocessor() {
+    use crate::preprocess::aes256gcm_encrypt;
+
+    init_test_logger();
+
+    // AES-256 key (32 bytes) and nonce (12 bytes).
+    let key = b"0123456789abcdef0123456789abcdef";
+    let nonce = b"test_nonce_1";
+
+    // Encrypt JSON data that the pipeline will decrypt and parse.
+    let json_input = br#"[
+        {"id": 1, "b": true, "s": "one"},
+        {"id": 2, "b": false, "s": "two"}
+    ]"#;
+    let encrypted = aes256gcm_encrypt(key, nonce, json_input);
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    temp_input_file.as_file().write_all(&encrypted).unwrap();
+
+    let key_b64 = BASE64.encode(key);
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_decryption_preprocessor",
+        "workers": 1,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": false
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "array": true,
+                        "update_format": "raw"
+                    }
+                },
+                "preprocessor": [
+                    {
+                        "name": "decryption",
+                        "message_oriented": true,
+                        "config": {
+                            "key": key_b64
+                        }
+                    }
+                ]
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            let (circuit, catalog) =
+                test_circuit::<TestStruct>(circuit_config, &TestStruct::schema(), &[None]);
+            // Register the factory before connectors are initialized.
+            catalog
+                .preprocessor_registry()
+                .lock()
+                .unwrap()
+                .register("decryption", Box::new(DecryptionPreprocessorFactory));
+            Ok((circuit, catalog))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+    wait(|| controller.pipeline_complete(), DEFAULT_TIMEOUT_MS).unwrap();
+
+    let result = controller
+        .execute_query_text_sync("select * from test_output1 order by id")
+        .unwrap();
+
+    let expected = r#"+----+-------+---+-----+
+| id | b     | i | s   |
++----+-------+---+-----+
+| 1  | true  |   | one |
+| 2  | false |   | two |
++----+-------+---+-----+"#;
+
+    assert_eq!(&result, expected);
+    controller.stop().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for `test_base64_csv_preprocessor`
+// ---------------------------------------------------------------------------
+
+use crate::format::{LineSplitter, SpongeSplitter};
+use feldera_adapterlib::format::Splitter;
+use feldera_adapterlib::preprocess::{Preprocessor, PreprocessorCreateError, PreprocessorFactory};
+use feldera_types::preprocess::PreprocessorConfig;
+
+/// Preprocessor that base64-decodes each line it receives.
+///
+/// The [`NewlineSplitter`] above ensures that `process` is called with exactly
+/// one base64-encoded line (including the trailing `\n`) at a time.
+/// `process` strips the newline and decodes the rest, returning the original
+/// CSV bytes (e.g. `b"1,true,,one\n"`).
+#[cfg(test)]
+struct Base64LinePreprocessor;
+
+#[cfg(test)]
+impl Preprocessor for Base64LinePreprocessor {
+    fn process(&mut self, data: &[u8]) -> (Vec<u8>, Vec<crate::format::ParseError>) {
+        let without_newline = data.strip_suffix(b"\n").unwrap_or(data);
+        match BASE64.decode(without_newline) {
+            Ok(decoded) => (decoded, vec![]),
+            Err(e) => (
+                vec![],
+                vec![crate::format::ParseError::bin_envelope_error(
+                    format!("base64 decode error: {e}"),
+                    without_newline,
+                    None,
+                )],
+            ),
+        }
+    }
+
+    fn fork(&self) -> Box<dyn Preprocessor> {
+        Box::new(Base64LinePreprocessor)
+    }
+
+    fn splitter(&self) -> Option<Box<dyn Splitter>> {
+        Some(Box::new(LineSplitter))
+    }
+}
+
+#[cfg(test)]
+struct Base64LinePreprocessorFactory;
+
+#[cfg(test)]
+impl PreprocessorFactory for Base64LinePreprocessorFactory {
+    fn create(
+        &self,
+        _config: &PreprocessorConfig,
+    ) -> Result<Box<dyn Preprocessor>, PreprocessorCreateError> {
+        Ok(Box::new(Base64LinePreprocessor))
+    }
+}
+
+/// Verify that [`PreprocessedParser`] exercises both the preprocessor splitter
+/// and the parser splitter in the same pipeline.
+///
+/// **Input format**: the file contains newline-separated base64-encoded CSV rows.
+///
+/// **Preprocessor splitter** (`NewlineSplitter`): the file transport calls
+/// `PreprocessedParser::splitter()`, which returns the preprocessor's splitter.
+/// That splitter finds `\n` boundaries in the raw byte stream so that each
+/// call to `PreprocessedParser::parse` receives exactly one base64-encoded
+/// line.
+///
+/// **Parser splitter** (`CsvSplitter`): inside `PreprocessedParser::parse`,
+/// after `process` decodes a base64 line back to a CSV row (e.g.
+/// `b"1,true,,one\n"`), the result is appended to the internal
+/// `StreamSplitter`, which uses the CSV parser's own splitter to find the
+/// CSV record boundary before forwarding the complete row to `CsvParser`.
+#[test]
+fn test_base64_csv_preprocessor() {
+    init_test_logger();
+
+    // Two CSV rows for `TestStruct { id: u32, b: bool, i: Option<i64>, s: String }`.
+    // `i` is None, which serialises as an empty field in CSV.
+    let rows: &[&[u8]] = &[b"1,true,,one\n", b"2,false,,two\n"];
+
+    // Build the input file: each CSV row is base64-encoded, one per line.
+    let mut file_contents = Vec::new();
+    for row in rows {
+        file_contents.extend_from_slice(BASE64.encode(row).as_bytes());
+        file_contents.push(b'\n');
+    }
+    // skip newline after last row
+    file_contents.pop();
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    temp_input_file.as_file().write_all(&file_contents).unwrap();
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_base64_csv_preprocessor",
+        "workers": 1,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": false
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                },
+                "preprocessor": [
+                    {
+                        "name": "base64LinePreprocessor",
+                        "message_oriented": true,
+                        "config": {}
+                    }
+                ]
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            let (circuit, catalog) =
+                test_circuit::<TestStruct>(circuit_config, &TestStruct::schema(), &[None]);
+            catalog.preprocessor_registry().lock().unwrap().register(
+                "base64LinePreprocessor",
+                Box::new(Base64LinePreprocessorFactory),
+            );
+            Ok((circuit, catalog))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+    wait(|| controller.pipeline_complete(), DEFAULT_TIMEOUT_MS).unwrap();
+
+    let result = controller
+        .execute_query_text_sync("select * from test_output1 order by id")
+        .unwrap();
+
+    let expected = r#"+----+-------+---+-----+
+| id | b     | i | s   |
++----+-------+---+-----+
+| 1  | true  |   | one |
+| 2  | false |   | two |
++----+-------+---+-----+"#;
+
+    assert_eq!(&result, expected);
+    controller.stop().unwrap();
+}
+
+/// Preprocessor that base64-decodes the input it receives.
+#[cfg(test)]
+struct Base64SpongePreprocessor;
+
+#[cfg(test)]
+impl Preprocessor for Base64SpongePreprocessor {
+    fn process(&mut self, data: &[u8]) -> (Vec<u8>, Vec<crate::format::ParseError>) {
+        let without_newline = data.strip_suffix(b"\n").unwrap_or(data);
+        match BASE64.decode(without_newline) {
+            Ok(decoded) => (decoded, vec![]),
+            Err(e) => (
+                vec![],
+                vec![crate::format::ParseError::bin_envelope_error(
+                    format!("base64 decode error: {e}"),
+                    without_newline,
+                    None,
+                )],
+            ),
+        }
+    }
+
+    fn fork(&self) -> Box<dyn Preprocessor> {
+        Box::new(Base64SpongePreprocessor)
+    }
+
+    fn splitter(&self) -> Option<Box<dyn Splitter>> {
+        Some(Box::new(SpongeSplitter))
+    }
+}
+
+#[cfg(test)]
+struct Base64SpongePreprocessorFactory;
+
+#[cfg(test)]
+impl PreprocessorFactory for Base64SpongePreprocessorFactory {
+    fn create(
+        &self,
+        _config: &PreprocessorConfig,
+    ) -> Result<Box<dyn Preprocessor>, PreprocessorCreateError> {
+        Ok(Box::new(Base64SpongePreprocessor))
+    }
+}
+
+/// Like the previous test, but use a SpongeSplitter in the preprocessor and
+/// uudecode everything, not at line boundaries.
+#[test]
+fn test_base64_sponge_csv_preprocessor() {
+    init_test_logger();
+
+    // Two CSV rows for `TestStruct { id: u32, b: bool, i: Option<i64>, s: String }`.
+    // `i` is None, which serialises as an empty field in CSV.
+    let rows: &[u8] = b"1,true,,one\n2,false,,two";
+
+    // Build the input file: each CSV row is base64-encoded, one per line.
+    let mut file_contents = Vec::new();
+    file_contents.extend_from_slice(BASE64.encode(rows).as_bytes());
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    temp_input_file.as_file().write_all(&file_contents).unwrap();
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_base64_sponge_csv_preprocessor",
+        "workers": 1,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": false
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                },
+                "preprocessor": [
+                    {
+                        "name": "base64SpongePreprocessor",
+                        "message_oriented": true,
+                        "config": {}
+                    }
+                ]
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            let (circuit, catalog) =
+                test_circuit::<TestStruct>(circuit_config, &TestStruct::schema(), &[None]);
+            catalog.preprocessor_registry().lock().unwrap().register(
+                "base64SpongePreprocessor",
+                Box::new(Base64SpongePreprocessorFactory),
+            );
+            Ok((circuit, catalog))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+    wait(|| controller.pipeline_complete(), DEFAULT_TIMEOUT_MS).unwrap();
+
+    let result = controller
+        .execute_query_text_sync("select * from test_output1 order by id")
+        .unwrap();
+
+    let expected = r#"+----+-------+---+-----+
+| id | b     | i | s   |
++----+-------+---+-----+
+| 1  | true  |   | one |
+| 2  | false |   | two |
++----+-------+---+-----+"#;
+
+    assert_eq!(&result, expected);
+    controller.stop().unwrap();
+}
+
+/// Tests that `checkpoint_activity()` returns correct states and timestamps
+/// during a coordinated checkpoint flow (prepare → delayed → in_progress → idle).
+#[test]
+fn test_checkpoint_activity_state_transitions() {
+    use chrono::Utc;
+    use feldera_types::checkpoint::CheckpointActivity;
+    use feldera_types::coordination::CheckpointCoordination;
+    use feldera_types::suspend::TemporarySuspendError;
+
+    init_test_logger();
+
+    let tempdir = TempDir::new().unwrap();
+    let storage_dir = tempdir.path().join("storage");
+    create_dir(&storage_dir).unwrap();
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    {
+        let mut writer = CsvWriterBuilder::new()
+            .has_headers(false)
+            .from_writer(temp_input_file.as_file());
+        for id in 0..10u32 {
+            writer.serialize(TestStruct::for_id(id)).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_checkpoint_activity",
+        "workers": 4,
+        "storage_config": {
+            "path": storage_dir,
+        },
+        "storage": true,
+        "fault_tolerance": {},
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": true
+                    }
+                },
+                "format": {
+                    "name": "csv"
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": tempdir.path().join("output.csv"),
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            Ok(test_circuit::<TestStruct>(
+                circuit_config,
+                &[],
+                &[Some("output")],
+            ))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+
+    // Wait for data to be processed.
+    wait_for_records(&controller, &[10]);
+
+    // --- Before any checkpoint, activity should be Idle ---
+    let activity = controller.checkpoint_activity();
+    assert!(
+        matches!(activity, CheckpointActivity::Idle),
+        "expected Idle before checkpoint, got {activity:?}"
+    );
+    assert!(controller.checkpoint_delay_started().is_none());
+    assert!(controller.checkpoint_started().is_none());
+
+    // --- Initiate a coordinated (prepare) checkpoint ---
+    // This sets coordination_prepare_checkpoint = true, which will
+    // cause the checkpoint to stall in "Ready" state (only the
+    // Coordination temporary error remains).
+    let before_prepare = Utc::now();
+    controller.prepare_checkpoint();
+
+    // Wait for the checkpoint coordination to reach Ready state.
+    // In Ready state, only TemporarySuspendError::Coordination is blocking.
+    wait(
+        || {
+            matches!(
+                *controller.checkpoint_watcher().borrow(),
+                Some(CheckpointCoordination::Ready)
+            )
+        },
+        10_000,
+    )
+    .expect("checkpoint coordination should reach Ready state");
+
+    // At this point, checkpoint_activity() should report Delayed with
+    // the Coordination reason.
+    let activity = controller.checkpoint_activity();
+    match &activity {
+        CheckpointActivity::Delayed {
+            reasons,
+            delayed_since,
+        } => {
+            assert!(
+                reasons
+                    .iter()
+                    .any(|r| matches!(r, TemporarySuspendError::Coordination)),
+                "expected Coordination reason in {reasons:?}"
+            );
+            // The delay timestamp should have been set around our prepare time.
+            assert!(
+                *delayed_since >= before_prepare,
+                "delayed_since {delayed_since:?} should be >= before_prepare {before_prepare:?}"
+            );
+        }
+        other => panic!("expected Delayed, got {other:?}"),
+    }
+
+    // checkpoint_delay_started should be set, checkpoint_started should not.
+    assert!(
+        controller.checkpoint_delay_started().is_some(),
+        "checkpoint_delay_started should be set in Delayed state"
+    );
+    assert!(
+        controller.checkpoint_started().is_none(),
+        "checkpoint_started should not be set before InProgress"
+    );
+
+    // --- Release the checkpoint so it proceeds to InProgress/Done ---
+    controller.release_checkpoint();
+
+    // Wait for the checkpoint to complete (Done).
+    wait(
+        || {
+            matches!(
+                *controller.checkpoint_watcher().borrow(),
+                Some(CheckpointCoordination::Done)
+            )
+        },
+        10_000,
+    )
+    .expect("checkpoint coordination should reach Done state");
+
+    // After completion, activity should be Idle and timestamps cleared.
+    let activity = controller.checkpoint_activity();
+    assert!(
+        matches!(activity, CheckpointActivity::Idle),
+        "expected Idle after checkpoint done, got {activity:?}"
+    );
+    assert!(
+        controller.checkpoint_delay_started().is_none(),
+        "checkpoint_delay_started should be cleared after Done"
+    );
+    assert!(
+        controller.checkpoint_started().is_none(),
+        "checkpoint_started should be cleared after Done"
+    );
+
+    controller.stop().unwrap();
+}
+
+/// Tests that `checkpoint_activity()` transitions through InProgress state
+/// during a `start_checkpoint()` call, and that the `checkpoint_started`
+/// timestamp is set during the write.
+#[test]
+fn test_checkpoint_activity_async_checkpoint() {
+    use chrono::Utc;
+    use feldera_types::checkpoint::CheckpointActivity;
+    use feldera_types::coordination::CheckpointCoordination;
+
+    init_test_logger();
+
+    let tempdir = TempDir::new().unwrap();
+    let storage_dir = tempdir.path().join("storage");
+    create_dir(&storage_dir).unwrap();
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    {
+        let mut writer = CsvWriterBuilder::new()
+            .has_headers(false)
+            .from_writer(temp_input_file.as_file());
+        for id in 0..10u32 {
+            writer.serialize(TestStruct::for_id(id)).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_checkpoint_activity_async",
+        "workers": 4,
+        "storage_config": {
+            "path": storage_dir,
+        },
+        "storage": true,
+        "fault_tolerance": {},
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": true
+                    }
+                },
+                "format": {
+                    "name": "csv"
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": tempdir.path().join("output.csv"),
+                    }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            Ok(test_circuit::<TestStruct>(
+                circuit_config,
+                &[],
+                &[Some("output")],
+            ))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+    wait_for_records(&controller, &[10]);
+
+    // Use the async start_checkpoint so we can observe the InProgress state
+    // from another thread.
+    let (sender, receiver) = oneshot::channel();
+    let before_checkpoint = Utc::now();
+    controller.start_checkpoint(Box::new(move |result| sender.send(result).unwrap()));
+
+    // Poll until we see either InProgress or Done.  The checkpoint may
+    // complete very quickly, so we accept either.
+    let mut saw_in_progress = false;
+    wait(
+        || {
+            let coord = controller.checkpoint_watcher().borrow().clone();
+            if matches!(coord, Some(CheckpointCoordination::InProgress)) {
+                saw_in_progress = true;
+                // Also verify the timestamp.
+                if let Some(started) = controller.checkpoint_started() {
+                    assert!(
+                        started >= before_checkpoint,
+                        "checkpoint_started {started:?} should be >= before_checkpoint {before_checkpoint:?}"
+                    );
+                }
+            }
+            matches!(coord, Some(CheckpointCoordination::Done))
+        },
+        10_000,
+    )
+    .expect("checkpoint should complete");
+
+    // After completion, both timestamps should be cleared.
+    assert!(
+        controller.checkpoint_delay_started().is_none(),
+        "checkpoint_delay_started should be cleared after checkpoint"
+    );
+    assert!(
+        controller.checkpoint_started().is_none(),
+        "checkpoint_started should be cleared after checkpoint"
+    );
+
+    // Activity should be Idle.
+    let activity = controller.checkpoint_activity();
+    assert!(
+        matches!(activity, CheckpointActivity::Idle),
+        "expected Idle after checkpoint, got {activity:?}"
+    );
+
+    // The checkpoint should have succeeded.
+    receiver.blocking_recv().unwrap().unwrap();
+
+    controller.stop().unwrap();
+}
+
+/// Tests that `permanent_suspend_errors()` returns errors when storage
+/// is explicitly disabled (the pipeline cannot checkpoint).
+#[test]
+fn test_permanent_suspend_errors_without_storage() {
+    use feldera_types::suspend::PermanentSuspendError;
+
+    init_test_logger();
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    temp_input_file
+        .as_file()
+        .write_all(b"1,true,,foo\n")
+        .unwrap();
+
+    // Storage explicitly disabled — pipeline cannot checkpoint.
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_no_storage",
+        "workers": 1,
+        "storage": false,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": false
+                    }
+                },
+                "format": {
+                    "name": "csv"
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            Ok(test_circuit::<TestStruct>(
+                circuit_config,
+                &TestStruct::schema(),
+                &[None],
+            ))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+    wait(|| controller.pipeline_complete(), DEFAULT_TIMEOUT_MS).unwrap();
+
+    // With storage disabled, permanent_suspend_errors should report StorageRequired.
+    let errors = controller.permanent_suspend_errors();
+    assert!(
+        errors.is_some(),
+        "expected permanent errors with storage disabled"
+    );
+    let errors = errors.unwrap();
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, PermanentSuspendError::StorageRequired)),
+        "expected StorageRequired error in {errors:?}"
+    );
+
+    // checkpoint_activity should still be Idle (no checkpoint was requested).
+    let activity = controller.checkpoint_activity();
+    assert!(
+        matches!(
+            activity,
+            feldera_types::checkpoint::CheckpointActivity::Idle
+        ),
+        "expected Idle, got {activity:?}"
+    );
+
+    controller.stop().unwrap();
 }

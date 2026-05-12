@@ -15,10 +15,8 @@ import java.util.List;
 
 /** An operator whose input contains all interned strings.
  * Behaves like a sink which is always live.
- * Does not correspond to a DBSP operator.
- * This operator is purely incremental; in non-incremental circuits
- * it must be preceded by a differentiator. */
-public class DBSPInternOperator extends DBSPUnaryOperator {
+ * Does not correspond to a DBSP operator. */
+public class DBSPInternOperator extends DBSPUnaryOperator implements ILinear {
     public DBSPInternOperator(OutputPort source) {
         super(CalciteEmptyRel.INSTANCE, "interned_strings", null, source.outputType(), false, source);
     }

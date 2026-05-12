@@ -217,30 +217,33 @@ public class PostgresIntervalTests extends SqlIoTest {
     public void testLimits() {
         this.qf("SELECT -(INTERVAL -2147483648 months)",
                 "Overflow during LongInterval negation");
-        this.qf("SELECT -(INTERVAL -9223372036854775.808 SECONDS)", "");
-        this.qf("SELECT -(INTERVAL -2147483648 days)", "");
-        this.qf("SELECT INTERVAL 2147483647 years", "Out of range");
+        this.qf("SELECT -(INTERVAL -9223372036854775.808 SECONDS)",
+                "overflow in short interval multiplication: result too large: OutOfRange");
+        this.qf("SELECT -(INTERVAL -2147483648 days)", "attempt to multiply with overflow");
+        // Last one is simplified to -1 by Calcite
+        this.qf("SELECT INTERVAL 2147483647 years", "attempt to multiply with overflow");
     }
 
     @Test
     public void testLimitsPositive() {
+        // Our limits are smaller than postgres, so this has been adapted
         this.qs("""
-                SELECT -(INTERVAL -2147483647 months);
+                SELECT -(INTERVAL -2147483 months);
                         ?column?
                 ------------------------
-                 178956970 years 7 months
+                 178956 years 11 months
                 (1 row)
 
-                SELECT -(INTERVAL -2147483647 days);
+                SELECT -(INTERVAL -2147483 days);
                     ?column?
                 -----------------
-                 2147483647 days
+                 2147483 days
                 (1 row)
 
-                SELECT -(INTERVAL -9223372036854.775807 SECONDS);
+                SELECT -(INTERVAL -92233720368.775807 SECONDS);
                         ?column?
                 -------------------------
-                 2562047788 hours 00 mins 54.775 secs
+                 25620477 hours 52 mins 48.775807 secs
                 (1 row)""");
     }
 
@@ -571,7 +574,7 @@ public class PostgresIntervalTests extends SqlIoTest {
                 SELECT CAST(CAST(INTERVAL '1 02:03:04.5' DAYS TO SECONDS AS INTERVAL DAYS TO SECONDS) AS VARCHAR);
                  x
                 ---
-                 +1 02:03:04.000000
+                 +1 02:03:04.500000
                 (1 row)
 
                 SELECT CAST(CAST(INTERVAL '1 02:03:04.5' DAYS TO SECONDS AS INTERVAL HOURS) AS VARCHAR);
@@ -589,7 +592,7 @@ public class PostgresIntervalTests extends SqlIoTest {
                 SELECT CAST(CAST(INTERVAL '1 02:03:04.5' DAYS TO SECONDS AS INTERVAL HOURS TO SECONDS) AS VARCHAR);
                  x
                 ---
-                 +26:03:04.000000
+                 +26:03:04.500000
                 (1 row)
                 
                 SELECT CAST(CAST(INTERVAL '1 02:03:04.5' DAYS TO SECONDS AS INTERVAL MINUTES) AS VARCHAR);
@@ -601,13 +604,13 @@ public class PostgresIntervalTests extends SqlIoTest {
                 SELECT CAST(CAST(INTERVAL '1 02:03:04.5' DAYS TO SECONDS AS INTERVAL MINUTES TO SECONDS) AS VARCHAR);
                  x
                 ---
-                 +1563:04.000000
+                 +1563:04.500000
                 (1 row)
                 
                 SELECT CAST(CAST(INTERVAL '1 02:03:04.5' DAYS TO SECONDS AS INTERVAL SECONDS) AS VARCHAR);
                  x
                 ---
-                 +93784.000000
+                 +93784.500000
                 (1 row)""");
     }
 
@@ -617,7 +620,7 @@ public class PostgresIntervalTests extends SqlIoTest {
                 SELECT CAST(INTERVAL '1 02:03:04.5' DAYS TO SECONDS AS VARCHAR);
                  x
                 ---
-                 +1 02:03:04.000000
+                 +1 02:03:04.500000
                 (1 row)
                 
                 SELECT CAST(INTERVAL '1' DAYS AS VARCHAR);
@@ -641,7 +644,7 @@ public class PostgresIntervalTests extends SqlIoTest {
                 SELECT CAST(INTERVAL '02:03:04.5' HOURS TO SECONDS AS VARCHAR);
                  x
                 ---
-                 +2:03:04.000000
+                 +2:03:04.500000
                 (1 row)
                 
                 SELECT CAST(INTERVAL '02:03' HOURS TO MINUTES AS VARCHAR);
@@ -671,7 +674,7 @@ public class PostgresIntervalTests extends SqlIoTest {
                 SELECT CAST(INTERVAL '-1 02:03:04.5' DAYS TO SECONDS AS VARCHAR);
                  x
                 ---
-                 -1 02:03:04.000000
+                 -1 02:03:04.500000
                 (1 row)
                 
                 SELECT CAST(INTERVAL '-1' DAYS AS VARCHAR);
@@ -713,7 +716,7 @@ public class PostgresIntervalTests extends SqlIoTest {
                 SELECT CAST(INTERVAL '-02:03:04.5' HOURS TO SECONDS AS VARCHAR);
                  x
                 ---
-                 -2:03:04.000000
+                 -2:03:04.500000
                 (1 row)
                 
                 SELECT CAST(INTERVAL '-4.000' SECONDS AS VARCHAR);

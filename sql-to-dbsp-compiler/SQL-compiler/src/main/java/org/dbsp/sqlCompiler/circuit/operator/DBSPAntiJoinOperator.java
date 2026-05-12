@@ -16,9 +16,9 @@ import java.util.List;
 
 /** Anti join operator: produces elements from the left stream that have no corresponding keys
  * in the right stream. */
-public final class DBSPAntiJoinOperator extends DBSPBinaryOperator {
+public final class DBSPAntiJoinOperator extends DBSPBinaryOperator implements IJoin, IIncremental {
     public DBSPAntiJoinOperator(CalciteRelNode node, OutputPort left, OutputPort right) {
-        super(node, "antijoin", null, left.outputType(), left.isMultiset(), left, right, true);
+        super(node, "antijoin", null, left.outputType(), left.isMultiset(), left, right);
         // Inputs must be indexed
         left.getOutputIndexedZSetType();
         right.getOutputIndexedZSetType();
@@ -26,7 +26,7 @@ public final class DBSPAntiJoinOperator extends DBSPBinaryOperator {
                 .keyType
                 .sameType(right.getOutputIndexedZSetType()
                         .keyType),
-                "Anti join key types to not match\n" +
+                () -> "Anti join key types to not match\n" +
                         left.getOutputIndexedZSetType().keyType + " and\n" +
                         right.getOutputIndexedZSetType().keyType);
     }

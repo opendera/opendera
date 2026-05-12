@@ -1,6 +1,9 @@
 use std::marker::PhantomData;
 
-use crate::dynamic::{Factory, WeightTrait};
+use crate::{
+    dynamic::{Factory, WeightTrait},
+    trace::cursor::Position,
+};
 
 use super::Cursor;
 
@@ -63,6 +66,10 @@ where
         panic!("CursorEmpty::weight")
     }
 
+    fn weight_checked(&mut self) -> &R {
+        panic!("CursorEmpty::weight_checked")
+    }
+
     fn step_key(&mut self) {
         panic!("CursorEmpty::step_key")
     }
@@ -73,7 +80,7 @@ where
 
     fn seek_key(&mut self, _key: &K) {}
 
-    fn seek_key_exact(&mut self, _key: &K) -> bool {
+    fn seek_key_exact(&mut self, _key: &K, _hash: Option<u64>) -> bool {
         false
     }
 
@@ -106,4 +113,11 @@ where
     fn seek_val_with_reverse(&mut self, _predicate: &dyn Fn(&V) -> bool) {}
 
     fn fast_forward_vals(&mut self) {}
+
+    fn position(&self) -> Option<Position> {
+        Some(Position {
+            total: 0,
+            offset: 0,
+        })
+    }
 }

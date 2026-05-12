@@ -4,17 +4,53 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{StreamExt, stream::FuturesUnordered};
 use rand::Rng;
 use rkyv::ser::Serializer;
 use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize};
 use size_of::SizeOf;
 
 use super::SpineCursor;
-use crate::dynamic::{DynVec, Factory};
-use crate::trace::cursor::{CursorFactory, CursorList};
-use crate::trace::{Batch, BatchReader, BatchReaderFactories, Cursor, Spine};
 use crate::NumEntries;
+use crate::dynamic::{DynVec, Factory};
+use crate::storage::file::FilterStats;
+use crate::trace::cursor::{CursorFactory, CursorList};
+use crate::trace::{
+    Batch, BatchReader, BatchReaderFactories, Cursor, Spine, merge_batches,
+    sample_keys_from_batches,
+};
+
+pub trait WithSnapshot: Sized {
+    type Batch: Batch;
+
+    fn into_ro_snapshot(self) -> SpineSnapshot<Self::Batch> {
+        self.ro_snapshot()
+    }
+
+    /// Returns a read-only, non-merging snapshot of the current trace
+    /// state.
+    fn ro_snapshot(&self) -> SpineSnapshot<Self::Batch>;
+}
+
+pub trait BatchReaderWithSnapshot:
+    BatchReader<
+        Key = <Self::Batch as BatchReader>::Key,
+        Val = <Self::Batch as BatchReader>::Val,
+        Time = <Self::Batch as BatchReader>::Time,
+        R = <Self::Batch as BatchReader>::R,
+    > + WithSnapshot
+{
+}
+
+impl<B> BatchReaderWithSnapshot for B where
+    B: BatchReader<
+            Key = <Self::Batch as BatchReader>::Key,
+            Val = <Self::Batch as BatchReader>::Val,
+            Time = <Self::Batch as BatchReader>::Time,
+            R = <Self::Batch as BatchReader>::R,
+        > + WithSnapshot
+{
+}
 
 #[derive(Clone, SizeOf)]
 pub struct SpineSnapshot<B>
@@ -26,9 +62,48 @@ where
     factories: B::Factories,
 }
 
+impl<B> WithSnapshot for SpineSnapshot<B>
+where
+    B: Batch + Send + Sync,
+{
+    type Batch = B;
+
+    fn into_ro_snapshot(self) -> SpineSnapshot<Self::Batch> {
+        self
+    }
+
+    fn ro_snapshot(&self) -> SpineSnapshot<B> {
+        self.clone()
+    }
+}
+
+impl<B> WithSnapshot for B
+where
+    B: Batch,
+{
+    type Batch = B;
+    fn into_ro_snapshot(self) -> SpineSnapshot<B> {
+        let factories = self.factories();
+
+        SpineSnapshot {
+            batches: vec![Arc::new(self)],
+            factories,
+        }
+    }
+
+    fn ro_snapshot(&self) -> SpineSnapshot<Self::Batch> {
+        SpineSnapshot {
+            batches: vec![Arc::new(self.clone())],
+            factories: self.factories(),
+        }
+    }
+}
+
 impl<B: Batch + Send + Sync> Debug for SpineSnapshot<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpineSnapshot").finish()
+        f.debug_struct("SpineSnapshot")
+            .field("batches", &self.batches)
+            .finish()
     }
 }
 
@@ -43,8 +118,52 @@ where
         }
     }
 
+    pub fn with_batches(factories: &B::Factories, batches: Vec<Arc<B>>) -> Self {
+        Self {
+            batches,
+            factories: factories.clone(),
+        }
+    }
+
     pub fn extend(&mut self, other: Self) {
         self.batches.extend(other.batches.iter().cloned())
+    }
+
+    pub fn extend_with_batches<I>(&mut self, batches: I)
+    where
+        I: IntoIterator<Item = Arc<B>>,
+    {
+        self.batches.extend(batches);
+    }
+
+    pub fn concat<'a, I>(factories: B::Factories, snapshots: I) -> Self
+    where
+        I: IntoIterator<Item = &'a Self>,
+    {
+        Self {
+            batches: snapshots
+                .into_iter()
+                .flat_map(|snapshot| snapshot.batches.iter().cloned())
+                .collect::<Vec<_>>(),
+            factories,
+        }
+    }
+
+    pub fn batches(&self) -> &[Arc<B>] {
+        &self.batches
+    }
+
+    pub fn consolidate(&self) -> B {
+        merge_batches(
+            &self.factories,
+            self.batches().iter().map(|b| b.as_ref().clone()),
+            &None,
+            &None,
+        )
+    }
+
+    pub fn into_batches(self) -> Vec<Arc<B>> {
+        self.batches
     }
 }
 
@@ -111,13 +230,41 @@ where
             .fold(0, |acc, batch| acc + batch.approximate_byte_size())
     }
 
-    fn sample_keys<RG>(&self, _rng: &mut RG, _sample_size: usize, _sample: &mut DynVec<Self::Key>)
+    fn membership_filter_stats(&self) -> FilterStats {
+        self.batches
+            .iter()
+            .map(|b| b.membership_filter_stats())
+            .sum()
+    }
+
+    fn range_filter_stats(&self) -> FilterStats {
+        self.batches.iter().map(|b| b.range_filter_stats()).sum()
+    }
+
+    fn sample_keys<RG>(&self, rng: &mut RG, sample_size: usize, sample: &mut DynVec<Self::Key>)
     where
-        Self::Time: PartialEq<()>,
         RG: Rng,
     {
-        // This method probably shouldn't be in the BatchReader
-        unimplemented!("Shouldn't be called on a snapshot");
+        let total_keys = self
+            .batches
+            .iter()
+            .map(|batch| batch.key_count())
+            .sum::<usize>();
+        let batch_refs: Vec<_> = self.batches.iter().map(Arc::as_ref).collect();
+        sample_keys_from_batches(
+            &self.factories,
+            &batch_refs,
+            rng,
+            |batch| {
+                if sample_size == 0 || total_keys == 0 {
+                    0
+                } else {
+                    ((batch.key_count() as u128) * (sample_size as u128) / (total_keys as u128))
+                        as usize
+                }
+            },
+            sample,
+        );
     }
 
     async fn fetch<K>(

@@ -1,19 +1,25 @@
-from feldera.rest import FelderaClient
+import logging
 import os
-import unittest
 
-BASE_URL = os.environ.get("FELDERA_BASE_URL", "http://localhost:8080")
-KAFKA_SERVER = os.environ.get("FELDERA_KAFKA_SERVER", "localhost:19092")
-PIPELINE_TO_KAFKA_SERVER = os.environ.get(
-    "FELDERA_PIPELINE_TO_KAFKA_SERVER", "redpanda:9092"
+from feldera.testutils import (
+    API_KEY,
+    BASE_URL,
+    FELDERA_REQUESTS_VERIFY,
+    TEST_CLIENT,
+    enterprise_only,
+    skip_on_arm64,
+    unique_pipeline_name,
 )
 
-TEST_CLIENT = FelderaClient(BASE_URL)
+LOGLEVEL = os.environ.get("LOGLEVEL", "INFO").upper()
+logging.basicConfig(level=LOGLEVEL)
 
-
-def enterprise_only(fn):
-    fn._enterprise_only = True
-    return unittest.skipUnless(
-        TEST_CLIENT.get_config().edition.is_enterprise(),
-        f"{fn.__name__} is enterprise only, skipping",
-    )(fn)
+__all__ = [
+    "TEST_CLIENT",
+    "unique_pipeline_name",
+    "enterprise_only",
+    "skip_on_arm64",
+    "API_KEY",
+    "BASE_URL",
+    "FELDERA_REQUESTS_VERIFY",
+]

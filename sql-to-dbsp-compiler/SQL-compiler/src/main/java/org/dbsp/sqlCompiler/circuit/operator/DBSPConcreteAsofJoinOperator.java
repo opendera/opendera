@@ -21,7 +21,7 @@ import java.util.Objects;
 
 /** This operator is purely incremental, it does not have a non-incremental form.
  * It corresponds to the DBSP asof_join operator. */
-public final class DBSPConcreteAsofJoinOperator extends DBSPJoinBaseOperator {
+public final class DBSPConcreteAsofJoinOperator extends DBSPJoinBaseOperator implements IIncremental {
     // Usually a DBSPComparatorExpression; currently not used
     // https://github.com/feldera/feldera/issues/2212
     public final DBSPExpression comparator;
@@ -50,7 +50,7 @@ public final class DBSPConcreteAsofJoinOperator extends DBSPJoinBaseOperator {
                                         DBSPExpression comparator,
                                         boolean isMultiset, boolean isLeft,
                                         OutputPort left, OutputPort right) {
-        super(node, "asof_join", function, outputType, isMultiset, left, right);
+        super(node, "asof_join", function, outputType, isMultiset, left, right, false);
         this.isLeft = isLeft;
         this.comparator = comparator;
         this.leftTimestamp = leftTimestamp;

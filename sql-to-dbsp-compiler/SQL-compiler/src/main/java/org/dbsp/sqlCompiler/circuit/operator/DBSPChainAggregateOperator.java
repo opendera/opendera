@@ -12,6 +12,7 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeWeight;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
@@ -19,19 +20,24 @@ import java.util.List;
 
 /** Corresponds to the DBSP chain_aggregate operator.
  * Used to implement min and max for append-only collections with O(1) space and time. */
-public class DBSPChainAggregateOperator extends DBSPUnaryOperator {
+public class DBSPChainAggregateOperator extends DBSPUnaryOperator implements ILinearAggregate {
     public final DBSPClosureExpression init;
 
     public DBSPChainAggregateOperator(CalciteRelNode node, DBSPClosureExpression init,
                                       DBSPClosureExpression function, DBSPType outputType, OutputPort source) {
-        super(node, "chain_aggregate", function, outputType, false, source, true);
+        super(node, "chain_aggregate", function, outputType, false, source);
         this.init = init;
         Utilities.enforce(init.parameters.length == 2);
         Utilities.enforce(function.parameters.length == 3);
         Utilities.enforce(init.getResultType().sameType(function.getResultType()));
+        Utilities.enforce(init.getResultType().sameType(function.parameters[0].getType()));
+        Utilities.enforce(init.parameters[0].getType().sameType(function.parameters[1].getType()));
+        Utilities.enforce(init.parameters[1].getType().sameType(DBSPTypeWeight.INSTANCE));
+        Utilities.enforce(function.parameters[2].getType().sameType(DBSPTypeWeight.INSTANCE));
         Utilities.enforce(outputType.is(DBSPTypeIndexedZSet.class));
         Utilities.enforce(source.outputType().is(DBSPTypeIndexedZSet.class));
         Utilities.enforce(source.getOutputIndexedZSetType().keyType.sameType(this.getOutputIndexedZSetType().keyType));
+        Utilities.enforce(source.getOutputIndexedZSetType().elementType.ref().sameType(init.parameters[0].getType()));
         this.checkResultType(function, this.getOutputIndexedZSetType().elementType);
     }
 

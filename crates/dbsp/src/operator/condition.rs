@@ -1,11 +1,15 @@
 //! Create subcircuits that iterate until a specified condition
 //! defined over the contents of a stream is satisfied.
 
-use crate::circuit::{
-    schedule::{Error as SchedulerError, Scheduler},
-    ChildCircuit, Circuit, Stream, WithClock,
+use crate::{
+    Timestamp,
+    circuit::{
+        ChildCircuit, Circuit, Stream,
+        circuit_builder::IterativeCircuit,
+        schedule::{Error as SchedulerError, Scheduler},
+    },
 };
-use std::{cell::RefCell, marker::PhantomData, rc::Rc};
+use std::{cell::Cell, marker::PhantomData, rc::Rc};
 
 impl<C, D> Stream<C, D>
 where
@@ -23,16 +27,17 @@ where
     where
         F: 'static + Fn(&D) -> bool,
     {
-        let cond = Rc::new(RefCell::new(false));
+        let cond = Rc::new(Cell::new(false));
         let cond_clone = cond.clone();
-        self.inspect(move |v| *cond_clone.borrow_mut() = condition_func(v));
+        self.inspect(move |v| cond_clone.set(condition_func(v)));
         Condition::new(cond)
     }
 }
 
-impl<P> ChildCircuit<P>
+impl<P, T> ChildCircuit<P, T>
 where
-    P: WithClock,
+    P: 'static,
+    T: Timestamp,
     Self: Circuit,
 {
     /// Create a subcircuit that iterates until a condition is satisfied.
@@ -47,11 +52,11 @@ where
     /// condition on each iteration and an arbitrary user-defined return
     /// value that typically contains output streams of the child.
     /// The subcircuit will iterate until the condition returns true.
-    pub fn iterate_with_condition<F, T>(&self, constructor: F) -> Result<T, SchedulerError>
+    pub fn iterate_with_condition<F, V>(&self, constructor: F) -> Result<V, SchedulerError>
     where
         F: FnOnce(
-            &mut ChildCircuit<Self>,
-        ) -> Result<(Condition<ChildCircuit<Self>>, T), SchedulerError>,
+            &mut IterativeCircuit<Self>,
+        ) -> Result<(Condition<IterativeCircuit<Self>>, V), SchedulerError>,
     {
         self.iterate(|child| {
             let (condition, res) = constructor(child)?;
@@ -61,14 +66,14 @@ where
 
     /// Similar to `Self::iterate_with_condition`, but with a user-specified
     /// [`Scheduler`].
-    pub fn iterate_with_condition_and_scheduler<F, T, S>(
+    pub fn iterate_with_condition_and_scheduler<F, V, S>(
         &self,
         constructor: F,
-    ) -> Result<T, SchedulerError>
+    ) -> Result<V, SchedulerError>
     where
         F: FnOnce(
-            &mut ChildCircuit<Self>,
-        ) -> Result<(Condition<ChildCircuit<Self>>, T), SchedulerError>,
+            &mut IterativeCircuit<Self>,
+        ) -> Result<(Condition<IterativeCircuit<Self>>, V), SchedulerError>,
         S: Scheduler + 'static,
     {
         self.iterate_with_scheduler::<_, _, _, S>(|child| {
@@ -83,11 +88,11 @@ where
     /// Similar to `Self::iterate_with_condition`, but allows the subcircuit to
     /// have multiple conditions.  The subcircuit will iterate until _all_
     /// conditions are satisfied _simultaneously_ in the same clock cycle.
-    pub fn iterate_with_conditions<F, T>(&self, constructor: F) -> Result<T, SchedulerError>
+    pub fn iterate_with_conditions<F, V>(&self, constructor: F) -> Result<V, SchedulerError>
     where
         F: FnOnce(
-            &mut ChildCircuit<Self>,
-        ) -> Result<(Vec<Condition<ChildCircuit<Self>>>, T), SchedulerError>,
+            &mut IterativeCircuit<Self>,
+        ) -> Result<(Vec<Condition<IterativeCircuit<Self>>>, V), SchedulerError>,
     {
         self.iterate(|child| {
             let (conditions, res) = constructor(child)?;
@@ -100,14 +105,14 @@ where
 
     /// Similar to `Self::iterate_with_conditions`, but with a user-specified
     /// [`Scheduler`].
-    pub fn iterate_with_conditions_and_scheduler<F, T, S>(
+    pub fn iterate_with_conditions_and_scheduler<F, V, S>(
         &self,
         constructor: F,
-    ) -> Result<T, SchedulerError>
+    ) -> Result<V, SchedulerError>
     where
         F: FnOnce(
-            &mut ChildCircuit<Self>,
-        ) -> Result<(Vec<Condition<ChildCircuit<Self>>>, T), SchedulerError>,
+            &mut IterativeCircuit<Self>,
+        ) -> Result<(Vec<Condition<IterativeCircuit<Self>>>, V), SchedulerError>,
         S: 'static + Scheduler,
     {
         self.iterate_with_scheduler::<_, _, _, S>(|child| {
@@ -127,12 +132,12 @@ where
 ///
 /// A condition is created by the [`Stream::condition`] method.
 pub struct Condition<C> {
-    cond: Rc<RefCell<bool>>,
+    cond: Rc<Cell<bool>>,
     _phantom: PhantomData<C>,
 }
 
 impl<C> Condition<C> {
-    fn new(cond: Rc<RefCell<bool>>) -> Self {
+    fn new(cond: Rc<Cell<bool>>) -> Self {
         Self {
             cond,
             _phantom: PhantomData,
@@ -140,19 +145,23 @@ impl<C> Condition<C> {
     }
 
     fn check(&self) -> bool {
-        *self.cond.borrow()
+        self.cond.get()
     }
 }
 
 #[cfg(test)]
 mod test {
     use crate::{
-        circuit::schedule::{DynamicScheduler, Scheduler},
+        Circuit, RootCircuit, Stream,
+        circuit::{
+            circuit_builder::IterativeCircuit,
+            schedule::{DynamicScheduler, Scheduler},
+        },
         monitor::TraceMonitor,
         operator::{DelayedFeedback, Generator},
         typed_batch::{OrdIndexedZSet, OrdZSet},
         utils::Tup2,
-        zset, ChildCircuit, Circuit, RootCircuit, Stream,
+        zset,
     };
 
     #[test]
@@ -212,7 +221,7 @@ mod test {
                     //
                     // where suc computes the set of successor nodes.
                     let reachable_circuit =
-                        |init: Stream<ChildCircuit<RootCircuit>, OrdZSet<u64>>| {
+                        |init: Stream<IterativeCircuit<RootCircuit>, OrdZSet<u64>>| {
                             let feedback = <DelayedFeedback<_, OrdZSet<u64>>>::new(child);
 
                             let feedback_pairs: Stream<_, OrdZSet<(u64, ())>> =
@@ -246,7 +255,7 @@ mod test {
         .0;
 
         for _ in 0..3 {
-            circuit.step().unwrap();
+            circuit.transaction().unwrap();
         }
     }
 }

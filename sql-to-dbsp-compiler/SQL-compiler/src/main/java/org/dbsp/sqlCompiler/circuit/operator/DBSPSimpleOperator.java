@@ -6,6 +6,7 @@ import org.dbsp.sqlCompiler.circuit.annotation.Annotations;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
 import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteRelNode;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
@@ -46,31 +47,30 @@ public abstract class DBSPSimpleOperator extends DBSPOperator
     /** Type of output produced. */
     public final DBSPType outputType;
     /** True if the output of the operator is a multiset.  Conservative approximation;
-     * if this is 'false', it is surely false.  It if is true, the output may still be a set. */
+     * if this is 'false', it is surely false.  If it is true, the output may still be a set. */
     public final boolean isMultiset;
-    @Nullable
-    public final String comment;
-    /** True if the operator contains an integrator */
-    public final boolean containsIntegrator;
 
     protected DBSPSimpleOperator(CalciteRelNode node, String operation,
                                  @Nullable DBSPExpression function, DBSPType outputType,
-                                 boolean isMultiset, @Nullable String comment,
-                                 boolean containsIntegrator) {
-        super(node);
+                                 boolean isMultiset, @Nullable String comment) {
+        super(node, comment);
         this.operation = operation;
         this.function = function;
         this.outputType = outputType;
         this.isMultiset = isMultiset;
-        this.comment = comment;
-        this.containsIntegrator = containsIntegrator;
         if (!operation.startsWith("waterline") &&
                 !operation.startsWith("apply") &&
-                !operation.startsWith("delay") &&
+                !operation.startsWith("transaction_delay") &&
                 !outputType.is(DBSPTypeZSet.class) &&
                 !outputType.is(DBSPTypeIndexedZSet.class))
             throw new InternalCompilerError("Operator " + operation +
                     " output type is unexpected " + outputType);
+    }
+
+    public CalciteObject getFunctionNode() {
+        if (this.function == null)
+            return CalciteObject.EMPTY;
+        return this.getFunction().getNode();
     }
 
     @Override
@@ -98,9 +98,8 @@ public abstract class DBSPSimpleOperator extends DBSPOperator
 
     public DBSPSimpleOperator(CalciteRelNode node, String operation,
                               @Nullable DBSPExpression function,
-                              DBSPType outputType, boolean isMultiset,
-                              boolean containsIntegrator) {
-        this(node, operation, function, outputType, isMultiset, null, containsIntegrator);
+                              DBSPType outputType, boolean isMultiset) {
+        this(node, operation, function, outputType, isMultiset, null);
     }
 
     public DBSPSimpleOperator copyAnnotations(DBSPSimpleOperator source) {
@@ -128,20 +127,23 @@ public abstract class DBSPSimpleOperator extends DBSPOperator
      * @param inputs      New inputs.
      * @param force       If false and all fields are the same, return original. */
     @CheckReturnValue
-    public abstract DBSPSimpleOperator with(
+    public abstract DBSPOperator with(
             @Nullable DBSPExpression function,
             DBSPType outputType,
             List<OutputPort> inputs,
             boolean force);
 
     @CheckReturnValue
-    public DBSPSimpleOperator withFunction(@Nullable DBSPExpression function, DBSPType outputType) {
+    public DBSPOperator withFunction(
+            @Nullable DBSPExpression function, DBSPType outputType) {
         return this.with(function, outputType, this.inputs, false);
     }
 
     protected void checkParameterCount(DBSPExpression function, int expected) {
         DBSPClosureExpression closure = function.to(DBSPClosureExpression.class);
-        Utilities.enforce(closure.parameters.length == expected);
+        Utilities.enforce(closure.parameters.length == expected,
+                () -> "Expected function with " + expected +
+                        " parameters, but got instead " + closure.parameters.length);
     }
 
     public DBSPTypeIndexedZSet getOutputIndexedZSetType() {
@@ -193,7 +195,8 @@ public abstract class DBSPSimpleOperator extends DBSPOperator
     }
 
     public DBSPExpression getFunction() {
-        return Objects.requireNonNull(this.function);
+        Utilities.enforce(this.function != null);
+        return this.function;
     }
 
     public DBSPClosureExpression getClosureFunction() {
@@ -205,12 +208,16 @@ public abstract class DBSPSimpleOperator extends DBSPOperator
      * @param force      If true always return a new operator.
      *                   If false and the inputs are the same this may return this.
      */
-    public final DBSPSimpleOperator withInputs(List<OutputPort> newInputs, boolean force) {
+    @Override
+    public final DBSPOperator withInputs(List<OutputPort> newInputs, boolean force) {
         return this.with(this.function, this.outputType, newInputs, force);
     }
 
     protected boolean mustReplace(boolean force, @Nullable DBSPExpression function, List<OutputPort> inputs, DBSPType outputType) {
-        return force || function != this.function || this.inputsDiffer(inputs) || !this.outputType.sameType(outputType);
+        return force ||
+                function != this.function ||
+                this.inputsDiffer(inputs) ||
+                !this.outputType.sameType(outputType);
     }
 
     public String getOutputName() {
