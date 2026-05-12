@@ -20,7 +20,7 @@
 
 use std::fmt::{self, Debug};
 use std::io::ErrorKind;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use feldera_storage::block::BlockLocation;
@@ -33,8 +33,17 @@ use feldera_storage::{
 };
 use feldera_types::config::{ObjectStorageConfig, StorageBackendConfig, StorageConfig};
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, PutPayload, parse_url_opts};
+use object_store::{MultipartUpload, ObjectStore, PutPayload, parse_url_opts};
 use url::Url;
+
+/// Threshold above which writes are streamed via multipart upload rather
+/// than buffered in memory for a single PUT.
+///
+/// S3 requires non-final parts to be at least 5 MiB; we pick 8 MiB to
+/// give some slack and reduce the number of part requests for typical
+/// checkpoint shard sizes. Below this threshold a single PUT is used,
+/// which is cheaper for small files (one round trip instead of three).
+const MULTIPART_THRESHOLD: usize = 8 * 1024 * 1024;
 
 use feldera_storage::tokio::TOKIO_DEDICATED_IO;
 
@@ -106,9 +115,9 @@ impl StorageBackend for ObjectStoreBackend {
             path: absolute_path(&self.base, name),
             relative: name.clone(),
             id: next_file_id(),
-            buffer: Vec::new(),
+            state: WriterState::Pending(Vec::new()),
+            bytes_written: 0,
             usage: self.usage.clone(),
-            completed: false,
         }))
     }
 
@@ -189,23 +198,54 @@ impl StorageBackend for ObjectStoreBackend {
     }
 }
 
-/// File writer that buffers all writes in memory and uploads as a single
-/// PUT on `complete()`. Multipart uploads for large files are a TODO.
+/// Backing state for `ObjectStoreFileWriter`. The writer starts in
+/// `Pending` (buffering in memory). The first time the buffer exceeds
+/// `MULTIPART_THRESHOLD`, the writer initiates a multipart upload and
+/// transitions to `Streaming`; subsequent writes accumulate into the
+/// part buffer and are flushed as parts whenever they reach the
+/// threshold. `complete()` either does a single PUT (if still pending)
+/// or uploads the final part and completes the multipart.
+enum WriterState {
+    /// No multipart upload started yet; bytes accumulated in this buffer.
+    Pending(Vec<u8>),
+    /// Multipart upload in progress; `part_buffer` holds bytes for the
+    /// next part not yet flushed. The upload is held in a `Mutex` only
+    /// because `MultipartUpload: Send` (not `Sync`) and `FileWriter`
+    /// requires `Sync`; only one thread ever calls into the writer at a
+    /// time, so the mutex is uncontended.
+    Streaming {
+        upload: Mutex<Box<dyn MultipartUpload>>,
+        part_buffer: Vec<u8>,
+    },
+    /// `complete()` has been called and the writer is consumed.
+    Done,
+}
+
+/// File writer that streams data to object storage. Uses a single PUT
+/// for small files (cheaper) and switches to multipart upload at
+/// `MULTIPART_THRESHOLD` bytes for large files (bounded memory,
+/// supports > 5 GiB).
 struct ObjectStoreFileWriter {
     store: Arc<dyn ObjectStore>,
     path: ObjPath,
     relative: StoragePath,
     id: FileId,
-    buffer: Vec<u8>,
+    state: WriterState,
+    bytes_written: u64,
     usage: Arc<AtomicI64>,
-    completed: bool,
 }
 
 impl Debug for ObjectStoreFileWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let buffered = match &self.state {
+            WriterState::Pending(b) => b.len(),
+            WriterState::Streaming { part_buffer, .. } => part_buffer.len(),
+            WriterState::Done => 0,
+        };
         f.debug_struct("ObjectStoreFileWriter")
             .field("path", &self.path.as_ref())
-            .field("buffered_bytes", &self.buffer.len())
+            .field("bytes_written", &self.bytes_written)
+            .field("part_buffered", &buffered)
             .finish()
     }
 }
@@ -219,18 +259,98 @@ impl FileRw for ObjectStoreFileWriter {
     }
 }
 
+impl ObjectStoreFileWriter {
+    /// Drain `part_buffer` and upload its current contents as a single
+    /// multipart part. Called whenever the buffer crosses the threshold
+    /// during `write_block`.
+    fn flush_part(&mut self) -> Result<(), StorageError> {
+        if let WriterState::Streaming { upload, part_buffer } = &mut self.state {
+            if part_buffer.is_empty() {
+                return Ok(());
+            }
+            let payload = PutPayload::from(std::mem::take(part_buffer));
+            let mut upload = upload.lock().unwrap();
+            TOKIO_DEDICATED_IO.block_on(upload.put_part(payload))?;
+        }
+        Ok(())
+    }
+}
+
 impl FileWriter for ObjectStoreFileWriter {
     fn write_block(&mut self, data: FBuf) -> Result<Arc<FBuf>, StorageError> {
-        self.buffer.extend_from_slice(data.as_slice());
+        self.bytes_written += data.as_slice().len() as u64;
+
+        // Append to whichever buffer is active.
+        match &mut self.state {
+            WriterState::Pending(buf) => buf.extend_from_slice(data.as_slice()),
+            WriterState::Streaming { part_buffer, .. } => {
+                part_buffer.extend_from_slice(data.as_slice())
+            }
+            WriterState::Done => {
+                return Err(StorageError::stdio(
+                    std::io::ErrorKind::Other,
+                    "write_block after complete",
+                    self.path.as_ref().to_string(),
+                ));
+            }
+        }
+
+        // If still pending and we've crossed the threshold, promote to
+        // multipart streaming and flush the pending bytes as the first
+        // part.
+        let should_upgrade = matches!(
+            &self.state,
+            WriterState::Pending(buf) if buf.len() >= MULTIPART_THRESHOLD
+        );
+        if should_upgrade {
+            let pending = match std::mem::replace(&mut self.state, WriterState::Done) {
+                WriterState::Pending(buf) => buf,
+                _ => unreachable!(),
+            };
+            let upload = TOKIO_DEDICATED_IO.block_on(self.store.put_multipart(&self.path))?;
+            self.state = WriterState::Streaming {
+                upload: Mutex::new(upload),
+                part_buffer: pending,
+            };
+            self.flush_part()?;
+        } else if let WriterState::Streaming { part_buffer, .. } = &self.state
+            && part_buffer.len() >= MULTIPART_THRESHOLD
+        {
+            self.flush_part()?;
+        }
+
         Ok(Arc::new(data))
     }
 
     fn complete(mut self: Box<Self>) -> Result<Arc<dyn FileReader>, StorageError> {
-        let buf = std::mem::take(&mut self.buffer);
-        let size = buf.len() as u64;
-        let payload = PutPayload::from(buf);
-        TOKIO_DEDICATED_IO.block_on(self.store.put(&self.path, payload))?;
-        self.completed = true;
+        let size = self.bytes_written;
+        match std::mem::replace(&mut self.state, WriterState::Done) {
+            WriterState::Pending(buf) => {
+                // Single-PUT path: cheaper for small files.
+                TOKIO_DEDICATED_IO.block_on(self.store.put(&self.path, PutPayload::from(buf)))?;
+            }
+            WriterState::Streaming {
+                upload,
+                part_buffer,
+            } => {
+                // Upload any remaining bytes as the final part (last part
+                // has no minimum size), then close the upload.
+                let mut upload = upload.into_inner().unwrap();
+                if !part_buffer.is_empty() {
+                    TOKIO_DEDICATED_IO
+                        .block_on(upload.put_part(PutPayload::from(part_buffer)))?;
+                }
+                TOKIO_DEDICATED_IO.block_on(upload.complete())?;
+            }
+            WriterState::Done => {
+                return Err(StorageError::stdio(
+                    std::io::ErrorKind::Other,
+                    "complete called twice",
+                    self.path.as_ref().to_string(),
+                ));
+            }
+        }
+
         self.usage.fetch_add(size as i64, Ordering::Relaxed);
         Ok(Arc::new(ObjectStoreFileReader {
             store: self.store.clone(),
@@ -244,15 +364,18 @@ impl FileWriter for ObjectStoreFileWriter {
 
 impl Drop for ObjectStoreFileWriter {
     fn drop(&mut self) {
-        // If the writer was dropped without completing, no remote object
-        // exists yet, so nothing to delete. The buffered bytes will be
-        // freed normally.
-        if !self.completed {
-            tracing::debug!(
-                "ObjectStoreFileWriter for {} dropped without complete; \
-                 nothing was uploaded",
-                self.path
-            );
+        // If the writer is dropped without completing, abort any
+        // in-flight multipart upload to avoid leaking S3 storage charges
+        // for orphaned parts.
+        if let WriterState::Streaming { upload, .. } = &mut self.state {
+            let mut upload = upload.lock().unwrap();
+            if let Err(err) = TOKIO_DEDICATED_IO.block_on(upload.abort()) {
+                tracing::debug!(
+                    "ObjectStoreFileWriter for {} dropped during multipart upload; \
+                     abort failed: {err}",
+                    self.path
+                );
+            }
         }
     }
 }
@@ -406,5 +529,49 @@ mod tests {
 
         // Delete of a missing file is idempotent.
         backend.delete_if_exists(&name).expect("delete_if_exists");
+    }
+
+    /// Force the writer onto the multipart path by writing a payload
+    /// larger than `MULTIPART_THRESHOLD`. Verifies the streaming code
+    /// path against `object_store::memory::InMemory` (which supports
+    /// multipart). The byte-for-byte round trip catches any part
+    /// boundary or ordering bug.
+    #[test]
+    fn multipart_streaming_round_trip() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let backend = ObjectStoreBackend::new_with_store(store, ObjPath::from("pipeline-mp"));
+
+        // Build ~20 MiB of payload across multiple write_block calls,
+        // each one well below the threshold, so the writer accumulates,
+        // crosses the threshold once, and then flushes parts on the way
+        // through.
+        let name: StoragePath = ObjPath::from("large.bin").into();
+        let mut writer = backend.create_named(&name).expect("create_named");
+        let chunk = vec![0x41u8; 2 * 1024 * 1024]; // 2 MiB
+        for i in 0..10u8 {
+            let mut data = FBuf::new();
+            // Stamp the chunk index in the first byte so we can detect
+            // ordering bugs at read time.
+            let mut block = chunk.clone();
+            block[0] = i;
+            data.extend_from_slice(&block);
+            writer.write_block(data).expect("write_block");
+        }
+        let reader = writer.complete().expect("complete");
+
+        let total = reader.get_size().unwrap();
+        assert_eq!(total, 20 * 1024 * 1024);
+
+        // Read back the stamps at each chunk boundary and verify order.
+        for i in 0..10u64 {
+            let offset = i * 2 * 1024 * 1024;
+            let block = reader
+                .read_block(BlockLocation {
+                    offset,
+                    size: 512,
+                })
+                .expect("read_block");
+            assert_eq!(block.as_slice()[0], i as u8, "chunk {i} out of order");
+        }
     }
 }
