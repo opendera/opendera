@@ -1,8 +1,6 @@
 use crate::api::error::ApiError;
 use crate::api::examples;
 use crate::api::main::ServerState;
-#[cfg(not(feature = "feldera-enterprise"))]
-use crate::common_error::CommonError;
 use crate::db::error::DBError;
 use crate::db::storage::Storage;
 use crate::db::types::combined_status::{combine_since, CombinedDesiredStatus, CombinedStatus};
@@ -16,7 +14,6 @@ use crate::db::types::tenant::TenantId;
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use crate::has_unstable_feature;
-#[cfg(feature = "feldera-enterprise")]
 use actix_web::http::Method;
 use actix_web::{
     delete, get,
@@ -36,7 +33,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-#[cfg(feature = "feldera-enterprise")]
 use std::time::Duration;
 use tracing::{debug, error, info};
 use utoipa::{IntoParams, ToSchema};
@@ -1508,64 +1504,55 @@ pub(crate) async fn post_pipeline_stop(
         );
         Ok(HttpResponse::Accepted().json(json!("Pipeline is forcefully stopping")))
     } else {
-        #[cfg(not(feature = "feldera-enterprise"))]
-        {
-            Err(ManagerError::from(CommonError::EnterpriseFeature {
-                feature: "stop?force=false".to_string(),
-            }))?
-        }
-        #[cfg(feature = "feldera-enterprise")]
-        {
-            let (was_set, pipeline_id) = state
+        let (was_set, pipeline_id) = state
+            .db
+            .lock()
+            .await
+            .set_deployment_resources_desired_status_stopped_if_not_provisioned(
+                *tenant_id,
+                &pipeline_name,
+            )
+            .await?;
+        if was_set {
+            info!(
+                pipeline_id = %pipeline_id,
+                pipeline = %pipeline_name,
+                tenant = %tenant_id.0,
+                "Accepted action: going to forcefully stop pipeline because it is not provisioned"
+            );
+            Ok(HttpResponse::Accepted().json(json!("Pipeline is forcefully stopping")))
+        } else {
+            let response = state
+                .runner
+                .forward_http_request_to_pipeline_by_name(
+                    _client.as_ref(),
+                    *tenant_id,
+                    &pipeline_name,
+                    Method::POST,
+                    "suspend",
+                    "",
+                    Some(Duration::from_secs(120)),
+                    None,
+                )
+                .await;
+            state
                 .db
                 .lock()
                 .await
-                .set_deployment_resources_desired_status_stopped_if_not_provisioned(
-                    *tenant_id,
-                    &pipeline_name,
-                )
+                .increment_notify_counter(*tenant_id, &pipeline_name)
                 .await?;
-            if was_set {
+            if response
+                .as_ref()
+                .is_ok_and(|v| v.status() == actix_web::http::StatusCode::ACCEPTED)
+            {
                 info!(
-                    pipeline_id = %pipeline_id,
                     pipeline = %pipeline_name,
+                    pipeline_id = %pipeline_id,
                     tenant = %tenant_id.0,
-                    "Accepted action: going to forcefully stop pipeline because it is not provisioned"
+                    "Accepted action: going to non-forcefully stop pipeline"
                 );
-                Ok(HttpResponse::Accepted().json(json!("Pipeline is forcefully stopping")))
-            } else {
-                let response = state
-                    .runner
-                    .forward_http_request_to_pipeline_by_name(
-                        _client.as_ref(),
-                        *tenant_id,
-                        &pipeline_name,
-                        Method::POST,
-                        "suspend",
-                        "",
-                        Some(Duration::from_secs(120)),
-                        None,
-                    )
-                    .await;
-                state
-                    .db
-                    .lock()
-                    .await
-                    .increment_notify_counter(*tenant_id, &pipeline_name)
-                    .await?;
-                if response
-                    .as_ref()
-                    .is_ok_and(|v| v.status() == actix_web::http::StatusCode::ACCEPTED)
-                {
-                    info!(
-                        pipeline = %pipeline_name,
-                        pipeline_id = %pipeline_id,
-                        tenant = %tenant_id.0,
-                        "Accepted action: going to non-forcefully stop pipeline"
-                    );
-                }
-                response
             }
+            response
         }
     }
 }

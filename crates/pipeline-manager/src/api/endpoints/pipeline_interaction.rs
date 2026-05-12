@@ -2,8 +2,6 @@
 use crate::api::error::ApiError;
 use crate::api::examples;
 use crate::api::main::ServerState;
-#[cfg(not(feature = "feldera-enterprise"))]
-use crate::common_error::CommonError;
 use crate::db::storage::Storage;
 use crate::db::types::tenant::TenantId;
 use crate::error::ManagerError;
@@ -1183,32 +1181,20 @@ pub(crate) async fn sync_checkpoint(
     path: web::Path<String>,
     request: HttpRequest,
 ) -> Result<HttpResponse, ManagerError> {
-    #[cfg(not(feature = "feldera-enterprise"))]
-    {
-        let _ = (state, tenant_id, path.into_inner(), request);
-        Err(CommonError::EnterpriseFeature {
-            feature: "checkpoint".to_string(),
-        }
-        .into())
-    }
-
-    #[cfg(feature = "feldera-enterprise")]
-    {
-        let pipeline_name = path.into_inner();
-        state
-            .runner
-            .forward_http_request_to_pipeline_by_name(
-                _client.as_ref(),
-                *tenant_id,
-                &pipeline_name,
-                Method::POST,
-                "checkpoint/sync",
-                request.query_string(),
-                Some(Duration::from_secs(120)),
-                None,
-            )
-            .await
-    }
+    let pipeline_name = path.into_inner();
+    state
+        .runner
+        .forward_http_request_to_pipeline_by_name(
+            _client.as_ref(),
+            *tenant_id,
+            &pipeline_name,
+            Method::POST,
+            "checkpoint/sync",
+            request.query_string(),
+            Some(Duration::from_secs(120)),
+            None,
+        )
+        .await
 }
 
 /// Checkpoint Now
@@ -1252,32 +1238,20 @@ pub(crate) async fn checkpoint_pipeline(
     path: web::Path<String>,
     request: HttpRequest,
 ) -> Result<HttpResponse, ManagerError> {
-    #[cfg(not(feature = "feldera-enterprise"))]
-    {
-        let _ = (state, tenant_id, path.into_inner(), request);
-        Err(CommonError::EnterpriseFeature {
-            feature: "checkpoint".to_string(),
-        }
-        .into())
-    }
-
-    #[cfg(feature = "feldera-enterprise")]
-    {
-        let pipeline_name = path.into_inner();
-        state
-            .runner
-            .forward_http_request_to_pipeline_by_name(
-                _client.as_ref(),
-                *tenant_id,
-                &pipeline_name,
-                Method::POST,
-                "checkpoint",
-                request.query_string(),
-                Some(Duration::from_secs(120)),
-                None,
-            )
-            .await
-    }
+    let pipeline_name = path.into_inner();
+    state
+        .runner
+        .forward_http_request_to_pipeline_by_name(
+            _client.as_ref(),
+            *tenant_id,
+            &pipeline_name,
+            Method::POST,
+            "checkpoint",
+            request.query_string(),
+            Some(Duration::from_secs(120)),
+            None,
+        )
+        .await
 }
 
 /// Get Checkpoint Status
@@ -1813,48 +1787,36 @@ pub(crate) async fn post_pipeline_activate(
     _query: web::Query<ActivateParams>,
     request: HttpRequest,
 ) -> Result<HttpResponse, ManagerError> {
-    #[cfg(not(feature = "feldera-enterprise"))]
-    {
-        let _ = (state, tenant_id, path.into_inner(), request);
-        Err(CommonError::EnterpriseFeature {
-            feature: "start from object store (S3)".to_string(),
-        }
-        .into())
-    }
+    let pipeline_name = path.into_inner();
+    let response = state
+        .runner
+        .forward_http_request_to_pipeline_by_name(
+            _client.as_ref(),
+            *tenant_id,
+            &pipeline_name,
+            Method::POST,
+            "activate",
+            request.query_string(),
+            None,
+            None,
+        )
+        .await?;
+    state
+        .db
+        .lock()
+        .await
+        .increment_notify_counter(*tenant_id, &pipeline_name)
+        .await?;
 
-    #[cfg(feature = "feldera-enterprise")]
-    {
-        let pipeline_name = path.into_inner();
-        let response = state
-            .runner
-            .forward_http_request_to_pipeline_by_name(
-                _client.as_ref(),
-                *tenant_id,
-                &pipeline_name,
-                Method::POST,
-                "activate",
-                request.query_string(),
-                None,
-                None,
-            )
-            .await?;
-        state
-            .db
-            .lock()
-            .await
-            .increment_notify_counter(*tenant_id, &pipeline_name)
-            .await?;
-
-        if response.status() == StatusCode::ACCEPTED {
-            info!(
-                pipeline = %pipeline_name,
-                pipeline_id = "N/A",
-                tenant = %tenant_id.0,
-                "Accepted action: activating pipeline"
-            );
-        }
-        Ok(response)
+    if response.status() == StatusCode::ACCEPTED {
+        info!(
+            pipeline = %pipeline_name,
+            pipeline_id = "N/A",
+            tenant = %tenant_id.0,
+            "Accepted action: activating pipeline"
+        );
     }
+    Ok(response)
 }
 
 /// Approve Bootstrap

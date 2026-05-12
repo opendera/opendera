@@ -124,22 +124,15 @@ impl Configuration {
 
         Configuration {
             telemetry: state.config.telemetry.clone(),
-            edition: if cfg!(feature = "feldera-enterprise") {
-                "Enterprise"
-            } else {
-                "Open source"
-            }
-            .to_string(),
+            edition: "Open source".to_string(),
             version: version.clone(),
             revision: revision.to_string(),
             runtime_revision: runtime_revision.to_string(),
             unstable_features: unstable_features()
                 .map(|features| features.iter().cloned().collect::<Vec<&str>>().join(",")),
-            changelog_url: if cfg!(feature = "feldera-enterprise") {
-                "https://docs.feldera.com/changelog/".to_string()
-            } else {
-                format!("https://github.com/feldera/feldera/releases/tag/v{version}")
-            },
+            changelog_url: format!(
+                "https://github.com/feldera/feldera/releases/tag/v{version}"
+            ),
             license_validity: Some(license_check.check_outcome.clone()),
             update_info: None,
             build_info: BuildInformation::from_env(),

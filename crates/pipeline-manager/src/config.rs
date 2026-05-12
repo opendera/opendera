@@ -30,22 +30,14 @@ use std::{
 };
 use tracing::warn;
 
-/// The default `platform_version` is formed using three compilation environment variables:
+/// The default `platform_version` is formed using two compilation environment variables:
 /// - `CARGO_PKG_VERSION` set by Cargo
 /// - `FELDERA_PLATFORM_VERSION_SUFFIX` set by the custom `build.rs` script,
 ///   which is determined using the similarly named environment variable
-///
-/// ... and whether the `feldera-enterprise` feature is enabled.
 fn default_platform_version() -> String {
     let suffix = env!("FELDERA_PLATFORM_VERSION_SUFFIX").to_string();
     let version = env!("CARGO_PKG_VERSION").to_string();
-    if cfg!(feature = "feldera-enterprise") {
-        if suffix.is_empty() {
-            format!("{version}+enterprise")
-        } else {
-            format!("{version}+enterprise.{suffix}")
-        }
-    } else if suffix.is_empty() {
+    if suffix.is_empty() {
         version
     } else {
         format!("{version}+{suffix}")

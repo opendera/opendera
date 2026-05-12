@@ -1017,7 +1017,7 @@ pub async fn perform_rust_compilation(
 async fn checkout_runtime_version(
     repo_location: &PathBuf,
     requested_runtime_version: &RuntimeSelector,
-    platform_sources: &Path,
+    _platform_sources: &Path,
 ) -> Result<(), RustCompilationError> {
     assert!(
         has_unstable_feature("runtime_version"),
@@ -1111,58 +1111,6 @@ async fn checkout_runtime_version(
             ))),
         }
     }
-
-    // Fork override: skip linking the proprietary `dbsp-enterprise` and
-    // `sync-checkpoint` crates — they are not part of this OSS tree, so the
-    // symlink would always fail. Keeping the block here (disabled) makes the
-    // delta against upstream easy to follow if you ever wire those crates
-    // back in.
-    //
-    // // Link enterprise platform sources into the feldera-checkout repository.
-    // //
-    // // This is necessary because the crates depend on some crates within the runtime source tree,
-    // // and so they can't use the platform crates for that otherwise cargo complains
-    // // https://github.com/rust-lang/cargo/issues/8639
-    // if cfg!(feature = "feldera-enterprise") {
-    //     // Helper function to remove directory if it exists, ignore NotFound errors
-    //     async fn remove_if_exists(path: &std::path::Path) -> Result<(), RustCompilationError> {
-    //         let _r = tokio::fs::remove_dir_all(path).await;
-    //         let _r = tokio::fs::remove_file(path).await;
-    //         Ok(())
-    //     }
-    //
-    //     pub async fn symlink_dir(
-    //         original: impl AsRef<Path>,
-    //         link: impl AsRef<Path>,
-    //     ) -> std::io::Result<()> {
-    //         let original = original.as_ref();
-    //         let link = link.as_ref();
-    //         #[cfg(windows)]
-    //         {
-    //             fs::symlink_dir(original, link).await
-    //         }
-    //         #[cfg(unix)]
-    //         {
-    //             fs::symlink(original, link).await
-    //         }
-    //         #[cfg(not(any(windows, unix)))]
-    //         {
-    //             compile_error!("Unsupported platform for symlinks")
-    //         }
-    //     }
-    //
-    //     for cr in ["dbsp-enterprise", "sync-checkpoint"] {
-    //         remove_if_exists(&repo_location.join("crates").join(cr)).await?;
-    //         symlink_dir(
-    //             platform_sources.join("crates").join(cr),
-    //             repo_location.join("crates").join(cr),
-    //         ).await.map_err(|e| {
-    //             RustCompilationError::SystemError(format!(
-    //                 "Unable to symlink {cr} crate in runtime version override to '{requested_runtime_version}' for compilation: {e}",
-    //             ))
-    //         })?;
-    //     }
-    // }
 
     // Try to checkout the requested runtime version, if it fails, try to sync with git repository and checkout again.
     match checkout(repo_location, requested_runtime_version).await {

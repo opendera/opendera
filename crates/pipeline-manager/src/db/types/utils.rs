@@ -66,8 +66,9 @@ pub(crate) fn validate_runtime_config(
         .map_err(|e| ValidationError::DeserializationFailed(e.to_string()));
     match deserialize_result {
         Ok(runtime_config) => {
-            #[cfg(not(feature = "feldera-enterprise"))]
             if runtime_config.fault_tolerance.is_enabled() {
+                // Fault tolerance has been removed pending clean-room
+                // reimplementation; reject configs that request it.
                 let e = ValidationError::EnterpriseFeature("fault tolerance".to_string());
                 if log_if_invalid {
                     error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}");
@@ -225,20 +226,9 @@ mod tests {
             Err(ValidationError::DeserializationFailed(_))
         ));
 
-        #[cfg(feature = "feldera-enterprise")]
-        assert!(
-            validate_runtime_config(&json!({ "fault_tolerance": {} }), true)
-                .unwrap()
-                .fault_tolerance
-                .model
-                .is_some()
-        );
-
-        #[cfg(not(feature = "feldera-enterprise"))]
-        assert!(matches!(
-            validate_runtime_config(&json!({ "fault_tolerance": {} }), true),
-            Err(ValidationError::EnterpriseFeature(s)) if s == "fault tolerance"
-        ));
+        // Fault tolerance support has been removed pending clean-room
+        // reimplementation; the assertion that previously verified the
+        // enterprise-only fault-tolerance path is deleted here.
 
         assert!(matches!(
             validate_runtime_config(&json!({ "env": { "TOKIO_WORKER_THREADS": "1" } }), true),

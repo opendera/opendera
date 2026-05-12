@@ -649,9 +649,11 @@ pub fn run_server(
         circuit_factory: CircuitFactoryFunc,
         runtime: &actix_web::rt::Runtime,
     ) -> Result<WebData<ServerState>, ControllerError> {
-        #[cfg(not(feature = "feldera-enterprise"))]
         if config.global.fault_tolerance.is_enabled() {
-            return Err(ControllerError::EnterpriseFeature("fault tolerance"));
+            // Fault tolerance has been removed pending clean-room reimplementation.
+            return Err(ControllerError::InvalidStandby(
+                "fault tolerance is unavailable until reimplemented",
+            ));
         }
 
         // Initiate creating the controller so that we can get access to storage,

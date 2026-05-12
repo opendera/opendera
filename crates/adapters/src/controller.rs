@@ -28,7 +28,7 @@ use crate::controller::sync::{
     CHECKPOINT_SYNC_PULL_SUCCESS, CHECKPOINT_SYNC_PULL_TRANSFER_SPEED,
     CHECKPOINT_SYNC_PULL_TRANSFERRED_BYTES, CHECKPOINT_SYNC_PUSH_DURATION_SECONDS,
     CHECKPOINT_SYNC_PUSH_FAILURES, CHECKPOINT_SYNC_PUSH_SUCCESS,
-    CHECKPOINT_SYNC_PUSH_TRANSFER_SPEED, CHECKPOINT_SYNC_PUSH_TRANSFERRED_BYTES, SYNCHRONIZER,
+    CHECKPOINT_SYNC_PUSH_TRANSFER_SPEED, CHECKPOINT_SYNC_PUSH_TRANSFERRED_BYTES,
 };
 use crate::server::metrics::{HistogramDiv, LabelStack, MetricsFormatter, MetricsWriter, Value};
 use crate::server::{InitializationState, ServerState};
@@ -271,44 +271,32 @@ impl ControllerBuilder {
 
     /// Checks if we need to pull a checkpoint from S3.
     /// Useful to set the pipeline `InitializationState` to `DownloadingCheckpoint`.
+    ///
+    /// Checkpoint sync support has been removed pending clean-room
+    /// reimplementation; currently returns `None`.
     pub(crate) fn is_pull_necessary(&self) -> Option<&SyncConfig> {
-        #[cfg(feature = "feldera-enterprise")]
-        {
-            self.storage
-                .as_ref()
-                .and_then(|s| sync::is_pull_necessary(s))
-        }
-
-        #[cfg(not(feature = "feldera-enterprise"))]
         None
     }
 
     /// Pulls the latest checkpoint just once from S3.
+    ///
+    /// Checkpoint sync support has been removed pending clean-room
+    /// reimplementation; currently a no-op.
     pub(crate) fn pull_once(&self, _sync: &SyncConfig) -> Result<(), ControllerError> {
-        #[cfg(feature = "feldera-enterprise")]
-        if let Some(storage) = &self.storage {
-            return sync::pull_once(storage, _sync);
-        };
-
         Ok(())
     }
 
     /// Continuously pull the latest checkpoint from S3.
+    ///
+    /// Checkpoint sync support has been removed pending clean-room
+    /// reimplementation; currently returns an error.
     pub(crate) fn continuous_pull<F>(&self, _is_activated: F) -> Result<(), ControllerError>
     where
         F: Fn() -> bool,
     {
-        #[cfg(feature = "feldera-enterprise")]
-        if let Some(storage) = &self.storage {
-            sync::continuous_pull(storage, _is_activated)
-        } else {
-            Err(ControllerError::InvalidStandby(
-                "standby mode requires storage configuration",
-            ))
-        }
-
-        #[cfg(not(feature = "feldera-enterprise"))]
-        Err(ControllerError::EnterpriseFeature("standby"))
+        Err(ControllerError::InvalidStandby(
+            "standby mode is unavailable until checkpoint sync is reimplemented",
+        ))
     }
 
     pub(crate) fn with_layout(self, layout: Layout) -> Self {
@@ -2205,23 +2193,15 @@ struct CheckpointSyncThread {
 
 impl CheckpointSyncThread {
     fn run(self) -> Result<(), Arc<ControllerError>> {
-        match SYNCHRONIZER.push(self.uuid, self.storage, self.config) {
-            Err(err) => {
-                CHECKPOINT_SYNC_PUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
-                Err(Arc::new(ControllerError::checkpoint_push_error(
-                    err.to_string(),
-                )))
-            }
-            Ok(metrics) => {
-                CHECKPOINT_SYNC_PUSH_SUCCESS.fetch_add(1, Ordering::Relaxed);
-                if let Some(metrics) = metrics {
-                    CHECKPOINT_SYNC_PUSH_TRANSFER_SPEED.record(metrics.speed);
-                    CHECKPOINT_SYNC_PUSH_DURATION_SECONDS.record(metrics.duration.as_secs());
-                    CHECKPOINT_SYNC_PUSH_TRANSFERRED_BYTES.record(metrics.bytes);
-                }
-                Ok(())
-            }
-        }
+        // Checkpoint sync to object storage has been removed pending clean-room
+        // reimplementation. The struct is retained so callers compile; the run
+        // method returns an error.
+        let _ = (self.uuid, self.storage, self.config);
+        CHECKPOINT_SYNC_PUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
+        Err(Arc::new(ControllerError::checkpoint_push_error(
+            "checkpoint sync to object storage is unavailable until reimplemented"
+                .to_string(),
+        )))
     }
 }
 
@@ -6939,9 +6919,6 @@ impl ControllerInner {
     pub fn can_suspend(&self) -> Result<(), SuspendError> {
         // First, check for reasons we can't suspend.
         let mut permanent = Vec::new();
-        #[cfg(not(feature = "feldera-enterprise"))]
-        #[cfg(not(test))]
-        permanent.push(PermanentSuspendError::EnterpriseFeature);
         if self.status.pipeline_config.global.storage.is_none() {
             permanent.push(PermanentSuspendError::StorageRequired);
         }
