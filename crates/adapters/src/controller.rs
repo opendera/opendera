@@ -269,34 +269,39 @@ impl ControllerBuilder {
         })
     }
 
-    /// Checks if we need to pull a checkpoint from S3.
-    /// Useful to set the pipeline `InitializationState` to `DownloadingCheckpoint`.
-    ///
-    /// Checkpoint sync support has been removed pending clean-room
-    /// reimplementation; currently returns `None`.
+    /// Checks if we need to pull a checkpoint from object storage.
+    /// Useful to set the pipeline `InitializationState` to
+    /// `DownloadingCheckpoint`. Returns the sync config to use, or `None`
+    /// if no pull is needed (no storage backend, no sync config, or no
+    /// `start_from_checkpoint`).
     pub(crate) fn is_pull_necessary(&self) -> Option<&SyncConfig> {
-        None
+        self.storage
+            .as_ref()
+            .and_then(|s| sync::is_pull_necessary(s))
     }
 
-    /// Pulls the latest checkpoint just once from S3.
-    ///
-    /// Checkpoint sync support has been removed pending clean-room
-    /// reimplementation; currently a no-op.
-    pub(crate) fn pull_once(&self, _sync: &SyncConfig) -> Result<(), ControllerError> {
+    /// Pulls the latest checkpoint just once from object storage.
+    pub(crate) fn pull_once(&self, sync: &SyncConfig) -> Result<(), ControllerError> {
+        if let Some(storage) = &self.storage {
+            return sync::pull_once(storage, sync);
+        }
         Ok(())
     }
 
-    /// Continuously pull the latest checkpoint from S3.
-    ///
-    /// Checkpoint sync support has been removed pending clean-room
-    /// reimplementation; currently returns an error.
-    pub(crate) fn continuous_pull<F>(&self, _is_activated: F) -> Result<(), ControllerError>
+    /// Continuously pull the latest checkpoint from object storage while
+    /// `is_activated()` returns false; on activation, do one more pull,
+    /// write the activation marker, and return.
+    pub(crate) fn continuous_pull<F>(&self, is_activated: F) -> Result<(), ControllerError>
     where
         F: Fn() -> bool,
     {
-        Err(ControllerError::InvalidStandby(
-            "standby mode is unavailable until checkpoint sync is reimplemented",
-        ))
+        if let Some(storage) = &self.storage {
+            sync::continuous_pull(storage, is_activated)
+        } else {
+            Err(ControllerError::InvalidStandby(
+                "standby mode requires storage configuration",
+            ))
+        }
     }
 
     pub(crate) fn with_layout(self, layout: Layout) -> Self {
@@ -2193,15 +2198,24 @@ struct CheckpointSyncThread {
 
 impl CheckpointSyncThread {
     fn run(self) -> Result<(), Arc<ControllerError>> {
-        // Checkpoint sync to object storage has been removed pending clean-room
-        // reimplementation. The struct is retained so callers compile; the run
-        // method returns an error.
-        let _ = (self.uuid, self.storage, self.config);
-        CHECKPOINT_SYNC_PUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
-        Err(Arc::new(ControllerError::checkpoint_push_error(
-            "checkpoint sync to object storage is unavailable until reimplemented"
-                .to_string(),
-        )))
+        use feldera_storage::checkpoint_synchronizer::SYNCHRONIZER;
+        match SYNCHRONIZER.push(self.uuid, self.storage, self.config) {
+            Err(err) => {
+                CHECKPOINT_SYNC_PUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
+                Err(Arc::new(ControllerError::checkpoint_push_error(
+                    err.to_string(),
+                )))
+            }
+            Ok(metrics) => {
+                CHECKPOINT_SYNC_PUSH_SUCCESS.fetch_add(1, Ordering::Relaxed);
+                if let Some(metrics) = metrics {
+                    CHECKPOINT_SYNC_PUSH_TRANSFER_SPEED.record(metrics.speed);
+                    CHECKPOINT_SYNC_PUSH_DURATION_SECONDS.record(metrics.duration.as_secs());
+                    CHECKPOINT_SYNC_PUSH_TRANSFERRED_BYTES.record(metrics.bytes);
+                }
+                Ok(())
+            }
+        }
     }
 }
 

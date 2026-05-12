@@ -71,6 +71,17 @@ impl Debug for ObjectStoreBackend {
 }
 
 impl ObjectStoreBackend {
+    /// Construct directly from an already-built `ObjectStore` plus a base
+    /// path prefix. Useful for tests (e.g. `object_store::memory::InMemory`)
+    /// and for callers that have a pre-configured store to share.
+    pub fn new_with_store(store: Arc<dyn ObjectStore>, base: ObjPath) -> Self {
+        Self {
+            store,
+            base,
+            usage: Arc::new(AtomicI64::new(0)),
+        }
+    }
+
     /// Construct from `ObjectStorageConfig` (already in `feldera-types`).
     pub fn from_config(cfg: &ObjectStorageConfig) -> Result<Self, StorageError> {
         let url = Url::parse(&cfg.url).map_err(|_| StorageError::InvalidURL(cfg.url.clone()))?;
@@ -359,11 +370,7 @@ mod tests {
     #[test]
     fn round_trip_in_memory() {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let backend = ObjectStoreBackend {
-            store,
-            base: ObjPath::from("pipeline-test"),
-            usage: Arc::new(AtomicI64::new(0)),
-        };
+        let backend = ObjectStoreBackend::new_with_store(store, ObjPath::from("pipeline-test"));
 
         let name: StoragePath = ObjPath::from("hello.bin");
         let payload = b"the quick brown fox jumps over the lazy dog";
