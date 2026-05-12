@@ -53,6 +53,8 @@ hex = { workspace = true }
 indoc = { workspace = true }
 openssl = { workspace = true }
 url = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
+futures = { workspace = true }
 urlencoding = { workspace = true }
 regex = { workspace = true }
 tar = { workspace = true }

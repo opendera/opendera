@@ -544,10 +544,62 @@ impl PipelineExecutor for FlyRunner {
         if let Some(handle) = self.cached.take() {
             self.destroy_machine(&handle.app_name, &handle.machine_id)
                 .await?;
-            // TODO: also delete the Tigris prefix for this pipeline.
-            // The Tigris credentials live on the pipeline-manager
-            // and aren't readily plumbed into the runner yet; punted
-            // to a follow-up commit.
+        }
+        // Drop the pipeline's Tigris prefix. We do this even if there
+        // was no cached machine handle, so a `clear` after a partial
+        // provision still releases storage. Failure here is logged
+        // but not propagated — the upstream `clear` contract is best-
+        // effort idempotent, and an orphaned prefix is cheap.
+        if let Err(e) = self.clear_tigris_prefix().await {
+            warn!(
+                pipeline_id = %self.pipeline_id,
+                "fly: failed to delete pipeline storage prefix: {e}; \
+                 leaving for offline GC"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl FlyRunner {
+    /// Delete every object under `s3://<tigris_bucket>/pipelines/<id>/`
+    /// using the same ObjectStoreBackend implementation the pipeline
+    /// worker uses. This collapses the lifecycle so the manager and
+    /// the worker speak the same storage protocol.
+    async fn clear_tigris_prefix(&self) -> Result<(), ManagerError> {
+        use futures::StreamExt;
+        use object_store::{ObjectStore, parse_url_opts, path::Path as ObjPath};
+
+        // Compose the Tigris URL pointed at this pipeline's prefix and
+        // parse it through object_store. Credentials are inherited
+        // from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the
+        // manager process env (Tigris is S3-compatible).
+        let url_str = format!(
+            "s3://{}/pipelines/{}",
+            self.config.tigris_bucket, self.pipeline_id
+        );
+        let url = url::Url::parse(&url_str)
+            .map_err(|e| Self::provision_err(format!("fly: parse tigris url: {e}")))?;
+        let opts = vec![
+            ("endpoint".to_string(), self.config.tigris_endpoint.clone()),
+            ("region".to_string(), "auto".to_string()),
+        ];
+        let (store, base) = parse_url_opts(&url, opts)
+            .map_err(|e| Self::provision_err(format!("fly: open tigris: {e}")))?;
+
+        // List then delete. object_store doesn't have a single
+        // 'delete prefix' call so we iterate; the pipeline's prefix
+        // contains at most a few hundred shards in steady state.
+        let mut stream = store.list(Some(&base));
+        let mut to_delete: Vec<ObjPath> = Vec::new();
+        while let Some(item) = stream.next().await {
+            let meta = item
+                .map_err(|e| Self::provision_err(format!("fly: list tigris: {e}")))?;
+            to_delete.push(meta.location);
+        }
+        for path in to_delete {
+            // Idempotent: a missing object is not an error here.
+            let _ = store.delete(&path).await;
         }
         Ok(())
     }
