@@ -33,30 +33,105 @@ use feldera_types::constants::CHECKPOINT_FILE_NAME;
 
 use crate::storage::backend::object_store_impl::ObjectStoreBackend;
 
-/// Build an `ObjectStoreBackend` from a `SyncConfig`. Maps the rclone-style
-/// fields in `SyncConfig` to the `ObjectStorageConfig` shape that
-/// `ObjectStoreBackend::from_config` understands.
+/// Cloud provider inferred from a `SyncConfig`. Drives the URL scheme
+/// (`s3://`, `gs://`, `abfs://`) and which credential keys to set in
+/// `other_options`.
+#[derive(Debug, Clone, Copy)]
+enum CloudKind {
+    /// S3, MinIO, Tigris, R2 — any S3-compatible endpoint.
+    S3,
+    /// Google Cloud Storage.
+    Gcs,
+    /// Azure Blob Storage / ADLS Gen2.
+    Azure,
+}
+
+impl CloudKind {
+    /// Infer the cloud kind from `SyncConfig`. Prefers an explicit
+    /// `provider` field; falls back to sniffing the endpoint URL.
+    /// Defaults to S3 (the broadest set of compatible services).
+    fn detect(sync: &SyncConfig) -> Self {
+        if let Some(provider) = sync.provider.as_deref() {
+            let p = provider.to_ascii_lowercase();
+            if p.contains("gcs") || p == "google" || p == "googlecloud" {
+                return Self::Gcs;
+            }
+            if p.contains("azure") || p == "abfs" || p == "adls" {
+                return Self::Azure;
+            }
+            // AWS, Minio, Tigris, Other — all S3-compatible.
+            return Self::S3;
+        }
+        if let Some(endpoint) = sync.endpoint.as_deref() {
+            let e = endpoint.to_ascii_lowercase();
+            if e.contains("storage.googleapis.com") {
+                return Self::Gcs;
+            }
+            if e.contains(".blob.core.windows.net")
+                || e.contains(".dfs.core.windows.net")
+                || e.contains(".dfs.fabric.microsoft.com")
+            {
+                return Self::Azure;
+            }
+        }
+        Self::S3
+    }
+}
+
+/// Build an `ObjectStoreBackend` from a `SyncConfig`. Translates the
+/// rclone-style fields in `SyncConfig` to the `ObjectStorageConfig`
+/// shape that `ObjectStoreBackend::from_config` understands, picking
+/// the right URL scheme + credential option names for the detected
+/// cloud provider.
 fn remote_backend(sync: &SyncConfig) -> anyhow::Result<ObjectStoreBackend> {
-    // Translate `SyncConfig` (rclone-style) to `ObjectStorageConfig`
-    // (object_store URL + key-value options).
-    //
-    // We currently produce S3 URLs only. GCS / Azure mapping is a TODO
-    // that will land alongside non-S3 cloud support; the spec calls them
-    // out but OpenDera Cloud uses S3 / Tigris.
-    let url = format!("s3://{}", sync.bucket);
+    let kind = CloudKind::detect(sync);
+    let url = match kind {
+        CloudKind::S3 => format!("s3://{}", sync.bucket),
+        CloudKind::Gcs => format!("gs://{}", sync.bucket),
+        // For Azure we treat `bucket` as `container[/path]`; if the user
+        // wanted the account-name @ syntax they can stuff it into
+        // `endpoint`. The object_store crate accepts the abfs:// form.
+        CloudKind::Azure => format!("abfs://{}", sync.bucket),
+    };
 
     let mut other_options = std::collections::BTreeMap::new();
     if let Some(endpoint) = &sync.endpoint {
         other_options.insert("endpoint".to_string(), endpoint.clone());
     }
-    if let Some(region) = &sync.region {
-        other_options.insert("region".to_string(), region.clone());
-    }
-    if let Some(key) = &sync.access_key {
-        other_options.insert("access_key_id".to_string(), key.clone());
-    }
-    if let Some(secret) = &sync.secret_key {
-        other_options.insert("secret_access_key".to_string(), secret.clone());
+    match kind {
+        CloudKind::S3 => {
+            if let Some(region) = &sync.region {
+                other_options.insert("region".to_string(), region.clone());
+            }
+            if let Some(key) = &sync.access_key {
+                other_options.insert("access_key_id".to_string(), key.clone());
+            }
+            if let Some(secret) = &sync.secret_key {
+                other_options.insert("secret_access_key".to_string(), secret.clone());
+            }
+        }
+        CloudKind::Gcs => {
+            // GCS uses a single service-account JSON for credentials.
+            // Map `secret_key` (which carries the JSON blob, per the
+            // SyncConfig docs) to the `service_account_key` option that
+            // object_store's GCS builder reads. `region` is meaningless
+            // on GCS and is dropped silently.
+            if let Some(secret) = &sync.secret_key {
+                other_options
+                    .insert("service_account_key".to_string(), secret.clone());
+            }
+        }
+        CloudKind::Azure => {
+            // Azure: `access_key` is the account name, `secret_key` is
+            // the account key. Region maps to the location URI's
+            // account, which is encoded in the URL itself.
+            if let Some(key) = &sync.access_key {
+                other_options.insert("account_name".to_string(), key.clone());
+            }
+            if let Some(secret) = &sync.secret_key {
+                other_options.insert("account_key".to_string(), secret.clone());
+            }
+        }
     }
 
     let cfg = ObjectStorageConfig {
@@ -215,6 +290,70 @@ mod tests {
         data.extend_from_slice(body);
         writer.write_block(data).expect("write_block");
         writer.complete().expect("complete");
+    }
+
+    fn cfg(
+        provider: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> SyncConfig {
+        SyncConfig {
+            provider: provider.map(String::from),
+            endpoint: endpoint.map(String::from),
+            bucket: "bucket".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn detect_cloud_kind() {
+        // Default: S3.
+        assert!(matches!(
+            CloudKind::detect(&SyncConfig::default()),
+            CloudKind::S3
+        ));
+
+        // Provider hints take precedence.
+        assert!(matches!(
+            CloudKind::detect(&cfg(Some("AWS"), None)),
+            CloudKind::S3
+        ));
+        assert!(matches!(
+            CloudKind::detect(&cfg(Some("Minio"), None)),
+            CloudKind::S3
+        ));
+        assert!(matches!(
+            CloudKind::detect(&cfg(Some("GCS"), None)),
+            CloudKind::Gcs
+        ));
+        assert!(matches!(
+            CloudKind::detect(&cfg(Some("google"), None)),
+            CloudKind::Gcs
+        ));
+        assert!(matches!(
+            CloudKind::detect(&cfg(Some("Azure"), None)),
+            CloudKind::Azure
+        ));
+        assert!(matches!(
+            CloudKind::detect(&cfg(Some("ADLS"), None)),
+            CloudKind::Azure
+        ));
+
+        // Endpoint sniffing kicks in when provider isn't set.
+        assert!(matches!(
+            CloudKind::detect(&cfg(None, Some("https://storage.googleapis.com"))),
+            CloudKind::Gcs
+        ));
+        assert!(matches!(
+            CloudKind::detect(&cfg(
+                None,
+                Some("https://myaccount.blob.core.windows.net")
+            )),
+            CloudKind::Azure
+        ));
+        assert!(matches!(
+            CloudKind::detect(&cfg(None, Some("https://s3.us-east-1.amazonaws.com"))),
+            CloudKind::S3
+        ));
     }
 
     /// End-to-end: stage a fake checkpoint locally, push it to an
