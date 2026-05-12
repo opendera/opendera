@@ -21,17 +21,52 @@
 
 #![warn(missing_docs)]
 
+use std::io::ErrorKind;
 use std::sync::Arc;
-use std::time::Instant;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use feldera_storage::checkpoint_synchronizer::CheckpointSynchronizer;
+use feldera_storage::error::StorageError;
 use feldera_storage::{StorageBackend, StoragePath};
 use feldera_types::checkpoint::{CheckpointMetadata, CheckpointSyncMetrics};
 use feldera_types::config::{ObjectStorageConfig, StartFromCheckpoint, SyncConfig};
 use feldera_types::constants::CHECKPOINT_FILE_NAME;
 
 use crate::storage::backend::object_store_impl::ObjectStoreBackend;
+
+/// Retry cap for per-file copy. `object_store` already retries
+/// individual HTTP requests internally; this outer retry catches the
+/// case where the underlying request retries are all exhausted.
+const COPY_MAX_ATTEMPTS: u32 = 4;
+
+/// Initial backoff between copy retries. Doubles each attempt:
+/// 200 ms, 400 ms, 800 ms, with full-jitter applied each step.
+const COPY_BASE_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Decide whether an error is worth retrying. Network glitches, server
+/// 5xx, and timeouts retry; not-found and permission-denied do not.
+fn is_retryable(err: &anyhow::Error) -> bool {
+    // Walk the error chain looking for a StorageError we can classify.
+    for cause in err.chain() {
+        if let Some(storage_err) = cause.downcast_ref::<StorageError>() {
+            return matches!(
+                storage_err.kind(),
+                ErrorKind::Interrupted
+                    | ErrorKind::TimedOut
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::WouldBlock
+                    | ErrorKind::Other
+            );
+        }
+    }
+    // No StorageError on the chain: be conservative and retry. The
+    // attempt cap will still stop runaway loops.
+    true
+}
 
 /// Cloud provider inferred from a `SyncConfig`. Drives the URL scheme
 /// (`s3://`, `gs://`, `abfs://`) and which credential keys to set in
@@ -143,8 +178,48 @@ fn remote_backend(sync: &SyncConfig) -> anyhow::Result<ObjectStoreBackend> {
 }
 
 /// Copy a single file from `src` to `dst` at the same path. Returns the
-/// number of bytes transferred.
+/// number of bytes transferred. Includes a bounded retry loop with
+/// exponential backoff + jitter for transient failures.
 fn copy_file(
+    src: &Arc<dyn StorageBackend>,
+    dst: &Arc<dyn StorageBackend>,
+    path: &StoragePath,
+) -> anyhow::Result<u64> {
+    let mut backoff = COPY_BASE_BACKOFF;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..COPY_MAX_ATTEMPTS {
+        match copy_file_once(src, dst, path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                let retryable = is_retryable(&err);
+                let is_last = attempt + 1 >= COPY_MAX_ATTEMPTS;
+                if !retryable || is_last {
+                    return Err(err.context(format!(
+                        "copy {path} failed after {attempts} attempt(s)",
+                        attempts = attempt + 1
+                    )));
+                }
+                tracing::warn!(
+                    "copy {path} attempt {attempt} failed (retryable): {err:#}; \
+                     sleeping {backoff:?} before retry",
+                    attempt = attempt + 1
+                );
+                // Full-jitter backoff: random in [0, backoff].
+                let jitter_ns =
+                    rand::random::<u64>() % (backoff.as_nanos() as u64).max(1);
+                sleep(Duration::from_nanos(jitter_ns));
+                backoff = backoff.saturating_mul(2);
+                last_err = Some(err);
+            }
+        }
+    }
+    // Unreachable: the loop either returns Ok, returns an error on the
+    // last attempt, or continues. But keep the safety net.
+    Err(last_err.unwrap_or_else(|| anyhow!("copy {path} exhausted retries with no error")))
+}
+
+/// Single-attempt copy. Read source, write to destination, commit.
+fn copy_file_once(
     src: &Arc<dyn StorageBackend>,
     dst: &Arc<dyn StorageBackend>,
     path: &StoragePath,
