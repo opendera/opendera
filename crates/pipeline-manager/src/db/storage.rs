@@ -88,6 +88,24 @@ pub(crate) trait Storage {
     /// Retrieves the tenant name for a given tenant ID.
     async fn get_tenant_name(&self, tenant_id: TenantId) -> Result<String, DBError>;
 
+    /// Returns the Stripe customer id associated with this tenant, or
+    /// `None` if the tenant hasn't been linked to a Stripe customer
+    /// (the default state for self-hosted deployments and brand-new
+    /// cloud signups before they enter payment details).
+    async fn get_tenant_stripe_customer_id(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Option<String>, DBError>;
+
+    /// Sets or clears the Stripe customer id for a tenant. Idempotent;
+    /// passing `None` unlinks. Called by the cloud onboarding flow
+    /// after a successful Stripe customer creation.
+    async fn set_tenant_stripe_customer_id(
+        &self,
+        tenant_id: TenantId,
+        stripe_customer_id: Option<&str>,
+    ) -> Result<(), DBError>;
+
     /// Retrieves the list of all API keys.
     async fn list_api_keys(&self, tenant_id: TenantId) -> Result<Vec<ApiKeyDescr>, DBError>;
 

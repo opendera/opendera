@@ -109,6 +109,30 @@ impl Storage for StoragePostgres {
         Ok(tenant_name)
     }
 
+    async fn get_tenant_stripe_customer_id(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Option<String>, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        let v = operations::tenant::get_tenant_stripe_customer_id(&txn, tenant_id).await?;
+        txn.commit().await?;
+        Ok(v)
+    }
+
+    async fn set_tenant_stripe_customer_id(
+        &self,
+        tenant_id: TenantId,
+        stripe_customer_id: Option<&str>,
+    ) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        operations::tenant::set_tenant_stripe_customer_id(&txn, tenant_id, stripe_customer_id)
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
     async fn list_api_keys(&self, tenant_id: TenantId) -> Result<Vec<ApiKeyDescr>, DBError> {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;

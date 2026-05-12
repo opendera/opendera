@@ -4094,6 +4094,32 @@ impl Storage for Mutex<DbModel> {
             .ok_or(DBError::UnknownTenant { tenant_id })
     }
 
+    async fn get_tenant_stripe_customer_id(
+        &self,
+        tenant_id: TenantId,
+    ) -> Result<Option<String>, DBError> {
+        let s = self.lock().await;
+        s.tenants
+            .get(&tenant_id)
+            .map(|t| t.stripe_customer_id.clone())
+            .ok_or(DBError::UnknownTenant { tenant_id })
+    }
+
+    async fn set_tenant_stripe_customer_id(
+        &self,
+        tenant_id: TenantId,
+        stripe_customer_id: Option<&str>,
+    ) -> Result<(), DBError> {
+        let mut s = self.lock().await;
+        match s.tenants.get_mut(&tenant_id) {
+            Some(t) => {
+                t.stripe_customer_id = stripe_customer_id.map(String::from);
+                Ok(())
+            }
+            None => Err(DBError::UnknownTenant { tenant_id }),
+        }
+    }
+
     async fn list_api_keys(&self, tenant_id: TenantId) -> DBResult<Vec<ApiKeyDescr>> {
         let s = self.lock().await;
         Ok(s.api_keys

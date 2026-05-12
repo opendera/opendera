@@ -263,6 +263,11 @@ pub(crate) struct TenantRecord {
 
     /// Corresponds to the identity provider from a claim
     pub provider: String,
+
+    /// Stripe customer id, populated once the tenant onboards to
+    /// paid billing in the cloud. `None` on self-hosted deployments
+    /// and brand-new signups.
+    pub stripe_customer_id: Option<String>,
 }
 
 const DEFAULT_TENANT_ID: TenantId = TenantId(Uuid::nil());
@@ -273,6 +278,7 @@ impl TenantRecord {
             id: DEFAULT_TENANT_ID,
             tenant: "default".to_string(),
             provider: "default".to_string(),
+            stripe_customer_id: None,
         }
     }
 }

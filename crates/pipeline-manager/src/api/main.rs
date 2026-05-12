@@ -606,6 +606,8 @@ fn internal_scope() -> Scope {
     web::scope("/internal/v0")
         .service(endpoints::internal::list_internal_pipelines)
         .service(endpoints::internal::activity_stream)
+        .service(endpoints::internal::get_tenant_billing)
+        .service(endpoints::internal::put_tenant_billing)
 }
 
 // Unauthenticated public endpoints and static UI assets. CORS is scoped to

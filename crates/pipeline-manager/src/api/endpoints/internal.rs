@@ -27,16 +27,17 @@
 use std::time::Duration;
 
 use actix_web::{
-    HttpRequest, HttpResponse, Responder, get,
+    HttpRequest, HttpResponse, Responder, get, put,
     http::header,
     web,
     web::Data as WebData,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::main::ServerState;
 use crate::db::storage::Storage;
+use crate::db::types::tenant::TenantId;
 use crate::error::ManagerError;
 use feldera_types::runtime_status::RuntimeStatus;
 
@@ -121,6 +122,52 @@ pub async fn list_internal_pipelines(
         })
         .collect();
     Ok(HttpResponse::Ok().json(pipelines))
+}
+
+/// Cloud-internal: read a tenant's Stripe customer id. Consumed by the
+/// Stripe metering daemon to resolve tenant -> customer before
+/// emitting meter events. Returns `null` JSON when the tenant has no
+/// linked Stripe customer.
+#[derive(Serialize)]
+struct TenantBilling {
+    stripe_customer_id: Option<String>,
+}
+
+#[get("/tenants/{tenant_id}/billing")]
+pub async fn get_tenant_billing(
+    state: WebData<ServerState>,
+    req: HttpRequest,
+    path: web::Path<uuid::Uuid>,
+) -> Result<HttpResponse, ManagerError> {
+    if let Err(resp) = check_internal_auth(&req) {
+        return Ok(resp);
+    }
+    let tenant_id = TenantId(path.into_inner());
+    let db = state.db.lock().await;
+    let stripe_customer_id = db.get_tenant_stripe_customer_id(tenant_id).await?;
+    Ok(HttpResponse::Ok().json(TenantBilling { stripe_customer_id }))
+}
+
+#[derive(Deserialize)]
+struct SetTenantBilling {
+    stripe_customer_id: Option<String>,
+}
+
+#[put("/tenants/{tenant_id}/billing")]
+pub async fn put_tenant_billing(
+    state: WebData<ServerState>,
+    req: HttpRequest,
+    path: web::Path<uuid::Uuid>,
+    body: web::Json<SetTenantBilling>,
+) -> Result<HttpResponse, ManagerError> {
+    if let Err(resp) = check_internal_auth(&req) {
+        return Ok(resp);
+    }
+    let tenant_id = TenantId(path.into_inner());
+    let db = state.db.lock().await;
+    db.set_tenant_stripe_customer_id(tenant_id, body.stripe_customer_id.as_deref())
+        .await?;
+    Ok(HttpResponse::NoContent().finish())
 }
 
 /// Stringify a `RuntimeStatus` for the cloud-side controller. Kept

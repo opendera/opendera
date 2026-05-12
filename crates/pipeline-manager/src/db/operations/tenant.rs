@@ -40,3 +40,31 @@ pub async fn get_tenant_name(
     let row = txn.query_one(&stmt, &[&tenant_id.0]).await?;
     Ok(row.get(0))
 }
+
+/// Reads the tenant's linked Stripe customer id. Returns `Ok(None)`
+/// when the column is NULL — i.e. self-hosted deployments and
+/// brand-new cloud signups not yet onboarded to billing.
+pub async fn get_tenant_stripe_customer_id(
+    txn: &Transaction<'_>,
+    tenant_id: TenantId,
+) -> Result<Option<String>, DBError> {
+    let stmt = txn
+        .prepare_cached("SELECT stripe_customer_id FROM tenant WHERE id = $1")
+        .await?;
+    let row = txn.query_one(&stmt, &[&tenant_id.0]).await?;
+    Ok(row.get(0))
+}
+
+/// Sets the tenant's linked Stripe customer id. Pass `None` to unlink.
+/// Idempotent.
+pub async fn set_tenant_stripe_customer_id(
+    txn: &Transaction<'_>,
+    tenant_id: TenantId,
+    stripe_customer_id: Option<&str>,
+) -> Result<(), DBError> {
+    let stmt = txn
+        .prepare_cached("UPDATE tenant SET stripe_customer_id = $2 WHERE id = $1")
+        .await?;
+    txn.execute(&stmt, &[&tenant_id.0, &stripe_customer_id]).await?;
+    Ok(())
+}
