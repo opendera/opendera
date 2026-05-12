@@ -107,7 +107,7 @@ impl Configuration {
             unstable_features: unstable_features()
                 .map(|features| features.iter().cloned().collect::<Vec<&str>>().join(",")),
             changelog_url: format!(
-                "https://github.com/feldera/feldera/releases/tag/v{version}"
+                "https://github.com/opendera/opendera/releases/tag/v{version}"
             ),
             update_info: None,
             build_info: BuildInformation::from_env(),

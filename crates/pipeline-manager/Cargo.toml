@@ -1,6 +1,6 @@
 [package]
 name = "pipeline-manager"
-description = "Data pipeline manager for the Feldera continuous analytics platform."
+description = "Data pipeline manager for the OpenDera continuous analytics platform (MIT fork of Feldera)."
 keywords = ["DBSP", "streaming", "analytics", "database", "webui"]
 categories = ["database", "gui"]
 publish = false

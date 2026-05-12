@@ -1,9 +1,12 @@
 [workspace.package]
-authors = ["Feldera Team <dev@feldera.com>"]
+authors = [
+    "Feldera Team <dev@feldera.com>",
+    "OpenDera contributors",
+]
 version = "0.296.0"
-license = "MIT OR Apache-2.0"
-homepage = "https://github.com/feldera/feldera"
-repository = "https://github.com/feldera/feldera"
+license = "MIT"
+homepage = "https://github.com/opendera/opendera"
+repository = "https://github.com/opendera/opendera"
 keywords = ["ivm", "analytics", "database", "incremental", "sql"]
 readme = "README.md"
 # Define Minimum Supported Rust Version (MSRV)
