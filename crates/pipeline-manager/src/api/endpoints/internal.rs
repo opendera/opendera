@@ -124,6 +124,83 @@ pub async fn list_internal_pipelines(
     Ok(HttpResponse::Ok().json(pipelines))
 }
 
+/// Usage record matching the shape the Stripe metering daemon expects
+/// (opendera-cloud/stripe/src/manager-client.ts). One record per
+/// (tenant, pipeline, dimension, bucket) tuple; `idempotency_key` is
+/// stable across retries so the daemon can safely re-submit.
+#[derive(Serialize, Clone, Debug)]
+struct UsageRecord {
+    idempotency_key: String,
+    tenant_id: String,
+    pipeline_id: String,
+    dim: UsageDimension,
+    amount: f64,
+    bucket_end_ts: DateTime<Utc>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+enum UsageDimension {
+    IngestionGb,
+    StorageGbMonth,
+    FcuHour,
+    QueryTb,
+}
+
+#[derive(Serialize)]
+struct UsagePage {
+    records: Vec<UsageRecord>,
+    /// Opaque pagination cursor; pass back to fetch the next page.
+    /// `None` when there are no more records right now (the daemon
+    /// polls again later).
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default = "default_usage_limit")]
+    limit: u32,
+}
+
+fn default_usage_limit() -> u32 {
+    100
+}
+
+#[get("/usage")]
+pub async fn list_usage(
+    state: WebData<ServerState>,
+    req: HttpRequest,
+    query: web::Query<UsageQuery>,
+) -> Result<HttpResponse, ManagerError> {
+    if let Err(resp) = check_internal_auth(&req) {
+        return Ok(resp);
+    }
+
+    // TODO: implement real usage aggregation. The engine needs to:
+    //   1. Maintain per-pipeline counters for each dimension (bytes
+    //      ingested, FCU-seconds active, GB-month storage avg, query
+    //      TB scanned).
+    //   2. Roll them up into time buckets (1-minute or 5-minute
+    //      depending on the dimension's natural granularity).
+    //   3. Persist completed buckets so a manager restart doesn't
+    //      lose unbilled usage.
+    //   4. Expose them here as UsageRecord rows, paginated by the
+    //      `since` cursor.
+    //
+    // The skeleton returns an empty page so the Stripe daemon
+    // (opendera-cloud/stripe/) can compile + connect against the
+    // contract immediately, and the bucket aggregation can land
+    // incrementally without a daemon-side compat break.
+
+    let _ = (&state, &query);
+    Ok(HttpResponse::Ok().json(UsagePage {
+        records: vec![],
+        next: query.since.clone(),
+    }))
+}
+
 /// Cloud-internal: read a tenant's Stripe customer id. Consumed by the
 /// Stripe metering daemon to resolve tenant -> customer before
 /// emitting meter events. Returns `null` JSON when the tenant has no
