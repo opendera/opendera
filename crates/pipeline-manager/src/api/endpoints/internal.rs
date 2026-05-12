@@ -36,7 +36,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::api::main::ServerState;
+use crate::db::storage::Storage;
 use crate::error::ManagerError;
+use feldera_types::runtime_status::RuntimeStatus;
 
 const INTERNAL_API_KEY_ENV: &str = "OPENDERA_INTERNAL_API_KEY";
 
@@ -93,14 +95,51 @@ pub async fn list_internal_pipelines(
         return Ok(resp);
     }
 
-    // TODO: implement an admin-scoped cross-tenant
-    // `list_all_pipelines_summary()` on `crate::db::storage::Storage`
-    // and call it here. Until that lands, return an empty array —
-    // the activity controller treats this as 'no pipelines to manage'
-    // and the SSE heartbeat keeps the connection alive.
-    let _ = &state;
-    let pipelines: Vec<PipelineSummary> = vec![];
+    let db = state.db.lock().await;
+    let rows = db.list_pipelines_across_all_tenants_for_monitoring().await?;
+    let pipelines: Vec<PipelineSummary> = rows
+        .into_iter()
+        .map(|(tenant_id, descr)| PipelineSummary {
+            pipeline_id: descr.id.to_string(),
+            tenant_id: tenant_id.0.to_string(),
+            observed_status: descr
+                .deployment_runtime_status
+                .map(runtime_status_to_str)
+                .unwrap_or_else(|| "Unknown".to_string()),
+            created_at: descr.created_at,
+            // Activity timestamps are emitted on the SSE stream; the DB
+            // doesn't (yet) snapshot them so we surface `None` and let
+            // the controller derive last-seen from the event stream.
+            last_activity_at: None,
+            // The cloud-only fields below land once the Fly executor
+            // persists its handle in the DB. Until then the activity
+            // controller skips pipelines whose `fly_machine_id` is None.
+            fly_app: None,
+            fly_machine_id: None,
+            tier: None,
+            ram_mb: None,
+        })
+        .collect();
     Ok(HttpResponse::Ok().json(pipelines))
+}
+
+/// Stringify a `RuntimeStatus` for the cloud-side controller. Kept
+/// inline rather than relying on `Display` so the wire format is
+/// stable independent of any future `Display` change.
+fn runtime_status_to_str(s: RuntimeStatus) -> String {
+    match s {
+        RuntimeStatus::Unavailable => "Unavailable",
+        RuntimeStatus::Coordination => "Coordination",
+        RuntimeStatus::Standby => "Standby",
+        RuntimeStatus::Initializing => "Initializing",
+        RuntimeStatus::AwaitingApproval => "AwaitingApproval",
+        RuntimeStatus::Bootstrapping => "Bootstrapping",
+        RuntimeStatus::Replaying => "Replaying",
+        RuntimeStatus::Paused => "Paused",
+        RuntimeStatus::Running => "Running",
+        RuntimeStatus::Suspended => "Suspended",
+    }
+    .to_string()
 }
 
 #[get("/activity")]
