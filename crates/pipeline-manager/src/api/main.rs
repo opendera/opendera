@@ -1,3 +1,4 @@
+use crate::api::activity_bus::ActivityBus;
 use crate::api::demo::{read_demos_from_directories, Demo};
 use crate::api::endpoints;
 use crate::api::support_data_collector::SupportDataCollector;
@@ -741,6 +742,11 @@ pub(crate) struct ServerState {
     pub jwk_cache: Arc<Mutex<JwkCache>>,
     probe: Arc<Mutex<DbProbe>>,
     pub demos: Vec<Demo>,
+    /// Broadcast bus of pipeline activity events. Producers
+    /// (ingest / query handlers) call `activity_bus.emit(...)`;
+    /// consumers (the internal SSE endpoint, the cloud activity
+    /// controller) subscribe.
+    pub activity_bus: ActivityBus,
 }
 
 impl ServerState {
@@ -760,6 +766,7 @@ impl ServerState {
             jwk_cache: Arc::new(Mutex::new(JwkCache::new())),
             probe: DbProbe::new(db_copy).await,
             demos,
+            activity_bus: ActivityBus::new(),
         })
     }
 

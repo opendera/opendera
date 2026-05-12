@@ -147,16 +147,49 @@ pub async fn activity_stream(state: WebData<ServerState>, req: HttpRequest) -> i
     if let Err(resp) = check_internal_auth(&req) {
         return resp;
     }
-    let _ = &state;
 
+    let mut rx = state.activity_bus.subscribe();
+
+    // The stream interleaves real activity events with a periodic
+    // heartbeat. The heartbeat is essential — proxies between the
+    // controller and the manager (CloudFront, Fly Proxy, etc.) will
+    // close idle HTTP/1.1 connections after 30-60s, so we must emit
+    // at least one byte on that cadence to keep the SSE alive.
+    let heartbeat = tokio::time::interval(Duration::from_secs(30));
     let stream = async_stream::stream! {
+        let mut heartbeat = heartbeat;
         loop {
-            let payload = format!(
-                "event: heartbeat\ndata: {{\"ts\":\"{}\"}}\n\n",
-                Utc::now().to_rfc3339()
-            );
-            yield Ok::<_, actix_web::Error>(web::Bytes::from(payload));
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::select! {
+                evt = rx.recv() => {
+                    match evt {
+                        Ok(event) => {
+                            let body = serde_json::to_string(&event)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            yield Ok::<_, actix_web::Error>(web::Bytes::from(
+                                format!("event: activity\ndata: {body}\n\n")
+                            ));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Slow subscriber lagged out. Emit a marker
+                            // so the controller knows it missed events
+                            // and can re-reconcile via /pipelines.
+                            yield Ok(web::Bytes::from(format!(
+                                "event: lag\ndata: {{\"missed\":{n}}}\n\n"
+                            )));
+                        }
+                        Err(_) => {
+                            // Sender dropped — channel closed for good.
+                            return;
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    yield Ok(web::Bytes::from(format!(
+                        "event: heartbeat\ndata: {{\"ts\":\"{}\"}}\n\n",
+                        Utc::now().to_rfc3339()
+                    )));
+                }
+            }
         }
     };
 
