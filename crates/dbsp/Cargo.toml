@@ -89,6 +89,8 @@ core_affinity = { workspace = true }
 indexmap = { workspace = true }
 feldera-storage = { workspace = true }
 inventory = { workspace = true }
+object_store = { workspace = true, features = ["aws", "gcp", "azure", "http"] }
+url = { workspace = true }
 time = { workspace = true, features = [
     "formatting",
     "macros",
