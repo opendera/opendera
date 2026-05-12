@@ -1043,14 +1043,9 @@ mod test {
         }
         let db = Arc::new(Mutex::new(conn));
         let state = actix_web::web::Data::new(
-            ServerState::new(
-                common_config,
-                manager_config,
-                db,
-                Arc::new(RwLock::new(None)),
-            )
-            .await
-            .unwrap(),
+            ServerState::new(common_config, manager_config, db)
+                .await
+                .unwrap(),
         );
         if let Some(decoding_key) = decoding_key {
             state
