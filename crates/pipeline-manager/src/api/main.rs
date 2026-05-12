@@ -6,7 +6,6 @@ use crate::config::{ApiServerConfig, CommonConfig};
 use crate::db::probe::DbProbe;
 use crate::db::storage_postgres::StoragePostgres;
 use crate::error::ManagerError;
-use crate::license::LicenseCheck;
 use crate::runner::interaction::RunnerInteraction;
 use crate::unstable_features;
 use actix_http::body::BoxBody;
@@ -32,7 +31,7 @@ use std::{env, io, net::TcpListener, sync::Arc};
 use termbg::{theme, Theme};
 use tokio::signal;
 use tokio::sync::watch;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tracing::{error, info, Level};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
@@ -264,7 +263,6 @@ It contains the following fields:
         // Common
         crate::db::types::version::Version,
         crate::db::types::tenant::TenantId,
-        crate::license::LicenseValidity,
         crate::api::endpoints::config::UpdateInformation,
         crate::api::endpoints::config::Configuration,
         crate::api::endpoints::config::BuildInformation,
@@ -473,9 +471,6 @@ It contains the following fields:
         feldera_types::adapter_stats::ShortEndpointConfig,
         feldera_types::adapter_stats::TransactionStatus,
 
-        // Telemetry & License
-        feldera_cloud1_client::license::DisplaySchedule,
-        feldera_cloud1_client::license::LicenseInformation,
     ),),
     tags(
         (name = "Pipeline management", description = "Create, retrieve, update, delete and deploy pipelines."),
@@ -731,7 +726,6 @@ pub(crate) struct ServerState {
     pub jwk_cache: Arc<Mutex<JwkCache>>,
     probe: Arc<Mutex<DbProbe>>,
     pub demos: Vec<Demo>,
-    pub license_check: Arc<RwLock<Option<LicenseCheck>>>,
 }
 
 impl ServerState {
@@ -739,7 +733,6 @@ impl ServerState {
         common_config: CommonConfig,
         config: ApiServerConfig,
         db: Arc<Mutex<StoragePostgres>>,
-        license_check: Arc<RwLock<Option<LicenseCheck>>>,
     ) -> AnyResult<Self> {
         let runner = RunnerInteraction::new(common_config.clone(), db.clone());
         let db_copy = db.clone();
@@ -752,7 +745,6 @@ impl ServerState {
             jwk_cache: Arc::new(Mutex::new(JwkCache::new())),
             probe: DbProbe::new(db_copy).await,
             demos,
-            license_check,
         })
     }
 
@@ -760,8 +752,7 @@ impl ServerState {
     pub(crate) async fn test_state(db: Arc<Mutex<StoragePostgres>>) -> Self {
         let common_config = CommonConfig::test_config();
         let api_config = ApiServerConfig::test_config();
-        let license_check = Arc::new(RwLock::new(None::<LicenseCheck>));
-        Self::new(common_config, api_config, db.clone(), license_check)
+        Self::new(common_config, api_config, db.clone())
             .await
             .unwrap()
     }
@@ -810,7 +801,6 @@ pub async fn run(
     db: Arc<Mutex<StoragePostgres>>,
     common_config: CommonConfig,
     api_config: ApiServerConfig,
-    license_check: Arc<RwLock<Option<LicenseCheck>>>,
 ) -> AnyResult<()> {
     let listener = TcpListener::bind((common_config.bind_address.clone(), common_config.api_port))
         .unwrap_or_else(|_| {
@@ -820,7 +810,7 @@ pub async fn run(
             )
         });
     let state = WebData::new(
-        ServerState::new(common_config.clone(), api_config.clone(), db, license_check).await?,
+        ServerState::new(common_config.clone(), api_config.clone(), db).await?,
     );
     let auth_configuration = match api_config.auth_provider {
         crate::config::AuthProviderType::None => None,

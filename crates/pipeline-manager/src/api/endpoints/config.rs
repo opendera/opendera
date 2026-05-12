@@ -4,7 +4,6 @@ use actix_web::{
     web::{Data as WebData, ReqData},
     HttpRequest, HttpResponse,
 };
-use feldera_cloud1_client::license::DisplaySchedule;
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -12,7 +11,6 @@ use crate::api::main::ServerState;
 use crate::db::storage::Storage;
 use crate::db::types::tenant::TenantId;
 use crate::error::ManagerError;
-use crate::license::{LicenseCheck, LicenseValidity};
 use crate::unstable_features;
 
 #[derive(Serialize, ToSchema)]
@@ -23,8 +21,6 @@ pub(crate) struct UpdateInformation {
     pub is_latest_version: bool,
     /// URL that navigates the user to instructions on how to update their deployment's version
     pub instructions_url: String,
-    /// Suggested frequency of reminding the user about updating
-    pub remind_schedule: DisplaySchedule,
 }
 
 /// Information about the build of the platform.
@@ -83,8 +79,6 @@ pub(crate) struct Configuration {
     pub unstable_features: Option<String>,
     /// URL that navigates to the changelog of the current version
     pub changelog_url: String,
-    /// Information about the checked Enterprise license
-    pub license_validity: Option<LicenseValidity>,
     /// Information about whether a new version is available for the corresponding edition
     pub update_info: Option<UpdateInformation>,
     /// Information about the build environment
@@ -103,24 +97,6 @@ impl Configuration {
             revision = env!("VERGEN_GIT_SHA");
         }
         let runtime_revision = env!("VERGEN_GIT_SHA");
-        // Fork override: hardcode a 10-year-valid Enterprise license so the
-        // platform always reports Enterprise without contacting the real
-        // license-check service (the proprietary cloud1 client is not
-        // available in this fork). Replace this block with the original
-        // `LicenseCheck::validate(state).await.unwrap_or_default()` if you
-        // ever wire up a real license check here.
-        let license_check = LicenseCheck {
-            checked_at: std::time::Instant::now(),
-            check_outcome: LicenseValidity::Exists(feldera_cloud1_client::license::LicenseInformation {
-                current: chrono::Utc::now(),
-                valid_until: Some(chrono::Utc::now() + chrono::Duration::days(365 * 10)),
-                is_trial: false,
-                description_html: String::new(),
-                extension_url: None,
-                remind_starting_at: None,
-                remind_schedule: DisplaySchedule::Once,
-            }),
-        };
 
         Configuration {
             telemetry: state.config.telemetry.clone(),
@@ -133,7 +109,6 @@ impl Configuration {
             changelog_url: format!(
                 "https://github.com/feldera/feldera/releases/tag/v{version}"
             ),
-            license_validity: Some(license_check.check_outcome.clone()),
             update_info: None,
             build_info: BuildInformation::from_env(),
             build_source: env!("FELDERA_BUILD_ORIGIN").to_string(),

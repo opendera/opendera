@@ -18,7 +18,7 @@ use pipeline_manager::runner::local_runner::LocalRunner;
 use pipeline_manager::runner::main::runner_main;
 use pipeline_manager::{ensure_default_crypto_provider, init_fd_limit, platform_enable_unstable};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tracing::info;
 use utoipa::OpenApi;
 
@@ -155,7 +155,6 @@ fn main() -> anyhow::Result<()> {
                 db,
                 common_config,
                 api_config,
-                Arc::new(RwLock::new(None)),
             )
             .await
             .expect("API server main failed");

@@ -20,7 +20,6 @@ development = ["pg-client-config"]
 [dependencies]
 # Feldera
 feldera-types = { workspace = true }
-feldera-cloud1-client = { workspace = true }
 feldera-ir = { workspace = true }
 
 # Logging
