@@ -62,6 +62,10 @@ impl ExtendedPipelineDescrRunner {
                 bootstrap_policy: pipeline.bootstrap_policy,
                 deployment_runtime_desired_status_since: pipeline
                     .deployment_runtime_desired_status_since,
+                fly_app: pipeline.fly_app.clone(),
+                fly_machine_id: pipeline.fly_machine_id.clone(),
+                tier: pipeline.tier.clone(),
+                ram_mb: pipeline.ram_mb,
             },
         }
     }

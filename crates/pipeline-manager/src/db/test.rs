@@ -3998,6 +3998,10 @@ fn convert_descriptor_to_monitoring(
         deployment_runtime_desired_status: pipeline.deployment_runtime_desired_status,
         bootstrap_policy: pipeline.bootstrap_policy,
         deployment_runtime_desired_status_since: pipeline.deployment_runtime_desired_status_since,
+        fly_app: pipeline.fly_app.clone(),
+        fly_machine_id: pipeline.fly_machine_id.clone(),
+        tier: pipeline.tier.clone(),
+        ram_mb: pipeline.ram_mb,
     }
 }
 
@@ -4406,6 +4410,10 @@ impl Storage for Mutex<DbModel> {
             deployment_runtime_desired_status: None,
             deployment_runtime_desired_status_since: None,
             bootstrap_policy: None,
+            fly_app: None,
+            fly_machine_id: None,
+            tier: None,
+            ram_mb: None,
         };
 
         // Insert into state

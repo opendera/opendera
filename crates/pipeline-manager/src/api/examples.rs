@@ -81,6 +81,10 @@ fn extended_pipeline_1() -> ExtendedPipelineDescr {
         deployment_runtime_status_since: None,
         deployment_runtime_desired_status: None,
         deployment_runtime_desired_status_since: None,
+        fly_app: None,
+        fly_machine_id: None,
+        tier: None,
+        ram_mb: None,
     }
 }
 
@@ -168,6 +172,10 @@ fn extended_pipeline_2() -> ExtendedPipelineDescr {
         deployment_runtime_status_since: None,
         deployment_runtime_desired_status: None,
         deployment_runtime_desired_status_since: None,
+        fly_app: None,
+        fly_machine_id: None,
+        tier: None,
+        ram_mb: None,
     }
 }
 
