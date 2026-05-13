@@ -78,6 +78,46 @@ fn default_local_runner_working_directory() -> String {
         .unwrap()
 }
 
+fn default_runner_kind() -> RunnerKind {
+    RunnerKind::Local
+}
+
+fn default_fly_region() -> String {
+    "iad".to_string()
+}
+
+fn default_fly_machine_cpu_kind() -> String {
+    "performance".to_string()
+}
+
+fn default_fly_machine_cpus() -> u32 {
+    1
+}
+
+// The default machine RAM (2048 MiB) is the largest size that still
+// supports Fly's snapshot-resume path. Bumping this disables suspend;
+// see `crates/pipeline-manager/src/runner/fly_runner.rs`.
+fn default_fly_machine_memory_mb() -> u32 {
+    2048
+}
+
+/// Default heuristic for which env keys are secret-bearing. See
+/// [`FlyRunnerConfig::secret_env_suffixes`].
+pub fn default_secret_env_suffixes() -> Vec<String> {
+    [
+        "_PASSWORD",
+        "_PASSWD",
+        "_SECRET",
+        "_TOKEN",
+        "_KEY",
+        "_CREDENTIALS",
+        "_API_KEY",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
 #[cfg(feature = "postgresql_embedded")]
 fn default_db_connection_string() -> String {
     "postgres-embed".to_string()
@@ -1108,6 +1148,132 @@ impl LocalRunnerConfig {
     pub(crate) fn port_file_path(&self, pipeline_id: PipelineId) -> PathBuf {
         self.pipeline_dir(pipeline_id)
             .join(feldera_types::transport::http::SERVER_PORT_FILE)
+    }
+}
+
+/// Selects which `PipelineExecutor` implementation the manager binary
+/// instantiates at startup.
+#[derive(clap::ValueEnum, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunnerKind {
+    /// Run each pipeline as a local OS process. Suitable for single-host
+    /// development and self-hosted deployments.
+    Local,
+    /// Provision each pipeline as a Fly.io Machine in a per-tenant Fly
+    /// App. Requires the `--fly-*` / `--tigris-*` configuration below.
+    Fly,
+}
+
+#[derive(Parser, Deserialize, Debug, Clone)]
+#[command(author, version, about, long_about = None)]
+pub struct RunnerSelectionConfig {
+    /// Executor implementation to use for pipeline provisioning.
+    #[serde(default = "default_runner_kind")]
+    #[arg(long, value_enum, default_value_t = default_runner_kind())]
+    pub runner_kind: RunnerKind,
+}
+
+/// Configuration for the Fly.io Machines executor. Consumed only when
+/// `runner_kind` is `Fly`; otherwise every field can be left unset.
+#[derive(Parser, Deserialize, Debug, Clone)]
+#[command(author, version, about, long_about = None)]
+pub struct FlyRunnerConfig {
+    /// Fly API token with org-scoped permission to create apps + machines.
+    #[serde(default)]
+    #[arg(long = "fly-api-token", env = "FLY_API_TOKEN", default_value = "")]
+    pub api_token: String,
+
+    /// Fly organization slug (where new per-tenant apps live).
+    #[serde(default)]
+    #[arg(long = "fly-org-slug", env = "FLY_ORG_SLUG", default_value = "")]
+    pub org_slug: String,
+
+    /// Default Fly region for new machines (e.g. `iad`).
+    #[serde(default = "default_fly_region")]
+    #[arg(long = "fly-region", env = "FLY_REGION", default_value_t = default_fly_region())]
+    pub region: String,
+
+    /// Container image to run for pipeline workers
+    /// (e.g. `ghcr.io/opendera/pipeline-runtime:latest`).
+    #[serde(default)]
+    #[arg(long = "fly-pipeline-image", env = "FLY_PIPELINE_IMAGE", default_value = "")]
+    pub pipeline_image: String,
+
+    /// Default machine CPU kind (`performance` or `shared`).
+    #[serde(default = "default_fly_machine_cpu_kind")]
+    #[arg(
+        long = "fly-default-machine-cpu-kind",
+        default_value_t = default_fly_machine_cpu_kind()
+    )]
+    pub default_machine_cpu_kind: String,
+
+    /// Default machine CPU count.
+    #[serde(default = "default_fly_machine_cpus")]
+    #[arg(
+        long = "fly-default-machine-cpus",
+        default_value_t = default_fly_machine_cpus()
+    )]
+    pub default_machine_cpus: u32,
+
+    /// Default machine RAM in MiB. Values > 2048 disable Fly's
+    /// snapshot-resume path.
+    #[serde(default = "default_fly_machine_memory_mb")]
+    #[arg(
+        long = "fly-default-machine-memory-mb",
+        default_value_t = default_fly_machine_memory_mb()
+    )]
+    pub default_machine_memory_mb: u32,
+
+    /// Tigris endpoint URL (Fly's S3-compatible no-egress storage).
+    #[serde(default)]
+    #[arg(long = "fly-tigris-endpoint", env = "TIGRIS_ENDPOINT", default_value = "")]
+    pub tigris_endpoint: String,
+
+    /// Tigris bucket used as the pipeline checkpoint root.
+    #[serde(default)]
+    #[arg(long = "fly-tigris-bucket", env = "TIGRIS_BUCKET", default_value = "")]
+    pub tigris_bucket: String,
+
+    /// Env-var name suffixes that the runner treats as secrets:
+    /// entries in `PipelineConfig.global.env` whose key ends in one of
+    /// these are pushed via Fly's secrets API and stripped from the
+    /// plaintext machine env. Default covers the common cases
+    /// (`*_PASSWORD`, `*_SECRET`, `*_TOKEN`, `*_KEY`, `*_CREDENTIALS`).
+    /// Repeat the flag for multiple suffixes.
+    #[serde(default = "default_secret_env_suffixes")]
+    #[arg(
+        long = "fly-secret-env-suffix",
+        default_values_t = default_secret_env_suffixes()
+    )]
+    pub secret_env_suffixes: Vec<String>,
+}
+
+impl FlyRunnerConfig {
+    /// Validates that every required field is populated. Call this only
+    /// when `RunnerKind::Fly` has been selected — when `Local` is in
+    /// effect, the Fly configuration is unused and may be left empty.
+    pub fn canonicalize(self) -> AnyResult<Self> {
+        let required = [
+            ("--fly-api-token / FLY_API_TOKEN", &self.api_token),
+            ("--fly-org-slug / FLY_ORG_SLUG", &self.org_slug),
+            ("--fly-pipeline-image / FLY_PIPELINE_IMAGE", &self.pipeline_image),
+            ("--fly-tigris-endpoint / TIGRIS_ENDPOINT", &self.tigris_endpoint),
+            ("--fly-tigris-bucket / TIGRIS_BUCKET", &self.tigris_bucket),
+        ];
+        for (name, value) in required {
+            if value.is_empty() {
+                return Err(AnyError::msg(format!(
+                    "fly runner: required configuration {name} is empty"
+                )));
+            }
+        }
+        if self.default_machine_memory_mb > 2048 {
+            warn!(
+                "fly runner: default_machine_memory_mb={} (> 2048): Fly snapshot-resume is unavailable at this size",
+                self.default_machine_memory_mb
+            );
+        }
+        Ok(self)
     }
 }
 
