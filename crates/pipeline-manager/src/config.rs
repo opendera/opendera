@@ -890,6 +890,20 @@ pub struct ApiServerConfig {
     #[serde(default = "default_auth_audience")]
     #[arg(long, default_value = "feldera-api", env = "FELDERA_AUTH_AUDIENCE")]
     pub auth_audience: String,
+
+    /// Run in cloud mode.
+    ///
+    /// When enabled, the manager registers the cloud-only `/v0/signup`,
+    /// `/v0/account/*`, `/v0/billing/*`, and `/v0/usage/*` endpoints
+    /// consumed by the opendera-cloud console-plugin. These endpoints
+    /// are stubs against the OSS Storage trait and only make sense
+    /// inside the opendera-cloud control plane.
+    ///
+    /// Self-hosters should leave this off (the default), in which case
+    /// every cloud endpoint responds 404.
+    #[serde(default)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false, env = "OPENDERA_CLOUD_MODE")]
+    pub cloud_mode: bool,
 }
 
 impl ApiServerConfig {
@@ -934,6 +948,7 @@ impl ApiServerConfig {
             individual_tenant: true,
             authorized_groups: vec![],
             auth_audience: "feldera-api".to_string(),
+            cloud_mode: false,
         }
     }
 }

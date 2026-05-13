@@ -573,10 +573,10 @@ fn build_app(
         Some(auth_configuration) => {
             let auth_middleware = HttpAuthentication::with_fn(crate::auth::auth_validator);
             app.app_data(auth_configuration.clone())
-                .service(api_scope().wrap(auth_middleware).wrap(cors))
+                .service(api_scope(api_config).wrap(auth_middleware).wrap(cors))
         }
         None => app.service(
-            api_scope()
+            api_scope(api_config)
                 .wrap_fn(|req, srv| {
                     let req = crate::auth::tag_with_default_tenant_id(req);
                     srv.call(req)
@@ -623,25 +623,32 @@ fn internal_scope() -> Scope {
 fn public_scope(api_config: &ApiServerConfig) -> Scope {
     let openapi = ApiDoc::openapi();
 
-    web::scope("")
+    let mut scope = web::scope("")
         .service(
             web::scope("/config")
                 .wrap(api_config.cors())
                 .service(endpoints::config::get_config_authentication),
         )
         .service(SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-doc/openapi.json", openapi))
-        .service(healthz)
-        .service(
-            web::scope("")
-                .wrap(middleware::from_fn(add_cache_headers))
-                .service(ResourceFiles::new("/", generate()).resolve_not_found_to_root()),
-        )
+        .service(healthz);
+
+    // Cloud-only unauthenticated endpoints (POST /v0/signup). Mounted
+    // BEFORE the SPA fallback below so it doesn't get shadowed.
+    if api_config.cloud_mode {
+        scope = scope.service(endpoints::cloud::register_public(web::scope("/v0")));
+    }
+
+    scope.service(
+        web::scope("")
+            .wrap(middleware::from_fn(add_cache_headers))
+            .service(ResourceFiles::new("/", generate()).resolve_not_found_to_root()),
+    )
 }
 
 // The scope for all authenticated API endpoints
-fn api_scope() -> Scope {
+fn api_scope(api_config: &ApiServerConfig) -> Scope {
     // Make APIs available under the /v0/ prefix
-    web::scope("/v0")
+    let scope = web::scope("/v0")
         // Pipeline management endpoints
         .service(endpoints::pipeline_management::list_pipelines)
         .service(endpoints::pipeline_management::get_pipeline)
@@ -707,7 +714,16 @@ fn api_scope() -> Scope {
         // Cluster health check
         .service(endpoints::cluster::list_cluster_events)
         .service(endpoints::cluster::get_cluster_event)
-        .service(endpoints::cluster::get_cluster_health)
+        .service(endpoints::cluster::get_cluster_health);
+
+    // Cloud-only authenticated endpoints (account / billing / usage).
+    // Off by default — only registered when the manager is configured
+    // for cloud deployment.
+    if api_config.cloud_mode {
+        endpoints::cloud::register_authenticated(scope)
+    } else {
+        scope
+    }
 }
 
 struct SecurityAddon;
