@@ -21,8 +21,9 @@
 
 use actix_web::{
     HttpResponse, get, post,
-    web::{Data as WebData, Json, ReqData},
+    web::{Data as WebData, Json, Path, ReqData},
 };
+use rand::{Rng, distributions::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -272,6 +273,128 @@ pub async fn current_usage(
 }
 
 // ---------------------------------------------------------------------------
+// OAuth signup helpers (unauthenticated, registered in public_scope)
+// ---------------------------------------------------------------------------
+//
+// The cloud signup page offers one-click signup via Google and GitHub
+// alongside email/password. These endpoints generate the provider's
+// authorization URL from server-side config (so client secrets never
+// touch the browser) and return it for the client to navigate to.
+//
+// The callback handler is stubbed today: real OAuth integration needs
+// app registration with each provider (REMAINING_WORK.md §18), and the
+// flow then exchanges the auth code for an access token, fetches the
+// user profile, and calls `get_or_create_tenant_id` the same way
+// `POST /signup` does. The 501 body lays out the exact remaining
+// wiring so a follow-up PR can implement it without re-deriving the
+// protocol.
+
+#[derive(Serialize)]
+pub struct OAuthStartResponse {
+    pub authorization_url: String,
+    pub state: String,
+}
+
+fn random_state() -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
+/// `POST /v0/signup/oauth/{provider}/start`
+///
+/// Builds the provider's authorization URL from env-configured
+/// credentials and a fresh CSRF state token. The client stores the
+/// state in a cookie before redirecting; the callback validates it.
+///
+/// Providers: "google" | "github". Anything else → 404.
+#[post("/signup/oauth/{provider}/start")]
+pub async fn oauth_start(
+    state: WebData<ServerState>,
+    provider: Path<String>,
+) -> Result<HttpResponse, ManagerError> {
+    let provider = provider.into_inner();
+    let cfg = &state.config;
+    let csrf = random_state();
+
+    let (auth_url, client_id, redirect_uri, scope, base) = match provider.as_str() {
+        "google" => (
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            cfg.oauth_google_client_id.as_deref(),
+            cfg.oauth_google_redirect_uri.as_deref(),
+            "openid email profile",
+            "google",
+        ),
+        "github" => (
+            "https://github.com/login/oauth/authorize",
+            cfg.oauth_github_client_id.as_deref(),
+            cfg.oauth_github_redirect_uri.as_deref(),
+            "read:user user:email",
+            "github",
+        ),
+        _ => return Ok(HttpResponse::NotFound().body("unknown oauth provider")),
+    };
+
+    let (Some(client_id), Some(redirect_uri)) = (client_id, redirect_uri) else {
+        // The provider isn't configured on this deployment. Surface
+        // 503 so the client can hide the button rather than redirect
+        // into an obviously-broken provider flow.
+        return Ok(HttpResponse::ServiceUnavailable()
+            .body(format!("oauth provider {base} not configured")));
+    };
+
+    let url = format!(
+        "{auth_url}?client_id={client_id}\
+         &redirect_uri={redirect_uri}\
+         &response_type=code\
+         &scope={scope}\
+         &state={csrf}",
+        // urlencoding the scope keeps the spaces well-formed.
+        scope = urlencoding::encode(scope),
+        redirect_uri = urlencoding::encode(redirect_uri),
+    );
+
+    Ok(HttpResponse::Ok().json(OAuthStartResponse {
+        authorization_url: url,
+        state: csrf,
+    }))
+}
+
+/// `GET /v0/signup/oauth/{provider}/callback`
+///
+/// Stub. Once an OAuth app is registered with each provider and the
+/// client_secret is wired into the manager (REMAINING_WORK.md §18),
+/// this endpoint will:
+///
+///   1. Read `code` + `state` from the query string.
+///   2. Validate `state` against the cookie set by `/start`.
+///   3. Exchange `code` for an access token at the provider's token
+///      endpoint (Google: oauth2.googleapis.com/token; GitHub:
+///      github.com/login/oauth/access_token).
+///   4. Fetch the user profile (Google: openidconnect.googleapis.com
+///      /v1/userinfo; GitHub: api.github.com/user).
+///   5. Call `db.get_or_create_tenant_id(...)` with the email-derived
+///      tenant name and provider `"oauth-google"` / `"oauth-github"`.
+///   6. Issue a session JWT (or set an OIDC-style session cookie) and
+///      302 to `/onboarding/new-pipeline`.
+///
+/// Until then, return 501 with that plan so the client renders a
+/// helpful message instead of a blank screen.
+#[get("/signup/oauth/{provider}/callback")]
+pub async fn oauth_callback(
+    provider: Path<String>,
+) -> Result<HttpResponse, ManagerError> {
+    Ok(HttpResponse::NotImplemented().body(format!(
+        "OAuth callback for provider '{}' is not yet implemented. \
+         Real OAuth signup requires app registration with the provider \
+         (REMAINING_WORK.md §18).",
+        provider.into_inner()
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Public exports for scope wiring (see api/main.rs).
 // ---------------------------------------------------------------------------
 
@@ -290,7 +413,10 @@ pub(crate) fn register_authenticated(scope: actix_web::Scope) -> actix_web::Scop
 /// Register the cloud endpoints that DON'T need tenant auth (signup
 /// only). Called from `public_scope` under the same `cloud_mode` gate.
 pub(crate) fn register_public(scope: actix_web::Scope) -> actix_web::Scope {
-    scope.service(signup)
+    scope
+        .service(signup)
+        .service(oauth_start)
+        .service(oauth_callback)
 }
 
 #[cfg(test)]

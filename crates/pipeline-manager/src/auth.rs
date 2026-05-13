@@ -1026,6 +1026,10 @@ mod test {
             issuer_tenant: false,
             auth_audience: "feldera-api".to_string(),
             cloud_mode: false,
+            oauth_google_client_id: None,
+            oauth_google_redirect_uri: None,
+            oauth_github_client_id: None,
+            oauth_github_redirect_uri: None,
         };
 
         let (conn, _temp) = crate::db::test::setup_pg().await;
