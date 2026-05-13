@@ -10,10 +10,12 @@ use pipeline_manager::compiler::main::{compiler_main, compiler_precompile};
 #[cfg(feature = "postgresql_embedded")]
 use pipeline_manager::config::PgEmbedConfig;
 use pipeline_manager::config::{
-    ApiServerConfig, CommonConfig, CompilerConfig, DatabaseConfig, LocalRunnerConfig,
+    ApiServerConfig, CommonConfig, CompilerConfig, DatabaseConfig, FlyRunnerConfig,
+    LocalRunnerConfig, RunnerKind, RunnerSelectionConfig,
 };
 use pipeline_manager::db::storage_postgres::StoragePostgres;
 use pipeline_manager::events_cleaner::events_cleaner;
+use pipeline_manager::runner::fly_runner::FlyRunner;
 use pipeline_manager::runner::local_runner::LocalRunner;
 use pipeline_manager::runner::main::runner_main;
 use pipeline_manager::{ensure_default_crypto_provider, init_fd_limit, platform_enable_unstable};
@@ -49,7 +51,9 @@ fn main() -> anyhow::Result<()> {
             let cli = DatabaseConfig::augment_args(cli);
             let cli = ApiServerConfig::augment_args(cli);
             let cli = CompilerConfig::augment_args(cli);
+            let cli = RunnerSelectionConfig::augment_args(cli);
             let cli = LocalRunnerConfig::augment_args(cli);
+            let cli = FlyRunnerConfig::augment_args(cli);
             let matches = cli.get_matches();
             let common_config = CommonConfig::from_arg_matches(&matches)
                 .map_err(|err| err.exit())
@@ -72,7 +76,13 @@ fn main() -> anyhow::Result<()> {
             let compiler_config = CompilerConfig::from_arg_matches(&matches)
                 .map_err(|err| err.exit())
                 .unwrap();
+            let runner_selection = RunnerSelectionConfig::from_arg_matches(&matches)
+                .map_err(|err| err.exit())
+                .unwrap();
             let local_runner_config = LocalRunnerConfig::from_arg_matches(&matches)
+                .map_err(|err| err.exit())
+                .unwrap();
+            let fly_runner_config = FlyRunnerConfig::from_arg_matches(&matches)
                 .map_err(|err| err.exit())
                 .unwrap();
 
@@ -82,6 +92,14 @@ fn main() -> anyhow::Result<()> {
             // `api_config` currently does not have any paths
             let compiler_config = compiler_config.canonicalize()?;
             let local_runner_config = local_runner_config.canonicalize()?;
+            // Only validate the Fly config if the operator actually
+            // selected the Fly executor; otherwise leave it untouched
+            // so Local-mode deployments don't need to set any Fly env
+            // vars.
+            let fly_runner_config = match runner_selection.runner_kind {
+                RunnerKind::Local => fly_runner_config,
+                RunnerKind::Fly => fly_runner_config.canonicalize()?,
+            };
 
             if compiler_config.precompile {
                 compiler_precompile(common_config, compiler_config).await?;
@@ -124,17 +142,37 @@ fn main() -> anyhow::Result<()> {
                 .expect("Compiler server main failed");
             });
 
-            // Spawn local runner
+            // Spawn the runner selected at startup. Only one executor
+            // runs in a given manager process; the others are inert.
             let db_clone = db.clone();
             let common_config_clone = common_config.clone();
-            let _local_runner = tokio::spawn(async move {
-                runner_main::<LocalRunner>(
-                    db_clone,
-                    common_config_clone,
-                    local_runner_config.clone(),
-                )
-                .await;
-            });
+            let _runner = match runner_selection.runner_kind {
+                RunnerKind::Local => {
+                    info!("Starting pipeline runner: local");
+                    tokio::spawn(async move {
+                        runner_main::<LocalRunner>(
+                            db_clone,
+                            common_config_clone,
+                            local_runner_config.clone(),
+                        )
+                        .await;
+                    })
+                }
+                RunnerKind::Fly => {
+                    info!(
+                        "Starting pipeline runner: fly (org={}, region={})",
+                        fly_runner_config.org_slug, fly_runner_config.region
+                    );
+                    tokio::spawn(async move {
+                        runner_main::<FlyRunner>(
+                            db_clone,
+                            common_config_clone,
+                            fly_runner_config.clone(),
+                        )
+                        .await;
+                    })
+                }
+            };
 
             // Spawn cluster monitor
             let common_config_clone = common_config.clone();

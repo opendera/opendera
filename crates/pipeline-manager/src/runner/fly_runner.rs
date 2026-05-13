@@ -34,7 +34,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::config::CommonConfig;
+use crate::config::{CommonConfig, FlyRunnerConfig};
 use crate::db::types::pipeline::PipelineId;
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
@@ -45,71 +45,6 @@ use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
 use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
 
 const FLY_API_BASE: &str = "https://api.machines.dev";
-
-/// Runner-specific config supplied by the operator. Lives next to
-/// `LocalRunnerConfig` in `crates/pipeline-manager/src/config.rs` (TODO:
-/// add it there once Fly is wired into the binary).
-#[derive(Debug, Clone)]
-pub struct FlyRunnerConfig {
-    /// Fly API token with org-scoped permission to create apps + machines.
-    pub api_token: String,
-    /// Fly organization slug (where new per-tenant apps live).
-    pub org_slug: String,
-    /// Default Fly region for new machines (e.g. `iad`).
-    pub region: String,
-    /// Container image to run for pipeline workers.
-    /// Format: `ghcr.io/opendera/pipeline-runtime:<tag>` or similar.
-    pub pipeline_image: String,
-    /// Default Machine size for new pipelines.
-    pub default_machine_size: FlyMachineSize,
-    /// Tigris endpoint (no-egress storage on Fly's network).
-    pub tigris_endpoint: String,
-    /// Tigris bucket used as the pipeline checkpoint root.
-    pub tigris_bucket: String,
-    /// Env-var name suffixes that the runner treats as secrets:
-    /// entries in `PipelineConfig.global.env` whose key ends in one of
-    /// these are pushed via Fly's secrets API and stripped from the
-    /// plaintext machine env. Default covers the common cases
-    /// (`*_PASSWORD`, `*_SECRET`, `*_TOKEN`, `*_KEY`, `*_CREDENTIALS`).
-    pub secret_env_suffixes: Vec<String>,
-}
-
-/// Default heuristic for which env keys are secret-bearing. See
-/// [`FlyRunnerConfig::secret_env_suffixes`].
-pub fn default_secret_env_suffixes() -> Vec<String> {
-    [
-        "_PASSWORD",
-        "_PASSWD",
-        "_SECRET",
-        "_TOKEN",
-        "_KEY",
-        "_CREDENTIALS",
-        "_API_KEY",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect()
-}
-
-/// Bundled CPU / RAM preset, mirroring Fly's named presets.
-#[derive(Debug, Clone)]
-pub struct FlyMachineSize {
-    pub cpu_kind: String,
-    pub cpus: u32,
-    pub memory_mb: u32,
-}
-
-impl Default for FlyMachineSize {
-    fn default() -> Self {
-        // performance-1x 2GB — the smallest preset that supports
-        // suspend (≤2GiB RAM). Reasonable default for new pipelines.
-        Self {
-            cpu_kind: "performance".into(),
-            cpus: 1,
-            memory_mb: 2048,
-        }
-    }
-}
 
 /// State the runner carries between trait method calls. Everything
 /// except the log-streaming task is derivable from `pipeline_id` so a
@@ -345,9 +280,9 @@ impl FlyRunner {
                 image: self.config.pipeline_image.clone(),
                 env: self.pipeline_env(deployment_id, deployment_config),
                 guest: GuestConfig {
-                    cpu_kind: self.config.default_machine_size.cpu_kind.clone(),
-                    cpus: self.config.default_machine_size.cpus,
-                    memory_mb: self.config.default_machine_size.memory_mb,
+                    cpu_kind: self.config.default_machine_cpu_kind.clone(),
+                    cpus: self.config.default_machine_cpus,
+                    memory_mb: self.config.default_machine_memory_mb,
                 },
                 services: vec![],
                 restart: RestartPolicy { policy: "on-failure" },
@@ -939,6 +874,7 @@ impl Serialize for MachineResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::default_secret_env_suffixes;
     use crate::db::types::pipeline::PipelineId;
 
     #[test]
@@ -947,9 +883,10 @@ mod tests {
         // (≤ 2 GiB RAM). If this assertion ever breaks, also revisit
         // the Tier classification in opendera-cloud's
         // activity-controller.
-        let s = FlyMachineSize::default();
+        use clap::Parser;
+        let cfg = FlyRunnerConfig::parse_from(["fly-runner-test"]);
         assert!(
-            s.memory_mb <= 2048,
+            cfg.default_machine_memory_mb <= 2048,
             "default machine size must be suspendable"
         );
     }
