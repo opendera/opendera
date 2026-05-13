@@ -50,8 +50,6 @@ pub fn validate_name(name: &str) -> Result<(), DBError> {
 pub enum ValidationError {
     #[error("could not deserialize due to: {0}")]
     DeserializationFailed(String),
-    #[error("enterprise feature: {0}")]
-    EnterpriseFeature(String),
     #[error("invalid pipeline environment: {0}")]
     InvalidPipelineEnv(String),
 }
@@ -66,15 +64,6 @@ pub(crate) fn validate_runtime_config(
         .map_err(|e| ValidationError::DeserializationFailed(e.to_string()));
     match deserialize_result {
         Ok(runtime_config) => {
-            if runtime_config.fault_tolerance.is_enabled() {
-                // Fault tolerance has been removed pending clean-room
-                // reimplementation; reject configs that request it.
-                let e = ValidationError::EnterpriseFeature("fault tolerance".to_string());
-                if log_if_invalid {
-                    error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}");
-                }
-                return Err(e);
-            }
             if let Err(e) = validate_pipeline_env(&runtime_config.env) {
                 let e = ValidationError::InvalidPipelineEnv(e);
                 if log_if_invalid {
@@ -226,9 +215,23 @@ mod tests {
             Err(ValidationError::DeserializationFailed(_))
         ));
 
-        // Fault tolerance support has been removed pending clean-room
-        // reimplementation; the assertion that previously verified the
-        // enterprise-only fault-tolerance path is deleted here.
+        // Fault tolerance is accepted. Both supported models round-trip.
+        for model in ["at_least_once", "exactly_once"] {
+            let rc = validate_runtime_config(
+                &json!({ "fault_tolerance": { "model": model } }),
+                true,
+            )
+            .unwrap_or_else(|e| panic!("fault_tolerance model {model:?} should validate: {e:?}"));
+            assert!(rc.fault_tolerance.is_enabled());
+        }
+
+        // Explicitly disabled fault tolerance (model: "none") is accepted and disabled.
+        let rc = validate_runtime_config(
+            &json!({ "fault_tolerance": { "model": "none" } }),
+            true,
+        )
+        .unwrap();
+        assert!(!rc.fault_tolerance.is_enabled());
 
         assert!(matches!(
             validate_runtime_config(&json!({ "env": { "TOKIO_WORKER_THREADS": "1" } }), true),

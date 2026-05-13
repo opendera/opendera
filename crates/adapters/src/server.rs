@@ -649,13 +649,6 @@ pub fn run_server(
         circuit_factory: CircuitFactoryFunc,
         runtime: &actix_web::rt::Runtime,
     ) -> Result<WebData<ServerState>, ControllerError> {
-        if config.global.fault_tolerance.is_enabled() {
-            // Fault tolerance has been removed pending clean-room reimplementation.
-            return Err(ControllerError::InvalidStandby(
-                "fault tolerance is unavailable until reimplemented",
-            ));
-        }
-
         // Initiate creating the controller so that we can get access to storage,
         // which is needed to determine the initial state.
         let builder = ControllerBuilder::new(config)?;
