@@ -3253,6 +3253,7 @@ async fn create_tenants_if_not_exists(
             id: tenant_id,
             tenant: Uuid::now_v7().to_string(),
             provider: Uuid::now_v7().to_string(),
+            stripe_customer_id: None,
         };
         e.insert(rec.clone());
         handle

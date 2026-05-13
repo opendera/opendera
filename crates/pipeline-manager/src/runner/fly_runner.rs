@@ -12,20 +12,26 @@
 //! Checkpoints + working state live on Tigris (Fly-network,
 //! no-egress) — see `generate_storage_config` below.
 //!
-//! Status (May 2026): minimum viable skeleton. The happy paths
-//! (provision -> ready -> stop -> clear) are implemented; the harder
-//! cases (Anycast IP allocation, multi-region failover, image-from-S3
-//! handoff, secrets push, multipart upload of generated binaries to
-//! the Fly image registry) are tracked with TODOs and will land
-//! alongside the cloud GA work.
+//! Status (May 2026): the happy paths (provision -> ready -> stop ->
+//! clear) plus pipeline secrets push and per-machine log streaming are
+//! implemented. Anycast IP allocation is intentionally not done — the
+//! cloud V1 model proxies pipeline traffic through the manager, so
+//! pipelines never need public IPs of their own. Multi-region failover
+//! and `program_binary_url` → Fly image registry handoff are still
+//! TODO and will land alongside the cloud GA work.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{info, warn};
+use tokio::spawn;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::CommonConfig;
@@ -34,7 +40,7 @@ use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use crate::runner::error::RunnerError;
 use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
-use crate::runner::pipeline_logs::LogsSender;
+use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
 use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
 
@@ -60,6 +66,29 @@ pub struct FlyRunnerConfig {
     pub tigris_endpoint: String,
     /// Tigris bucket used as the pipeline checkpoint root.
     pub tigris_bucket: String,
+    /// Env-var name suffixes that the runner treats as secrets:
+    /// entries in `PipelineConfig.global.env` whose key ends in one of
+    /// these are pushed via Fly's secrets API and stripped from the
+    /// plaintext machine env. Default covers the common cases
+    /// (`*_PASSWORD`, `*_SECRET`, `*_TOKEN`, `*_KEY`, `*_CREDENTIALS`).
+    pub secret_env_suffixes: Vec<String>,
+}
+
+/// Default heuristic for which env keys are secret-bearing. See
+/// [`FlyRunnerConfig::secret_env_suffixes`].
+pub fn default_secret_env_suffixes() -> Vec<String> {
+    [
+        "_PASSWORD",
+        "_PASSWD",
+        "_SECRET",
+        "_TOKEN",
+        "_KEY",
+        "_CREDENTIALS",
+        "_API_KEY",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 /// Bundled CPU / RAM preset, mirroring Fly's named presets.
@@ -82,18 +111,33 @@ impl Default for FlyMachineSize {
     }
 }
 
-/// State the runner carries between trait method calls. Everything is
-/// derivable from `pipeline_id` so a runner restart can rebuild it;
-/// the cache exists to avoid round-tripping the Fly API on every call.
+/// State the runner carries between trait method calls. Everything
+/// except the log-streaming task is derivable from `pipeline_id` so a
+/// runner restart can rebuild it; the cache exists to avoid round-
+/// tripping the Fly API on every call.
 pub struct FlyRunner {
     pipeline_id: PipelineId,
     common_config: CommonConfig,
     config: FlyRunnerConfig,
     client: Client,
-    #[allow(dead_code)]
     logs_sender: LogsSender,
     /// Cached after the first provision call.
     cached: Option<MachineHandle>,
+    /// Termination + join handle for the background task forwarding
+    /// Fly machine logs into [`LogsSender`]. Created in `provision`,
+    /// torn down in `stop` / `clear` / `Drop`.
+    log_streamer: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
+}
+
+impl Drop for FlyRunner {
+    fn drop(&mut self) {
+        if let Some((terminate, join)) = self.log_streamer.take() {
+            // Best-effort: signal the streamer to stop and abort if it
+            // hasn't noticed yet. Same pattern as LocalRunner::drop.
+            let _ = terminate.send(());
+            join.abort();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -169,7 +213,10 @@ impl FlyRunner {
         format!("Bearer {}", self.config.api_token)
     }
 
-    /// Build the env map handed to the pipeline binary.
+    /// Build the env map handed to the pipeline binary, omitting any
+    /// entries that match `secret_env_suffixes` — those land on the
+    /// Fly App as secrets via [`push_secrets`] so they never appear in
+    /// plaintext on the Machine config.
     fn pipeline_env(
         &self,
         deployment_id: &Uuid,
@@ -187,9 +234,30 @@ impl FlyRunner {
         env.insert("AWS_ENDPOINT_URL_S3".into(), json!(self.config.tigris_endpoint));
         env.insert("AWS_REGION".into(), json!("auto"));
         for (k, v) in &deployment_config.global.env {
+            if self.is_secret_env_name(k) {
+                continue;
+            }
             env.insert(k.clone(), json!(v));
         }
         env
+    }
+
+    /// Whether `name` should be pushed as a Fly Secret instead of
+    /// inlined in the Machine env block.
+    fn is_secret_env_name(&self, name: &str) -> bool {
+        is_secret_env_name_with(name, &self.config.secret_env_suffixes)
+    }
+
+    /// Subset of `deployment_config.global.env` that should land as
+    /// Fly Secrets. Order-stable so a redeploy doesn't churn the App.
+    fn collect_secrets(&self, deployment_config: &PipelineConfig) -> BTreeMap<String, String> {
+        deployment_config
+            .global
+            .env
+            .iter()
+            .filter(|(k, _)| self.is_secret_env_name(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Create the Fly App if it doesn't already exist. Idempotent
@@ -377,9 +445,70 @@ impl FlyRunner {
         Ok(())
     }
 
+    /// Set secret-bearing pipeline env vars on the Fly App so they get
+    /// injected into the Machine's process env at boot without
+    /// appearing in the (plaintext) Machine config. Idempotent — Fly
+    /// treats a re-set with the same name+value as a no-op.
+    ///
+    /// Uses the Machines API bulk endpoint:
+    /// `POST /v1/apps/{app}/secrets`, body
+    /// `{ "secrets": { K: V, ... }, "replace_all": false }`.
+    /// `replace_all: false` so an operator pushing additional secrets
+    /// out-of-band (e.g. via `flyctl secrets set`) doesn't get wiped.
+    async fn push_secrets(
+        &self,
+        app_name: &str,
+        secrets: &BTreeMap<String, String>,
+    ) -> Result<(), ManagerError> {
+        if secrets.is_empty() {
+            return Ok(());
+        }
+        let body = json!({
+            "secrets": secrets,
+            "replace_all": false,
+        });
+        let url = format!("{FLY_API_BASE}/v1/apps/{app_name}/secrets");
+        let res = self
+            .client
+            .post(url)
+            .header("Authorization", self.auth_header())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Self::provision_err(format!("fly: push secrets: {e}")))?;
+        if !res.status().is_success() {
+            let status = res.status();
+            // Fly's API redacts the value in error responses, but
+            // including the keys we tried to set helps debugging
+            // without leaking material.
+            let keys: Vec<&String> = secrets.keys().collect();
+            let body = res.text().await.unwrap_or_default();
+            return Err(Self::provision_err(format!(
+                "fly: push secrets ({} keys) failed: {status}: {body}; keys={keys:?}",
+                secrets.len()
+            )));
+        }
+        info!(
+            pipeline_id = %self.pipeline_id,
+            app = %app_name,
+            count = secrets.len(),
+            "Fly: pushed pipeline secrets"
+        );
+        Ok(())
+    }
+
     fn provision_err(msg: impl Into<String>) -> ManagerError {
         RunnerError::RunnerProvisionError { error: msg.into() }.into()
     }
+}
+
+/// Case-insensitive suffix match. Standalone so tests don't need to
+/// build a [`FlyRunner`].
+fn is_secret_env_name_with(name: &str, suffixes: &[String]) -> bool {
+    let upper = name.to_ascii_uppercase();
+    suffixes
+        .iter()
+        .any(|s| upper.ends_with(&s.to_ascii_uppercase()))
 }
 
 /// Produce a short, URL-safe id from a pipeline id + deployment id.
@@ -415,6 +544,7 @@ impl PipelineExecutor for FlyRunner {
             client,
             logs_sender,
             cached: None,
+            log_streamer: None,
         }
     }
 
@@ -456,6 +586,11 @@ impl PipelineExecutor for FlyRunner {
         let app_name = self.app_name_for(*deployment_id);
         self.ensure_app(&app_name).await?;
 
+        // Secrets must be set on the App before the Machine starts,
+        // otherwise the worker boots without them.
+        let secrets = self.collect_secrets(deployment_config);
+        self.push_secrets(&app_name, &secrets).await?;
+
         let handle = match self.find_machine(&app_name).await? {
             Some(existing) => {
                 info!(
@@ -483,6 +618,14 @@ impl PipelineExecutor for FlyRunner {
                 }
             }
         };
+
+        // Begin streaming the Machine's stdout/stderr into the
+        // runner's `LogsSender` so `/v0/pipelines/.../logs` followers
+        // see the same stream they get from local-runner pipelines.
+        // Idempotent: a stale streamer from a previous provision is
+        // torn down first.
+        self.stop_log_streaming();
+        self.log_streamer = Some(self.start_log_streaming(&handle));
 
         self.cached = Some(handle);
         Ok(())
@@ -537,10 +680,15 @@ impl PipelineExecutor for FlyRunner {
         if let Some(handle) = self.cached.clone() {
             self.stop_machine(&handle.app_name, &handle.machine_id).await?;
         }
+        // The Fly Machine is no longer producing fresh logs; tear
+        // down the streamer so we don't keep polling a stopped
+        // machine. A subsequent `provision` will start a new one.
+        self.stop_log_streaming();
         Ok(())
     }
 
     async fn clear(&mut self) -> Result<(), ManagerError> {
+        self.stop_log_streaming();
         if let Some(handle) = self.cached.take() {
             self.destroy_machine(&handle.app_name, &handle.machine_id)
                 .await?;
@@ -603,6 +751,175 @@ impl FlyRunner {
         }
         Ok(())
     }
+
+    /// Spawn a background task that follows a Fly Machine's log
+    /// stream and forwards each line into [`LogsSender`]. Mirrors
+    /// the stdout/stderr-tailing thread that `LocalRunner` runs for
+    /// in-process pipelines, so consumers of
+    /// `/v0/pipelines/{name}/logs` see a unified stream regardless of
+    /// which executor backs the pipeline.
+    ///
+    /// The task:
+    /// - Authenticates with `FLY_API_BASE` using the same bearer
+    ///   token as the rest of the runner.
+    /// - Opens a follow-mode GET on the Machine logs endpoint and
+    ///   reads streamed bytes chunk-by-chunk, segmenting on newline.
+    /// - Re-opens the stream with exponential backoff if Fly closes
+    ///   the connection (Fly typically caps long-lived HTTP follows
+    ///   at a few minutes, after which the client must reconnect).
+    /// - Exits cleanly when the returned [`oneshot::Sender`] is
+    ///   triggered (via `stop_log_streaming` / `Drop`).
+    fn start_log_streaming(
+        &self,
+        handle: &MachineHandle,
+    ) -> (oneshot::Sender<()>, JoinHandle<()>) {
+        let (terminate_tx, mut terminate_rx) = oneshot::channel::<()>();
+        let client = self.client.clone();
+        let auth = self.auth_header();
+        let url = format!(
+            "{FLY_API_BASE}/v1/apps/{}/machines/{}/logs?follow=true",
+            handle.app_name, handle.machine_id
+        );
+        let pipeline_id = self.pipeline_id;
+        let mut logs_sender = self.logs_sender.clone();
+
+        let join = spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+            loop {
+                // Termination check before each (re)connect.
+                if terminate_rx.try_recv().is_ok() {
+                    return;
+                }
+
+                let req = client
+                    .get(&url)
+                    .header("Authorization", &auth)
+                    .send()
+                    .await;
+                let mut resp = match req {
+                    Ok(r) if r.status().is_success() => r,
+                    Ok(r) => {
+                        warn!(
+                            pipeline_id = %pipeline_id,
+                            status = %r.status(),
+                            "Fly: machine logs follow returned non-2xx; backing off"
+                        );
+                        if !backoff_or_exit(&mut terminate_rx, &mut backoff, MAX_BACKOFF).await {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            pipeline_id = %pipeline_id,
+                            "Fly: machine logs follow: connect failed: {e}; backing off"
+                        );
+                        if !backoff_or_exit(&mut terminate_rx, &mut backoff, MAX_BACKOFF).await {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+
+                // Reset backoff on a successful connect.
+                backoff = Duration::from_secs(1);
+
+                // Stream chunks and segment on '\n'. A pipeline log
+                // line can exceed a single chunk (the Fly proxy doesn't
+                // align reads on line boundaries), so we buffer the
+                // tail of the most recent chunk between iterations.
+                let mut tail: Vec<u8> = Vec::new();
+                loop {
+                    tokio::select! {
+                        _ = &mut terminate_rx => {
+                            return;
+                        }
+                        chunk = resp.chunk() => match chunk {
+                            Ok(Some(bytes)) => {
+                                tail.extend_from_slice(&bytes);
+                                while let Some(pos) = tail.iter().position(|b| *b == b'\n') {
+                                    let line_bytes: Vec<u8> = tail.drain(..=pos).collect();
+                                    // Drop the trailing '\n' (and '\r' if
+                                    // CRLF) before forwarding.
+                                    let end = line_bytes.len()
+                                        - 1
+                                        - usize::from(
+                                            line_bytes.len() >= 2
+                                                && line_bytes[line_bytes.len() - 2] == b'\r',
+                                        );
+                                    let line = String::from_utf8_lossy(&line_bytes[..end])
+                                        .into_owned();
+                                    if !line.is_empty() {
+                                        logs_sender
+                                            .send(LogMessage::new_from_pipeline(&line))
+                                            .await;
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // EOS — Fly closed the follow stream.
+                                // Flush any trailing partial line.
+                                if !tail.is_empty() {
+                                    let line = String::from_utf8_lossy(&tail).into_owned();
+                                    if !line.is_empty() {
+                                        logs_sender
+                                            .send(LogMessage::new_from_pipeline(&line))
+                                            .await;
+                                    }
+                                }
+                                debug!(
+                                    pipeline_id = %pipeline_id,
+                                    "Fly: machine logs stream closed; reconnecting"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    pipeline_id = %pipeline_id,
+                                    "Fly: machine logs read error: {e}; reconnecting"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Brief pause before reconnect so a flapping endpoint
+                // doesn't peg the manager.
+                if !backoff_or_exit(&mut terminate_rx, &mut backoff, MAX_BACKOFF).await {
+                    return;
+                }
+            }
+        });
+
+        (terminate_tx, join)
+    }
+
+    /// Tear down the log-streaming task if one is running.
+    fn stop_log_streaming(&mut self) {
+        if let Some((terminate, join)) = self.log_streamer.take() {
+            let _ = terminate.send(());
+            join.abort();
+        }
+    }
+}
+
+/// Wait either for the termination signal or until `*backoff` elapses,
+/// then double the backoff up to `max`. Returns false if termination
+/// fired (caller should exit), true otherwise.
+async fn backoff_or_exit(
+    terminate_rx: &mut oneshot::Receiver<()>,
+    backoff: &mut Duration,
+    max: Duration,
+) -> bool {
+    let wait = *backoff;
+    *backoff = std::cmp::min(*backoff * 2, max);
+    tokio::select! {
+        _ = terminate_rx => false,
+        _ = sleep(wait) => true,
+    }
 }
 
 // Manual Serialize for MachineResponse so the trait's `details: Value`
@@ -648,5 +965,56 @@ mod tests {
         // ('opendera-p-') eats 11, leaving ~19 for short_id. Our
         // format is 8 + '-' + 6 = 15 chars; that's the budget.
         assert!(a.len() <= 19, "short_id too long for fly app name");
+    }
+
+    #[test]
+    fn default_secret_suffixes_cover_common_names() {
+        let s = default_secret_env_suffixes();
+        // Sanity-check the cases that motivated the heuristic: a
+        // Kafka SASL password, a Postgres CDC password, a generic
+        // API token, and an AWS-style access key.
+        let secret_names = [
+            "KAFKA_SASL_PASSWORD",
+            "POSTGRES_PASSWORD",
+            "STRIPE_API_KEY",
+            "GITHUB_TOKEN",
+            "MY_SERVICE_SECRET",
+            "DB_CREDENTIALS",
+        ];
+        for n in secret_names {
+            assert!(
+                is_secret_env_name_with(n, &s),
+                "expected {n} to be classified as secret"
+            );
+        }
+        // Names that should NOT be classified as secret.
+        let plain_names = [
+            "LOG_LEVEL",
+            "RUST_LOG",
+            "OPENDERA_PIPELINE_ID",
+            "AWS_REGION",
+        ];
+        for n in plain_names {
+            assert!(
+                !is_secret_env_name_with(n, &s),
+                "did not expect {n} to be classified as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_match_is_case_insensitive() {
+        let s = default_secret_env_suffixes();
+        assert!(is_secret_env_name_with("my_password", &s));
+        assert!(is_secret_env_name_with("My_Password", &s));
+        assert!(is_secret_env_name_with("MY_PASSWORD", &s));
+    }
+
+    #[test]
+    fn empty_suffix_list_classifies_nothing_as_secret() {
+        // Operators can disable the heuristic by passing an empty
+        // suffix list. In that mode no env var is treated as secret;
+        // they all flow into the (plaintext) Machine env block.
+        assert!(!is_secret_env_name_with("KAFKA_PASSWORD", &[]));
     }
 }
