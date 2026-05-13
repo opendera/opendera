@@ -26,7 +26,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::spawn;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -39,6 +39,7 @@ use crate::db::types::pipeline::PipelineId;
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use crate::runner::error::RunnerError;
+use crate::runner::fly_image_registry::FlyImagePusher;
 use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
 use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
@@ -166,7 +167,10 @@ impl FlyRunner {
             "OPENDERA_DEPLOYMENT_ID".into(),
             json!(deployment_id.to_string()),
         );
-        env.insert("AWS_ENDPOINT_URL_S3".into(), json!(self.config.tigris_endpoint));
+        env.insert(
+            "AWS_ENDPOINT_URL_S3".into(),
+            json!(self.config.tigris_endpoint),
+        );
         env.insert("AWS_REGION".into(), json!("auto"));
         for (k, v) in &deployment_config.global.env {
             if self.is_secret_env_name(k) {
@@ -267,17 +271,23 @@ impl FlyRunner {
     }
 
     /// Create a new Machine in the given app and return its handle.
+    /// `image` may be a per-pipeline tag pushed earlier in
+    /// `provision`; when None, falls back to the bundled
+    /// `pipeline_image`.
     async fn create_machine(
         &self,
         app_name: &str,
         deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
+        image: Option<&str>,
     ) -> Result<MachineResponse, ManagerError> {
         let body = CreateMachineBody {
             name: &self.machine_name(),
             region: &self.config.region,
             config: MachineConfig {
-                image: self.config.pipeline_image.clone(),
+                image: image
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| self.config.pipeline_image.clone()),
                 env: self.pipeline_env(deployment_id, deployment_config),
                 guest: GuestConfig {
                     cpu_kind: self.config.default_machine_cpu_kind.clone(),
@@ -285,7 +295,9 @@ impl FlyRunner {
                     memory_mb: self.config.default_machine_memory_mb,
                 },
                 services: vec![],
-                restart: RestartPolicy { policy: "on-failure" },
+                restart: RestartPolicy {
+                    policy: "on-failure",
+                },
             },
         };
         let url = format!("{FLY_API_BASE}/v1/apps/{app_name}/machines");
@@ -333,13 +345,8 @@ impl FlyRunner {
             .map_err(|e| Self::provision_err(format!("fly: parse machine: {e}")))
     }
 
-    async fn stop_machine(
-        &self,
-        app_name: &str,
-        machine_id: &str,
-    ) -> Result<(), ManagerError> {
-        let url =
-            format!("{FLY_API_BASE}/v1/apps/{app_name}/machines/{machine_id}/stop");
+    async fn stop_machine(&self, app_name: &str, machine_id: &str) -> Result<(), ManagerError> {
+        let url = format!("{FLY_API_BASE}/v1/apps/{app_name}/machines/{machine_id}/stop");
         let res = self
             .client
             .post(url)
@@ -356,14 +363,8 @@ impl FlyRunner {
         Ok(())
     }
 
-    async fn destroy_machine(
-        &self,
-        app_name: &str,
-        machine_id: &str,
-    ) -> Result<(), ManagerError> {
-        let url = format!(
-            "{FLY_API_BASE}/v1/apps/{app_name}/machines/{machine_id}?force=true"
-        );
+    async fn destroy_machine(&self, app_name: &str, machine_id: &str) -> Result<(), ManagerError> {
+        let url = format!("{FLY_API_BASE}/v1/apps/{app_name}/machines/{machine_id}?force=true");
         let res = self
             .client
             .delete(url)
@@ -435,6 +436,60 @@ impl FlyRunner {
     fn provision_err(msg: impl Into<String>) -> ManagerError {
         RunnerError::RunnerProvisionError { error: msg.into() }.into()
     }
+
+    /// Download the pipeline binary from the compiler's HTTP endpoint,
+    /// then push it as a one-layer OCI image on top of
+    /// `image_registry.base_image`. Returns the resulting image
+    /// reference suitable for `MachineConfig.image`.
+    ///
+    /// Pre-condition: `self.config.image_registry.enabled()` is true.
+    /// The caller checked.
+    async fn push_pipeline_image(&self, program_binary_url: &str) -> Result<String, ManagerError> {
+        let registry_cfg = &self.config.image_registry;
+
+        // The compiler exposes the binary at a single HTTP URL —
+        // download it as bytes. The download can be large (tens of
+        // MB) but well within in-memory budget for a control-plane
+        // process that drives one pipeline at a time per executor.
+        let res = self
+            .client
+            .get(program_binary_url)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .map_err(|e| {
+                Self::provision_err(format!(
+                    "fly: download pipeline binary from {program_binary_url}: {e}"
+                ))
+            })?;
+        if !res.status().is_success() {
+            return Err(Self::provision_err(format!(
+                "fly: download pipeline binary {program_binary_url}: status {}",
+                res.status()
+            )));
+        }
+        let binary = res
+            .bytes()
+            .await
+            .map_err(|e| Self::provision_err(format!("fly: read pipeline binary body: {e}")))?
+            .to_vec();
+        let digest_hex = sha256_hex_only(&binary);
+
+        let pusher = FlyImagePusher::new(
+            self.client.clone(),
+            registry_cfg.clone(),
+            &self.config.api_token,
+        );
+        pusher.push_pipeline_image(&binary, &digest_hex).await
+    }
+}
+
+fn sha256_hex_only(bytes: &[u8]) -> String {
+    // Strip the `sha256:` prefix returned by the helper in
+    // `fly_image_registry` — we want just the hex for the tag.
+    crate::runner::fly_image_registry::sha256_hex(bytes)
+        .trim_start_matches("sha256:")
+        .to_string()
 }
 
 /// Case-insensitive suffix match. Standalone so tests don't need to
@@ -504,18 +559,14 @@ impl PipelineExecutor for FlyRunner {
         deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
         _program_info: &Value,
-        _program_binary_url: &str,
+        program_binary_url: &str,
         _program_info_url: Option<&str>,
         _program_version: Version,
     ) -> Result<(), ManagerError> {
-        // Avoid letting unused-arg warnings touch the trait impl
-        // every time the signature gains a parameter; mark them dead
-        // via the bindings above (TODOs:
+        // Remaining TODOs (independent of image push):
         //   - bootstrap_policy: pass to the pipeline as an env hint
-        //   - program_binary_url: hand off to Fly's image registry or
-        //     the pipeline pre-start hook to fetch
         //   - deployment_initial: communicate to the binary so it
-        //     boots in the requested initial state).
+        //     boots in the requested initial state.
         let _ = &self.common_config;
 
         let app_name = self.app_name_for(*deployment_id);
@@ -525,6 +576,18 @@ impl PipelineExecutor for FlyRunner {
         // otherwise the worker boots without them.
         let secrets = self.collect_secrets(deployment_config);
         self.push_secrets(&app_name, &secrets).await?;
+
+        // When configured, build a per-pipeline image (binary on top
+        // of the runtime base) and push it to the Fly registry. The
+        // resulting tag is passed as the Machine's `config.image`.
+        // Otherwise the Machine launches from the shared
+        // `pipeline_image` and is expected to fetch the binary at
+        // start-up via the legacy `program_binary_url` mechanism.
+        let machine_image = if self.config.image_registry.enabled() {
+            Some(self.push_pipeline_image(program_binary_url).await?)
+        } else {
+            None
+        };
 
         let handle = match self.find_machine(&app_name).await? {
             Some(existing) => {
@@ -540,11 +603,17 @@ impl PipelineExecutor for FlyRunner {
             }
             None => {
                 let created = self
-                    .create_machine(&app_name, deployment_id, deployment_config)
+                    .create_machine(
+                        &app_name,
+                        deployment_id,
+                        deployment_config,
+                        machine_image.as_deref(),
+                    )
                     .await?;
                 info!(
                     pipeline_id = %self.pipeline_id,
                     machine_id = %created.id,
+                    image = machine_image.as_deref().unwrap_or(&self.config.pipeline_image),
                     "Fly: created pipeline machine"
                 );
                 MachineHandle {
@@ -571,7 +640,9 @@ impl PipelineExecutor for FlyRunner {
             .cached
             .clone()
             .ok_or_else(|| Self::provision_err("provision was not called"))?;
-        let m = self.get_machine(&handle.app_name, &handle.machine_id).await?;
+        let m = self
+            .get_machine(&handle.app_name, &handle.machine_id)
+            .await?;
         match m.state.as_str() {
             "started" => Ok(ProvisionStatus::Provisioned {
                 location: format!(
@@ -582,11 +653,9 @@ impl PipelineExecutor for FlyRunner {
                 ),
                 details: serde_json::to_value(&m).unwrap_or_default(),
             }),
-            "created" | "starting" | "stopped" | "suspended" => {
-                Ok(ProvisionStatus::Ongoing {
-                    details: serde_json::to_value(&m).unwrap_or_default(),
-                })
-            }
+            "created" | "starting" | "stopped" | "suspended" => Ok(ProvisionStatus::Ongoing {
+                details: serde_json::to_value(&m).unwrap_or_default(),
+            }),
             "failed" => Err(Self::provision_err(format!(
                 "fly: machine entered failed state: {:?}",
                 m
@@ -604,7 +673,9 @@ impl PipelineExecutor for FlyRunner {
             Some(h) => h.clone(),
             None => return Ok(json!({ "state": "not_provisioned" })),
         };
-        let m = self.get_machine(&handle.app_name, &handle.machine_id).await?;
+        let m = self
+            .get_machine(&handle.app_name, &handle.machine_id)
+            .await?;
         Ok(json!({
             "state": m.state,
             "private_ip": m.private_ip,
@@ -613,7 +684,8 @@ impl PipelineExecutor for FlyRunner {
 
     async fn stop(&mut self) -> Result<(), ManagerError> {
         if let Some(handle) = self.cached.clone() {
-            self.stop_machine(&handle.app_name, &handle.machine_id).await?;
+            self.stop_machine(&handle.app_name, &handle.machine_id)
+                .await?;
         }
         // The Fly Machine is no longer producing fresh logs; tear
         // down the streamer so we don't keep polling a stopped
@@ -651,7 +723,7 @@ impl FlyRunner {
     /// the worker speak the same storage protocol.
     async fn clear_tigris_prefix(&self) -> Result<(), ManagerError> {
         use futures::StreamExt;
-        use object_store::{ObjectStore, parse_url_opts, path::Path as ObjPath};
+        use object_store::{parse_url_opts, path::Path as ObjPath, ObjectStore};
 
         // Compose the Tigris URL pointed at this pipeline's prefix and
         // parse it through object_store. Credentials are inherited
@@ -676,8 +748,7 @@ impl FlyRunner {
         let mut stream = store.list(Some(&base));
         let mut to_delete: Vec<ObjPath> = Vec::new();
         while let Some(item) = stream.next().await {
-            let meta = item
-                .map_err(|e| Self::provision_err(format!("fly: list tigris: {e}")))?;
+            let meta = item.map_err(|e| Self::provision_err(format!("fly: list tigris: {e}")))?;
             to_delete.push(meta.location);
         }
         for path in to_delete {

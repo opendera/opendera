@@ -1246,6 +1246,77 @@ pub struct FlyRunnerConfig {
         default_values_t = default_secret_env_suffixes()
     )]
     pub secret_env_suffixes: Vec<String>,
+
+    /// Optional per-pipeline image-registry push (binary on top of
+    /// `pipeline_image`). When `image_registry_host` is empty the
+    /// runner does not push and uses `pipeline_image` directly.
+    #[command(flatten)]
+    #[serde(default)]
+    pub image_registry: FlyImageRegistryConfig,
+}
+
+/// Per-pipeline OCI image push configuration. Consumed only when the
+/// host field is non-empty (see [`FlyImageRegistryConfig::enabled`]).
+#[derive(Parser, Deserialize, Debug, Clone, Default)]
+#[command(author, version, about, long_about = None)]
+pub struct FlyImageRegistryConfig {
+    /// Registry hostname, e.g. `registry.fly.io`. Empty disables the
+    /// per-pipeline image push.
+    #[serde(default)]
+    #[arg(
+        long = "fly-image-registry-host",
+        env = "FLY_IMAGE_REGISTRY_HOST",
+        default_value = ""
+    )]
+    pub registry_host: String,
+
+    /// Base image to rebase per-pipeline binaries onto. Typically the
+    /// same as `pipeline_image` but pinned by digest. Empty disables
+    /// the push.
+    #[serde(default)]
+    #[arg(
+        long = "fly-image-registry-base-image",
+        env = "FLY_IMAGE_REGISTRY_BASE_IMAGE",
+        default_value = ""
+    )]
+    pub base_image: String,
+
+    /// Repository the pushed images live under, e.g.
+    /// `opendera-pipelines`. The full pushed reference is
+    /// `<registry_host>/<target_repo>:p-<binary-digest>`. Empty
+    /// disables the push.
+    #[serde(default)]
+    #[arg(
+        long = "fly-image-registry-target-repo",
+        env = "FLY_IMAGE_REGISTRY_TARGET_REPO",
+        default_value = ""
+    )]
+    pub target_repo: String,
+
+    /// Absolute path inside the image where the pipeline binary
+    /// lands. The base image's entrypoint must `exec` this path.
+    #[serde(default = "default_fly_image_install_path")]
+    #[arg(
+        long = "fly-image-registry-binary-install-path",
+        env = "FLY_IMAGE_REGISTRY_BINARY_INSTALL_PATH",
+        default_value_t = default_fly_image_install_path()
+    )]
+    pub binary_install_path: String,
+}
+
+fn default_fly_image_install_path() -> String {
+    "/usr/local/bin/opendera-pipeline".to_string()
+}
+
+impl FlyImageRegistryConfig {
+    /// True when enough fields are populated to attempt a push. When
+    /// false the Fly runner skips the push and uses the bundled
+    /// `pipeline_image` directly.
+    pub fn enabled(&self) -> bool {
+        !self.registry_host.is_empty()
+            && !self.base_image.is_empty()
+            && !self.target_repo.is_empty()
+    }
 }
 
 impl FlyRunnerConfig {

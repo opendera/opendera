@@ -1,4 +1,5 @@
 pub mod error;
+pub mod fly_image_registry;
 pub mod fly_runner;
 pub mod interaction;
 pub mod local_runner;
