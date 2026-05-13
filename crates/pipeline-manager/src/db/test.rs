@@ -3302,6 +3302,7 @@ fn db_impl_behaves_like_model() {
                     pipelines: BTreeMap::new(),
                     pipeline_events: BTreeMap::new(),
                     cluster_events: BTreeMap::new(),
+                    usage_buckets: BTreeMap::new(),
                 });
                 runtime.block_on(async {
                     // We empty all tables in the database before each test
@@ -3680,6 +3681,12 @@ struct DbModel {
     pub pipelines: BTreeMap<(TenantId, PipelineId), ExtendedPipelineDescr>,
     pub pipeline_events: BTreeMap<(TenantId, PipelineId), Vec<ExtendedPipelineMonitorEvent>>,
     pub cluster_events: BTreeMap<ClusterMonitorEventId, ExtendedClusterMonitorEvent>,
+    /// Keyed by (pipeline_id, dim string, bucket_end_ts) — matches the
+    /// natural key in the `usage_bucket` Postgres table.
+    pub usage_buckets: BTreeMap<
+        (PipelineId, &'static str, chrono::DateTime<chrono::Utc>),
+        crate::db::types::usage::UsageBucket,
+    >,
 }
 
 #[async_trait]
@@ -5931,5 +5938,49 @@ impl Storage for Mutex<DbModel> {
             num_deleted += len_before - events.len();
         }
         Ok(num_deleted as u64)
+    }
+
+    async fn insert_usage_bucket(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        dim: crate::db::types::usage::UsageDimension,
+        bucket_end_ts: chrono::DateTime<chrono::Utc>,
+        amount: f64,
+    ) -> Result<(), DBError> {
+        let mut state = self.lock().await;
+        state.usage_buckets.insert(
+            (pipeline_id, dim.as_str(), bucket_end_ts),
+            crate::db::types::usage::UsageBucket {
+                pipeline_id,
+                tenant_id,
+                dim,
+                bucket_end_ts,
+                amount,
+            },
+        );
+        Ok(())
+    }
+
+    async fn list_usage_buckets(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: i64,
+    ) -> Result<Vec<crate::db::types::usage::UsageBucket>, DBError> {
+        let state = self.lock().await;
+        let mut rows: Vec<crate::db::types::usage::UsageBucket> = state
+            .usage_buckets
+            .values()
+            .filter(|b| since.map_or(true, |s| b.bucket_end_ts > s))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.bucket_end_ts
+                .cmp(&b.bucket_end_ts)
+                .then_with(|| a.pipeline_id.0.cmp(&b.pipeline_id.0))
+                .then_with(|| a.dim.cmp(&b.dim))
+        });
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows)
     }
 }

@@ -613,4 +613,27 @@ pub(crate) trait Storage {
         &self,
         retention_num: u32,
     ) -> Result<u64, DBError>;
+
+    /// Record one closed usage bucket. Idempotent on the natural key
+    /// `(pipeline_id, dim, bucket_end_ts)`: a second insert with the
+    /// same key overwrites the amount, so the usage collector can
+    /// retry without double-counting.
+    async fn insert_usage_bucket(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        dim: crate::db::types::usage::UsageDimension,
+        bucket_end_ts: chrono::DateTime<chrono::Utc>,
+        amount: f64,
+    ) -> Result<(), DBError>;
+
+    /// Return up to `limit` closed usage buckets in
+    /// `(bucket_end_ts, pipeline_id, dim)` ascending order, restricted
+    /// to `bucket_end_ts > since` when `since` is provided. Drives the
+    /// cursor-paginated `GET /internal/v0/usage` endpoint.
+    async fn list_usage_buckets(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: i64,
+    ) -> Result<Vec<crate::db::types::usage::UsageBucket>, DBError>;
 }

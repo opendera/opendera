@@ -1505,6 +1505,41 @@ impl Storage for StoragePostgres {
         txn.commit().await?;
         Ok(num_deleted)
     }
+
+    async fn insert_usage_bucket(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        dim: crate::db::types::usage::UsageDimension,
+        bucket_end_ts: chrono::DateTime<chrono::Utc>,
+        amount: f64,
+    ) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        operations::usage::insert_usage_bucket(
+            &txn,
+            tenant_id,
+            pipeline_id,
+            dim,
+            bucket_end_ts,
+            amount,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn list_usage_buckets(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: i64,
+    ) -> Result<Vec<crate::db::types::usage::UsageBucket>, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        let out = operations::usage::list_usage_buckets(&txn, since, limit).await?;
+        txn.commit().await?;
+        Ok(out)
+    }
 }
 
 impl StoragePostgres {

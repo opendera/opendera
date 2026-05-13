@@ -18,6 +18,7 @@ use pipeline_manager::events_cleaner::events_cleaner;
 use pipeline_manager::runner::fly_runner::FlyRunner;
 use pipeline_manager::runner::local_runner::LocalRunner;
 use pipeline_manager::runner::main::runner_main;
+use pipeline_manager::usage_collector::usage_collector;
 use pipeline_manager::{ensure_default_crypto_provider, init_fd_limit, platform_enable_unstable};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -186,6 +187,16 @@ fn main() -> anyhow::Result<()> {
             let common_config_clone = common_config.clone();
             tokio::spawn(async move {
                 events_cleaner(db_clone, common_config_clone).await;
+            });
+
+            // Spawn the usage collector. Closes one usage bucket per
+            // minute per running pipeline; rows are read by the
+            // cloud-side Stripe metering daemon through
+            // `/internal/v0/usage`.
+            let db_clone = db.clone();
+            let common_config_clone = common_config.clone();
+            tokio::spawn(async move {
+                usage_collector(db_clone, common_config_clone).await;
             });
 
             // The api-server blocks forever

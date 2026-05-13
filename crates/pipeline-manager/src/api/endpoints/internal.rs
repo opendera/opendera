@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::main::ServerState;
 use crate::db::storage::Storage;
 use crate::db::types::tenant::TenantId;
+use crate::db::types::usage::UsageDimension;
 use crate::error::ManagerError;
 use opendera_types::runtime_status::RuntimeStatus;
 
@@ -138,26 +139,20 @@ struct UsageRecord {
     bucket_end_ts: DateTime<Utc>,
 }
 
-#[derive(Serialize, Clone, Copy, Debug)]
-#[serde(rename_all = "snake_case")]
-enum UsageDimension {
-    IngestionGb,
-    StorageGbMonth,
-    FcuHour,
-    QueryTb,
-}
-
 #[derive(Serialize)]
 struct UsagePage {
     records: Vec<UsageRecord>,
-    /// Opaque pagination cursor; pass back to fetch the next page.
-    /// `None` when there are no more records right now (the daemon
-    /// polls again later).
+    /// Cursor (RFC 3339 timestamp) — pass back as `since` to fetch the
+    /// next page. `None` when the daemon has caught up; it should poll
+    /// again later.
     next: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct UsageQuery {
+    /// RFC 3339 timestamp. Only buckets whose `bucket_end_ts >` this
+    /// value are returned. Omit on first call to start from the oldest
+    /// available bucket.
     #[serde(default)]
     since: Option<String>,
     #[serde(default = "default_usage_limit")]
@@ -167,6 +162,10 @@ struct UsageQuery {
 fn default_usage_limit() -> u32 {
     100
 }
+
+/// Hard ceiling on a single page. Prevents a misbehaving daemon from
+/// scanning the whole table in one request and starving other readers.
+const MAX_USAGE_LIMIT: u32 = 1000;
 
 #[get("/usage")]
 pub async fn list_usage(
@@ -178,27 +177,48 @@ pub async fn list_usage(
         return Ok(resp);
     }
 
-    // TODO: implement real usage aggregation. The engine needs to:
-    //   1. Maintain per-pipeline counters for each dimension (bytes
-    //      ingested, FCU-seconds active, GB-month storage avg, query
-    //      TB scanned).
-    //   2. Roll them up into time buckets (1-minute or 5-minute
-    //      depending on the dimension's natural granularity).
-    //   3. Persist completed buckets so a manager restart doesn't
-    //      lose unbilled usage.
-    //   4. Expose them here as UsageRecord rows, paginated by the
-    //      `since` cursor.
-    //
-    // The skeleton returns an empty page so the Stripe daemon
-    // (opendera-cloud/stripe/) can compile + connect against the
-    // contract immediately, and the bucket aggregation can land
-    // incrementally without a daemon-side compat break.
+    let since = match query.since.as_deref() {
+        Some(s) => match DateTime::parse_from_rfc3339(s) {
+            Ok(ts) => Some(ts.with_timezone(&Utc)),
+            Err(_) => {
+                return Ok(HttpResponse::BadRequest().body("`since` must be an RFC 3339 timestamp"));
+            }
+        },
+        None => None,
+    };
+    let limit = query.limit.clamp(1, MAX_USAGE_LIMIT) as i64;
 
-    let _ = (&state, &query);
-    Ok(HttpResponse::Ok().json(UsagePage {
-        records: vec![],
-        next: query.since.clone(),
-    }))
+    let db = state.db.lock().await;
+    let buckets = db.list_usage_buckets(since, limit).await?;
+
+    // Cursor: the bucket_end_ts of the last record. The daemon passes
+    // it back as `since` and `WHERE bucket_end_ts > since` excludes it
+    // on the next page. When the page is short of `limit`, we still
+    // return a cursor so the daemon can resume polling from there
+    // when new buckets close.
+    let next = buckets.last().map(|b| b.bucket_end_ts.to_rfc3339());
+
+    let records: Vec<UsageRecord> = buckets
+        .into_iter()
+        .map(|b| {
+            let dim_str = b.dim.as_str();
+            UsageRecord {
+                idempotency_key: format!(
+                    "{}:{}:{}",
+                    b.pipeline_id.0,
+                    dim_str,
+                    b.bucket_end_ts.timestamp()
+                ),
+                tenant_id: b.tenant_id.0.to_string(),
+                pipeline_id: b.pipeline_id.0.to_string(),
+                dim: b.dim,
+                amount: b.amount,
+                bucket_end_ts: b.bucket_end_ts,
+            }
+        })
+        .collect();
+
+    Ok(HttpResponse::Ok().json(UsagePage { records, next }))
 }
 
 /// Cloud-internal: read a tenant's Stripe customer id. Consumed by the

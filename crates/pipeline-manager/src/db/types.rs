@@ -9,5 +9,6 @@ pub mod program;
 pub mod resources_status;
 pub mod storage;
 pub mod tenant;
+pub mod usage;
 pub mod utils;
 pub mod version;

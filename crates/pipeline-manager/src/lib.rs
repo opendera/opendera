@@ -16,6 +16,7 @@ pub mod events_cleaner;
 pub mod logging;
 pub mod pipeline_env;
 pub mod runner;
+pub mod usage_collector;
 
 /// Feature gate for new/unstable features that aren't rolled out or will change
 /// substantially in the future.
