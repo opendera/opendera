@@ -94,7 +94,7 @@ public final class MultiCratesWriter extends RustWriter {
                 paste = { version = "1.0.12" }
                 derive_more = { version = "1.0.0", features = ["add", "not", "from"] }
                 dbsp = { path = "$ROOT/crates/dbsp", features = ["backend-mode"] }
-                dbsp_adapters = { path = "$ROOT/crates/adapters"$FEATURES }
+                dbsp_adapters = { path = "$ROOT/crates/adapters" }
                 opendera-macros = { path = "$ROOT/crates/opendera-macros" }
                 opendera-types = { path = "$ROOT/crates/opendera-types" }
                 opendera-adapterlib = { path = "$ROOT/crates/adapterlib" }
@@ -111,17 +111,7 @@ public final class MultiCratesWriter extends RustWriter {
         if (!options.ioOptions.runtimePath.isEmpty())
             relativePath = options.ioOptions.runtimePath;
         deps = deps.replace("$ROOT", relativePath);
-        String enterpriseFeatures = options.ioOptions.enterprise ?
-                ", features = [\"feldera-enterprise\"] " : "";
-        deps = deps.replace("$FEATURES", enterpriseFeatures);
         cargoStream.println(deps);
-
-        if (options.ioOptions.enterprise) {
-            cargoStream.println("""
-                dbsp-enterprise = { path = "$ROOT/crates/dbsp-enterprise" }
-                sync-checkpoint = { path = "$ROOT/crates/sync-checkpoint" }
-            """.replace("$ROOT", relativePath));
-        }
 
         cargoStream.close();
     }
@@ -144,7 +134,7 @@ public final class MultiCratesWriter extends RustWriter {
                     .withUdf(false).withMalloc(false).withGenerateTuples(false);
             CrateGenerator test = new CrateGenerator(
                     this.rootDirectory, MultiCrates.CRATES_DIRECTORY, MultiCratesWriter.getTestName(), writer,
-                    crates.enterprise(), true);
+                    true);
             RustWriter.StructuresUsed locallyUsed = new RustWriter.StructuresUsed();
             FindInnerResources finder = new FindInnerResources(compiler, locallyUsed);
 

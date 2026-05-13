@@ -164,8 +164,6 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         public Map<String, String> loggingLevel = new HashMap<>();
         @Parameter(names = "--noRust", description = "Do not generate Rust output files")
         public boolean noRust = false;
-        @Parameter(names = "--enterprise", description = "Generate code supporting enterprise features")
-        public boolean enterprise = false;
         @Parameter(names="-o", description = "Output file; stdout if not specified")
         public String outputFile = "";
         @Parameter(names="--errors", description = "Error output file; stderr if not specified")

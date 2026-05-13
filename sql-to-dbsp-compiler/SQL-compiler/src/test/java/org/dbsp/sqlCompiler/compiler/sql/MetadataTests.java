@@ -1236,9 +1236,6 @@ public class MetadataTests extends BaseSQLTests {
                       Default: <empty string>
                     --dataflow
                       Emit the Dataflow graph of the program in the specified JSON file
-                    --enterprise
-                      Generate code supporting enterprise features
-                      Default: false
                     --errors
                       Error output file; stderr if not specified
                       Default: <empty string>

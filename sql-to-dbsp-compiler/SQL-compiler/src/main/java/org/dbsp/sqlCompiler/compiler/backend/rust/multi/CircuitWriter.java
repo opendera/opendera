@@ -225,12 +225,6 @@ public final class CircuitWriter extends BaseRustCodeGenerator {
                         });
                     }
                     """);
-            if (compiler.options.ioOptions.enterprise) {
-                this.builder().append("extern crate dbsp_enterprise;")
-                        .newline()
-                        .append("extern crate sync_checkpoint;")
-                        .newline();
-            }
         }
     }
 }

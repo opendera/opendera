@@ -23,7 +23,6 @@ public final class CrateGenerator {
     public final File baseDirectory;
     public final String directory;
     public final String crateName;
-    public final boolean enterprise;
     public final boolean lib;
 
     /** Cargo file name */
@@ -38,13 +37,12 @@ public final class CrateGenerator {
     final ICodeGenerator codeGenerator;
 
     public CrateGenerator(File baseDirectory, String directory, String crateName, ICodeGenerator codeGenerator,
-                          boolean enterprise, boolean lib) {
+                          boolean lib) {
         this.crateName = crateName;
         this.directory = directory;
         this.baseDirectory = baseDirectory;
         this.dependencies = new HashSet<>();
         this.codeGenerator = codeGenerator;
-        this.enterprise = enterprise;
         this.lib = lib;
     }
 
@@ -117,14 +115,6 @@ public final class CrateGenerator {
                 serde_json = { workspace = true }
                 seq-macro = { workspace = true }
                 rkyv = { workspace = true }""");
-        // Fork override: do not emit `dbsp-enterprise` / `sync-checkpoint`
-        // workspace dependencies — those proprietary crates are not part
-        // of this OSS tree, so requesting them would cause cargo to fail
-        // while resolving the generated pipeline workspace.
-        // if (this.enterprise) {
-        //     stream.println("dbsp-enterprise = { workspace = true }");
-        //     stream.println("sync-checkpoint = { workspace = true }");
-        // }
         if (isMain()) {
             stream.println("""
                     [target.'cfg(not(target_env = "msvc"))'.dependencies]

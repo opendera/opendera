@@ -62,10 +62,6 @@ public class MultiCrates {
         return FILE_PREFIX + this.pipelineName + "_main";
     }
 
-    public boolean enterprise() {
-        return this.compiler.options.ioOptions.enterprise;
-    }
-
     MultiCrates(File rootDirectory, String pipelineName, DBSPCompiler compiler, RustWriter.StructuresUsed used,
                 LateMaterializations materializations) {
         this.pipelineName = pipelineName;
@@ -76,7 +72,6 @@ public class MultiCrates {
         this.semiCrates = new HashMap<>();
         this.rootDirectory = rootDirectory;
         this.materializations = materializations;
-        boolean enterprise = this.enterprise();
 
         // One crate for each tuple size used
         for (int i : used.tupleSizesUsed) {
@@ -86,7 +81,7 @@ public class MultiCrates {
             BaseRustCodeGenerator tWriter = new RustFileWriter(this.materializations)
                     .setUsed(t).withUdf(false).withMalloc(false);
             CrateGenerator tuple = new CrateGenerator(
-                    this.rootDirectory, CRATES_DIRECTORY, FILE_PREFIX + "tuple" + i, tWriter, enterprise, true);
+                    this.rootDirectory, CRATES_DIRECTORY, FILE_PREFIX + "tuple" + i, tWriter, true);
             Utilities.putNew(this.tupleCrates, i, tuple);
         }
 
@@ -97,7 +92,7 @@ public class MultiCrates {
             BaseRustCodeGenerator tWriter = new RustFileWriter(this.materializations)
                     .setUsed(t).withUdf(false).withMalloc(false);
             CrateGenerator semi = new CrateGenerator(
-                    this.rootDirectory, CRATES_DIRECTORY, FILE_PREFIX + "semi" + i, tWriter, enterprise, true);
+                    this.rootDirectory, CRATES_DIRECTORY, FILE_PREFIX + "semi" + i, tWriter, true);
             if (!used.isPredefined(i)) {
                 CrateGenerator tuple = Utilities.getExists(this.tupleCrates, i);
                 semi.addDependency(tuple);
@@ -110,16 +105,16 @@ public class MultiCrates {
                 .withUdf(true).withMalloc(false).withGenerateTuples(false).withDeclareSourceMap(true);
         // Main crate contains the circuit
         this.main = new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, this.getMainName(),
-                mainWriter, enterprise, !compiler.options.generateMultiCrateMain());
+                mainWriter, !compiler.options.generateMultiCrateMain());
         // Crate with global variables
-        this.globals = new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, this.getGlobalsName(), globalsWriter, enterprise, true);
+        this.globals = new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, this.getGlobalsName(), globalsWriter, true);
         this.main.addDependency(this.globals);
     }
 
-    CrateGenerator createOperatorCrate(DBSPCircuit circuit, DBSPOperator operator, ICircuit parent, boolean enterprise) {
+    CrateGenerator createOperatorCrate(DBSPCircuit circuit, DBSPOperator operator, ICircuit parent) {
         String name = FILE_PREFIX + operator.getNodeName(true);
         SingleOperatorWriter single = new SingleOperatorWriter(operator, circuit, parent, this.materializations);
-        return new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, name, single, enterprise, true);
+        return new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, name, single, true);
     }
 
     static class UsesComparator extends InnerVisitor {
@@ -232,19 +227,19 @@ public class MultiCrates {
                         DBSPNestedOperator nested = operator.to(DBSPNestedOperator.class);
                         NestedOperatorWriter writer = new NestedOperatorWriter(nested, circuit, this.materializations);
                         String name = FILE_PREFIX + operator.getNodeName(true);
-                        op = new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, name, writer, this.enterprise(), true);
+                        op = new CrateGenerator(this.rootDirectory, CRATES_DIRECTORY, name, writer, true);
                         op.add(nested);
                         for (DBSPOperator inside: nested.getAllOperators()) {
                             if (inside.is(DBSPViewDeclarationOperator.class))
                                 continue;
                             CrateGenerator insideOp = this.createOperatorCrate(
-                                    circuit, inside.to(DBSPSimpleOperator.class), nested, this.enterprise());
+                                    circuit, inside.to(DBSPSimpleOperator.class), nested);
                             this.addDependencies(insideOp, inside);
                             op.addDependency(insideOp);
                             this.operators.add(insideOp);
                         }
                     } else {
-                        op = this.createOperatorCrate(circuit, operator, circuit, this.enterprise());
+                        op = this.createOperatorCrate(circuit, operator, circuit);
                     }
 
                     if (this.compiler.options.ioOptions.emitHandles &&
