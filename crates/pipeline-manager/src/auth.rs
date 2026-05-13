@@ -995,6 +995,7 @@ mod test {
         let auth_middleware = HttpAuthentication::with_fn(closure);
 
         let common_config = CommonConfig {
+            service_mode: crate::config::ServiceMode::Full,
             bind_address: "127.0.0.1".to_string(),
             api_host: "127.0.0.1".to_string(),
             api_port: 0,

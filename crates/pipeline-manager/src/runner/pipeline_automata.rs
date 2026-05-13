@@ -2086,6 +2086,7 @@ mod test {
 
         let automaton = PipelineAutomaton::new(
             CommonConfig {
+                service_mode: crate::config::ServiceMode::Full,
                 platform_version: "v0".to_string(),
                 bind_address: "127.0.0.1".to_string(),
                 api_host: "127.0.0.1".to_string(),

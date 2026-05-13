@@ -11,7 +11,7 @@ use pipeline_manager::compiler::main::{compiler_main, compiler_precompile};
 use pipeline_manager::config::PgEmbedConfig;
 use pipeline_manager::config::{
     ApiServerConfig, CommonConfig, CompilerConfig, DatabaseConfig, FlyRunnerConfig,
-    LocalRunnerConfig, RunnerKind, RunnerSelectionConfig,
+    LocalRunnerConfig, RunnerKind, RunnerSelectionConfig, ServiceMode,
 };
 use pipeline_manager::db::storage_postgres::StoragePostgres;
 use pipeline_manager::events_cleaner::events_cleaner;
@@ -122,87 +122,114 @@ fn main() -> anyhow::Result<()> {
             db.run_migrations().await?;
             let db = Arc::new(Mutex::new(db));
 
-            let db_clone = db.clone();
-            let common_config_clone = common_config.clone();
-            let compiler_config_clone = compiler_config.clone();
+            info!("Starting in service mode: {:?}", common_config.service_mode);
 
-            // Running multiple compiler workers on the same machine is not yet supported
-            // due to the HTTP server ran by compiler_main & cleanup status files.
-            // For now, we run a single compiler worker in the pipeline manager.
-            let worker_id = 0;
-            let total_workers = 1;
-            let _compiler = tokio::spawn(async move {
-                compiler_main(
-                    common_config_clone,
-                    compiler_config_clone,
-                    db_clone,
-                    worker_id,
-                    total_workers,
-                )
-                .await
-                .expect("Compiler server main failed");
-            });
-
-            // Spawn the runner selected at startup. Only one executor
-            // runs in a given manager process; the others are inert.
-            let db_clone = db.clone();
-            let common_config_clone = common_config.clone();
-            let _runner = match runner_selection.runner_kind {
-                RunnerKind::Local => {
-                    info!("Starting pipeline runner: local");
-                    tokio::spawn(async move {
-                        runner_main::<LocalRunner>(
-                            db_clone,
-                            common_config_clone,
-                            local_runner_config.clone(),
-                        )
-                        .await;
-                    })
+            // Branch on service mode. Three shapes:
+            //   Full     — everything in one process (default).
+            //   Manager  — API + runner + monitors; no compiler.
+            //   Compiler — compiler HTTP server only; foreground.
+            match common_config.service_mode {
+                ServiceMode::Compiler => {
+                    // Compile-only worker: blocks on compiler_main. Skips
+                    // API, runner, monitors, usage collector.
+                    let worker_id = 0;
+                    let total_workers = 1;
+                    compiler_main(
+                        common_config,
+                        compiler_config,
+                        db,
+                        worker_id,
+                        total_workers,
+                    )
+                    .await
+                    .expect("Compiler server main failed");
+                    Ok(())
                 }
-                RunnerKind::Fly => {
-                    info!(
-                        "Starting pipeline runner: fly (org={}, region={})",
-                        fly_runner_config.org_slug, fly_runner_config.region
-                    );
+                ServiceMode::Full | ServiceMode::Manager => {
+                    if common_config.service_mode == ServiceMode::Full {
+                        // Spawn the in-process compiler. In Manager mode this
+                        // is delegated to a separate `Compiler`-mode process
+                        // reachable at `--compiler-host`.
+                        let db_clone = db.clone();
+                        let common_config_clone = common_config.clone();
+                        let compiler_config_clone = compiler_config.clone();
+                        let worker_id = 0;
+                        let total_workers = 1;
+                        let _compiler = tokio::spawn(async move {
+                            compiler_main(
+                                common_config_clone,
+                                compiler_config_clone,
+                                db_clone,
+                                worker_id,
+                                total_workers,
+                            )
+                            .await
+                            .expect("Compiler server main failed");
+                        });
+                    }
+
+                    // Spawn the runner selected at startup. Only one executor
+                    // runs in a given manager process; the others are inert.
+                    let db_clone = db.clone();
+                    let common_config_clone = common_config.clone();
+                    let _runner = match runner_selection.runner_kind {
+                        RunnerKind::Local => {
+                            info!("Starting pipeline runner: local");
+                            tokio::spawn(async move {
+                                runner_main::<LocalRunner>(
+                                    db_clone,
+                                    common_config_clone,
+                                    local_runner_config.clone(),
+                                )
+                                .await;
+                            })
+                        }
+                        RunnerKind::Fly => {
+                            info!(
+                                "Starting pipeline runner: fly (org={}, region={})",
+                                fly_runner_config.org_slug, fly_runner_config.region
+                            );
+                            tokio::spawn(async move {
+                                runner_main::<FlyRunner>(
+                                    db_clone,
+                                    common_config_clone,
+                                    fly_runner_config.clone(),
+                                )
+                                .await;
+                            })
+                        }
+                    };
+
+                    // Cluster monitor
+                    let common_config_clone = common_config.clone();
+                    let db_clone = db.clone();
                     tokio::spawn(async move {
-                        runner_main::<FlyRunner>(
-                            db_clone,
-                            common_config_clone,
-                            fly_runner_config.clone(),
-                        )
-                        .await;
-                    })
+                        cluster_monitor(db_clone, common_config_clone, LocalResourcesPoller {})
+                            .await;
+                    });
+
+                    // Events cleaner
+                    let db_clone = db.clone();
+                    let common_config_clone = common_config.clone();
+                    tokio::spawn(async move {
+                        events_cleaner(db_clone, common_config_clone).await;
+                    });
+
+                    // Usage collector: closes one usage bucket per minute
+                    // per running pipeline; rows are read by the cloud-side
+                    // Stripe metering daemon through `/internal/v0/usage`.
+                    let db_clone = db.clone();
+                    let common_config_clone = common_config.clone();
+                    tokio::spawn(async move {
+                        usage_collector(db_clone, common_config_clone).await;
+                    });
+
+                    // The api-server blocks forever
+                    pipeline_manager::api::main::run(db, common_config, api_config)
+                        .await
+                        .expect("API server main failed");
+                    Ok(())
                 }
-            };
-
-            // Spawn cluster monitor
-            let common_config_clone = common_config.clone();
-            let db_clone = db.clone();
-            tokio::spawn(async move {
-                cluster_monitor(db_clone, common_config_clone, LocalResourcesPoller {}).await;
-            });
-
-            // Spawn events cleaner
-            let db_clone = db.clone();
-            let common_config_clone = common_config.clone();
-            tokio::spawn(async move {
-                events_cleaner(db_clone, common_config_clone).await;
-            });
-
-            // Spawn the usage collector. Closes one usage bucket per
-            // minute per running pipeline; rows are read by the
-            // cloud-side Stripe metering daemon through
-            // `/internal/v0/usage`.
-            let db_clone = db.clone();
-            let common_config_clone = common_config.clone();
-            tokio::spawn(async move {
-                usage_collector(db_clone, common_config_clone).await;
-            });
-
-            // The api-server blocks forever
-            pipeline_manager::api::main::run(db, common_config, api_config)
-                .await
-                .expect("API server main failed");
-            Ok(())
+            }
         })
 }
