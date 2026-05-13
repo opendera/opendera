@@ -144,7 +144,14 @@ export default defineConfig(async () => {
         // The plugins module is loaded from the cloud repo via package name
         'virtual:feldera-triage-plugins': process.env.FELDERA_PLUGINS_MODULE
           ? `export { default, createBundle, TriageResults } from '${process.env.FELDERA_PLUGINS_MODULE}'`
-          : `export default []; export async function createBundle() { return {} }; export class TriageResults { constructor() { this.results = [] } }`
+          : `export default []; export async function createBundle() { return {} }; export class TriageResults { constructor() { this.results = [] } }`,
+        // Cloud chrome injection point. The OSS build resolves to a stub
+        // exporting `TenantSwitcher = null`; the cloud build sets
+        // OPENDERA_CLOUD_CHROME_MODULE to a module that re-exports the
+        // real Svelte components (see opendera-cloud/console-plugin).
+        'virtual:opendera-cloud-chrome': process.env.OPENDERA_CLOUD_CHROME_MODULE
+          ? `export { TenantSwitcher } from '${process.env.OPENDERA_CLOUD_CHROME_MODULE}'`
+          : `export const TenantSwitcher = null`
       }),
       devtoolsJson()
     ] as PluginOption[],

@@ -16,3 +16,13 @@ declare module 'virtual:feldera-triage-plugins' {
   const plugins: TriagePlugin[]
   export default plugins
 }
+
+declare module 'virtual:opendera-cloud-chrome' {
+  import type { Component } from 'svelte'
+  // Null in OSS builds; populated by the cloud build via
+  // OPENDERA_CLOUD_CHROME_MODULE. Props mirror the plugin's
+  // TenantSwitcher.svelte signature.
+  export const TenantSwitcher:
+    | Component<{ current_tenant_id: string }>
+    | null
+}
