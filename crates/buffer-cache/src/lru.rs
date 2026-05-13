@@ -1,4 +1,4 @@
-use feldera_types::config::dev_tweaks::BufferCacheStrategy;
+use opendera_types::config::dev_tweaks::BufferCacheStrategy;
 
 use crate::{BufferCache, CacheEntry};
 use std::any::Any;

@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 md5 = { version = "0.7.0" }
 sltsqlvalue = { path = "../sltsqlvalue" }
-feldera-sqllib = { path = "../../../crates/sqllib" }
+opendera-sqllib = { path = "../../../crates/sqllib" }
 num = { version = "0.4.0" }
 dbsp = { path = "../../../crates/dbsp" }
 size-of = { version = "0.1.5", package = "feldera-size-of" }

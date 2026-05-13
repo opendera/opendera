@@ -4,10 +4,10 @@ use crate::{some_function2, some_polymorphic_function2};
 use ::serde::{Deserialize, Serialize};
 use dbsp::algebra::F64;
 use dbsp::num_entries_scalar;
-use feldera_macros::IsNone;
-use feldera_types::serde_with_context::SerializeWithContext;
 use geo::EuclideanDistance;
 use geo::Point;
+use opendera_macros::IsNone;
+use opendera_types::serde_with_context::SerializeWithContext;
 use serde::ser::Error;
 use size_of::*;
 

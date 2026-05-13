@@ -1,5 +1,5 @@
 [package]
-name = "feldera-rest-api"
+name = "opendera-rest-api"
 description = "REST API bindings for Feldera"
 keywords = ["incremental", "api", "rest", "database", "sql"]
 publish = true
@@ -19,11 +19,11 @@ serde_json = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["serde", "v7"] }
 reqwest = { workspace = true, features = ["json", "stream"] }
-feldera-types = { workspace = true }
+opendera-types = { workspace = true }
 progenitor-client = { workspace = true }
 rustversion.workspace = true
 sentry = { workspace = true }
-feldera-observability = { workspace = true }
+opendera-observability = { workspace = true }
 
 [build-dependencies]
 prettyplease = { workspace = true }

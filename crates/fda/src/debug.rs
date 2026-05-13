@@ -6,10 +6,10 @@ use std::{
     path::Path,
 };
 
-use feldera_rest_api::Client;
-use feldera_rest_api::types::*;
-use feldera_types::config::RuntimeConfig;
 use itertools::Itertools;
+use opendera_rest_api::Client;
+use opendera_rest_api::types::*;
+use opendera_types::config::RuntimeConfig;
 use ordered_float::OrderedFloat;
 use serde_json::Value;
 use tracing::{debug, info, warn};

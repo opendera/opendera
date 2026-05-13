@@ -431,7 +431,7 @@ import TabItem from '@theme/TabItem';
         - Added a `--force` option to `fda delete` to clear the storage of a pipeline.
         - Removed the `fda suspend` command, use `fda stop` instead (which can be set to take a checkpoint using `--checkpoint`).
 
-        ### Changes to Rust SDK `feldera-rest-api`:
+        ### Changes to Rust SDK `opendera-rest-api`:
 
         - `PipelineStatus::Shutdown`, `PipelineStatus::Suspend`, `PipelineStatus::Stopped` all map to `PipelineStatus::Stopped` now
         - API calls to start/pause pipeline functions are replaced with individual functions, e.g.,

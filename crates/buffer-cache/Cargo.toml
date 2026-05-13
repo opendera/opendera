@@ -1,5 +1,5 @@
 [package]
-name = "feldera-buffer-cache"
+name = "opendera-buffer-cache"
 version = { workspace = true }
 edition = "2024"
 homepage = { workspace = true }
@@ -13,7 +13,7 @@ description = "Weighted in-memory buffer caches with LRU and S3-FIFO eviction"
 [dependencies]
 crossbeam-utils = { workspace = true }
 enum-map = { workspace = true }
-feldera-types = { workspace = true }
+opendera-types = { workspace = true }
 quick_cache = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }

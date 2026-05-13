@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
-use feldera_adapterlib::errors::controller::ConfigError;
-use feldera_types::config::PipelineConfig;
+use opendera_adapterlib::errors::controller::ConfigError;
+use opendera_types::config::PipelineConfig;
 
 pub fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     let mut dependencies = Vec::new();

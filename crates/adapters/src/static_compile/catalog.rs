@@ -13,10 +13,10 @@ use dbsp::{
     operator::{MapHandle, SetHandle, ZSetHandle},
     typed_batch::BatchReader,
 };
-use feldera_adapterlib::catalog::CircuitCatalog;
-use feldera_sqllib::{SqlString, Variant, build_string_interner};
-use feldera_types::program_schema::{Relation, SqlIdentifier};
-use feldera_types::serde_with_context::{
+use opendera_adapterlib::catalog::CircuitCatalog;
+use opendera_sqllib::{SqlString, Variant, build_string_interner};
+use opendera_types::program_schema::{Relation, SqlIdentifier};
+use opendera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
 };
 use std::any::TypeId;
@@ -823,8 +823,8 @@ mod test {
 
     use crate::{Catalog, CircuitCatalog, catalog::RecordFormat, test::TestStruct};
     use dbsp::Runtime;
-    use feldera_adapterlib::catalog::SerBatchReader;
-    use feldera_types::format::json::JsonFlavor;
+    use opendera_adapterlib::catalog::SerBatchReader;
+    use opendera_types::format::json::JsonFlavor;
 
     const RECORD_FORMAT: RecordFormat = RecordFormat::Json(JsonFlavor::Default);
 

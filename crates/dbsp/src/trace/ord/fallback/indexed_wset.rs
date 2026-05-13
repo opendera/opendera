@@ -21,7 +21,7 @@ use crate::{
         serialize_indexed_wset,
     },
 };
-use feldera_storage::{FileReader, StoragePath};
+use opendera_storage::{FileReader, StoragePath};
 use rand::Rng;
 use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, ser::Serializer};
 use size_of::SizeOf;

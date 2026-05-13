@@ -15,16 +15,16 @@ use chrono::{DateTime, Utc};
 use crossbeam::queue::ArrayQueue;
 use crossbeam::sync::{Parker, Unparker};
 use dbsp::operator::StagedBuffers;
-use feldera_adapterlib::ConnectorMetadata;
-use feldera_adapterlib::format::BufferSize;
-use feldera_adapterlib::transport::{
+use itertools::Itertools;
+use opendera_adapterlib::ConnectorMetadata;
+use opendera_adapterlib::format::BufferSize;
+use opendera_adapterlib::transport::{
     InputEndpoint, InputReaderCommand, Resume, Watermark, parse_resume_info,
 };
-use feldera_sqllib::{ByteArray, SqlString, Timestamp, Variant};
-use feldera_types::config::FtModel;
-use feldera_types::program_schema::Relation;
-use feldera_types::transport::kafka::{KafkaInputConfig, KafkaStartFromConfig};
-use itertools::Itertools;
+use opendera_sqllib::{ByteArray, SqlString, Timestamp, Variant};
+use opendera_types::config::FtModel;
+use opendera_types::program_schema::Relation;
+use opendera_types::transport::kafka::{KafkaInputConfig, KafkaStartFromConfig};
 use rdkafka::client::OAuthToken;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::base_consumer::PartitionQueue;

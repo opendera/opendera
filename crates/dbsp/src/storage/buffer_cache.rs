@@ -3,7 +3,7 @@
 /// Buffer-cache implementations and cache statistics.
 mod cache;
 
-pub use feldera_storage::fbuf::{FBuf, FBufSerializer, LimitExceeded};
+pub use opendera_storage::fbuf::{FBuf, FBufSerializer, LimitExceeded};
 
 pub use cache::{
     AtomicCacheCounts, AtomicCacheStats, BufferCache, CacheAccess, CacheCounts, CacheStats,

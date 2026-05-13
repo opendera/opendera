@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use feldera_storage::tokio::TOKIO;
+use opendera_storage::tokio::TOKIO;
 use proptest::{collection::vec, prelude::*, strategy::BoxedStrategy};
 use size_of::SizeOf;
 use tempfile::tempdir;

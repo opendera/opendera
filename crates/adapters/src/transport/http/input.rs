@@ -13,12 +13,12 @@ use atomic::Atomic;
 use chrono::{DateTime, Utc};
 use circular_queue::CircularQueue;
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::format::BufferSize;
-use feldera_adapterlib::transport::{Resume, Watermark};
-use feldera_types::config::FtModel;
-use feldera_types::program_schema::Relation;
-use feldera_types::transport::http::HttpInputConfig;
 use futures_util::StreamExt;
+use opendera_adapterlib::format::BufferSize;
+use opendera_adapterlib::transport::{Resume, Watermark};
+use opendera_types::config::FtModel;
+use opendera_types::program_schema::Relation;
+use opendera_types::transport::http::HttpInputConfig;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::{

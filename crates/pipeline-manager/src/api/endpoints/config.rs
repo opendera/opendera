@@ -106,9 +106,7 @@ impl Configuration {
             runtime_revision: runtime_revision.to_string(),
             unstable_features: unstable_features()
                 .map(|features| features.iter().cloned().collect::<Vec<&str>>().join(",")),
-            changelog_url: format!(
-                "https://github.com/opendera/opendera/releases/tag/v{version}"
-            ),
+            changelog_url: format!("https://github.com/opendera/opendera/releases/tag/v{version}"),
             update_info: None,
             build_info: BuildInformation::from_env(),
             build_source: env!("FELDERA_BUILD_ORIGIN").to_string(),

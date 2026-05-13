@@ -1,8 +1,8 @@
 use clap::Parser;
 use directories::ProjectDirs;
-use feldera_rest_api::Client;
-use feldera_types::error::ErrorResponse;
 use futures_util::StreamExt;
+use opendera_rest_api::Client;
+use opendera_types::error::ErrorResponse;
 use progenitor_client::Error;
 use reqwest::StatusCode;
 use rustyline::error::ReadlineError;

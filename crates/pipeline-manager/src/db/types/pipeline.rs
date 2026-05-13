@@ -4,8 +4,8 @@ use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus
 use crate::db::types::storage::StorageStatus;
 use crate::db::types::version::Version;
 use chrono::{DateTime, Utc};
-use feldera_types::error::ErrorResponse;
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+use opendera_types::error::ErrorResponse;
+use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Display;

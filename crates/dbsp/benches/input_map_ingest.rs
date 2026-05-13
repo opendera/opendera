@@ -7,7 +7,7 @@ use dbsp::{
     operator::{MapHandle, Update},
     utils::{Tup2, Tup5},
 };
-use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
+use opendera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::{

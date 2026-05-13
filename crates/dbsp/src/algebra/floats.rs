@@ -3,7 +3,7 @@
 //! stored in a database.
 
 use crate::algebra::{HasOne, HasZero};
-use feldera_types::{deserialize_without_context, serialize_without_context};
+use opendera_types::{deserialize_without_context, serialize_without_context};
 use ordered_float::OrderedFloat;
 use paste::paste;
 use size_of::SizeOf;
@@ -22,7 +22,7 @@ macro_rules! float {
         $(
             paste!{
             #[doc = concat!("A wrapper around [`", stringify!($inner), "`] that provides additional useful traits, such as [Ord].")]
-            #[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, SizeOf, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, feldera_macros::IsNone)]
+            #[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, SizeOf, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, opendera_macros::IsNone)]
             #[repr(transparent)]
             #[size_of(skip_all)]
             #[derive(Serialize, Deserialize)]

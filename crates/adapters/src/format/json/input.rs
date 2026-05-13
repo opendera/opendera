@@ -11,10 +11,10 @@ use crate::{
 use actix_web::HttpRequest;
 use dbsp::operator::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
-use feldera_adapterlib::ConnectorMetadata;
-use feldera_adapterlib::format::Splitter;
-use feldera_sqllib::Variant;
-use feldera_types::format::json::{JsonLines, JsonParserConfig, JsonUpdateFormat};
+use opendera_adapterlib::ConnectorMetadata;
+use opendera_adapterlib::format::Splitter;
+use opendera_sqllib::Variant;
+use opendera_types::format::json::{JsonLines, JsonParserConfig, JsonUpdateFormat};
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::value::RawValue;
@@ -554,9 +554,9 @@ mod test {
         test::{MockUpdate, data::TestStructMetadata, init_test_logger, mock_parser_pipeline},
         transport::InputConsumer,
     };
-    use feldera_adapterlib::{ConnectorMetadata, format::Splitter};
-    use feldera_sqllib::{SqlString, Timestamp, Variant};
-    use feldera_types::{
+    use opendera_adapterlib::{ConnectorMetadata, format::Splitter};
+    use opendera_sqllib::{SqlString, Timestamp, Variant};
+    use opendera_types::{
         deserialize_table_record,
         format::json::{JsonFlavor, JsonLines, JsonParserConfig, JsonUpdateFormat},
         program_schema::Relation,

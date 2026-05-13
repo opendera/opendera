@@ -73,9 +73,9 @@ metrics = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 ptr_meta = { workspace = true }
-feldera-samply = { workspace = true }
-feldera-types = { workspace = true }
-feldera-macros = { workspace = true }
+opendera-samply = { workspace = true }
+opendera-types = { workspace = true }
+opendera-macros = { workspace = true }
 libc = { workspace = true }
 static_assertions = { workspace = true }
 zip = { workspace = true }
@@ -87,7 +87,7 @@ fastbloom = { workspace = true }
 roaring = { workspace = true }
 core_affinity = { workspace = true }
 indexmap = { workspace = true }
-feldera-storage = { workspace = true }
+opendera-storage = { workspace = true }
 inventory = { workspace = true }
 object_store = { workspace = true, features = ["aws", "gcp", "azure", "http"] }
 url = { workspace = true }
@@ -97,12 +97,12 @@ time = { workspace = true, features = [
     "serde",
     "serde-human-readable",
 ] }
-feldera-ir = { workspace = true }
+opendera-ir = { workspace = true }
 smallvec = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
 rmp-serde = { workspace = true }
-feldera-buffer-cache = { workspace = true }
+opendera-buffer-cache = { workspace = true }
 memory-stats = { workspace = true }
 serde_json_path_to_error = { workspace = true }
 flate2 = { workspace = true }

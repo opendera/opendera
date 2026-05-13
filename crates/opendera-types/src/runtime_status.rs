@@ -117,7 +117,7 @@ impl RuntimeDesiredStatus {
 /// `serde`, use this module in the field declaration, e.g.:
 ///
 /// ```ignore
-/// #[serde(with = "feldera_types::runtime_status::snake_case_runtime_desired_status")]
+/// #[serde(with = "opendera_types::runtime_status::snake_case_runtime_desired_status")]
 /// ```
 pub mod snake_case_runtime_desired_status {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};

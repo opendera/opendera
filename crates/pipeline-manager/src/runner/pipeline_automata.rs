@@ -20,9 +20,9 @@ use crate::runner::interaction::{format_pipeline_url, format_timeout_error_messa
 use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
 use crate::runner::pipeline_logs::{start_thread_pipeline_logs, LogMessage, LogsSender};
 use chrono::Utc;
-use feldera_observability::ReqwestTracingExt;
-use feldera_types::error::ErrorResponse;
-use feldera_types::runtime_status::{
+use opendera_observability::ReqwestTracingExt;
+use opendera_types::error::ErrorResponse;
+use opendera_types::runtime_status::{
     ExtendedRuntimeStatus, RuntimeDesiredStatus, RuntimeStatus, StorageStatusDetails,
 };
 use reqwest::{Method, StatusCode};
@@ -1825,9 +1825,9 @@ mod test {
     use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
     use crate::runner::pipeline_logs::{LogMessage, LogsSender};
     use async_trait::async_trait;
-    use feldera_types::config::{PipelineConfig, StorageConfig};
-    use feldera_types::program_schema::ProgramSchema;
-    use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+    use opendera_types::config::{PipelineConfig, StorageConfig};
+    use opendera_types::program_schema::ProgramSchema;
+    use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
     use serde_json::json;
     use std::str::FromStr;
     use std::sync::Arc;

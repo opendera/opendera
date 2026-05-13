@@ -1,6 +1,6 @@
 use crate::db::error::DBError;
 use crate::db::types::storage::StorageStatus;
-use feldera_types::error::ErrorResponse;
+use opendera_types::error::ErrorResponse;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Display;

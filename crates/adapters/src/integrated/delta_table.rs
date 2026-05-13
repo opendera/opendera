@@ -4,9 +4,9 @@ mod output;
 #[cfg(test)]
 mod test;
 
-use feldera_types::serde_with_context::serde_config::{DecimalFormat, UuidFormat};
-use feldera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimestampFormat};
 pub use input::DeltaTableInputEndpoint;
+use opendera_types::serde_with_context::serde_config::{DecimalFormat, UuidFormat};
+use opendera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimestampFormat};
 pub use output::DeltaTableWriter;
 use std::sync::Once;
 

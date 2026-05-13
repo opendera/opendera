@@ -22,7 +22,7 @@ num-traits = "0.2.19"
 
     udfs = """
 use i256::I256;
-use feldera_sqllib::*;
+use opendera_sqllib::*;
 use crate::{AddAssignByRef, AddByRef, HasZero, MulByRef, SizeOf, Tup3};
 use derive_more::Add;
 use num_traits::Zero;

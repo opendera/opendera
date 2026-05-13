@@ -2,7 +2,7 @@ use anyhow::Result;
 use csv::Reader;
 use dbsp::utils::Tup2;
 use dbsp::{RootCircuit, ZSet, ZSetHandle, ZWeight};
-use feldera_macros::IsNone;
+use opendera_macros::IsNone;
 use rkyv::{Archive, Serialize};
 use size_of::SizeOf;
 

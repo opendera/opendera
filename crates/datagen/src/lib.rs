@@ -15,13 +15,13 @@ use async_channel::Receiver as AsyncReceiver;
 use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, Days, Duration, NaiveDate, NaiveTime, Timelike, Utc};
 use crossbeam::sync::{Parker, Unparker};
-use feldera_fxp::{DynamicDecimal, UniformDecimal, pow10};
-use feldera_types::config::FtModel;
 use governor::clock::DefaultClock;
 use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Jitter, Quota, RateLimiter};
 use num_traits::{Bounded, ToPrimitive, clamp};
+use opendera_fxp::{DynamicDecimal, UniformDecimal, pow10};
+use opendera_types::config::FtModel;
 use rand::distributions::{Alphanumeric, Uniform};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng, thread_rng};
@@ -33,13 +33,13 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::{sync::mpsc::UnboundedSender, time::Instant as TokioInstant};
 
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::format::{BufferSize, InputBuffer, Parser, StagedInputBuffer};
-use feldera_adapterlib::transport::{
+use opendera_adapterlib::format::{BufferSize, InputBuffer, Parser, StagedInputBuffer};
+use opendera_adapterlib::transport::{
     InputCommandReceiver, InputConsumer, InputEndpoint, InputReader, InputReaderCommand, Resume,
     TransportInputEndpoint, Watermark, parse_resume_info,
 };
-use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier, SqlType};
-use feldera_types::transport::datagen::{
+use opendera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier, SqlType};
+use opendera_types::transport::datagen::{
     DatagenInputConfig, DatagenStrategy, GenerationPlan, RngFieldSettings,
 };
 use xxhash_rust::xxh3::Xxh3Default;
@@ -2288,7 +2288,7 @@ mod tests {
     use super::{
         FELDERA_MAX_DECIMAL_PRECISION, FELDERA_MAX_DECIMAL_SCALE, decimal_max, decimal_min,
     };
-    use feldera_fxp::{DynamicDecimal, UniformDecimal};
+    use opendera_fxp::{DynamicDecimal, UniformDecimal};
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
 

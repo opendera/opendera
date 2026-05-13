@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
-use feldera_types::checkpoint::{CheckpointMetadata, PSpineBatches};
-use feldera_types::config::{StorageBackendConfig, StorageConfig, StorageOptions};
-use feldera_types::constants::CREATE_FILE_EXTENSION;
+use opendera_types::checkpoint::{CheckpointMetadata, PSpineBatches};
+use opendera_types::config::{StorageBackendConfig, StorageConfig, StorageOptions};
+use opendera_types::constants::CREATE_FILE_EXTENSION;
 use serde::de::DeserializeOwned;
 use tracing::warn;
 use uuid::Uuid;

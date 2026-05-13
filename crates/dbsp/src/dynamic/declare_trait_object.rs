@@ -123,7 +123,7 @@ macro_rules! declare_typed_trait_object {
 
 #[cfg(test)]
 mod test {
-    use feldera_macros::IsNone;
+    use opendera_macros::IsNone;
     use rkyv::{Archive, Deserialize, Serialize};
     use size_of::SizeOf;
 

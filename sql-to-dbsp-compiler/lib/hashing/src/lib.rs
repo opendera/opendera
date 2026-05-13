@@ -6,7 +6,7 @@ use dbsp::{
 };
 
 use dbsp::dynamic::{DowncastTrait, Erase};
-use feldera_sqllib::{SqlString, WSet, Weight};
+use opendera_sqllib::{SqlString, WSet, Weight};
 use sltsqlvalue::*;
 use std::ops::{Add, Neg};
 use std::sync::Arc;

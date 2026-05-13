@@ -4,7 +4,7 @@ use csv::Reader;
 use dbsp::typed_batch::IndexedZSetReader;
 use dbsp::utils::{Tup2, Tup3};
 use dbsp::{OrdIndexedZSet, OutputHandle, RootCircuit, ZSetHandle, ZWeight};
-use feldera_macros::IsNone;
+use opendera_macros::IsNone;
 use rkyv::{Archive, Serialize};
 use size_of::SizeOf;
 

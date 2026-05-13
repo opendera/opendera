@@ -11,8 +11,8 @@ use actix_ws::{CloseCode, CloseReason};
 use awc::error::{ConnectError, SendRequestError};
 use awc::{ClientRequest, ClientResponse};
 use crossbeam::sync::ShardedLock;
-use feldera_observability::AwcRequestTracingExt;
-use feldera_types::query::MAX_WS_FRAME_SIZE;
+use opendera_observability::AwcRequestTracingExt;
+use opendera_types::query::MAX_WS_FRAME_SIZE;
 use std::fmt::Display;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -22,7 +22,7 @@ use tracing::{error, info};
 use crate::db::listen_table::PIPELINE_NOTIFY_CHANNEL_CAPACITY;
 use crate::db::types::resources_status::ResourcesStatus;
 use actix_http::encoding::Decoder;
-use feldera_types::runtime_status::RuntimeStatus;
+use opendera_types::runtime_status::RuntimeStatus;
 
 /// Max non-streaming decompressed HTTP response body size returned by the pipeline.
 /// The awc default is 2MiB, which is not enough to, for example, retrieve

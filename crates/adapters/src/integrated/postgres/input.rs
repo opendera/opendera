@@ -4,12 +4,12 @@ use crate::transport::{
 use crate::{ControllerError, InputConsumer, InputReader, PipelineState, RecordFormat};
 use anyhow::{Result as AnyResult, anyhow};
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::catalog::{DeCollectionStream, InputCollectionHandle};
-use feldera_adapterlib::format::ParseError;
-use feldera_types::config::FtModel;
-use feldera_types::format::json::JsonFlavor;
-use feldera_types::program_schema::Relation;
-use feldera_types::transport::postgres::PostgresReaderConfig;
+use opendera_adapterlib::catalog::{DeCollectionStream, InputCollectionHandle};
+use opendera_adapterlib::format::ParseError;
+use opendera_types::config::FtModel;
+use opendera_types::format::json::JsonFlavor;
+use opendera_types::program_schema::Relation;
+use opendera_types::transport::postgres::PostgresReaderConfig;
 
 use super::tls::make_tls_connector;
 use chrono::{TimeZone, Utc};

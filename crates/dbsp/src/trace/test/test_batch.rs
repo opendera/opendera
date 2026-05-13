@@ -1379,16 +1379,16 @@ where
 
     fn save(
         &mut self,
-        _base: &feldera_storage::StoragePath,
+        _base: &opendera_storage::StoragePath,
         _pid: &str,
-        _files: &mut Vec<std::sync::Arc<dyn feldera_storage::FileCommitter>>,
+        _files: &mut Vec<std::sync::Arc<dyn opendera_storage::FileCommitter>>,
     ) -> Result<(), crate::Error> {
         todo!()
     }
 
     fn restore(
         &mut self,
-        _base: &feldera_storage::StoragePath,
+        _base: &opendera_storage::StoragePath,
         _pid: &str,
     ) -> Result<(), crate::Error> {
         todo!()

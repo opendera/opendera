@@ -1,5 +1,5 @@
 use crate::trace::{Deserializable, Deserializer};
-use feldera_macros::IsNone;
+use opendera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 use std::{

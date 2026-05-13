@@ -6,9 +6,9 @@ pub mod val_batch;
 pub mod wset_batch;
 
 use crate::storage::file::reader::Error as ReaderError;
-use feldera_storage::error::StorageError;
 pub use indexed_wset_batch::{FileIndexedWSet, FileIndexedWSetFactories};
 pub use key_batch::{FileKeyBatch, FileKeyBatchFactories};
+use opendera_storage::error::StorageError;
 pub use val_batch::{FileValBatch, FileValBatchFactories};
 pub use wset_batch::{FileWSet, FileWSetFactories};
 

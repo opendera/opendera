@@ -1,10 +1,10 @@
-//! Throughput comparison between `feldera-buffer-cache`'s weighted LRU and
+//! Throughput comparison between `opendera-buffer-cache`'s weighted LRU and
 //! sharded S3-FIFO caches.
 //!
 //! `cargo bench -p dbsp --bench buffer_cache -- --write-ratios 0,10 --capacity-mib 1024 --strategy s3-fifo,lru --max-duration 30`
 use clap::{Parser, ValueEnum};
 use dbsp::mimalloc::MiMalloc;
-use feldera_buffer_cache::{CacheEntry, LruCache, S3FifoCache};
+use opendera_buffer_cache::{CacheEntry, LruCache, S3FifoCache};
 use rand::rngs::ThreadRng;
 use rand::{Rng, thread_rng};
 use rand_distr::{Distribution, Zipf};

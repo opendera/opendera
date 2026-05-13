@@ -9,7 +9,7 @@
 //! The API also prevents reading from a file that is not completed.
 #![warn(missing_docs)]
 
-use feldera_types::config::StorageCacheConfig;
+use opendera_types::config::StorageCacheConfig;
 use std::{fs::OpenOptions, path::PathBuf};
 use tempfile::TempDir;
 use tracing::warn;
@@ -22,7 +22,7 @@ pub mod posixio_impl;
 #[cfg(test)]
 mod tests;
 
-pub use feldera_storage::{
+pub use opendera_storage::{
     FileReader, FileRw, FileWriter, StorageBackend, StorageFileType, StoragePath, StoragePathPart,
     block::{BlockLocation, InvalidBlockLocation},
     error::StorageError,

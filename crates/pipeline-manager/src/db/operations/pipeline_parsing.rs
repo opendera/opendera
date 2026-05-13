@@ -16,8 +16,8 @@ use crate::db::types::utils::{
 };
 use crate::db::types::version::Version;
 use chrono::{DateTime, Utc};
-use feldera_types::error::ErrorResponse;
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+use opendera_types::error::ErrorResponse;
+use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
 use tokio_postgres::Row;
 use tracing::error;
 use uuid::Uuid;
@@ -553,9 +553,9 @@ mod tests {
     use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
     use crate::db::types::storage::StorageStatus;
     use crate::db::types::version::Version;
-    use feldera_types::error::ErrorResponse;
-    use feldera_types::program_schema::SourcePosition;
     use itertools::Itertools;
+    use opendera_types::error::ErrorResponse;
+    use opendera_types::program_schema::SourcePosition;
     use serde_json::json;
     use std::borrow::Cow;
     use std::collections::BTreeSet;

@@ -13,7 +13,7 @@ use dbsp::storage::file::writer::{Parameters, Writer1, Writer2};
 use dbsp::storage::file::BatchKeyFilter;
 use dbsp::storage::file::{Factories, FilterPlan};
 use dbsp::{dynamic::Erase, DBData};
-use feldera_types::config::{StorageConfig, StorageOptions};
+use opendera_types::config::{StorageConfig, StorageOptions};
 
 use storage_test_compat::{
     buffer_cache, golden_aux, golden_file_specs, golden_row, golden_row_small, golden_writer2_key,

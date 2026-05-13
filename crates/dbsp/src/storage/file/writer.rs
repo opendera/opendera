@@ -34,8 +34,8 @@ use binrw::{
 use crc32c::crc32c;
 #[cfg(debug_assertions)]
 use dyn_clone::clone_box;
-use feldera_buffer_cache::CacheEntry;
-use feldera_storage::StoragePath;
+use opendera_buffer_cache::CacheEntry;
+use opendera_storage::StoragePath;
 use snap::raw::{Encoder, max_compress_len};
 use std::{cell::RefCell, sync::Arc};
 use std::{
@@ -1333,7 +1333,7 @@ impl Writer {
 /// ```
 /// # use dbsp::dynamic::{DynData, Erase, DynUnit};
 /// # use dbsp::storage::file::{writer::{Parameters, Writer1}};
-/// use feldera_types::config::{StorageConfig, StorageOptions};
+/// use opendera_types::config::{StorageConfig, StorageOptions};
 /// # use std::sync::Arc;
 /// use dbsp::storage::{
 ///     backend::StorageBackend,
@@ -1498,7 +1498,7 @@ where
 /// # use dbsp::dynamic::{DynData, DynUnit};
 /// # use dbsp::storage::file::{writer::{Parameters, Writer2}};
 /// # use std::sync::Arc;
-/// use feldera_types::config::{StorageConfig, StorageOptions};
+/// use opendera_types::config::{StorageConfig, StorageOptions};
 /// use dbsp::storage::{
 ///     backend::StorageBackend,
 ///     file::{Factories, format::BatchMetadata},

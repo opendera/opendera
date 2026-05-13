@@ -25,8 +25,8 @@ use crate::{
     },
 };
 use async_stream::stream;
-use feldera_storage::{FileCommitter, StoragePath};
 use futures::Stream as AsyncStream;
+use opendera_storage::{FileCommitter, StoragePath};
 use rkyv::Deserialize;
 use std::{
     borrow::Cow,

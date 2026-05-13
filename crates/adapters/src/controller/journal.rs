@@ -9,8 +9,8 @@ use dbsp::storage::{
     backend::{StorageBackend, StorageError, StoragePath},
     buffer_cache::FBuf,
 };
-use feldera_adapterlib::{errors::journal::StepError, transport::Step};
-use feldera_types::config::InputEndpointConfig;
+use opendera_adapterlib::{errors::journal::StepError, transport::Step};
+use opendera_types::config::InputEndpointConfig;
 use rmpv::Value as RmpValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -215,7 +215,7 @@ mod tests {
         storage::backend::{StoragePath, posixio_impl::PosixBackend},
     };
 
-    use feldera_types::config::FileBackendConfig;
+    use opendera_types::config::FileBackendConfig;
     use tempfile::TempDir;
 
     use crate::{controller::journal::Journal, test::init_test_logger};

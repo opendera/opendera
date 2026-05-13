@@ -6,7 +6,6 @@ use crate::test::{
 };
 use csv::WriterBuilder;
 use dbsp::circuit::tokio::TOKIO;
-use feldera_types::program_schema::Relation;
 use google_cloud_gax::conn::Environment;
 use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::{
@@ -15,6 +14,7 @@ use google_cloud_pubsub::{
     subscription::SubscriptionConfig,
     topic::Topic,
 };
+use opendera_types::program_schema::Relation;
 use proptest::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, json};

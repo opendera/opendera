@@ -1,5 +1,5 @@
 [package]
-name = "feldera-datagen"
+name = "opendera-datagen"
 edition = "2024"
 version = { workspace = true }
 homepage = { workspace = true }
@@ -11,12 +11,12 @@ readme = { workspace = true }
 publish = false
 
 [dependencies]
-feldera-types = { workspace = true }
-feldera-adapterlib = { workspace = true }
+opendera-types = { workspace = true }
+opendera-adapterlib = { workspace = true }
 dbsp = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
-feldera-fxp = { workspace = true }
+opendera-fxp = { workspace = true }
 num-traits = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
 rand_distr = { workspace = true }

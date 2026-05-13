@@ -16,8 +16,8 @@ use actix_web::rt::time::timeout;
 use actix_web::HttpResponse;
 use awc::Client;
 use chrono::{DateTime, Utc};
-use feldera_types::error::ErrorResponse;
 use futures_util::StreamExt;
+use opendera_types::error::ErrorResponse;
 use serde::Deserialize;
 use std::cmp::min;
 use std::collections::BTreeMap;
@@ -1263,7 +1263,7 @@ mod tests {
     use crate::db::types::pipeline::PipelineDescr;
     use crate::db::types::program::{RustCompilationInfo, SqlCompilationInfo};
     use crate::db::types::version::Version;
-    use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+    use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
     use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::Mutex;

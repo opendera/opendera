@@ -29,9 +29,9 @@ use crate::{
         },
     },
 };
-use feldera_storage::{FileCommitter, StoragePath};
 use futures::Stream as AsyncStream;
 use futures_util::StreamExt;
+use opendera_storage::{FileCommitter, StoragePath};
 
 pub trait StreamingBinaryOperator<I1, I2, O>: Operator {
     fn eval(

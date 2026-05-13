@@ -1,5 +1,5 @@
 use colored::ColoredString;
-use feldera_observability::json_logging::{
+use opendera_observability::json_logging::{
     init_pipeline_logging, init_service_logging as init_service_logging_subscriber, ServiceName,
 };
 use tracing::warn;

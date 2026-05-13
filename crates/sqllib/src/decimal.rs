@@ -1,8 +1,8 @@
 //! Operations on Decimal values
 
 use crate::{some_polymorphic_function1, some_polymorphic_function2};
-pub use feldera_fxp::DynamicDecimal;
-use feldera_fxp::Fixed;
+pub use opendera_fxp::DynamicDecimal;
+use opendera_fxp::Fixed;
 
 pub type SqlDecimal<const P: usize, const S: usize> = Fixed<P, S>;
 

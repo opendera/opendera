@@ -16,8 +16,8 @@
 //! We implement the `actix-web` `ResponseError` trait for all error types,
 //! which allows them to be returned as error responses by HTTP endpoints.
 //! Our `ResponseError` implementation generates an HTTP response whose body
-//! is a JSON serialization of the `feldera_types::ErrorResponse` type from the
-//! `feldera_types` crate, i.e., errors returned by the API server and
+//! is a JSON serialization of the `opendera_types::ErrorResponse` type from the
+//! `opendera_types` crate, i.e., errors returned by the API server and
 //! by individual pipelines have the same format.
 
 use crate::api::demo::DemoError;
@@ -29,7 +29,7 @@ use crate::runner::error::RunnerError;
 use actix_web::{
     body::BoxBody, http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError,
 };
-use feldera_types::error::{DetailedError, ErrorResponse};
+use opendera_types::error::{DetailedError, ErrorResponse};
 use openssl::error::ErrorStack;
 use serde::Serialize;
 use std::{

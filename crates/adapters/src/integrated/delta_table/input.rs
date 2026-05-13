@@ -25,19 +25,19 @@ use deltalake::kernel::Action;
 use deltalake::logstore::{self, IORuntime};
 use deltalake::table::builder::ensure_table_uri;
 use deltalake::{DeltaTable, DeltaTableBuilder, datafusion};
-use feldera_adapterlib::format::{ParseError, StagedInputBuffer};
-use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
-use feldera_adapterlib::transport::{InputQueueEntry, Resume, Watermark, parse_resume_info};
-use feldera_adapterlib::utils::datafusion::{
+use futures_util::StreamExt;
+use opendera_adapterlib::format::{ParseError, StagedInputBuffer};
+use opendera_adapterlib::metrics::{ConnectorMetrics, ValueType};
+use opendera_adapterlib::transport::{InputQueueEntry, Resume, Watermark, parse_resume_info};
+use opendera_adapterlib::utils::datafusion::{
     array_to_string, execute_query_collect, execute_singleton_query, timestamp_to_sql_expression,
     validate_sql_expression, validate_timestamp_column,
 };
-use feldera_storage::tokio::TOKIO_DEDICATED_IO;
-use feldera_types::adapter_stats::ConnectorHealth;
-use feldera_types::config::FtModel;
-use feldera_types::program_schema::Relation;
-use feldera_types::transport::delta_table::{DeltaTableReaderConfig, DeltaTableTransactionMode};
-use futures_util::StreamExt;
+use opendera_storage::tokio::TOKIO_DEDICATED_IO;
+use opendera_types::adapter_stats::ConnectorHealth;
+use opendera_types::config::FtModel;
+use opendera_types::program_schema::Relation;
+use opendera_types::transport::delta_table::{DeltaTableReaderConfig, DeltaTableTransactionMode};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;

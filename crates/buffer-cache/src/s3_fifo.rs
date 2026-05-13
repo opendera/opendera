@@ -1,5 +1,5 @@
 use crate::{BufferCache, CacheEntry};
-use feldera_types::config::dev_tweaks::BufferCacheStrategy;
+use opendera_types::config::dev_tweaks::BufferCacheStrategy;
 use quick_cache::{OptionsBuilder, Weighter, sync::Cache as QuickCache};
 use std::any::Any;
 use std::hash::{BuildHasher, Hash, RandomState};

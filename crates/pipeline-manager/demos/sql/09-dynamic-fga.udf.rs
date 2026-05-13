@@ -1,4 +1,4 @@
-use feldera_sqllib::{SqlString, Variant};
+use opendera_sqllib::{SqlString, Variant};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

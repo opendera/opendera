@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use feldera_ir::{LirCircuit, LirEdge, LirNode, LirStreamId, MirNodeId};
+use opendera_ir::{LirCircuit, LirEdge, LirNode, LirStreamId, MirNodeId};
 
 use crate::{
     Circuit, Stream,

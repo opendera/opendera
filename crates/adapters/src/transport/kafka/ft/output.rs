@@ -7,7 +7,7 @@ use crate::{
     transport::{Step, kafka::DeferredLogging},
 };
 use anyhow::{Context, Error as AnyError, Result as AnyResult, anyhow, bail};
-use feldera_types::transport::kafka::KafkaOutputConfig;
+use opendera_types::transport::kafka::KafkaOutputConfig;
 use rdkafka::client::OAuthToken;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::ConsumerContext;

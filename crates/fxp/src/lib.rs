@@ -408,7 +408,7 @@ fn i128_mul_pow10_round_even(value: i128, exponent: i32) -> Option<i128> {
 /// of Fixed::<S,P>::one() for S >= P have magnitude less than one"
 ///
 /// ```compile_fail
-/// use feldera_fxp::Fixed;
+/// use opendera_fxp::Fixed;
 ///
 /// let _ = Fixed::<5,5>::ONE;
 /// ```

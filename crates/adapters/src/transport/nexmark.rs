@@ -1,9 +1,9 @@
 //! An input adapter that generates Nexmark event input data.
 
 use chrono::{DateTime, Utc};
-use feldera_adapterlib::format::BufferSize;
-use feldera_adapterlib::transport::{InputReaderCommand, Resume, Watermark, parse_resume_info};
-use feldera_types::config::FtModel;
+use opendera_adapterlib::format::BufferSize;
+use opendera_adapterlib::transport::{InputReaderCommand, Resume, Watermark, parse_resume_info};
+use opendera_types::config::FtModel;
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::hash::Hasher;
@@ -25,8 +25,8 @@ use dbsp_nexmark::generator::RandomGenerator;
 use dbsp_nexmark::model::Event;
 use dbsp_nexmark::{config::GeneratorOptions, generator::config::Config as GeneratorConfig};
 use enum_map::EnumMap;
-use feldera_types::program_schema::Relation;
-use feldera_types::transport::nexmark::{NexmarkInputConfig, NexmarkInputOptions, NexmarkTable};
+use opendera_types::program_schema::Relation;
+use opendera_types::transport::nexmark::{NexmarkInputConfig, NexmarkInputOptions, NexmarkTable};
 use rand::rngs::SmallRng;
 use serde::{Deserialize, Serialize};
 

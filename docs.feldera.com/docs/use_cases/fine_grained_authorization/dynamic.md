@@ -109,7 +109,7 @@ to evaluate the JMESPath expression:
 
 ```rust
 use std::collections::BTreeMap;
-use feldera_sqllib::Variant;
+use opendera_sqllib::Variant;
 
 pub fn check_condition(
     condition: Option<SqlString>,

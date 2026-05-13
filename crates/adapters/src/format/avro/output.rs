@@ -11,12 +11,12 @@ use apache_avro::schema::RecordField;
 use apache_avro::{Schema as AvroSchema, to_avro_datum, types::Value as AvroValue};
 use crossbeam::channel::Sender;
 use erased_serde::Serialize as ErasedSerialize;
-use feldera_adapterlib::catalog::SplitCursorBuilder;
-use feldera_types::config::{ConnectorConfig, TransportConfig};
-use feldera_types::format::avro::{
+use opendera_adapterlib::catalog::SplitCursorBuilder;
+use opendera_types::config::{ConnectorConfig, TransportConfig};
+use opendera_types::format::avro::{
     AvroEncoderConfig, AvroEncoderKeyMode, AvroUpdateFormat, SubjectNameStrategy,
 };
-use feldera_types::program_schema::{Relation, SqlIdentifier};
+use opendera_types::program_schema::{Relation, SqlIdentifier};
 use schema_registry_converter::blocking::schema_registry::SrSettings;
 use schema_registry_converter::blocking::schema_registry::post_schema;
 use schema_registry_converter::schema_registry_common::{SchemaType, SuppliedSchema};
@@ -93,7 +93,7 @@ impl OutputFormat for AvroOutputFormat {
 
         if matches!(
             config.transport,
-            feldera_types::config::TransportConfig::RedisOutput(_)
+            opendera_types::config::TransportConfig::RedisOutput(_)
         ) {
             return Err(ControllerError::invalid_encoder_configuration(
                 endpoint_name,

@@ -30,9 +30,9 @@ use apache_avro::{
     types::Value,
 };
 use erased_serde::Deserializer as ErasedDeserializer;
-use feldera_adapterlib::catalog::AvroSchemaRefs;
-use feldera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 use num_bigint::BigInt;
+use opendera_adapterlib::catalog::AvroSchemaRefs;
+use opendera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 use serde::{
     de::{self, DeserializeSeed, Visitor},
     forward_to_deserialize_any,

@@ -23,12 +23,12 @@ use actix_web::{
     HttpResponse,
 };
 use chrono::{DateTime, Utc};
-use feldera_types::adapter_stats::PipelineStatsErrorsResponse;
-use feldera_types::config::{InputEndpointConfig, OutputEndpointConfig, RuntimeConfig};
-use feldera_types::error::ErrorResponse;
-use feldera_types::program_schema::ProgramSchema;
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
 use futures_util::future::join_all;
+use opendera_types::adapter_stats::PipelineStatsErrorsResponse;
+use opendera_types::config::{InputEndpointConfig, OutputEndpointConfig, RuntimeConfig};
+use opendera_types::error::ErrorResponse;
+use opendera_types::program_schema::ProgramSchema;
+use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;

@@ -340,7 +340,7 @@ public class MultiCrateTests extends BaseSQLTests {
                 CREATE VIEW V AS SELECT I8_AVG(x) FROM T;""");
 
         File udf = this.createUdfFile("""
-                use feldera_sqllib::*;
+                use opendera_sqllib::*;
                 use crate::Tup2;
                 
                 pub type i8_avg_accumulator_type = Tup2<i32, i32>;
@@ -366,7 +366,7 @@ public class MultiCrateTests extends BaseSQLTests {
                 CREATE VIEW V0 AS SELECT contains_number(CAST('YES: 10 NO:5 MAYBE: 2' AS VARCHAR), 5);""");
 
         File udf = this.createUdfFile("""
-                use feldera_sqllib::*;
+                use opendera_sqllib::*;
                 pub fn contains_number(str: SqlString, value: Option<i32>) -> Result<bool, Box<dyn std::error::Error>> {
                    match value {
                        None => Err("null value".into()),
@@ -418,7 +418,7 @@ public class MultiCrateTests extends BaseSQLTests {
         PrintWriter udfFile = new PrintWriter(udf, StandardCharsets.UTF_8);
         udfFile.println("""
                 use crate::{Tup1, Tup2, Tup12};
-                use feldera_sqllib::*;
+                use opendera_sqllib::*;
                 pub fn f(x: Option<Tup12<Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<i32>,
                                          Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<i32>>>) ->
                    Result<Option<Tup1<Option<i32>>>, Box<dyn std::error::Error>> {

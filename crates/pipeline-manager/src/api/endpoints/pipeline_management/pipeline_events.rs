@@ -16,8 +16,8 @@ use actix_web::{
     HttpResponse,
 };
 use chrono::{DateTime, Utc};
-use feldera_types::error::ErrorResponse;
-use feldera_types::runtime_status::{RuntimeDesiredStatus, RuntimeStatus};
+use opendera_types::error::ErrorResponse;
+use opendera_types::runtime_status::{RuntimeDesiredStatus, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use utoipa::{IntoParams, ToSchema};

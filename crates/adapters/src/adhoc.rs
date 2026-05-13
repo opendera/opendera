@@ -15,10 +15,10 @@ use executor::{
     hash_query_result, infallible_from_bytestring, stream_arrow_query, stream_json_query,
     stream_parquet_query, stream_text_query,
 };
-use feldera_adapterlib::errors::journal::ControllerError;
-use feldera_types::config::PipelineConfig;
-use feldera_types::query::{AdHocResultFormat, AdhocQueryArgs, MAX_WS_FRAME_SIZE};
 use futures_util::StreamExt;
+use opendera_adapterlib::errors::journal::ControllerError;
+use opendera_types::config::PipelineConfig;
+use opendera_types::query::{AdHocResultFormat, AdhocQueryArgs, MAX_WS_FRAME_SIZE};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;

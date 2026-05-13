@@ -3,7 +3,7 @@
 use clap::{Args, Command, FromArgMatches};
 
 use colored::Colorize;
-use feldera_observability as observability;
+use opendera_observability as observability;
 use pipeline_manager::api::main::ApiDoc;
 use pipeline_manager::cluster_monitor::{cluster_monitor, LocalResourcesPoller};
 use pipeline_manager::compiler::main::{compiler_main, compiler_precompile};
@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
     let _guard = observability::init("https://18aa37ae23e7130b57b91aaad432bc18@o4510219052253184.ingest.us.sentry.io/4510298809827328", "pipeline-manager", env!("CARGO_PKG_VERSION"));
     pipeline_manager::logging::init_service_logging(
         "[manager]".cyan(),
-        feldera_observability::json_logging::ServiceName::Manager,
+        opendera_observability::json_logging::ServiceName::Manager,
     );
     if let Some(provider) = rustls::crypto::CryptoProvider::get_default() {
         observability::fips::log_rustls_provider_fips_status(
@@ -189,13 +189,9 @@ fn main() -> anyhow::Result<()> {
             });
 
             // The api-server blocks forever
-            pipeline_manager::api::main::run(
-                db,
-                common_config,
-                api_config,
-            )
-            .await
-            .expect("API server main failed");
+            pipeline_manager::api::main::run(db, common_config, api_config)
+                .await
+                .expect("API server main failed");
             Ok(())
         })
 }

@@ -160,7 +160,7 @@ impl<K, V> IsNone for BTreeMap<K, V> {
 
 #[cfg(test)]
 mod test {
-    use feldera_macros::IsNone;
+    use opendera_macros::IsNone;
 
     #[derive(IsNone)]
     struct X {

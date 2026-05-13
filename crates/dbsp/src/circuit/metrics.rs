@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use feldera_storage::histogram::{ExponentialHistogram, SlidingHistogram};
+use opendera_storage::histogram::{ExponentialHistogram, SlidingHistogram};
 
 /// Total number of files created.
 pub static FILES_CREATED: AtomicU64 = AtomicU64::new(0);

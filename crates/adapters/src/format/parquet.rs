@@ -11,14 +11,14 @@ use arrow::datatypes::{
 use bytes::Bytes;
 use dbsp::operator::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
-use feldera_adapterlib::ConnectorMetadata;
-use feldera_adapterlib::catalog::ArrowStream;
-use feldera_sqllib::Variant;
-use feldera_types::config::ConnectorConfig;
-use feldera_types::serde_with_context::serde_config::{
+use opendera_adapterlib::ConnectorMetadata;
+use opendera_adapterlib::catalog::ArrowStream;
+use opendera_sqllib::Variant;
+use opendera_types::config::ConnectorConfig;
+use opendera_types::serde_with_context::serde_config::{
     BinaryFormat, DecimalFormat, UuidFormat, VariantFormat,
 };
-use feldera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimeFormat, TimestampFormat};
+use opendera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimeFormat, TimestampFormat};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::file::properties::WriterProperties;
@@ -35,8 +35,8 @@ use crate::{
     catalog::{InputCollectionHandle, RecordFormat},
     format::{Encoder, InputFormat, OutputFormat, ParseError, Parser},
 };
-use feldera_types::format::parquet::{ParquetEncoderConfig, ParquetParserConfig};
-use feldera_types::program_schema::{ColumnType, Field, IntervalUnit, Relation, SqlType};
+use opendera_types::format::parquet::{ParquetEncoderConfig, ParquetParserConfig};
+use opendera_types::program_schema::{ColumnType, Field, IntervalUnit, Relation, SqlType};
 
 use super::{InputBuffer, SpongeSplitter};
 
@@ -218,7 +218,7 @@ impl OutputFormat for ParquetOutputFormat {
 
         if matches!(
             config.transport,
-            feldera_types::config::TransportConfig::RedisOutput(_)
+            opendera_types::config::TransportConfig::RedisOutput(_)
         ) {
             return Err(ControllerError::invalid_encoder_configuration(
                 endpoint_name,

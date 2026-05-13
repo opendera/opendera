@@ -12,15 +12,15 @@ use crate::{
 };
 use anyhow::Error as AnyError;
 use crossbeam::channel::{Receiver, Select, Sender, TryRecvError, bounded};
-use feldera_buffer_cache::ThreadType;
-use feldera_ir::LirCircuit;
-use feldera_storage::{FileCommitter, StorageBackend, StoragePath};
-use feldera_types::checkpoint::CheckpointMetadata;
-use feldera_types::config::DevTweaks;
-use feldera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
-pub use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
-use feldera_types::transaction::CommitProgressSummary;
 use itertools::Either;
+use opendera_buffer_cache::ThreadType;
+use opendera_ir::LirCircuit;
+use opendera_storage::{FileCommitter, StorageBackend, StoragePath};
+use opendera_types::checkpoint::CheckpointMetadata;
+use opendera_types::config::DevTweaks;
+use opendera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
+pub use opendera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
+use opendera_types::transaction::CommitProgressSummary;
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::num::NonZeroUsize;
@@ -1856,8 +1856,8 @@ pub(crate) mod tests {
         OutputHandle, Runtime, RuntimeError, ZSetHandle, ZWeight,
     };
     use anyhow::anyhow;
-    use feldera_buffer_cache::ThreadType;
-    use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
+    use opendera_buffer_cache::ThreadType;
+    use opendera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
     use tempfile::tempdir;
     use uuid::Uuid;
 

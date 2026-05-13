@@ -7,13 +7,13 @@ use crate::{
 use base58::{FromBase58, ToBase58};
 use base64::prelude::*;
 use dbsp::NumEntries;
-use feldera_macros::IsNone;
-use feldera_types::serde_with_context::{
-    DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, serde_config::BinaryFormat,
-};
 use flate2::read::GzDecoder;
 use hex::ToHex;
 use md5::{Digest, Md5};
+use opendera_macros::IsNone;
+use opendera_types::serde_with_context::{
+    DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, serde_config::BinaryFormat,
+};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as _, Visitor},
@@ -163,7 +163,7 @@ impl<'de, AUX> DeserializeWithContext<'de, SqlSerdeConfig, AUX> for ByteArray {
 
 #[cfg(test)]
 mod test_binary_deserializer {
-    use feldera_types::{
+    use opendera_types::{
         format::json::JsonFlavor,
         serde_with_context::{DeserializeWithContext, SerializeWithContext, SqlSerdeConfig},
     };

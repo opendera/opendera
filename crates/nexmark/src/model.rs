@@ -2,7 +2,7 @@
 //!
 //! Based on the equivalent [Nexmark Flink Java model classes](https://github.com/nexmark/nexmark/blob/v0.2.0/nexmark-flink/src/main/java/com/github/nexmark/flink/model).
 
-use feldera_macros::IsNone;
+use opendera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Serialize as SerdeSerialize, Serializer as SerdeSerializer};
 use size_of::SizeOf;

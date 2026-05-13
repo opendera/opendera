@@ -6,10 +6,10 @@ use crate::{
     array::Array, binary::ByteArray, casts::*, error::*, map::Map, tn, to_hex_, ttn,
 };
 use dbsp::algebra::{F32, F64};
-use feldera_fxp::DynamicDecimal;
-use feldera_macros::IsNone;
-use feldera_types::serde_with_context::serde_config::VariantFormat;
-use feldera_types::serde_with_context::{
+use opendera_fxp::DynamicDecimal;
+use opendera_macros::IsNone;
+use opendera_types::serde_with_context::serde_config::VariantFormat;
+use opendera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
 };
 use serde::de::{self, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};

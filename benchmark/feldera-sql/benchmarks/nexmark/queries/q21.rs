@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use regex::Regex;
 use std::sync::LazyLock;
-use feldera_sqllib::*;
+use opendera_sqllib::*;
 
 static REGEXS: LazyLock<DashMap<SqlString, Regex>> = LazyLock::new(|| DashMap::new());
 

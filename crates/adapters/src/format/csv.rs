@@ -8,9 +8,9 @@ use actix_web::HttpRequest;
 use anyhow::{Result as AnyResult, bail};
 use dbsp::operator::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
-use feldera_adapterlib::ConnectorMetadata;
-use feldera_sqllib::Variant;
-use feldera_types::{
+use opendera_adapterlib::ConnectorMetadata;
+use opendera_sqllib::Variant;
+use opendera_types::{
     config::ConnectorConfig,
     format::csv::{CsvEncoderConfig, CsvParserConfig},
 };
@@ -23,7 +23,7 @@ pub(crate) mod deserializer;
 use crate::catalog::{InputCollectionHandle, SerBatchReader};
 pub use deserializer::byte_record_deserializer;
 pub use deserializer::string_record_deserializer;
-use feldera_types::program_schema::Relation;
+use opendera_types::program_schema::Relation;
 
 use super::{InputBuffer, Splitter};
 
@@ -280,7 +280,7 @@ impl OutputFormat for CsvOutputFormat {
 
         if matches!(
             config.transport,
-            feldera_types::config::TransportConfig::RedisOutput(_)
+            opendera_types::config::TransportConfig::RedisOutput(_)
         ) {
             return Err(ControllerError::invalid_encoder_configuration(
                 endpoint_name,
@@ -390,8 +390,8 @@ impl Encoder for CsvEncoder {
 #[cfg(test)]
 mod test {
     use crate::format::string_record_deserializer;
-    use feldera_types::deserialize_table_record;
-    use feldera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
+    use opendera_types::deserialize_table_record;
+    use opendera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 
     #[derive(Debug, Eq, PartialEq)]
     #[allow(non_snake_case)]

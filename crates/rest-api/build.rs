@@ -3,207 +3,213 @@ use std::{env, fs, path::Path};
 
 fn type_replacement() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("PipelineConfig", "feldera_types::config::PipelineConfig"),
-        ("StorageConfig", "feldera_types::config::StorageConfig"),
-        ("FtModel", "feldera_types::config::FtModel"),
+        ("PipelineConfig", "opendera_types::config::PipelineConfig"),
+        ("StorageConfig", "opendera_types::config::StorageConfig"),
+        ("FtModel", "opendera_types::config::FtModel"),
         (
             "StorageCacheConfig",
-            "feldera_types::config::StorageCacheConfig",
+            "opendera_types::config::StorageCacheConfig",
         ),
         (
             "StorageBackendConfig",
-            "feldera_types::config::StorageBackendConfig",
+            "opendera_types::config::StorageBackendConfig",
         ),
         (
             "StorageCompression",
-            "feldera_types::config::StorageCompression",
+            "opendera_types::config::StorageCompression",
         ),
-        ("RuntimeConfig", "feldera_types::config::RuntimeConfig"),
+        ("RuntimeConfig", "opendera_types::config::RuntimeConfig"),
         (
             "InputEndpointConfig",
-            "feldera_types::config::InputEndpointConfig",
+            "opendera_types::config::InputEndpointConfig",
         ),
-        ("ConnectorConfig", "feldera_types::config::ConnectorConfig"),
+        ("ConnectorConfig", "opendera_types::config::ConnectorConfig"),
         (
             "OutputBufferConfig",
-            "feldera_types::config::OutputBufferConfig",
+            "opendera_types::config::OutputBufferConfig",
         ),
         (
             "OutputEndpointConfig",
-            "feldera_types::config::OutputEndpointConfig",
+            "opendera_types::config::OutputEndpointConfig",
         ),
-        ("TransportConfig", "feldera_types::config::TransportConfig"),
-        ("FormatConfig", "feldera_types::config::FormatConfig"),
-        ("ResourceConfig", "feldera_types::config::ResourceConfig"),
+        ("TransportConfig", "opendera_types::config::TransportConfig"),
+        ("FormatConfig", "opendera_types::config::FormatConfig"),
+        ("ResourceConfig", "opendera_types::config::ResourceConfig"),
         (
             "FileInputConfig",
-            "feldera_types::transport::file::FileInputConfig",
+            "opendera_types::transport::file::FileInputConfig",
         ),
         (
             "FileOutputConfig",
-            "feldera_types::transport::file::FileOutputConfig",
+            "opendera_types::transport::file::FileOutputConfig",
         ),
         (
             "UrlInputConfig",
-            "feldera_types::transport::url::UrlInputConfig",
+            "opendera_types::transport::url::UrlInputConfig",
         ),
         (
             "KafkaHeader",
-            "feldera_types::transport::kafka::KafkaHeader",
+            "opendera_types::transport::kafka::KafkaHeader",
         ),
         (
             "KafkaHeaderValue",
-            "feldera_types::transport::kafka::KafkaHeaderValue",
+            "opendera_types::transport::kafka::KafkaHeaderValue",
         ),
         (
             "KafkaLogLevel",
-            "feldera_types::transport::kafka::KafkaLogLevel",
+            "opendera_types::transport::kafka::KafkaLogLevel",
         ),
         (
             "KafkaInputConfig",
-            "feldera_types::transport::kafka::KafkaInputConfig",
+            "opendera_types::transport::kafka::KafkaInputConfig",
         ),
         (
             "KafkaOutputConfig",
-            "feldera_types::transport::kafka::KafkaOutputConfig",
+            "opendera_types::transport::kafka::KafkaOutputConfig",
         ),
         (
             "KafkaInputFtConfig",
-            "feldera_types::transport::kafka::KafkaInputFtConfig",
+            "opendera_types::transport::kafka::KafkaInputFtConfig",
         ),
         (
             "KafkaOutputFtConfig",
-            "feldera_types::transport::kafka::KafkaOutputFtConfig",
+            "opendera_types::transport::kafka::KafkaOutputFtConfig",
         ),
         (
             "ConsumeStrategy",
-            "feldera_types::transport::s3::ConsumeStrategy",
+            "opendera_types::transport::s3::ConsumeStrategy",
         ),
-        ("ReadStrategy", "feldera_types::transport::s3::ReadStrategy"),
+        (
+            "ReadStrategy",
+            "opendera_types::transport::s3::ReadStrategy",
+        ),
         (
             "AwsCredentials",
-            "feldera_types::transport::s3::AwsCredentials",
+            "opendera_types::transport::s3::AwsCredentials",
         ),
         (
             "S3InputConfig",
-            "feldera_types::transport::s3::S3InputConfig",
+            "opendera_types::transport::s3::S3InputConfig",
         ),
         (
             "DatagenStrategy",
-            "feldera_types::transport::datagen::DatagenStrategy",
+            "opendera_types::transport::datagen::DatagenStrategy",
         ),
         (
             "RngFieldSettings",
-            "feldera_types::transport::datagen::RngFieldSettings",
+            "opendera_types::transport::datagen::RngFieldSettings",
         ),
         (
             "GenerationPlan",
-            "feldera_types::transport::datagen::GenerationPlan",
+            "opendera_types::transport::datagen::GenerationPlan",
         ),
         (
             "DatagenInputConfig",
-            "feldera_types::transport::datagen::DatagenInputConfig",
+            "opendera_types::transport::datagen::DatagenInputConfig",
         ),
         (
             "NexmarkInputConfig",
-            "feldera_types::transport::nexmark::NexmarkInputConfig",
+            "opendera_types::transport::nexmark::NexmarkInputConfig",
         ),
         (
             "NexmarkTable",
-            "feldera_types::transport::nexmark::NexmarkTable",
+            "opendera_types::transport::nexmark::NexmarkTable",
         ),
         (
             "NexmarkInputOptions",
-            "feldera_types::transport::nexmark::NexmarkInputOptions",
+            "opendera_types::transport::nexmark::NexmarkInputOptions",
         ),
         (
             "DeltaTableIngestMode",
-            "feldera_types::transport::delta_table::DeltaTableIngestMode",
+            "opendera_types::transport::delta_table::DeltaTableIngestMode",
         ),
         (
             "DeltaTableWriteMode",
-            "feldera_types::transport::delta_table::DeltaTableWriteMode",
+            "opendera_types::transport::delta_table::DeltaTableWriteMode",
         ),
         (
             "DeltaTableReaderConfig",
-            "feldera_types::transport::delta_table::DeltaTableReaderConfig",
+            "opendera_types::transport::delta_table::DeltaTableReaderConfig",
         ),
         (
             "DeltaTableWriterConfig",
-            "feldera_types::transport::delta_table::DeltaTableWriterConfig",
+            "opendera_types::transport::delta_table::DeltaTableWriterConfig",
         ),
-        ("Chunk", "feldera_types::transport::http::Chunk"),
+        ("Chunk", "opendera_types::transport::http::Chunk"),
         (
             "JsonUpdateFormat",
-            "feldera_types::format::json::JsonUpdateFormat",
+            "opendera_types::format::json::JsonUpdateFormat",
         ),
         (
             "ProgramSchema",
-            "feldera_types::program_schema::ProgramSchema",
+            "opendera_types::program_schema::ProgramSchema",
         ),
-        ("Relation", "feldera_types::program_schema::Relation"),
-        ("SqlType", "feldera_types::program_schema::SqlType"),
-        ("Field", "feldera_types::program_schema::Field"),
-        ("ColumnType", "feldera_types::program_schema::ColumnType"),
+        ("Relation", "opendera_types::program_schema::Relation"),
+        ("SqlType", "opendera_types::program_schema::SqlType"),
+        ("Field", "opendera_types::program_schema::Field"),
+        ("ColumnType", "opendera_types::program_schema::ColumnType"),
         (
             "IntervalUnit",
-            "feldera_types::program_schema::IntervalUnit",
+            "opendera_types::program_schema::IntervalUnit",
         ),
         (
             "SourcePosition",
-            "feldera_types::program_schema::SourcePosition",
+            "opendera_types::program_schema::SourcePosition",
         ),
         (
             "PropertyValue",
-            "feldera_types::program_schema::PropertyValue",
+            "opendera_types::program_schema::PropertyValue",
         ),
-        ("ErrorResponse", "feldera_types::error::ErrorResponse"),
+        ("ErrorResponse", "opendera_types::error::ErrorResponse"),
         (
             "OutputBufferConfig",
-            "feldera_types::config::OutputBufferConfig",
+            "opendera_types::config::OutputBufferConfig",
         ),
         (
             "OutputEndpointConfig",
-            "feldera_types::config::OutputEndpointConfig",
+            "opendera_types::config::OutputEndpointConfig",
         ),
-        ("FtConfig", "feldera_types::config::FtConfig"),
+        ("FtConfig", "opendera_types::config::FtConfig"),
         (
             "CheckpointResponse",
-            "feldera_types::checkpoint::CheckpointResponse",
+            "opendera_types::checkpoint::CheckpointResponse",
         ),
         (
             "CheckpointStatus",
-            "feldera_types::checkpoint::CheckpointStatus",
+            "opendera_types::checkpoint::CheckpointStatus",
         ),
         (
             "CheckpointStatusFailure",
-            "feldera_types::checkpoint::CheckpointFailure",
+            "opendera_types::checkpoint::CheckpointFailure",
         ),
         (
             "ConsumerConfig",
-            "feldera_types::transport::nats::ConsumerConfig",
+            "opendera_types::transport::nats::ConsumerConfig",
         ),
         (
             "ConnectOptions",
-            "feldera_types::transport::nats::ConnectOptions",
+            "opendera_types::transport::nats::ConnectOptions",
         ),
         (
             "ReplayPolicy",
-            "feldera_types::transport::nats::ReplayPolicy",
+            "opendera_types::transport::nats::ReplayPolicy",
         ),
         (
             "DeliverPolicy",
-            "feldera_types::transport::nats::DeliverPolicy",
+            "opendera_types::transport::nats::DeliverPolicy",
         ),
-        ("Credentials", "feldera_types::transport::nats::Credentials"),
+        (
+            "Credentials",
+            "opendera_types::transport::nats::Credentials",
+        ),
         (
             "UserAndPassword",
-            "feldera_types::transport::nats::UserAndPassword",
+            "opendera_types::transport::nats::UserAndPassword",
         ),
-        ("Auth", "feldera_types::transport::nats::Auth"),
+        ("Auth", "opendera_types::transport::nats::Auth"),
         (
             "NatsInputConfig",
-            "feldera_types::transport::nats::NatsInputConfig",
+            "opendera_types::transport::nats::NatsInputConfig",
         ),
     ]
 }
@@ -231,7 +237,7 @@ fn main() {
     }
     content = content.replace(
         "pub mod builder {",
-        "pub mod builder {\n    use feldera_observability::ReqwestTracingExt;",
+        "pub mod builder {\n    use opendera_observability::ReqwestTracingExt;",
     );
     let content = content.replace(
         "impl Client",

@@ -46,46 +46,46 @@ use dbsp::circuit::checkpointer::Checkpointer;
 use dbsp::{DBSPHandle, circuit::CircuitConfig};
 use dbsp::{RootCircuit, Runtime};
 use dyn_clone::DynClone;
-use feldera_adapterlib::PipelineState;
-use feldera_adapterlib::errors::controller::ConfigError;
-use feldera_observability as observability;
-use feldera_observability::json_logging::init_pipeline_logging_with_id;
-use feldera_storage::{StorageBackend, StoragePath};
-use feldera_types::adapter_stats::{
-    EndpointErrorStats, InputEndpointErrorMetrics, OutputEndpointErrorMetrics,
-    PipelineStatsErrorsResponse,
-};
-use feldera_types::checkpoint::{
-    CheckpointFailure, CheckpointResponse, CheckpointStatus, CheckpointSyncFailure,
-    CheckpointSyncResponse, CheckpointSyncStatus,
-};
-use feldera_types::completion_token::{
-    CompletionStatusArgs, CompletionStatusResponse, CompletionTokenResponse,
-};
-use feldera_types::constants::STATUS_FILE;
-use feldera_types::coordination::{
-    AdHocScan, CoordinationActivate, CoordinationStatus, Labels, RestartArgs, Step, StepRequest,
-};
-use feldera_types::format::json::JsonEncoderConfig;
-use feldera_types::pipeline_diff::PipelineDiff;
-use feldera_types::query_params::{
-    ActivateParams, MetricsFormat, MetricsParameters, SamplyProfileGetParams, SamplyProfileParams,
-};
-use feldera_types::runtime_status::{
-    BootstrapPolicy, ExtendedRuntimeStatus, ExtendedRuntimeStatusError, RuntimeDesiredStatus,
-    RuntimeStatus, StorageStatusDetails,
-};
-use feldera_types::suspend::{SuspendError, SuspendableResponse};
-use feldera_types::time_series::TimeSeries;
-use feldera_types::transport::http::HttpOutputConfig;
-use feldera_types::{
-    checkpoint::CheckpointMetadata, config::TransportConfig, transport::http::HttpInputConfig,
-};
-use feldera_types::{query::AdhocQueryArgs, transport::http::SERVER_PORT_FILE};
 use futures::StreamExt;
 use futures::stream::unfold;
 use futures_util::FutureExt;
 use futures_util::stream::once;
+use opendera_adapterlib::PipelineState;
+use opendera_adapterlib::errors::controller::ConfigError;
+use opendera_observability as observability;
+use opendera_observability::json_logging::init_pipeline_logging_with_id;
+use opendera_storage::{StorageBackend, StoragePath};
+use opendera_types::adapter_stats::{
+    EndpointErrorStats, InputEndpointErrorMetrics, OutputEndpointErrorMetrics,
+    PipelineStatsErrorsResponse,
+};
+use opendera_types::checkpoint::{
+    CheckpointFailure, CheckpointResponse, CheckpointStatus, CheckpointSyncFailure,
+    CheckpointSyncResponse, CheckpointSyncStatus,
+};
+use opendera_types::completion_token::{
+    CompletionStatusArgs, CompletionStatusResponse, CompletionTokenResponse,
+};
+use opendera_types::constants::STATUS_FILE;
+use opendera_types::coordination::{
+    AdHocScan, CoordinationActivate, CoordinationStatus, Labels, RestartArgs, Step, StepRequest,
+};
+use opendera_types::format::json::JsonEncoderConfig;
+use opendera_types::pipeline_diff::PipelineDiff;
+use opendera_types::query_params::{
+    ActivateParams, MetricsFormat, MetricsParameters, SamplyProfileGetParams, SamplyProfileParams,
+};
+use opendera_types::runtime_status::{
+    BootstrapPolicy, ExtendedRuntimeStatus, ExtendedRuntimeStatusError, RuntimeDesiredStatus,
+    RuntimeStatus, StorageStatusDetails,
+};
+use opendera_types::suspend::{SuspendError, SuspendableResponse};
+use opendera_types::time_series::TimeSeries;
+use opendera_types::transport::http::HttpOutputConfig;
+use opendera_types::{
+    checkpoint::CheckpointMetadata, config::TransportConfig, transport::http::HttpInputConfig,
+};
+use opendera_types::{query::AdhocQueryArgs, transport::http::SERVER_PORT_FILE};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
@@ -1419,7 +1419,7 @@ fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRunt
                 )),
                 PipelineState::Terminated => Err(ExtendedRuntimeStatusError {
                     status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    error: feldera_types::error::ErrorResponse {
+                    error: opendera_types::error::ErrorResponse {
                         message: "Pipeline has been terminated.".to_string(),
                         error_code: Cow::from("PipelineTerminated"),
                         details: json!({}),
@@ -1466,7 +1466,7 @@ fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRunt
             let e = ErrorResponse::from_error(&e);
             Err(ExtendedRuntimeStatusError {
                 status_code,
-                error: feldera_types::error::ErrorResponse {
+                error: opendera_types::error::ErrorResponse {
                     message: e.message,
                     error_code: e.error_code,
                     details: e.details,
@@ -1475,7 +1475,7 @@ fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRunt
         }
         PipelinePhase::InitializationComplete => Err(ExtendedRuntimeStatusError {
             status_code: StatusCode::INTERNAL_SERVER_ERROR,
-            error: feldera_types::error::ErrorResponse {
+            error: opendera_types::error::ErrorResponse {
                 message: "Pipeline initialization was completed but the controller was not set."
                     .to_string(),
                 error_code: Cow::from("ControllerMissingAfterInitialization"),
@@ -1504,7 +1504,7 @@ fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRunt
                 let e = ErrorResponse::from_error(&e);
                 Err(ExtendedRuntimeStatusError {
                     status_code,
-                    error: feldera_types::error::ErrorResponse {
+                    error: opendera_types::error::ErrorResponse {
                         message: e.message,
                         error_code: e.error_code,
                         details: e.details,
@@ -2193,7 +2193,7 @@ pub fn encoder_config_from_http_request(
 ) -> Result<FormatConfig, ControllerError> {
     let format = match format {
         HttpOutputFormat::Csv => {
-            Box::new(CsvOutputFormat) as Box<dyn feldera_adapterlib::format::OutputFormat>
+            Box::new(CsvOutputFormat) as Box<dyn opendera_adapterlib::format::OutputFormat>
         }
         HttpOutputFormat::Json => Box::new(JsonOutputFormat),
     };
@@ -2810,8 +2810,8 @@ mod test_with_kafka {
     };
     use actix_test::TestServer;
     use actix_web::{App, http::StatusCode, middleware::Logger, web::Data as WebData};
-    use feldera_types::runtime_status::RuntimeDesiredStatus;
-    use feldera_types::{
+    use opendera_types::runtime_status::RuntimeDesiredStatus;
+    use opendera_types::{
         completion_token::{CompletionStatus, CompletionStatusResponse, CompletionTokenResponse},
         runtime_status::BootstrapPolicy,
     };

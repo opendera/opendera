@@ -11,11 +11,11 @@ use std::{future::Future, pin::Pin};
 
 use anyhow::{Result as AnyResult, bail};
 use dashmap::DashMap;
-use feldera_adapterlib::catalog::SerCursor;
-use feldera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "with-deltalake")]
 use futures::channel::oneshot;
 use itertools::Itertools;
+use opendera_adapterlib::catalog::SerCursor;
+use opendera_types::program_schema::SqlIdentifier;
 #[cfg(feature = "with-deltalake")]
 use tokio::{spawn, task::JoinHandle};
 use tracing::warn;
@@ -719,7 +719,7 @@ pub(crate) fn run_in_posix_runtime<F>(
 {
     use dbsp::Runtime;
     use dbsp::circuit::{CircuitConfig, CircuitStorageConfig};
-    use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
+    use opendera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
     use std::sync::{Arc, Mutex};
 
     let temp = tempfile::tempdir().expect("failed to create temp dir for storage");

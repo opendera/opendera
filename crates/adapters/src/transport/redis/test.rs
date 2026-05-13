@@ -1,5 +1,5 @@
-use feldera_sqllib::{ByteArray, Date, F32, F64, SqlDecimal, SqlString, Timestamp, Uuid, Variant};
-use feldera_types::{
+use opendera_sqllib::{ByteArray, Date, F32, F64, SqlDecimal, SqlString, Timestamp, Uuid, Variant};
+use opendera_types::{
     format::json::JsonFlavor,
     serde_with_context::{SerializeWithContext, SqlSerdeConfig},
 };

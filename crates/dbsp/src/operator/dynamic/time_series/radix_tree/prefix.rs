@@ -4,8 +4,8 @@ use std::{
     mem::size_of,
 };
 
-use feldera_macros::IsNone;
 use num::PrimInt;
+use opendera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 

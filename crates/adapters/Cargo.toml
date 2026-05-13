@@ -28,12 +28,12 @@ default = [
 ]
 with-kafka = ["rdkafka"]
 with-deltalake = ["deltalake", "deltalake-catalog-unity"]
-with-iceberg = ["feldera-iceberg"]
+with-iceberg = ["opendera-iceberg"]
 with-pubsub = ["google-cloud-pubsub", "google-cloud-gax"]
 with-avro = [
     "apache-avro",
     "schema_registry_converter",
-    "feldera-adapterlib/with-avro",
+    "opendera-adapterlib/with-avro",
 ]
 with-nexmark = ["dbsp_nexmark"]
 with-redis = ["redis", "r2d2"]
@@ -55,13 +55,13 @@ bench-mode = []
 with-postgres-cdc = ["etl", "etl-config", "etl-postgres"]
 
 [dependencies]
-feldera-types = { workspace = true }
-feldera-adapterlib = { workspace = true }
-feldera-datagen = { workspace = true }
-feldera-observability = { workspace = true }
-feldera-samply = { workspace = true }
-feldera-storage = { workspace = true }
-feldera-iceberg = { workspace = true, optional = true }
+opendera-types = { workspace = true }
+opendera-adapterlib = { workspace = true }
+opendera-datagen = { workspace = true }
+opendera-observability = { workspace = true }
+opendera-samply = { workspace = true }
+opendera-storage = { workspace = true }
+opendera-iceberg = { workspace = true, optional = true }
 awc = { workspace = true, features = [
     "compress-gzip",
     "compress-brotli",
@@ -181,11 +181,11 @@ postgres = { workspace = true }
 postgres-openssl = { workspace = true }
 dyn-clone = { workspace = true }
 cpu-time = "1.0.0"
-feldera-ir = { workspace = true }
+opendera-ir = { workspace = true }
 base64 = { workspace = true }
 aws-msk-iam-sasl-signer = "1.0.1"
 aws-credential-types = "1.2.3"
-feldera-sqllib = { workspace = true }
+opendera-sqllib = { workspace = true }
 inventory = { workspace = true }
 backtrace = { workspace = true }
 itertools = { workspace = true }
@@ -222,7 +222,7 @@ vergen-gitcl = { workspace = true }
 [dev-dependencies]
 actix-test = { workspace = true }
 bstr = { workspace = true, features = ["serde1"] }
-feldera-macros = { workspace = true }
+opendera-macros = { workspace = true }
 serde_json = { workspace = true }
 size-of = { workspace = true }
 tempfile = { workspace = true }

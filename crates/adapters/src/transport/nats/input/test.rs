@@ -1,4 +1,4 @@
-use feldera_types::deserialize_without_context;
+use opendera_types::deserialize_without_context;
 use serde::{Deserialize, Serialize};
 
 mod control_tests;

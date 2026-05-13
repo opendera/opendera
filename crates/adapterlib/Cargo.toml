@@ -1,5 +1,5 @@
 [package]
-name = "feldera-adapterlib"
+name = "opendera-adapterlib"
 description = "Connector support for the Feldera streaming engine"
 categories = ["parsing"]
 authors = { workspace = true }
@@ -17,8 +17,8 @@ publish = true
 with-avro = ["apache-avro"]
 
 [dependencies]
-feldera-types = { workspace = true }
-feldera-sqllib = { workspace = true }
+opendera-types = { workspace = true }
+opendera-sqllib = { workspace = true }
 dbsp = { workspace = true }
 anyhow = { workspace = true, features = ["backtrace"] }
 serde_yaml = { workspace = true }

@@ -7,11 +7,11 @@ use crate::{InputBuffer, Parser};
 use anyhow::{Error as AnyError, Result as AnyResult, bail};
 use chrono::Utc;
 use crossbeam::sync::{Parker, Unparker};
-use feldera_adapterlib::format::BufferSize;
-use feldera_adapterlib::transport::{Resume, Watermark, parse_resume_info};
-use feldera_types::config::FtModel;
-use feldera_types::program_schema::Relation;
-use feldera_types::transport::file::{FileInputConfig, FileOutputConfig};
+use opendera_adapterlib::format::BufferSize;
+use opendera_adapterlib::transport::{Resume, Watermark, parse_resume_info};
+use opendera_types::config::FtModel;
+use opendera_types::program_schema::Relation;
+use opendera_types::transport::file::{FileInputConfig, FileOutputConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::hash::Hasher;
@@ -397,8 +397,8 @@ however the File transport does not support this representation."
 mod test {
     use crate::test::{DEFAULT_TIMEOUT_MS, mock_input_pipeline, wait};
     use csv::WriterBuilder as CsvWriterBuilder;
-    use feldera_types::deserialize_without_context;
-    use feldera_types::program_schema::Relation;
+    use opendera_types::deserialize_without_context;
+    use opendera_types::program_schema::Relation;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::{io::Write, thread::sleep, time::Duration};

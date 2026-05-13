@@ -255,7 +255,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     /// # Examples
     ///
     /// ```
-    /// # use feldera_fxp::Fixed;
+    /// # use opendera_fxp::Fixed;
     ///
     /// assert_eq!(Fixed::<11, 1>::new(435, 0).unwrap().to_string(), "435");
     /// assert_eq!(Fixed::<11, 1>::new(435, 1).unwrap().to_string(), "43.5");
@@ -273,7 +273,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     /// # Examples
     ///
     /// ```
-    /// # use feldera_fxp::Fixed;
+    /// # use opendera_fxp::Fixed;
     ///
     /// assert_eq!(Fixed::<11, 1>::new_round_even(435, 0).unwrap().to_string(), "435");
     /// assert_eq!(Fixed::<11, 1>::new_round_even(435, 1).unwrap().to_string(), "43.5");

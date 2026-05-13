@@ -1,5 +1,5 @@
 [package]
-name = "feldera-macros"
+name = "opendera-macros"
 description = "Continuous streaming analytics engine"
 categories = ["algorithms", "data-structures"]
 publish = true

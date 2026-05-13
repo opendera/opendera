@@ -2,7 +2,7 @@ mod input;
 
 pub use input::IcebergInputEndpoint;
 
-use feldera_types::serde_with_context::{
+use opendera_types::serde_with_context::{
     serde_config::DecimalFormat, DateFormat, SqlSerdeConfig, TimestampFormat,
 };
 

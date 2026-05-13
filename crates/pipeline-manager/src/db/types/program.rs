@@ -4,12 +4,12 @@ use crate::db::types::pipeline::PipelineId;
 use crate::db::types::utils::validate_name;
 use crate::has_unstable_feature;
 use clap::Parser;
-use feldera_ir::Dataflow;
-use feldera_types::config::{
+use opendera_ir::Dataflow;
+use opendera_types::config::{
     ConnectorConfig, InputEndpointConfig, MultihostConfig, OutputEndpointConfig, PipelineConfig,
     PipelineConfigProgramInfo, ProgramIr, RuntimeConfig, TransportConfig,
 };
-use feldera_types::program_schema::{ProgramSchema, PropertyValue, SourcePosition, SqlIdentifier};
+use opendera_types::program_schema::{ProgramSchema, PropertyValue, SourcePosition, SqlIdentifier};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -862,9 +862,9 @@ pub fn generate_pipeline_config(
 mod tests {
     use super::{determine_connector_endpoint_names, RuntimeSelector};
     use crate::db::types::program::ConnectorGenerationError::RelationConnectorNameCollision;
-    use feldera_types::config::{ConnectorConfig, TransportConfig};
-    use feldera_types::program_schema::{PropertyValue, SourcePosition};
-    use feldera_types::transport::datagen::DatagenInputConfig;
+    use opendera_types::config::{ConnectorConfig, TransportConfig};
+    use opendera_types::program_schema::{PropertyValue, SourcePosition};
+    use opendera_types::transport::datagen::DatagenInputConfig;
 
     #[test]
     fn test_runtime_version_validation() {

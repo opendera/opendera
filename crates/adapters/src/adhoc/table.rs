@@ -27,14 +27,14 @@ use datafusion::physical_plan::stream::{
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use feldera_adapterlib::catalog::SerBatchReader;
-use feldera_types::config::{ConnectorConfig, FormatConfig, InputEndpointConfig, TransportConfig};
-use feldera_types::program_schema::SqlIdentifier;
-use feldera_types::serde_with_context::serde_config::{
+use opendera_adapterlib::catalog::SerBatchReader;
+use opendera_types::config::{ConnectorConfig, FormatConfig, InputEndpointConfig, TransportConfig};
+use opendera_types::program_schema::SqlIdentifier;
+use opendera_types::serde_with_context::serde_config::{
     BinaryFormat, DecimalFormat, UuidFormat, VariantFormat,
 };
-use feldera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimeFormat, TimestampFormat};
-use feldera_types::transport::adhoc::AdHocInputConfig;
+use opendera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimeFormat, TimestampFormat};
+use opendera_types::transport::adhoc::AdHocInputConfig;
 use serde_arrow::ArrayBuilder;
 use serde_arrow::schema::SerdeArrowSchema;
 use tokio::sync::mpsc::Sender;

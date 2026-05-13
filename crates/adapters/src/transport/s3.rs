@@ -9,16 +9,16 @@ use async_channel::{Receiver, SendError, Sender, bounded, unbounded};
 use aws_sdk_s3::operation::{get_object::GetObjectOutput, list_objects_v2::ListObjectsV2Error};
 use chrono::{DateTime, Utc};
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::{
+use futures::future::join_all;
+#[cfg(test)]
+use mockall::automock;
+use opendera_adapterlib::{
     PipelineState,
     format::BufferSize,
     transport::{Resume, Watermark, parse_resume_info},
 };
-use feldera_types::transport::s3::S3InputConfig;
-use feldera_types::{config::FtModel, program_schema::Relation};
-use futures::future::join_all;
-#[cfg(test)]
-use mockall::automock;
+use opendera_types::transport::s3::S3InputConfig;
+use opendera_types::{config::FtModel, program_schema::Relation};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use std::{
@@ -976,12 +976,12 @@ mod test {
         primitives::{ByteStream, SdkBody},
         types::error::builders::{NoSuchBucketBuilder, NoSuchKeyBuilder},
     };
-    use feldera_types::{
+    use mockall::predicate::eq;
+    use opendera_types::{
         config::{InputEndpointConfig, TransportConfig},
         deserialize_without_context,
         program_schema::Relation,
     };
-    use mockall::predicate::eq;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
 

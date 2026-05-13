@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use dbsp::storage::backend::{StorageBackend, StoragePath};
-use feldera_types::{
+use opendera_types::{
     adapter_stats::ConnectorError, checkpoint::CheckpointMetadata, config::PipelineConfig,
 };
 use serde::{Deserialize, Serialize};
@@ -289,7 +289,7 @@ mod tests {
     use super::{CheckpointInputEndpointMetrics, CheckpointOutputEndpointMetrics};
     use crate::controller::stats::{ConnectorErrorList, MAX_CONNECTOR_ERRORS};
     use chrono::{TimeZone, Utc};
-    use feldera_types::adapter_stats::ConnectorError;
+    use opendera_types::adapter_stats::ConnectorError;
 
     fn mk_error(index: u64, tag: Option<&str>, msg: &str) -> ConnectorError {
         ConnectorError {

@@ -1,11 +1,11 @@
 use dbsp::utils::tuple::TupleFormat;
-use feldera_sqllib::SqlString;
+use opendera_sqllib::SqlString;
 
-feldera_macros::declare_tuple! { Tup1<T1> }
-feldera_macros::declare_tuple! { Tup2<T1, T2> }
-feldera_macros::declare_tuple! { Tup7<T1, T2, T3, T4, T5, T6, T7> }
-feldera_macros::declare_tuple! { Tup8<T1, T2, T3, T4, T5, T6, T7, T8> }
-feldera_macros::declare_tuple! { Tup12<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> }
+opendera_macros::declare_tuple! { Tup1<T1> }
+opendera_macros::declare_tuple! { Tup2<T1, T2> }
+opendera_macros::declare_tuple! { Tup7<T1, T2, T3, T4, T5, T6, T7> }
+opendera_macros::declare_tuple! { Tup8<T1, T2, T3, T4, T5, T6, T7, T8> }
+opendera_macros::declare_tuple! { Tup12<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> }
 
 type Tup1OptStr = Tup1<Option<SqlString>>;
 type Tup2Sql = Tup2<SqlString, Option<u16>>;

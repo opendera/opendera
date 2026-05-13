@@ -191,7 +191,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -248,7 +248,7 @@
 //! # Serialize,
 //! # rkyv::Deserialize,
 //! # serde::Deserialize,
-//! # feldera_macros::IsNone,
+//! # opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -320,7 +320,7 @@
 //!     Serialize,
 //!     rkyv::Deserialize,
 //!     serde::Deserialize,
-//!     feldera_macros::IsNone,
+//!     opendera_macros::IsNone,
 //! )]
 //! #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -365,7 +365,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -447,7 +447,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -526,7 +526,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -608,7 +608,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -744,7 +744,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -903,7 +903,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -1061,7 +1061,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -1185,7 +1185,7 @@
 //!     Serialize,
 //!     rkyv::Deserialize,
 //!     serde::Deserialize,
-//!     feldera_macros::IsNone,
+//!     opendera_macros::IsNone,
 //! )]
 //! #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! struct VaxMonthly {
@@ -1243,7 +1243,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -1266,7 +1266,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct VaxMonthly {
@@ -1402,7 +1402,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -1520,7 +1520,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -1641,7 +1641,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -1724,7 +1724,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -1867,7 +1867,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct Record {
@@ -1890,7 +1890,7 @@
 //! #     Serialize,
 //! #     rkyv::Deserialize,
 //! #     serde::Deserialize,
-//! #     feldera_macros::IsNone,
+//! #     opendera_macros::IsNone,
 //! # )]
 //! # #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 //! # struct VaxMonthly {

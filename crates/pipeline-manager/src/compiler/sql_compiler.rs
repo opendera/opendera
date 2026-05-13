@@ -18,11 +18,11 @@ use crate::db::types::utils::validate_program_config;
 use crate::db::types::version::Version;
 use crate::error::source_error;
 use crate::has_unstable_feature;
-use feldera_ir::Dataflow;
-use feldera_observability::ReqwestTracingExt;
-use feldera_types::program_schema::ProgramSchema;
 use futures_util::StreamExt;
 use indoc::formatdoc;
+use opendera_ir::Dataflow;
+use opendera_observability::ReqwestTracingExt;
+use opendera_types::program_schema::ProgramSchema;
 use std::fs::Metadata;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -913,9 +913,9 @@ mod test {
     use crate::db::types::program::ProgramStatus;
     use crate::db::types::utils::validate_program_info;
     use crate::db::types::version::Version;
-    use feldera_types::config::TransportConfig;
-    use feldera_types::program_schema::{SqlIdentifier, SqlType};
     use indoc::formatdoc;
+    use opendera_types::config::TransportConfig;
+    use opendera_types::program_schema::{SqlIdentifier, SqlType};
 
     /// Tests the compilation of several of the most basic SQL programs succeeds.
     #[tokio::test]

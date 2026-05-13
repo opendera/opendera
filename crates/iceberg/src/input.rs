@@ -3,25 +3,6 @@ use anyhow::{anyhow, bail, Error as AnyError, Result as AnyResult};
 use chrono::{DateTime, Utc};
 use datafusion::prelude::{DataFrame, SQLOptions, SessionContext};
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::{
-    catalog::{ArrowStream, InputCollectionHandle},
-    errors::journal::ControllerError,
-    format::ParseError,
-    transport::{
-        InputConsumer, InputEndpoint, InputQueue, InputReader, InputReaderCommand,
-        IntegratedInputEndpoint, NonFtInputReaderCommand,
-    },
-    utils::datafusion::{
-        array_to_string, execute_query_collect, execute_singleton_query,
-        timestamp_to_sql_expression, validate_sql_expression, validate_timestamp_column,
-    },
-    PipelineState,
-};
-use feldera_types::{
-    config::FtModel,
-    program_schema::Relation,
-    transport::iceberg::{IcebergCatalogType, IcebergReaderConfig},
-};
 use futures_util::StreamExt;
 use iceberg::CatalogBuilder;
 use iceberg::{io::FileIO, spec::TableMetadata, table::Table as IcebergTable, Catalog, TableIdent};
@@ -35,6 +16,25 @@ use iceberg_catalog_rest::{
 };
 use iceberg_datafusion::IcebergStaticTableProvider;
 use log::{debug, info, trace};
+use opendera_adapterlib::{
+    catalog::{ArrowStream, InputCollectionHandle},
+    errors::journal::ControllerError,
+    format::ParseError,
+    transport::{
+        InputConsumer, InputEndpoint, InputQueue, InputReader, InputReaderCommand,
+        IntegratedInputEndpoint, NonFtInputReaderCommand,
+    },
+    utils::datafusion::{
+        array_to_string, execute_query_collect, execute_singleton_query,
+        timestamp_to_sql_expression, validate_sql_expression, validate_timestamp_column,
+    },
+    PipelineState,
+};
+use opendera_types::{
+    config::FtModel,
+    program_schema::Relation,
+    transport::iceberg::{IcebergCatalogType, IcebergReaderConfig},
+};
 use std::{sync::Arc, thread};
 use tokio::{
     select,

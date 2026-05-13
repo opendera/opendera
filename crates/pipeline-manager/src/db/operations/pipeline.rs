@@ -30,8 +30,8 @@ use crate::db::types::utils::{
 };
 use crate::db::types::version::Version;
 use deadpool_postgres::Transaction;
-use feldera_types::error::ErrorResponse;
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+use opendera_types::error::ErrorResponse;
+use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
 use rmp_serde::{from_slice, to_vec};
 use serde_json::json;
 use tokio_postgres::Row;

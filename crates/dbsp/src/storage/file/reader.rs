@@ -29,9 +29,9 @@ use binrw::{
 };
 use crc32c::crc32c;
 use dyn_clone::clone_box;
-use feldera_buffer_cache::CacheEntry;
-use feldera_storage::StoragePath;
-use feldera_storage::file::FileId;
+use opendera_buffer_cache::CacheEntry;
+use opendera_storage::StoragePath;
+use opendera_storage::file::FileId;
 use size_of::SizeOf;
 use smallvec::SmallVec;
 use snap::raw::{Decoder, decompress_len};

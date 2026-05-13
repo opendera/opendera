@@ -22,8 +22,8 @@ use crate::{
     utils::Tup2,
 };
 use async_stream::stream;
-use feldera_storage::{FileCommitter, StoragePath};
 use futures::{Stream as AsyncStream, StreamExt};
+use opendera_storage::{FileCommitter, StoragePath};
 use size_of::{Context, SizeOf};
 use std::{
     cell::{Cell, RefCell},

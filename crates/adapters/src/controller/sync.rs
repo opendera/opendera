@@ -17,13 +17,13 @@ use std::time::Duration;
 
 use dbsp::circuit::CircuitStorageConfig;
 use dbsp::circuit::checkpointer::Checkpointer;
-use feldera_adapterlib::errors::journal::ControllerError;
-use feldera_storage::checkpoint_synchronizer::SYNCHRONIZER;
-use feldera_storage::histogram::ExponentialHistogram;
-use feldera_storage::{StorageBackend, StoragePath};
-use feldera_types::checkpoint::CheckpointMetadata;
-use feldera_types::config::{FileBackendConfig, StorageBackendConfig, SyncConfig};
-use feldera_types::constants::ACTIVATION_MARKER_FILE;
+use opendera_adapterlib::errors::journal::ControllerError;
+use opendera_storage::checkpoint_synchronizer::SYNCHRONIZER;
+use opendera_storage::histogram::ExponentialHistogram;
+use opendera_storage::{StorageBackend, StoragePath};
+use opendera_types::checkpoint::CheckpointMetadata;
+use opendera_types::config::{FileBackendConfig, StorageBackendConfig, SyncConfig};
+use opendera_types::constants::ACTIVATION_MARKER_FILE;
 
 // ---------------------------------------------------------------------------
 // Metrics (preserved across the clean-room reimplementation)
@@ -121,10 +121,7 @@ fn pull_and_gc(
 }
 
 /// One-shot pull. Calls `pull_and_gc` once and returns.
-pub fn pull_once(
-    storage: &CircuitStorageConfig,
-    sync: &SyncConfig,
-) -> Result<(), ControllerError> {
+pub fn pull_once(storage: &CircuitStorageConfig, sync: &SyncConfig) -> Result<(), ControllerError> {
     pull_and_gc(storage.backend.clone(), sync, &mut uuid::Uuid::nil())?;
     Ok(())
 }

@@ -1,5 +1,5 @@
 #![allow(clippy::all, unused)]
 
-use feldera_observability::ReqwestTracingExt;
+use opendera_observability::ReqwestTracingExt;
 
 include!(concat!(env!("OUT_DIR"), "/codegen.rs"));

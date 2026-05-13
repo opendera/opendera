@@ -2,8 +2,8 @@
 
 use crate::error::{SqlResult, convert_error};
 use dbsp::NumEntries;
-use feldera_macros::IsNone;
-use feldera_types::serde_with_context::{
+use opendera_macros::IsNone;
+use opendera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, serde_config::UuidFormat,
 };
 use serde::{Deserializer, Serializer, de, de::Error as _};

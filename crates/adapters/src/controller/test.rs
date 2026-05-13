@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::anyhow;
 use csv::{ReaderBuilder as CsvReaderBuilder, WriterBuilder as CsvWriterBuilder};
-use feldera_types::{
+use opendera_types::{
     config::{InputEndpointConfig, OutputEndpointConfig},
     constants::STATE_FILE,
     memory_pressure::MemoryPressure,
@@ -1554,7 +1554,7 @@ fn start_controller(storage_dir: &Path, barriers: &[usize]) -> Controller {
 /// Test suspend when barriers are involved, with one input
 ///
 /// An input endpoint that supports suspend and resume can emit a barrier,
-/// specifically [feldera_adapterlib::transport::Resume::Barrier], when it
+/// specifically [opendera_adapterlib::transport::Resume::Barrier], when it
 /// can't suspend after a particular step.  When a suspend is requested and
 /// there's a barrier, the controller advances the input endpoints with
 /// barriers (and only those input endpoints) until past the barrier.
@@ -1677,7 +1677,7 @@ fn suspend_barrier() {
 /// Test suspend when barriers are involved, with multiple inputs.
 ///
 /// An input endpoint that supports suspend and resume can emit a barrier,
-/// specifically [feldera_adapterlib::transport::Resume::Barrier], when it
+/// specifically [opendera_adapterlib::transport::Resume::Barrier], when it
 /// can't suspend after a particular step.  When a suspend is requested and
 /// there's a barrier, the controller advances the input endpoints with
 /// barriers (and only those input endpoints) until past the barrier.
@@ -2072,7 +2072,7 @@ fn test_external_controller_status_serialization() {
     use crate::controller::stats::InputEndpointStatus;
     use crate::{ControllerStatus, OutputEndpointConfig, PipelineState};
     use chrono::{TimeZone, Utc};
-    use feldera_types::suspend::{PermanentSuspendError, SuspendError};
+    use opendera_types::suspend::{PermanentSuspendError, SuspendError};
     use std::sync::atomic::Ordering;
     use uuid::Uuid;
 
@@ -2305,7 +2305,7 @@ fn test_external_controller_status_serialization() {
             PermanentSuspendError::StorageRequired,
             PermanentSuspendError::UnsupportedInputEndpoint("kafka_input".to_string()),
         ])),
-        checkpoint_activity: feldera_types::checkpoint::CheckpointActivity::Idle,
+        checkpoint_activity: opendera_types::checkpoint::CheckpointActivity::Idle,
         permanent_checkpoint_errors: None,
         pipeline_complete: false,
         transaction_info: TransactionInfo::default(),
@@ -2428,7 +2428,7 @@ fn test_custom_connector_metrics_prometheus_output() {
         controller::{stats::InputEndpointStatus, write_custom_metrics},
         server::metrics::{LabelStack, MetricsWriter, PrometheusFormatter},
     };
-    use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
+    use opendera_adapterlib::metrics::{ConnectorMetrics, ValueType};
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -2515,7 +2515,7 @@ fn test_custom_connector_metrics_prometheus_grouping() {
         controller::{stats::InputEndpointStatus, write_custom_metrics},
         server::metrics::{LabelStack, MetricsWriter, PrometheusFormatter},
     };
-    use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
+    use opendera_adapterlib::metrics::{ConnectorMetrics, ValueType};
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -2769,9 +2769,9 @@ fn test_decryption_preprocessor() {
 // ---------------------------------------------------------------------------
 
 use crate::format::{LineSplitter, SpongeSplitter};
-use feldera_adapterlib::format::Splitter;
-use feldera_adapterlib::preprocess::{Preprocessor, PreprocessorCreateError, PreprocessorFactory};
-use feldera_types::preprocess::PreprocessorConfig;
+use opendera_adapterlib::format::Splitter;
+use opendera_adapterlib::preprocess::{Preprocessor, PreprocessorCreateError, PreprocessorFactory};
+use opendera_types::preprocess::PreprocessorConfig;
 
 /// Preprocessor that base64-decodes each line it receives.
 ///
@@ -3046,9 +3046,9 @@ fn test_base64_sponge_csv_preprocessor() {
 #[test]
 fn test_checkpoint_activity_state_transitions() {
     use chrono::Utc;
-    use feldera_types::checkpoint::CheckpointActivity;
-    use feldera_types::coordination::CheckpointCoordination;
-    use feldera_types::suspend::TemporarySuspendError;
+    use opendera_types::checkpoint::CheckpointActivity;
+    use opendera_types::coordination::CheckpointCoordination;
+    use opendera_types::suspend::TemporarySuspendError;
 
     init_test_logger();
 
@@ -3227,8 +3227,8 @@ fn test_checkpoint_activity_state_transitions() {
 #[test]
 fn test_checkpoint_activity_async_checkpoint() {
     use chrono::Utc;
-    use feldera_types::checkpoint::CheckpointActivity;
-    use feldera_types::coordination::CheckpointCoordination;
+    use opendera_types::checkpoint::CheckpointActivity;
+    use opendera_types::coordination::CheckpointCoordination;
 
     init_test_logger();
 
@@ -3359,7 +3359,7 @@ fn test_checkpoint_activity_async_checkpoint() {
 /// is explicitly disabled (the pipeline cannot checkpoint).
 #[test]
 fn test_permanent_suspend_errors_without_storage() {
-    use feldera_types::suspend::PermanentSuspendError;
+    use opendera_types::suspend::PermanentSuspendError;
 
     init_test_logger();
 
@@ -3427,7 +3427,7 @@ fn test_permanent_suspend_errors_without_storage() {
     assert!(
         matches!(
             activity,
-            feldera_types::checkpoint::CheckpointActivity::Idle
+            opendera_types::checkpoint::CheckpointActivity::Idle
         ),
         "expected Idle, got {activity:?}"
     );

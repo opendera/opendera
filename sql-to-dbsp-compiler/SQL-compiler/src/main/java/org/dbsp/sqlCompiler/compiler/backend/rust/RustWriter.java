@@ -231,7 +231,7 @@ public abstract class RustWriter extends BaseRustCodeGenerator {
                     // These are already pre-declared
                     continue;
                 this.builder()
-                        .append("feldera_types::deserialize_without_context!(")
+                        .append("opendera_types::deserialize_without_context!(")
                         .append(DBSPTypeCode.TUPLE.rustName)
                         .append(i);
                 for (int j = 0; j < i; j++) {

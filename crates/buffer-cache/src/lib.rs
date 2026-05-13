@@ -9,8 +9,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 pub use builder::BufferCacheBuilder;
-use feldera_types::config::dev_tweaks::BufferCacheStrategy;
 pub use lru::LruCache;
+use opendera_types::config::dev_tweaks::BufferCacheStrategy;
 pub use s3_fifo::S3FifoCache;
 pub use thread_type::ThreadType;
 

@@ -9,7 +9,7 @@ use crate::{
     dynamic::{ClonableTrait, DataTrait, Erase, Factory, Weight, WeightTrait, WithFactory},
     trace::Deserializable,
 };
-use feldera_macros::IsNone;
+use opendera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 use std::{

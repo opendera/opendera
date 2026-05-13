@@ -4,8 +4,8 @@ use crate::format::SpongeSplitter;
 use std::borrow::Cow;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use feldera_adapterlib::preprocess::{Preprocessor, PreprocessorCreateError, PreprocessorFactory};
-use feldera_types::preprocess::PreprocessorConfig;
+use opendera_adapterlib::preprocess::{Preprocessor, PreprocessorCreateError, PreprocessorFactory};
+use opendera_types::preprocess::PreprocessorConfig;
 use openssl::symm::{Cipher, decrypt_aead};
 use serde::Deserialize;
 
@@ -203,7 +203,7 @@ pub fn aes256gcm_encrypt(key: &[u8], nonce: &[u8; 12], plaintext: &[u8]) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feldera_adapterlib::preprocess::PreprocessorCreateError;
+    use opendera_adapterlib::preprocess::PreprocessorCreateError;
     use serde_json::json;
 
     fn make_config(key_bytes: &[u8]) -> PreprocessorConfig {

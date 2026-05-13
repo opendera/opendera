@@ -3,12 +3,12 @@
 use crate::dynamic::{self, data::DataTyped};
 use crate::storage::file::SerializerInner;
 use crate::{Error, NumEntries, TypedBox};
-use feldera_types::checkpoint::CheckpointMetadata;
-use feldera_types::constants::{
+use itertools::Itertools;
+use opendera_types::checkpoint::CheckpointMetadata;
+use opendera_types::constants::{
     ACTIVATION_MARKER_FILE, ADHOC_TEMP_DIR, CHECKPOINT_DEPENDENCIES, CHECKPOINT_FILE_NAME,
     DBSP_FILE_EXTENSION, STATE_FILE, STATUS_FILE, STEPS_FILE,
 };
-use itertools::Itertools;
 use size_of::SizeOf;
 
 use std::io::ErrorKind;
@@ -18,9 +18,9 @@ use std::{
     sync::Arc,
 };
 
-use feldera_storage::error::StorageError;
-use feldera_storage::fbuf::FBuf;
-use feldera_storage::{StorageBackend, StorageFileType, StoragePath};
+use opendera_storage::error::StorageError;
+use opendera_storage::fbuf::FBuf;
+use opendera_storage::{StorageBackend, StorageFileType, StoragePath};
 use uuid::Uuid;
 
 use super::RuntimeError;
@@ -456,8 +456,8 @@ impl<T: Default> Checkpoint for EmptyCheckpoint<T> {
 mod test {
     use std::sync::Arc;
 
-    use feldera_storage::StorageBackend;
-    use feldera_types::config::{FileBackendConfig, StorageCacheConfig};
+    use opendera_storage::StorageBackend;
+    use opendera_types::config::{FileBackendConfig, StorageCacheConfig};
     use std::collections::HashSet;
 
     use crate::storage::backend::posixio_impl::PosixBackend;

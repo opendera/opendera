@@ -5,11 +5,11 @@ use std::io::{Read, Write};
 
 use arrow::ipc::reader::StreamReader;
 use arrow::util::pretty::pretty_format_batches;
-use feldera_rest_api::Client;
-use feldera_types::query::{AdHocResultFormat, AdhocQueryArgs};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use log::{debug, error, trace, warn};
+use opendera_rest_api::Client;
+use opendera_types::query::{AdHocResultFormat, AdhocQueryArgs};
 use reqwest_websocket::{CloseCode, Message, RequestBuilderExt};
 
 use crate::UPGRADE_NOTICE;

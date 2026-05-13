@@ -1017,7 +1017,7 @@ mod tests {
     #[test]
     /// A simple test to verify the code of Tup<> types, for manual invocation run this:
     ///
-    /// `cargo test -p feldera-macros -- dump_tup_expansions --nocapture`
+    /// `cargo test -p opendera-macros -- dump_tup_expansions --nocapture`
     fn dump_tup_expansions() {
         let tuple: TupleDef = syn::parse2(quote!(Tup2<T0, T1>)).expect("Failed to parse TupleDef");
         let expanded = declare_tuple_impl(tuple);

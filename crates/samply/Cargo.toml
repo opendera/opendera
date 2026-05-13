@@ -1,5 +1,5 @@
 [package]
-name = "feldera-samply"
+name = "opendera-samply"
 description = "Enhance profiles produced using samply"
 categories = ["development-tools::profiling", "command-line-utilities"]
 authors = { workspace = true }

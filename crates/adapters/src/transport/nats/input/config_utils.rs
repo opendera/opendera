@@ -1,6 +1,6 @@
 use anyhow::Result as AnyResult;
 use async_nats::jetstream::consumer as nats;
-use feldera_types::transport::nats as cfg;
+use opendera_types::transport::nats as cfg;
 use std::time::Duration;
 
 pub async fn translate_connect_options(

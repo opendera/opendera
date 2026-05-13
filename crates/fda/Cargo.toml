@@ -22,13 +22,13 @@ reqwest = { workspace = true, features = ["json", "stream"] }
 reqwest-websocket = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "process"] }
-feldera-types = { workspace = true }
-feldera-rest-api = { workspace = true }
+opendera-types = { workspace = true }
+opendera-rest-api = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing-log = { workspace = true }
 sentry = { workspace = true }
-feldera-observability = { workspace = true }
+opendera-observability = { workspace = true }
 tabled = { workspace = true, features = ["macros", "ansi"] }
 json_to_table = { workspace = true }
 rustyline = { workspace = true, features = ["with-file-history"] }

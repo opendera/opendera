@@ -27,7 +27,7 @@ use crate::{
     },
 };
 use crate::{DynZWeight, ZWeight};
-use feldera_storage::{FileReader, StoragePath};
+use opendera_storage::{FileReader, StoragePath};
 use rand::{Rng, seq::index::sample};
 use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, ser::Serializer};
 use size_of::SizeOf;

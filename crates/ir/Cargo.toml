@@ -1,5 +1,5 @@
 [package]
-name = "feldera-ir"
+name = "opendera-ir"
 description = "Intermediate representation types for Feldera Programs"
 keywords = ["DBSP", "calcite", "compiler", "ir"]
 categories = ["database"]
