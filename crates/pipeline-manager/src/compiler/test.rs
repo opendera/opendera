@@ -34,6 +34,7 @@ impl CompilerTest {
         let workdir = compiler_tempdir.path().to_str().unwrap();
         let platform_version = "v0";
         let common_config = CommonConfig {
+            service_mode: crate::config::ServiceMode::Full,
             bind_address: "127.0.0.1".to_string(),
             api_host: "127.0.0.1".to_string(),
             api_port: 8080,

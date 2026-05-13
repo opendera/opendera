@@ -222,10 +222,40 @@ fn cpu_quantity_to_workers(s: &str) -> Result<usize, String> {
     Ok(quantity.ceil().max(1.0) as usize)
 }
 
+/// Which subset of services this process runs.
+///
+/// `Full` is the single-binary default and what self-hosters use:
+/// API + runner + monitors + compiler all live in one process.
+///
+/// `Manager` and `Compiler` are the split-deployment shape used by the
+/// opendera-cloud Fly stack: the compile pool is a separate Fly App
+/// that auto-stops on idle and scales out on bursty compilation
+/// load, while the manager App stays small ($1-5/mo). They communicate
+/// via the shared Postgres job queue plus the compiler's HTTP server
+/// (which pipelines hit to fetch their compiled binary at startup).
+#[derive(clap::ValueEnum, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceMode {
+    /// API + runner + compiler in one process. Default.
+    #[default]
+    Full,
+    /// API + runner + monitors, no compiler. Pair with a separate
+    /// `Compiler`-mode process reachable at `--compiler-host`.
+    Manager,
+    /// Compiler HTTP server only. No API, no runner, no monitors.
+    /// Pulls pending compile jobs from the shared DB.
+    Compiler,
+}
+
 /// Configuration common to API server, compiler and runner.
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 pub struct CommonConfig {
+    /// Which services this process runs. See `ServiceMode` for the
+    /// split-deployment rationale.
+    #[arg(long, value_enum, default_value_t = ServiceMode::default(), env = "OPENDERA_SERVICE_MODE")]
+    pub service_mode: ServiceMode,
+
     /// Platform version which is used to determine if an upgrade occurred.
     /// Default is determined at compile time.
     #[arg(long, default_value_t = default_platform_version())]
@@ -245,11 +275,11 @@ pub struct CommonConfig {
     pub api_port: u16,
 
     /// Host (hostname or IP address) at which the compiler HTTP server can be reached by the others (e.g., pipelines).
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1", env = "OPENDERA_COMPILER_HOST")]
     pub compiler_host: String,
 
     /// Port used by the compiler to both bind its HTTP server, and on which it can be reached.
-    #[arg(long, long, default_value_t = 8085)]
+    #[arg(long, long, default_value_t = 8085, env = "OPENDERA_COMPILER_PORT")]
     pub compiler_port: u16,
 
     /// Host (hostname or IP address) at which the runner HTTP server can be reached by the others (e.g., API server).
@@ -603,6 +633,7 @@ impl CommonConfig {
     #[cfg(test)]
     pub(crate) fn test_config() -> Self {
         Self {
+            service_mode: ServiceMode::Full,
             bind_address: "127.0.0.1".to_string(),
             api_host: "127.0.0.1".to_string(),
             api_port: 8080,
