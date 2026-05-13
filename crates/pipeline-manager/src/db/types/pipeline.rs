@@ -283,6 +283,22 @@ pub struct ExtendedPipelineDescr {
 
     /// Timestamp when the `deployment_runtime_desired_status` last changed.
     pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
+
+    /// Fly App that owns this pipeline's Machine, when running under the
+    /// Fly executor. `None` on local/self-hosted deployments and on any
+    /// pipeline whose Machine has not yet been provisioned.
+    pub fly_app: Option<String>,
+
+    /// Fly Machine identifier. The cloud-side activity controller calls
+    /// Fly's `machines/{id}/{start,stop,suspend}` API with this value.
+    pub fly_machine_id: Option<String>,
+
+    /// Free-form Fly tier label (e.g. "shared-cpu-1x", "performance-2x").
+    /// Surfaced for the cloud console's right-sizing recommender.
+    pub tier: Option<String>,
+
+    /// Provisioned guest RAM in MiB. Mirrors Fly's per-Machine `guest.memory_mb`.
+    pub ram_mb: Option<i32>,
 }
 
 /// Pipeline descriptor which includes the fields relevant to system monitoring.
@@ -320,6 +336,10 @@ pub struct ExtendedPipelineDescrMonitoring {
     pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
     pub bootstrap_policy: Option<BootstrapPolicy>,
     pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
+    pub fly_app: Option<String>,
+    pub fly_machine_id: Option<String>,
+    pub tier: Option<String>,
+    pub ram_mb: Option<i32>,
 }
 
 /// Pipeline descriptor with all fields needed to create a monitor event.

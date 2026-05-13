@@ -112,13 +112,14 @@ pub async fn list_internal_pipelines(
             // doesn't (yet) snapshot them so we surface `None` and let
             // the controller derive last-seen from the event stream.
             last_activity_at: None,
-            // The cloud-only fields below land once the Fly executor
-            // persists its handle in the DB. Until then the activity
-            // controller skips pipelines whose `fly_machine_id` is None.
-            fly_app: None,
-            fly_machine_id: None,
-            tier: None,
-            ram_mb: None,
+            fly_app: descr.fly_app,
+            fly_machine_id: descr.fly_machine_id,
+            tier: descr.tier,
+            // ram_mb is stored as int4 (i32) — widen to u64 for the
+            // wire type, which matches Fly's `guest.memory_mb` shape.
+            // Saturate at 0 defensively; the column is only written by
+            // the Fly executor with valid Fly machine sizes.
+            ram_mb: descr.ram_mb.map(|v| v.max(0) as u64),
         })
         .collect();
     Ok(HttpResponse::Ok().json(pipelines))

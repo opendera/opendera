@@ -32,7 +32,8 @@ pub const PIPELINE_COLUMNS_ALL: &str =
      p.deployment_resources_status, p.deployment_resources_status_details, p.deployment_resources_status_since,
      p.deployment_resources_desired_status, p.deployment_resources_desired_status_since,
      p.deployment_runtime_status, p.deployment_runtime_status_details, p.deployment_runtime_status_since,
-     p.deployment_runtime_desired_status, p.deployment_runtime_desired_status_since, p.bootstrap_policy
+     p.deployment_runtime_desired_status, p.deployment_runtime_desired_status_since, p.bootstrap_policy,
+     p.fly_app, p.fly_machine_id, p.tier, p.ram_mb
      ";
 
 pub const PIPELINE_COLUMNS_MONITORING: &str =
@@ -43,7 +44,8 @@ pub const PIPELINE_COLUMNS_MONITORING: &str =
      p.deployment_resources_status, p.deployment_resources_status_since,
      p.deployment_resources_desired_status, p.deployment_resources_desired_status_since,
      p.deployment_runtime_status, p.deployment_runtime_status_details, p.deployment_runtime_status_since,
-     p.deployment_runtime_desired_status, p.deployment_runtime_desired_status_since, p.bootstrap_policy
+     p.deployment_runtime_desired_status, p.deployment_runtime_desired_status_since, p.bootstrap_policy,
+     p.fly_app, p.fly_machine_id, p.tier, p.ram_mb
      ";
 
 pub const PIPELINE_COLUMNS_EVENT_INFO: &str = "p.id,
@@ -100,6 +102,10 @@ pub fn parse_pipeline_row_all(row: &Row) -> Result<ExtendedPipelineDescr, DBErro
         deployment_runtime_status_since: parse_from_row_deployment_runtime_status_since(row),
         deployment_runtime_desired_status: parse_from_row_deployment_runtime_desired_status(row)?,
         deployment_runtime_desired_status_since: parse_from_row_deployment_runtime_desired_status_since(row),
+        fly_app: parse_from_row_fly_app(row),
+        fly_machine_id: parse_from_row_fly_machine_id(row),
+        tier: parse_from_row_tier(row),
+        ram_mb: parse_from_row_ram_mb(row),
     })
 }
 
@@ -133,6 +139,10 @@ pub fn parse_pipeline_row_monitoring(row: &Row) -> Result<ExtendedPipelineDescrM
         deployment_runtime_status_since: parse_from_row_deployment_runtime_status_since(row),
         deployment_runtime_desired_status: parse_from_row_deployment_runtime_desired_status(row)?,
         deployment_runtime_desired_status_since: parse_from_row_deployment_runtime_desired_status_since(row),
+        fly_app: parse_from_row_fly_app(row),
+        fly_machine_id: parse_from_row_fly_machine_id(row),
+        tier: parse_from_row_tier(row),
+        ram_mb: parse_from_row_ram_mb(row),
     })
 }
 
@@ -428,6 +438,22 @@ fn parse_from_row_deployment_runtime_desired_status_since(row: &Row) -> Option<D
     row.get("deployment_runtime_desired_status_since")
 }
 
+fn parse_from_row_fly_app(row: &Row) -> Option<String> {
+    row.get("fly_app")
+}
+
+fn parse_from_row_fly_machine_id(row: &Row) -> Option<String> {
+    row.get("fly_machine_id")
+}
+
+fn parse_from_row_tier(row: &Row) -> Option<String> {
+    row.get("tier")
+}
+
+fn parse_from_row_ram_mb(row: &Row) -> Option<i32> {
+    row.get("ram_mb")
+}
+
 fn parse_from_row_bootstrap_policy(row: &Row) -> Result<Option<BootstrapPolicy>, DBError> {
     Ok(match row.get::<_, Option<String>>("bootstrap_policy") {
         None => None,
@@ -622,6 +648,10 @@ mod tests {
             deployment_runtime_status_since: None,
             deployment_runtime_desired_status: None,
             deployment_runtime_desired_status_since: None,
+            fly_app: None,
+            fly_machine_id: None,
+            tier: None,
+            ram_mb: None,
         })
         .unwrap();
         let mut all_obj_keys = all_descr
@@ -662,6 +692,10 @@ mod tests {
             deployment_runtime_desired_status: None,
             bootstrap_policy: None,
             deployment_runtime_desired_status_since: None,
+            fly_app: None,
+            fly_machine_id: None,
+            tier: None,
+            ram_mb: None,
         })
         .unwrap();
         let mut monitoring_obj_keys = monitoring_descr
