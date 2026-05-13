@@ -3842,13 +3842,7 @@ dependencies = [
  "enum-map",
  "fastbloom",
  "fdlimit",
- "feldera-buffer-cache",
- "feldera-ir",
- "feldera-macros",
- "feldera-samply",
  "feldera-size-of",
- "feldera-storage",
- "feldera-types",
  "flate2",
  "futures",
  "futures-util",
@@ -3869,6 +3863,12 @@ dependencies = [
  "num-traits",
  "object_store 0.11.2",
  "once_cell",
+ "opendera-buffer-cache",
+ "opendera-ir",
+ "opendera-macros",
+ "opendera-samply",
+ "opendera-storage",
+ "opendera-types",
  "ordered-float 4.6.0",
  "ouroboros",
  "paste",
@@ -3969,17 +3969,7 @@ dependencies = [
  "etl",
  "etl-config",
  "etl-postgres",
- "feldera-adapterlib",
- "feldera-datagen",
- "feldera-iceberg",
- "feldera-ir",
- "feldera-macros",
- "feldera-observability",
- "feldera-samply",
  "feldera-size-of",
- "feldera-sqllib",
- "feldera-storage",
- "feldera-types",
  "feldera_rust_decimal",
  "flate2",
  "form_urlencoded",
@@ -4004,6 +3994,16 @@ dependencies = [
  "num-derive",
  "num-traits",
  "once_cell",
+ "opendera-adapterlib",
+ "opendera-datagen",
+ "opendera-iceberg",
+ "opendera-ir",
+ "opendera-macros",
+ "opendera-observability",
+ "opendera-samply",
+ "opendera-sqllib",
+ "opendera-storage",
+ "opendera-types",
  "openssl",
  "ordered-float 4.6.0",
  "parking_lot 0.12.4",
@@ -4065,13 +4065,13 @@ dependencies = [
  "clap",
  "csv",
  "dbsp",
- "feldera-macros",
  "feldera-size-of",
  "feldera_rust_decimal",
  "hdrhist",
  "indicatif",
  "mimalloc-rust-sys",
  "num-format",
+ "opendera-macros",
  "paste",
  "rand 0.8.6",
  "rdkafka",
@@ -5039,14 +5039,14 @@ dependencies = [
  "clap",
  "clap_complete",
  "directories",
- "feldera-observability",
- "feldera-rest-api",
- "feldera-types",
  "futures",
  "futures-util",
  "itertools 0.14.0",
  "json_to_table",
  "log",
+ "opendera-observability",
+ "opendera-rest-api",
+ "opendera-types",
  "ordered-float 4.6.0",
  "prettyplease",
  "progenitor",
@@ -5082,193 +5082,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "feldera-adapterlib"
-version = "0.296.0"
-dependencies = [
- "actix-web",
- "anyhow",
- "apache-avro 0.18.0",
- "arrow",
- "bytemuck",
- "chrono",
- "datafusion",
- "dbsp",
- "dyn-clone",
- "erased-serde",
- "feldera-sqllib",
- "feldera-types",
- "num-derive",
- "num-traits",
- "rmp-serde",
- "rmpv",
- "serde",
- "serde_arrow",
- "serde_json",
- "serde_json_path_to_error",
- "serde_yaml",
- "thiserror 2.0.17",
- "tokio",
- "tracing",
- "xxhash-rust",
-]
-
-[[package]]
-name = "feldera-buffer-cache"
-version = "0.296.0"
-dependencies = [
- "crossbeam-utils",
- "enum-map",
- "feldera-types",
- "proptest",
- "quick_cache",
- "rand 0.8.6",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "feldera-datagen"
-version = "0.296.0"
-dependencies = [
- "anyhow",
- "async-channel 2.5.0",
- "chrono",
- "crossbeam",
- "dbsp",
- "fake",
- "feldera-adapterlib",
- "feldera-fxp",
- "feldera-types",
- "governor",
- "num-traits",
- "rand 0.8.6",
- "rand_distr",
- "range-set",
- "rmpv",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
- "xxhash-rust",
-]
-
-[[package]]
-name = "feldera-fxp"
-version = "0.296.0"
-dependencies = [
- "bytecheck",
- "dbsp",
- "feldera-size-of",
- "feldera-types",
- "itertools 0.14.0",
- "num-bigint",
- "num-traits",
- "rand 0.8.6",
- "rand_distr",
- "rkyv",
- "serde",
- "serde_json",
- "smallstr",
- "smallvec",
-]
-
-[[package]]
-name = "feldera-iceberg"
-version = "0.296.0"
-dependencies = [
- "anyhow",
- "chrono",
- "datafusion",
- "dbsp",
- "feldera-adapterlib",
- "feldera-types",
- "futures-util",
- "iceberg",
- "iceberg-catalog-glue",
- "iceberg-catalog-rest",
- "iceberg-datafusion",
- "log",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "feldera-ir"
-version = "0.296.0"
-dependencies = [
- "proptest",
- "proptest-derive",
- "serde",
- "serde_json",
- "utoipa",
- "zip 6.0.0",
-]
-
-[[package]]
-name = "feldera-macros"
-version = "0.296.0"
-dependencies = [
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "feldera-observability"
-version = "0.296.0"
-dependencies = [
- "actix-http",
- "awc",
- "chrono",
- "colored",
- "reqwest 0.12.24",
- "sentry",
- "serde_json",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "feldera-rest-api"
-version = "0.296.0"
-dependencies = [
- "chrono",
- "feldera-observability",
- "feldera-types",
- "prettyplease",
- "progenitor",
- "progenitor-client 0.9.1",
- "reqwest 0.12.24",
- "rustversion",
- "sentry",
- "serde",
- "serde_json",
- "syn 2.0.117",
- "uuid",
-]
-
-[[package]]
-name = "feldera-samply"
-version = "0.296.0"
-dependencies = [
- "crossbeam",
- "feldera-size-of",
- "flate2",
- "itertools 0.14.0",
- "libc",
- "memory-stats",
- "nix 0.29.0",
- "serde",
- "serde_json",
- "serde_json_path_to_error",
- "thiserror 2.0.17",
- "thread-id",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "feldera-size-of"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5281,101 +5094,6 @@ dependencies = [
  "size-of-derive",
  "time",
  "xxhash-rust",
-]
-
-[[package]]
-name = "feldera-sqllib"
-version = "0.296.0"
-dependencies = [
- "arcstr",
- "base58",
- "base64 0.22.1",
- "blake3",
- "chrono",
- "chrono-tz",
- "dbsp",
- "derive_more 1.0.0",
- "feldera-fxp",
- "feldera-macros",
- "feldera-size-of",
- "feldera-types",
- "flate2",
- "geo",
- "hex",
- "itertools 0.14.0",
- "lexical-core",
- "like",
- "md-5",
- "num",
- "num-traits",
- "once_cell",
- "paste",
- "proptest",
- "quick_cache",
- "regex",
- "rkyv",
- "ryu",
- "serde",
- "serde_json",
- "smallstr",
- "smallvec",
- "tempfile",
- "thiserror 2.0.17",
- "tracing",
- "typedmap",
- "uuid",
- "xxhash-rust",
-]
-
-[[package]]
-name = "feldera-storage"
-version = "0.296.0"
-dependencies = [
- "anyhow",
- "crossbeam",
- "feldera-size-of",
- "feldera-types",
- "inventory",
- "itertools 0.14.0",
- "libc",
- "nix 0.27.1",
- "object_store 0.11.2",
- "once_cell",
- "rkyv",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "feldera-types"
-version = "0.296.0"
-dependencies = [
- "actix-web",
- "anyhow",
- "arrow-schema",
- "bytemuck",
- "chrono",
- "clap",
- "csv",
- "enum-map",
- "erased-serde",
- "feldera-ir",
- "libc",
- "log",
- "proptest",
- "proptest-derive",
- "regex",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.17",
- "time",
- "utoipa",
- "uuid",
 ]
 
 [[package]]
@@ -7890,6 +7608,288 @@ dependencies = [
 ]
 
 [[package]]
+name = "opendera-adapterlib"
+version = "0.296.0"
+dependencies = [
+ "actix-web",
+ "anyhow",
+ "apache-avro 0.18.0",
+ "arrow",
+ "bytemuck",
+ "chrono",
+ "datafusion",
+ "dbsp",
+ "dyn-clone",
+ "erased-serde",
+ "num-derive",
+ "num-traits",
+ "opendera-sqllib",
+ "opendera-types",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_arrow",
+ "serde_json",
+ "serde_json_path_to_error",
+ "serde_yaml",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "opendera-buffer-cache"
+version = "0.296.0"
+dependencies = [
+ "crossbeam-utils",
+ "enum-map",
+ "opendera-types",
+ "proptest",
+ "quick_cache",
+ "rand 0.8.6",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "opendera-datagen"
+version = "0.296.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "chrono",
+ "crossbeam",
+ "dbsp",
+ "fake",
+ "governor",
+ "num-traits",
+ "opendera-adapterlib",
+ "opendera-fxp",
+ "opendera-types",
+ "rand 0.8.6",
+ "rand_distr",
+ "range-set",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "opendera-fxp"
+version = "0.296.0"
+dependencies = [
+ "bytecheck",
+ "dbsp",
+ "feldera-size-of",
+ "itertools 0.14.0",
+ "num-bigint",
+ "num-traits",
+ "opendera-types",
+ "rand 0.8.6",
+ "rand_distr",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "smallstr",
+ "smallvec",
+]
+
+[[package]]
+name = "opendera-iceberg"
+version = "0.296.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "datafusion",
+ "dbsp",
+ "futures-util",
+ "iceberg",
+ "iceberg-catalog-glue",
+ "iceberg-catalog-rest",
+ "iceberg-datafusion",
+ "log",
+ "opendera-adapterlib",
+ "opendera-types",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "opendera-ir"
+version = "0.296.0"
+dependencies = [
+ "proptest",
+ "proptest-derive",
+ "serde",
+ "serde_json",
+ "utoipa",
+ "zip 6.0.0",
+]
+
+[[package]]
+name = "opendera-macros"
+version = "0.296.0"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "opendera-observability"
+version = "0.296.0"
+dependencies = [
+ "actix-http",
+ "awc",
+ "chrono",
+ "colored",
+ "reqwest 0.12.24",
+ "sentry",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "opendera-rest-api"
+version = "0.296.0"
+dependencies = [
+ "chrono",
+ "opendera-observability",
+ "opendera-types",
+ "prettyplease",
+ "progenitor",
+ "progenitor-client 0.9.1",
+ "reqwest 0.12.24",
+ "rustversion",
+ "sentry",
+ "serde",
+ "serde_json",
+ "syn 2.0.117",
+ "uuid",
+]
+
+[[package]]
+name = "opendera-samply"
+version = "0.296.0"
+dependencies = [
+ "crossbeam",
+ "feldera-size-of",
+ "flate2",
+ "itertools 0.14.0",
+ "libc",
+ "memory-stats",
+ "nix 0.29.0",
+ "serde",
+ "serde_json",
+ "serde_json_path_to_error",
+ "thiserror 2.0.17",
+ "thread-id",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "opendera-sqllib"
+version = "0.296.0"
+dependencies = [
+ "arcstr",
+ "base58",
+ "base64 0.22.1",
+ "blake3",
+ "chrono",
+ "chrono-tz",
+ "dbsp",
+ "derive_more 1.0.0",
+ "feldera-size-of",
+ "flate2",
+ "geo",
+ "hex",
+ "itertools 0.14.0",
+ "lexical-core",
+ "like",
+ "md-5",
+ "num",
+ "num-traits",
+ "once_cell",
+ "opendera-fxp",
+ "opendera-macros",
+ "opendera-types",
+ "paste",
+ "proptest",
+ "quick_cache",
+ "regex",
+ "rkyv",
+ "ryu",
+ "serde",
+ "serde_json",
+ "smallstr",
+ "smallvec",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tracing",
+ "typedmap",
+ "uuid",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "opendera-storage"
+version = "0.296.0"
+dependencies = [
+ "anyhow",
+ "crossbeam",
+ "feldera-size-of",
+ "inventory",
+ "itertools 0.14.0",
+ "libc",
+ "nix 0.27.1",
+ "object_store 0.11.2",
+ "once_cell",
+ "opendera-types",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "opendera-types"
+version = "0.296.0"
+dependencies = [
+ "actix-web",
+ "anyhow",
+ "arrow-schema",
+ "bytemuck",
+ "chrono",
+ "clap",
+ "csv",
+ "enum-map",
+ "erased-serde",
+ "libc",
+ "log",
+ "opendera-ir",
+ "proptest",
+ "proptest-derive",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "time",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "openssl"
 version = "0.10.79"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8426,9 +8426,6 @@ dependencies = [
  "deadpool-postgres",
  "dirs 5.0.1",
  "fdlimit",
- "feldera-ir",
- "feldera-observability",
- "feldera-types",
  "flate2",
  "futures",
  "futures-util",
@@ -8438,6 +8435,9 @@ dependencies = [
  "jsonwebtoken 10.3.0",
  "nix 0.29.0",
  "object_store 0.11.2",
+ "opendera-ir",
+ "opendera-observability",
+ "opendera-types",
  "openssl",
  "pg-client-config",
  "postgres-openssl",
@@ -9593,9 +9593,9 @@ dependencies = [
  "csv",
  "dbsp",
  "derive_more 0.99.20",
- "feldera-macros",
  "feldera-size-of",
- "feldera-sqllib",
+ "opendera-macros",
+ "opendera-sqllib",
  "paste",
  "rkyv",
  "serde",
@@ -11220,7 +11220,7 @@ name = "sltsqlvalue"
 version = "0.296.0"
 dependencies = [
  "dbsp",
- "feldera-sqllib",
+ "opendera-sqllib",
 ]
 
 [[package]]
@@ -11596,10 +11596,10 @@ version = "0.296.0"
 dependencies = [
  "dbsp",
  "derive_more 1.0.0",
- "feldera-macros",
  "feldera-size-of",
- "feldera-sqllib",
- "feldera-types",
+ "opendera-macros",
+ "opendera-sqllib",
+ "opendera-types",
  "rand 0.8.6",
  "rkyv",
  "serde",

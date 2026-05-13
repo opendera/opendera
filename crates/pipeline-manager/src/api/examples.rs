@@ -19,8 +19,8 @@ use crate::runner::error::RunnerError;
 use crate::runner::interaction::{
     format_disconnected_error_message, format_timeout_error_message, RunnerInteraction,
 };
-use feldera_types::config::{DevTweaks, FtConfig, ResourceConfig, StorageOptions};
-use feldera_types::{config::RuntimeConfig, error::ErrorResponse};
+use opendera_types::config::{DevTweaks, FtConfig, ResourceConfig, StorageOptions};
+use opendera_types::{config::RuntimeConfig, error::ErrorResponse};
 use uuid::uuid;
 
 ////////////////////////////////////////

@@ -17,9 +17,9 @@ use crate::{
     util::IndexedOperationType,
 };
 use anyhow::{Context, Result as AnyResult, anyhow, bail};
-use feldera_adapterlib::catalog::SplitCursorBuilder;
-use feldera_adapterlib::transport::{AsyncErrorCallback, CommandHandler, Step};
-use feldera_types::{
+use opendera_adapterlib::catalog::SplitCursorBuilder;
+use opendera_adapterlib::transport::{AsyncErrorCallback, CommandHandler, Step};
+use opendera_types::{
     format::json::JsonFlavor,
     program_schema::{Relation, SqlIdentifier},
     transport::postgres::{PostgresWriteMode, PostgresWriterConfig},
@@ -1049,8 +1049,8 @@ impl OutputEndpoint for PostgresOutputEndpoint {
 mod tests {
     use std::sync::Weak;
 
-    use feldera_adapterlib::errors::journal::ControllerError;
-    use feldera_types::{
+    use opendera_adapterlib::errors::journal::ControllerError;
+    use opendera_types::{
         program_schema::{ColumnType, Field, Relation, SqlType},
         transport::postgres::{PostgresTlsConfig, PostgresWriteMode, PostgresWriterConfig},
     };
@@ -1271,10 +1271,10 @@ mod tests {
         use chrono::NaiveDateTime;
         use dbsp::OrdIndexedZSet;
         use dbsp::utils::Tup2;
-        use feldera_adapterlib::transport::OutputEndpoint;
-        use feldera_macros::IsNone;
-        use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
-        use feldera_types::{deserialize_without_context, serialize_struct};
+        use opendera_adapterlib::transport::OutputEndpoint;
+        use opendera_macros::IsNone;
+        use opendera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
+        use opendera_types::{deserialize_without_context, serialize_struct};
         use postgres::NoTls;
         use size_of::SizeOf;
 
@@ -1284,7 +1284,7 @@ mod tests {
         use crate::static_compile::seroutput::SerBatchImpl;
 
         use super::super::PostgresOutputEndpoint;
-        use feldera_types::transport::postgres::{
+        use opendera_types::transport::postgres::{
             PostgresTlsConfig, PostgresWriteMode, PostgresWriterConfig,
         };
 

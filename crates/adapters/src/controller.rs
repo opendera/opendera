@@ -68,39 +68,39 @@ use dbsp::{
 };
 use dbsp::{Runtime, WeakRuntime};
 use enum_map::EnumMap;
-use feldera_adapterlib::format::BufferSize;
-use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
-use feldera_adapterlib::transport::{CommandHandler, InputReader, Resume, Watermark};
-use feldera_ir::LirCircuit;
-use feldera_samply::{AnnotationOptions, CaptureOptions, Span};
-use feldera_storage::fbuf::slab::FBufSlabsStats;
-use feldera_storage::histogram::{ExponentialHistogram, ExponentialHistogramSnapshot};
-use feldera_storage::metrics::{
-    READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS, SYNC_LATENCY_MICROSECONDS, WRITE_BLOCKS_BYTES,
-    WRITE_LATENCY_MICROSECONDS,
-};
-use feldera_types::adapter_stats::{
-    ConnectorHealth, ExternalControllerStatus, ExternalInputEndpointStatus,
-    ExternalOutputEndpointStatus,
-};
-use feldera_types::checkpoint::{CheckpointActivity, CheckpointMetadata};
-use feldera_types::coordination::{
-    self, AdHocCatalog, AdHocTableType, CheckpointCoordination, Completion, StepAction, StepInputs,
-    StepRequest, StepStatus, TransactionCoordination,
-};
-use feldera_types::format::json::JsonLines;
-use feldera_types::pipeline_diff::PipelineDiff;
-use feldera_types::runtime_status::BootstrapPolicy;
-use feldera_types::secret_resolver::resolve_secret_references_in_connector_config;
-use feldera_types::suspend::{PermanentSuspendError, SuspendError, TemporarySuspendError};
-use feldera_types::time_series::SampleStatistics;
-use feldera_types::transaction::{StartTransactionResponse, TransactionId};
 use governor::DefaultDirectRateLimiter;
 use governor::Quota;
 use governor::RateLimiter;
 use itertools::Itertools;
 use journal::StepMetadata;
 use nonzero_ext::nonzero;
+use opendera_adapterlib::format::BufferSize;
+use opendera_adapterlib::metrics::{ConnectorMetrics, ValueType};
+use opendera_adapterlib::transport::{CommandHandler, InputReader, Resume, Watermark};
+use opendera_ir::LirCircuit;
+use opendera_samply::{AnnotationOptions, CaptureOptions, Span};
+use opendera_storage::fbuf::slab::FBufSlabsStats;
+use opendera_storage::histogram::{ExponentialHistogram, ExponentialHistogramSnapshot};
+use opendera_storage::metrics::{
+    READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS, SYNC_LATENCY_MICROSECONDS, WRITE_BLOCKS_BYTES,
+    WRITE_LATENCY_MICROSECONDS,
+};
+use opendera_types::adapter_stats::{
+    ConnectorHealth, ExternalControllerStatus, ExternalInputEndpointStatus,
+    ExternalOutputEndpointStatus,
+};
+use opendera_types::checkpoint::{CheckpointActivity, CheckpointMetadata};
+use opendera_types::coordination::{
+    self, AdHocCatalog, AdHocTableType, CheckpointCoordination, Completion, StepAction, StepInputs,
+    StepRequest, StepStatus, TransactionCoordination,
+};
+use opendera_types::format::json::JsonLines;
+use opendera_types::pipeline_diff::PipelineDiff;
+use opendera_types::runtime_status::BootstrapPolicy;
+use opendera_types::secret_resolver::resolve_secret_references_in_connector_config;
+use opendera_types::suspend::{PermanentSuspendError, SuspendError, TemporarySuspendError};
+use opendera_types::time_series::SampleStatistics;
+use opendera_types::transaction::{StartTransactionResponse, TransactionId};
 use rmpv::Value as RmpValue;
 use serde_json::Value as JsonValue;
 use size_of::HumanBytes;
@@ -154,17 +154,17 @@ use crate::format::{MessageOrientedPreprocessedParser, StreamingPreprocessedPars
 use crate::format::{get_input_format, get_output_format};
 use crate::integrated::create_integrated_input_endpoint;
 pub use error::{ConfigError, ControllerError};
-pub use feldera_types::config::{
+pub use opendera_types::config::{
     ConnectorConfig, FormatConfig, InputEndpointConfig, OutputEndpointConfig, PipelineConfig,
     RuntimeConfig, TransportConfig,
 };
-use feldera_types::config::{
+use opendera_types::config::{
     DEFAULT_MAX_WORKER_BATCH_SIZE, DevTweaks, FileBackendConfig, FtConfig, FtModel,
     OutputBufferConfig, StorageBackendConfig, SyncConfig,
 };
-use feldera_types::constants::{STATE_FILE, STEPS_FILE};
-use feldera_types::format::json::{JsonFlavor, JsonParserConfig, JsonUpdateFormat};
-use feldera_types::program_schema::{SqlIdentifier, canonical_identifier};
+use opendera_types::constants::{STATE_FILE, STEPS_FILE};
+use opendera_types::format::json::{JsonFlavor, JsonParserConfig, JsonUpdateFormat};
+use opendera_types::program_schema::{SqlIdentifier, canonical_identifier};
 pub use pipeline_diff::compute_pipeline_diff;
 pub use stats::{CompletionToken, ControllerStatus, ControllerStatusContext, InputEndpointStatus};
 
@@ -2198,7 +2198,7 @@ struct CheckpointSyncThread {
 
 impl CheckpointSyncThread {
     fn run(self) -> Result<(), Arc<ControllerError>> {
-        use feldera_storage::checkpoint_synchronizer::SYNCHRONIZER;
+        use opendera_storage::checkpoint_synchronizer::SYNCHRONIZER;
         match SYNCHRONIZER.push(self.uuid, self.storage, self.config) {
             Err(err) => {
                 CHECKPOINT_SYNC_PUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -2253,7 +2253,7 @@ impl RunningCheckpointSync {
             )));
         };
 
-        let feldera_types::config::StorageBackendConfig::File(ref file_cfg) = options.backend
+        let opendera_types::config::StorageBackendConfig::File(ref file_cfg) = options.backend
         else {
             return Err(Arc::new(ControllerError::storage_error(
                 "syncing checkpoint is only supported with file backend",
@@ -5226,7 +5226,7 @@ enum AdvanceTransaction {
 /// be in one of these two states:
 ///
 /// The initiator cannot start another transaction until the current transaction is committed.
-// Keep in sync with feldera_types::ExternalTransactionPhase
+// Keep in sync with opendera_types::ExternalTransactionPhase
 #[derive(Clone, PartialEq, Eq, Copy, Debug)]
 enum TransactionPhase {
     /// The initiator can push more data as part of the transaction.
@@ -5237,9 +5237,9 @@ enum TransactionPhase {
 }
 
 impl TransactionPhase {
-    /// Convert to the public API type in `feldera_types`.
-    fn to_api_type(self) -> feldera_types::adapter_stats::ExternalTransactionPhase {
-        use feldera_types::adapter_stats;
+    /// Convert to the public API type in `opendera_types`.
+    fn to_api_type(self) -> opendera_types::adapter_stats::ExternalTransactionPhase {
+        use opendera_types::adapter_stats;
         match self {
             TransactionPhase::Started => adapter_stats::ExternalTransactionPhase::Started,
             TransactionPhase::Committed => adapter_stats::ExternalTransactionPhase::Committed,
@@ -5248,7 +5248,7 @@ impl TransactionPhase {
 }
 
 /// Connection phase with an additional label used for debugging.
-// Keep in sync with feldera_types::ExternalConnectorTransactionPhase
+// Keep in sync with opendera_types::ExternalConnectorTransactionPhase
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct ConnectorTransactionPhase {
     phase: TransactionPhase,
@@ -5256,9 +5256,9 @@ struct ConnectorTransactionPhase {
 }
 
 impl ConnectorTransactionPhase {
-    /// Convert to the public API type in `feldera_types`.
-    fn to_api_type(&self) -> feldera_types::adapter_stats::ExternalConnectorTransactionPhase {
-        use feldera_types::adapter_stats;
+    /// Convert to the public API type in `opendera_types`.
+    fn to_api_type(&self) -> opendera_types::adapter_stats::ExternalConnectorTransactionPhase {
+        use opendera_types::adapter_stats;
         adapter_stats::ExternalConnectorTransactionPhase {
             phase: self.phase.to_api_type(),
             label: self.label.clone(),
@@ -5289,9 +5289,9 @@ pub struct TransactionInitiators {
 }
 
 impl TransactionInitiators {
-    /// Convert to the public API type in `feldera_types`.
-    pub fn to_api_type(&self) -> feldera_types::adapter_stats::ExternalTransactionInitiators {
-        use feldera_types::adapter_stats;
+    /// Convert to the public API type in `opendera_types`.
+    pub fn to_api_type(&self) -> opendera_types::adapter_stats::ExternalTransactionInitiators {
+        use opendera_types::adapter_stats;
 
         adapter_stats::ExternalTransactionInitiators {
             transaction_id: self.transaction_id,

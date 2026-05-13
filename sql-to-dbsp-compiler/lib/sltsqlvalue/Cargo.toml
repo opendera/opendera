@@ -6,4 +6,4 @@ publish = false
 
 [dependencies]
 dbsp = { path = "../../../crates/dbsp", default-features = false }
-feldera-sqllib = { workspace = true }
+opendera-sqllib = { workspace = true }

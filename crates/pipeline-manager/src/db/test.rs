@@ -30,13 +30,13 @@ use crate::db::types::utils::{
 use crate::db::types::version::Version;
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use feldera_types::checkpoint::CheckpointMetadata;
-use feldera_types::config::{
+use opendera_types::checkpoint::CheckpointMetadata;
+use opendera_types::config::{
     DevTweaks, FtConfig, PipelineConfig, ProgramIr, ResourceConfig, RuntimeConfig,
 };
-use feldera_types::error::ErrorResponse;
-use feldera_types::program_schema::ProgramSchema;
-use feldera_types::runtime_status::{
+use opendera_types::error::ErrorResponse;
+use opendera_types::program_schema::ProgramSchema;
+use opendera_types::runtime_status::{
     BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus, StorageStatusDetails,
 };
 use openssl::sha;

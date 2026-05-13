@@ -1,7 +1,7 @@
 use crate::ThreadType;
 use crate::{CacheEntry, LruCache, S3FifoCache, SharedBufferCache};
 use enum_map::{Enum, EnumMap};
-use feldera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
+use opendera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
 use std::fmt::Debug;
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::marker::PhantomData;

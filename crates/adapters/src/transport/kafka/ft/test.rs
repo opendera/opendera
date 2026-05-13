@@ -20,19 +20,19 @@ use anyhow::Error as AnyError;
 use crossbeam::sync::{Parker, Unparker};
 use csv::{ReaderBuilder as CsvReaderBuilder, WriterBuilder as CsvWriterBuilder};
 use dbsp::operator::StagedBuffers;
-use feldera_adapterlib::ConnectorMetadata;
-use feldera_adapterlib::format::{BufferSize, flatten_nested};
-use feldera_adapterlib::transport::{Resume, Watermark};
-use feldera_macros::IsNone;
-use feldera_sqllib::{ByteArray, SqlString, Variant};
-use feldera_types::adapter_stats::ConnectorHealth;
-use feldera_types::config::{
+use opendera_adapterlib::ConnectorMetadata;
+use opendera_adapterlib::format::{BufferSize, flatten_nested};
+use opendera_adapterlib::transport::{Resume, Watermark};
+use opendera_macros::IsNone;
+use opendera_sqllib::{ByteArray, SqlString, Variant};
+use opendera_types::adapter_stats::ConnectorHealth;
+use opendera_types::config::{
     ConnectorConfig, FormatConfig, FtModel, InputEndpointConfig, TransportConfig,
 };
-use feldera_types::deserialize_table_record;
-use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
-use feldera_types::secret_resolver::default_secrets_directory;
-use feldera_types::transport::kafka::{
+use opendera_types::deserialize_table_record;
+use opendera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
+use opendera_types::secret_resolver::default_secrets_directory;
+use opendera_types::transport::kafka::{
     KafkaInputConfig, KafkaLogLevel, KafkaStartFromConfig, default_redpanda_server,
 };
 use parquet::data_type::AsBytes;
@@ -751,7 +751,7 @@ impl InputConsumer for DummyInputConsumer {
 
     fn completion_watcher(
         &self,
-    ) -> Option<tokio::sync::watch::Receiver<feldera_types::coordination::Completion>> {
+    ) -> Option<tokio::sync::watch::Receiver<opendera_types::coordination::Completion>> {
         None
     }
 
@@ -2568,7 +2568,7 @@ fn test_kafka_metadata_json() {
                 ),
             ]))),
             SqlString::from(topic),
-            feldera_sqllib::Timestamp::from_microseconds(0),
+            opendera_sqllib::Timestamp::from_microseconds(0),
             0,
             0,
         ),
@@ -2576,15 +2576,15 @@ fn test_kafka_metadata_json() {
             1,
             Variant::Map(Arc::new(BTreeMap::new())),
             SqlString::from(topic),
-            feldera_sqllib::Timestamp::from_microseconds(0),
+            opendera_sqllib::Timestamp::from_microseconds(0),
             0,
             1,
         ),
     ];
 
     let mut received = wait_for_output_count(&zset, 2, flush);
-    received[0].kafka_timestamp = feldera_sqllib::Timestamp::from_microseconds(0);
-    received[1].kafka_timestamp = feldera_sqllib::Timestamp::from_microseconds(0);
+    received[0].kafka_timestamp = opendera_sqllib::Timestamp::from_microseconds(0);
+    received[1].kafka_timestamp = opendera_sqllib::Timestamp::from_microseconds(0);
     assert_eq!(received, expected);
 }
 
@@ -2611,7 +2611,7 @@ pub struct TestRawStructMetadata {
     pub data: SqlString,
     pub kafka_headers: Variant,
     pub kafka_topic: SqlString,
-    pub kafka_timestamp: feldera_sqllib::Timestamp,
+    pub kafka_timestamp: opendera_sqllib::Timestamp,
     pub kafka_partition: i32,
     pub kafka_offset: i64,
 }
@@ -2620,7 +2620,7 @@ deserialize_table_record!(TestRawStructMetadata["TestRawStructMetadata", Variant
     (data, "data", false, SqlString, |_| None),
     (kafka_headers, "kafka_headers", false, Variant, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().map(|metadata| metadata.index_string("kafka_headers"))),
     (kafka_topic, "kafka_topic", false, SqlString, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| SqlString::try_from(metadata.index_string("kafka_topic")).ok())),
-    (kafka_timestamp, "kafka_timestamp", false, feldera_sqllib::Timestamp, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| feldera_sqllib::Timestamp::try_from(metadata.index_string("kafka_timestamp")).ok())),
+    (kafka_timestamp, "kafka_timestamp", false, opendera_sqllib::Timestamp, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| opendera_sqllib::Timestamp::try_from(metadata.index_string("kafka_timestamp")).ok())),
     (kafka_partition, "kafka_partition", false, i32, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| i32::try_from(metadata.index_string("kafka_partition")).ok())),
     (kafka_offset, "kafka_offset", false, i64, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| i64::try_from(metadata.index_string("kafka_offset")).ok()))
 });
@@ -2630,7 +2630,7 @@ impl TestRawStructMetadata {
         data: SqlString,
         kafka_headers: Variant,
         kafka_topic: SqlString,
-        kafka_timestamp: feldera_sqllib::Timestamp,
+        kafka_timestamp: opendera_sqllib::Timestamp,
         kafka_partition: i32,
         kafka_offset: i64,
     ) -> Self {
@@ -2748,7 +2748,7 @@ fn test_kafka_metadata_raw() {
                 ),
             ]))),
             SqlString::from(topic),
-            feldera_sqllib::Timestamp::from_microseconds(0),
+            opendera_sqllib::Timestamp::from_microseconds(0),
             0,
             0,
         ),
@@ -2756,14 +2756,14 @@ fn test_kafka_metadata_raw() {
             SqlString::from("bar"),
             Variant::Map(Arc::new(BTreeMap::new())),
             SqlString::from(topic),
-            feldera_sqllib::Timestamp::from_microseconds(0),
+            opendera_sqllib::Timestamp::from_microseconds(0),
             0,
             1,
         ),
     ];
 
     let mut received = wait_for_output_count(&zset, 2, flush);
-    received[0].kafka_timestamp = feldera_sqllib::Timestamp::from_microseconds(0);
-    received[1].kafka_timestamp = feldera_sqllib::Timestamp::from_microseconds(0);
+    received[0].kafka_timestamp = opendera_sqllib::Timestamp::from_microseconds(0);
+    received[1].kafka_timestamp = opendera_sqllib::Timestamp::from_microseconds(0);
     assert_eq!(received, expected);
 }

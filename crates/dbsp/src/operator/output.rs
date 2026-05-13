@@ -13,7 +13,7 @@ use crate::{
     },
     typed_batch::{Spine, SpineSnapshot, TypedBatch},
 };
-use feldera_storage::{FileCommitter, StoragePath};
+use opendera_storage::{FileCommitter, StoragePath};
 use std::{
     borrow::Cow,
     fmt::Debug,

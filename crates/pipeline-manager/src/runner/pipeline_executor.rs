@@ -4,8 +4,8 @@ use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use crate::runner::pipeline_logs::LogsSender;
 use async_trait::async_trait;
-use feldera_types::config::{PipelineConfig, StorageConfig};
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
+use opendera_types::config::{PipelineConfig, StorageConfig};
+use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
 use std::time::Duration;
 use uuid::Uuid;
 

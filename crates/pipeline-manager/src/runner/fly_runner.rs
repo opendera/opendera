@@ -42,8 +42,8 @@ use crate::runner::error::RunnerError;
 use crate::runner::fly_image_registry::FlyImagePusher;
 use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
 use crate::runner::pipeline_logs::{LogMessage, LogsSender};
-use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
+use opendera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
+use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
 
 const FLY_API_BASE: &str = "https://api.machines.dev";
 
@@ -775,10 +775,7 @@ impl FlyRunner {
     ///   at a few minutes, after which the client must reconnect).
     /// - Exits cleanly when the returned [`oneshot::Sender`] is
     ///   triggered (via `stop_log_streaming` / `Drop`).
-    fn start_log_streaming(
-        &self,
-        handle: &MachineHandle,
-    ) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    fn start_log_streaming(&self, handle: &MachineHandle) -> (oneshot::Sender<()>, JoinHandle<()>) {
         let (terminate_tx, mut terminate_rx) = oneshot::channel::<()>();
         let client = self.client.clone();
         let auth = self.auth_header();
@@ -799,11 +796,7 @@ impl FlyRunner {
                     return;
                 }
 
-                let req = client
-                    .get(&url)
-                    .header("Authorization", &auth)
-                    .send()
-                    .await;
+                let req = client.get(&url).header("Authorization", &auth).send().await;
                 let mut resp = match req {
                     Ok(r) if r.status().is_success() => r,
                     Ok(r) => {

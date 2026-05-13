@@ -4,7 +4,7 @@ use crate::transport::kafka::{
 };
 use crate::{AsyncErrorCallback, OutputEndpoint};
 use anyhow::{Error as AnyError, Result as AnyResult, anyhow, bail};
-use feldera_types::transport::kafka::KafkaOutputConfig;
+use opendera_types::transport::kafka::KafkaOutputConfig;
 use rdkafka::client::OAuthToken;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::{

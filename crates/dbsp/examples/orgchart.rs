@@ -9,7 +9,7 @@
 use anyhow::Result;
 use clap::Parser;
 use dbsp::{OrdZSet, OutputHandle, Runtime, Stream, typed_batch::IndexedZSetReader};
-use feldera_macros::IsNone;
+use opendera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 use std::hash::Hash;

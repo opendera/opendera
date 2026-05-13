@@ -1,6 +1,6 @@
 //! Object-store-backed `StorageBackend` implementation.
 //!
-//! Implements `feldera_storage::StorageBackend` on top of the
+//! Implements `opendera_storage::StorageBackend` on top of the
 //! [`object_store`] crate, which abstracts S3, GCS, Azure Blob, and HTTP
 //! servers. Selected when the pipeline config's `storage.backend` is
 //! `StorageBackendConfig::Object(...)`.
@@ -20,20 +20,20 @@
 
 use std::fmt::{self, Debug};
 use std::io::ErrorKind;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use feldera_storage::block::BlockLocation;
-use feldera_storage::error::StorageError;
-use feldera_storage::fbuf::FBuf;
-use feldera_storage::file::FileId;
-use feldera_storage::{
+use object_store::path::Path as ObjPath;
+use object_store::{MultipartUpload, ObjectStore, PutPayload, parse_url_opts};
+use opendera_storage::block::BlockLocation;
+use opendera_storage::error::StorageError;
+use opendera_storage::fbuf::FBuf;
+use opendera_storage::file::FileId;
+use opendera_storage::{
     FileCommitter, FileReader, FileRw, FileWriter, StorageBackend, StorageBackendFactory,
     StorageFileType, StoragePath,
 };
-use feldera_types::config::{ObjectStorageConfig, StorageBackendConfig, StorageConfig};
-use object_store::path::Path as ObjPath;
-use object_store::{MultipartUpload, ObjectStore, PutPayload, parse_url_opts};
+use opendera_types::config::{ObjectStorageConfig, StorageBackendConfig, StorageConfig};
 use url::Url;
 
 /// Threshold above which writes are streamed via multipart upload rather
@@ -45,7 +45,7 @@ use url::Url;
 /// which is cheaper for small files (one round trip instead of three).
 const MULTIPART_THRESHOLD: usize = 8 * 1024 * 1024;
 
-use feldera_storage::tokio::TOKIO_DEDICATED_IO;
+use opendera_storage::tokio::TOKIO_DEDICATED_IO;
 
 /// Allocates a fresh process-unique `FileId`. Thin wrapper that just
 /// delegates to `FileId::new()` (which has its own internal counter); the
@@ -91,7 +91,7 @@ impl ObjectStoreBackend {
         }
     }
 
-    /// Construct from `ObjectStorageConfig` (already in `feldera-types`).
+    /// Construct from `ObjectStorageConfig` (already in `opendera-types`).
     pub fn from_config(cfg: &ObjectStorageConfig) -> Result<Self, StorageError> {
         let url = Url::parse(&cfg.url).map_err(|_| StorageError::InvalidURL(cfg.url.clone()))?;
         let opts: Vec<(String, String)> = cfg
@@ -264,7 +264,11 @@ impl ObjectStoreFileWriter {
     /// multipart part. Called whenever the buffer crosses the threshold
     /// during `write_block`.
     fn flush_part(&mut self) -> Result<(), StorageError> {
-        if let WriterState::Streaming { upload, part_buffer } = &mut self.state {
+        if let WriterState::Streaming {
+            upload,
+            part_buffer,
+        } = &mut self.state
+        {
             if part_buffer.is_empty() {
                 return Ok(());
             }
@@ -337,8 +341,7 @@ impl FileWriter for ObjectStoreFileWriter {
                 // has no minimum size), then close the upload.
                 let mut upload = upload.into_inner().unwrap();
                 if !part_buffer.is_empty() {
-                    TOKIO_DEDICATED_IO
-                        .block_on(upload.put_part(PutPayload::from(part_buffer)))?;
+                    TOKIO_DEDICATED_IO.block_on(upload.put_part(PutPayload::from(part_buffer)))?;
                 }
                 TOKIO_DEDICATED_IO.block_on(upload.complete())?;
             }
@@ -484,7 +487,7 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feldera_storage::StorageBackend;
+    use opendera_storage::StorageBackend;
 
     /// Round-trip a small payload through an in-memory object store
     /// (`object_store::memory::InMemory`) using the same code path that
@@ -566,10 +569,7 @@ mod tests {
         for i in 0..10u64 {
             let offset = i * 2 * 1024 * 1024;
             let block = reader
-                .read_block(BlockLocation {
-                    offset,
-                    size: 512,
-                })
+                .read_block(BlockLocation { offset, size: 512 })
                 .expect("read_block");
             assert_eq!(block.as_slice()[0], i as u8, "chunk {i} out of order");
         }
@@ -604,14 +604,10 @@ mod tests {
             return;
         };
 
-        let prefix = format!(
-            "opendera-it/{}",
-            uuid::Uuid::now_v7().simple()
-        );
+        let prefix = format!("opendera-it/{}", uuid::Uuid::now_v7().simple());
 
         // Small file: single-PUT path.
-        let small_name: StoragePath =
-            format!("{prefix}/small.bin").as_str().into();
+        let small_name: StoragePath = format!("{prefix}/small.bin").as_str().into();
         let body = b"hello s3 integration";
         let mut w = backend.create_named(&small_name).expect("create_named");
         let mut fbuf = FBuf::new();
@@ -629,8 +625,7 @@ mod tests {
 
         // Large file: multipart path. ~12 MiB across six 2 MiB chunks
         // to cross the 8 MiB threshold and produce at least two parts.
-        let big_name: StoragePath =
-            format!("{prefix}/big.bin").as_str().into();
+        let big_name: StoragePath = format!("{prefix}/big.bin").as_str().into();
         let chunk = vec![0x42u8; 2 * 1024 * 1024];
         let mut w = backend.create_named(&big_name).expect("create_named big");
         for _ in 0..6 {
@@ -650,9 +645,9 @@ mod tests {
             .expect("list");
         assert_eq!(listed.len(), 2, "expected exactly 2 files under prefix");
 
-        backend.delete_recursive(&prefix.as_str().into()).expect(
-            "delete_recursive should remove everything under the prefix",
-        );
+        backend
+            .delete_recursive(&prefix.as_str().into())
+            .expect("delete_recursive should remove everything under the prefix");
 
         let mut listed2 = Vec::new();
         backend
@@ -660,7 +655,10 @@ mod tests {
                 listed2.push(p.as_ref().to_string());
             })
             .expect("list after delete_recursive");
-        assert!(listed2.is_empty(), "prefix not empty after recursive delete");
+        assert!(
+            listed2.is_empty(),
+            "prefix not empty after recursive delete"
+        );
     }
 
     /// Build an `ObjectStoreBackend` from environment variables, or
@@ -682,10 +680,7 @@ mod tests {
                 }
             }
         }
-        let cfg = ObjectStorageConfig {
-            url,
-            other_options,
-        };
+        let cfg = ObjectStorageConfig { url, other_options };
         Some(ObjectStoreBackend::from_config(&cfg).expect("from_config"))
     }
 }

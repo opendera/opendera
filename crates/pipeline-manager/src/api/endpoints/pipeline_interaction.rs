@@ -14,8 +14,10 @@ use actix_web::{
     web::{self, Data as WebData, ReqData},
     HttpRequest, HttpResponse,
 };
-use feldera_types::query_params::{MetricsParameters, SamplyProfileGetParams, SamplyProfileParams};
-use feldera_types::{program_schema::SqlIdentifier, query_params::ActivateParams};
+use opendera_types::query_params::{
+    MetricsParameters, SamplyProfileGetParams, SamplyProfileParams,
+};
+use opendera_types::{program_schema::SqlIdentifier, query_params::ActivateParams};
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -161,8 +163,13 @@ pub(crate) async fn http_input(
     // forward_streaming_http_request_to_pipeline_by_name to return
     // the resolved id so we don't double-lookup.
     if response.status().is_success() {
-        emit_pipeline_activity(&state, *tenant_id, &pipeline_name, ActivityEventKind::Ingested)
-            .await;
+        emit_pipeline_activity(
+            &state,
+            *tenant_id,
+            &pipeline_name,
+            ActivityEventKind::Ingested,
+        )
+        .await;
     }
     Ok(response)
 }
@@ -1076,7 +1083,7 @@ pub(crate) async fn extract_pipeline_dataflow_graph(
     state: &ServerState,
     tenant_id: TenantId,
     pipeline_name: &str,
-) -> Result<feldera_ir::Dataflow, ManagerError> {
+) -> Result<opendera_ir::Dataflow, ManagerError> {
     // Get pipeline from database
     let pipeline = state
         .db
@@ -2022,7 +2029,13 @@ pub(crate) async fn pipeline_adhoc_sql(
     // of whether the response 200'd — a 4xx that came back from the
     // pipeline still indicates the pipeline was alive enough to
     // respond, so the wake-reset is correct either way.
-    emit_pipeline_activity(&state, *tenant_id, &pipeline_name, ActivityEventKind::Queried).await;
+    emit_pipeline_activity(
+        &state,
+        *tenant_id,
+        &pipeline_name,
+        ActivityEventKind::Queried,
+    )
+    .await;
 
     if request_is_websocket(&request) {
         state

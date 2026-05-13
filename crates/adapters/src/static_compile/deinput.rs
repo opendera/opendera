@@ -22,11 +22,11 @@ use dbsp::{
 };
 use erased_serde::Deserializer as ErasedDeserializer;
 #[cfg(feature = "with-avro")]
-use feldera_adapterlib::catalog::AvroSchemaRefs;
-use feldera_adapterlib::format::{BufferSize, flatten_nested};
-use feldera_sqllib::Variant;
-use feldera_types::format::csv::CsvParserConfig;
-use feldera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
+use opendera_adapterlib::catalog::AvroSchemaRefs;
+use opendera_adapterlib::format::{BufferSize, flatten_nested};
+use opendera_sqllib::Variant;
+use opendera_types::format::csv::CsvParserConfig;
+use opendera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 use serde_arrow::Deserializer as ArrowDeserializer;
 use serde_json::de::SliceRead;
 use std::hash::Hasher;
@@ -1987,8 +1987,8 @@ mod test {
     use dbsp::{
         DBSPHandle, OrdIndexedZSet, OrdZSet, OutputHandle, Runtime, algebra::F32, utils::Tup2,
     };
-    use feldera_macros::IsNone;
-    use feldera_types::{deserialize_without_context, format::json::JsonFlavor};
+    use opendera_macros::IsNone;
+    use opendera_types::{deserialize_without_context, format::json::JsonFlavor};
     use serde_json::to_string as to_json_string;
     use size_of::SizeOf;
     use std::hash::Hash;

@@ -17,7 +17,7 @@
 use anyhow::{Result as AnyResult, anyhow};
 use chrono::Utc;
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::{
+use opendera_adapterlib::{
     PipelineState,
     format::{BufferSize, Parser},
     transport::{
@@ -25,7 +25,7 @@ use feldera_adapterlib::{
         TransportInputEndpoint, Watermark,
     },
 };
-use feldera_types::{
+use opendera_types::{
     config::{
         ConnectorConfig, DEFAULT_CLOCK_RESOLUTION_USECS, FormatConfig, FtModel,
         InputEndpointConfig, PipelineConfig, TransportConfig,
@@ -262,9 +262,9 @@ mod test {
     };
 
     use dbsp::{DBSPHandle, Runtime, circuit::CircuitConfig, utils::Tup1};
-    use feldera_adapterlib::catalog::CircuitCatalog;
-    use feldera_sqllib::{Timestamp, Variant};
-    use feldera_types::{
+    use opendera_adapterlib::catalog::CircuitCatalog;
+    use opendera_sqllib::{Timestamp, Variant};
+    use opendera_types::{
         deserialize_table_record,
         program_schema::{ColumnType, Field, Relation, SqlIdentifier},
         serialize_table_record,

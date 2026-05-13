@@ -1,6 +1,6 @@
 use std::sync::{Arc, LazyLock};
 
-use feldera_types::{
+use opendera_types::{
     checkpoint::{CheckpointMetadata, CheckpointSyncMetrics},
     config::SyncConfig,
 };

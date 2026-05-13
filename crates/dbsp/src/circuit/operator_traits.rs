@@ -5,7 +5,7 @@
 
 #![allow(async_fn_in_trait)]
 
-use feldera_storage::{FileCommitter, StoragePath};
+use opendera_storage::{FileCommitter, StoragePath};
 
 use crate::Error;
 use crate::{

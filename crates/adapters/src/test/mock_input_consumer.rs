@@ -3,11 +3,11 @@ use crate::format::{InputBuffer, Splitter, get_input_format};
 use crate::{InputConsumer, ParseError, Parser, controller::FormatConfig};
 use anyhow::{Error as AnyError, anyhow};
 use dbsp::operator::StagedBuffers;
-use feldera_adapterlib::ConnectorMetadata;
-use feldera_adapterlib::format::BufferSize;
-use feldera_adapterlib::transport::{Resume, Watermark};
-use feldera_types::adapter_stats::ConnectorHealth;
-use feldera_types::config::FtModel;
+use opendera_adapterlib::ConnectorMetadata;
+use opendera_adapterlib::format::BufferSize;
+use opendera_adapterlib::transport::{Resume, Watermark};
+use opendera_types::adapter_stats::ConnectorHealth;
+use opendera_types::config::FtModel;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub type ErrorCallback = Box<dyn FnMut(bool, &AnyError) + Send>;
@@ -135,7 +135,7 @@ impl InputConsumer for MockInputConsumer {
 
     fn completion_watcher(
         &self,
-    ) -> Option<tokio::sync::watch::Receiver<feldera_types::coordination::Completion>> {
+    ) -> Option<tokio::sync::watch::Receiver<opendera_types::coordination::Completion>> {
         None
     }
 }

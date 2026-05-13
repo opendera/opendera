@@ -13,8 +13,8 @@ use crate::db::types::program::{RustCompilationInfo, SqlCompilationInfo};
 use crate::db::types::tenant::TenantId;
 use crate::db::types::version::Version;
 use async_trait::async_trait;
-use feldera_types::error::ErrorResponse;
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+use opendera_types::error::ErrorResponse;
+use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Eq)]

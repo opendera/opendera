@@ -1,8 +1,8 @@
 use crate::controller::{ControllerInner, EndpointId};
 use crate::transport::IntegratedInputEndpoint;
 use crate::{ControllerError, Encoder, InputConsumer, OutputEndpoint};
-use feldera_types::config::{ConnectorConfig, TransportConfig};
-use feldera_types::program_schema::Relation;
+use opendera_types::config::{ConnectorConfig, TransportConfig};
+use opendera_types::program_schema::Relation;
 use std::sync::Weak;
 
 #[cfg(feature = "with-deltalake")]
@@ -99,7 +99,7 @@ pub fn create_integrated_input_endpoint(
         ),
         #[cfg(feature = "with-iceberg")]
         TransportConfig::IcebergInput(config) => Box::new(
-            feldera_iceberg::IcebergInputEndpoint::new(endpoint_name, config, consumer),
+            opendera_iceberg::IcebergInputEndpoint::new(endpoint_name, config, consumer),
         ),
         TransportConfig::PostgresInput(config) => {
             Box::new(PostgresInputEndpoint::new(endpoint_name, config, consumer))

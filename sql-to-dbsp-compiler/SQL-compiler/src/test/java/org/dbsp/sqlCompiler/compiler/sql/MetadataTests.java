@@ -90,7 +90,7 @@ public class MetadataTests extends BaseSQLTests {
         PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
         script.println("""
                 use crate::{Tup1, Tup2};
-                use feldera_sqllib::*;
+                use opendera_sqllib::*;
                 pub fn f(x: Option<Tup1<Option<i32>>>) -> Result<Option<Tup1<Option<i32>>>, Box<dyn std::error::Error>> {
                    match x {
                       None => Ok(None),
@@ -757,7 +757,7 @@ public class MetadataTests extends BaseSQLTests {
         File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
         PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
         script.println("""
-                use feldera_sqllib::*;
+                use opendera_sqllib::*;
                 use crate::Tup2;
                 
                 pub type i8_avg_accumulator_type = Tup2<i32, i32>;
@@ -804,7 +804,7 @@ public class MetadataTests extends BaseSQLTests {
         File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
         PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
         script.println("""
-                use feldera_sqllib::*;
+                use opendera_sqllib::*;
                 
                 pub type u64_sum_accumulator_type = i64;
                 
@@ -855,7 +855,7 @@ public class MetadataTests extends BaseSQLTests {
             PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
             script.println("""
                     use i256::I256;
-                    use feldera_sqllib::*;
+                    use opendera_sqllib::*;
                     use crate::{AddAssignByRef, AddByRef, HasZero, MulByRef, SizeOf, Tup3};
                     use derive_more::Add;
                     use num_traits::Zero;
@@ -1068,7 +1068,7 @@ public class MetadataTests extends BaseSQLTests {
             cargoContents = cargoContents.replace("[dependencies]",
                     """
                             [dependencies]
-                            feldera-adapterlib = { path = "../../crates/adapterlib" }
+                            opendera-adapterlib = { path = "../../crates/adapterlib" }
                             """);
             PrintWriter p = new PrintWriter(cargo.toFile(), StandardCharsets.UTF_8);
             p.write(cargoContents);
@@ -1076,9 +1076,9 @@ public class MetadataTests extends BaseSQLTests {
 
             PrintWriter udfWriter = new PrintWriter(udf, StandardCharsets.UTF_8);
             udfWriter.println("""
-                    use feldera_adapterlib::format::{ParseError, Splitter};
-                    use feldera_types::preprocess::PreprocessorConfig;
-                    use feldera_adapterlib::preprocess::{
+                    use opendera_adapterlib::format::{ParseError, Splitter};
+                    use opendera_types::preprocess::PreprocessorConfig;
+                    use opendera_adapterlib::preprocess::{
                         Preprocessor, PreprocessorCreateError, PreprocessorFactory,
                     };
 
@@ -1135,7 +1135,7 @@ public class MetadataTests extends BaseSQLTests {
         File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
         PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
         script.println("""
-                use feldera_sqllib::*;
+                use opendera_sqllib::*;
                 pub fn contains_number(str: SqlString, value: Option<SqlDecimal<2, 0>>) -> Result<bool, Box<dyn std::error::Error>> {
                    match value {
                        None => Err("null value".into()),
@@ -1163,7 +1163,7 @@ public class MetadataTests extends BaseSQLTests {
 
                 #![allow(non_snake_case)]
 
-                use feldera_sqllib::*;
+                use opendera_sqllib::*;
                 use crate::*;
                 pub fn contains_number(str: SqlString, value: Option<SqlDecimal<2, 0>>) -> Result<bool, Box<dyn std::error::Error>> {
                     udf::contains_number(

@@ -1,6 +1,6 @@
 use anyhow::{Result as AnyResult, anyhow};
-use feldera_adapterlib::transport::{AsyncErrorCallback, OutputEndpoint};
-use feldera_types::transport::redis::RedisOutputConfig;
+use opendera_adapterlib::transport::{AsyncErrorCallback, OutputEndpoint};
+use opendera_types::transport::redis::RedisOutputConfig;
 use redis::{ConnectionInfo, Pipeline};
 use std::str::FromStr;
 use tracing::{info_span, span::EnteredSpan};
@@ -54,7 +54,7 @@ impl OutputEndpoint for RedisOutputEndpoint {
 
     // Creates a [`redis::Pipeline`] that is atomic, so that every batch is
     // committed as a transaction.
-    fn batch_start(&mut self, _step: feldera_adapterlib::transport::Step) -> AnyResult<()> {
+    fn batch_start(&mut self, _step: opendera_adapterlib::transport::Step) -> AnyResult<()> {
         let mut pipeline = Pipeline::new();
         pipeline.atomic();
         self.pipeline = Some(pipeline);

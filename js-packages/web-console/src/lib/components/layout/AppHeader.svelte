@@ -1,8 +1,8 @@
 <script lang="ts">
-  import FelderaModernLogoColorDark from '$assets/images/feldera-modern/Feldera Logo Color Dark.svg?component'
-  import FelderaModernLogoColorLight from '$assets/images/feldera-modern/Feldera Logo Color Light.svg?component'
-  import FelderaModernLogomarkColorDark from '$assets/images/feldera-modern/Feldera Logomark Color Dark.svg?component'
-  import FelderaModernLogomarkColorLight from '$assets/images/feldera-modern/Feldera Logomark Color Light.svg?component'
+  import OpenderaLogoColorDark from '$assets/images/opendera/Opendera Logo Color Dark.svg?component'
+  import OpenderaLogoColorLight from '$assets/images/opendera/Opendera Logo Color Light.svg?component'
+  import OpenderaLogomarkColorDark from '$assets/images/opendera/Opendera Logomark Color Dark.svg?component'
+  import OpenderaLogomarkColorLight from '$assets/images/opendera/Opendera Logomark Color Light.svg?component'
   import ProfileButton from '$lib/components/auth/ProfileButton.svelte'
   import { useClusterHealth } from '$lib/compositions/health/useClusterHealth.svelte'
   import { useDarkMode } from '$lib/compositions/useDarkMode.svelte'
@@ -19,16 +19,16 @@
   <a class="py-3 lg:pt-2 lg:pr-6 lg:pb-4" href={resolve('/')}>
     <span class="hidden lg:block">
       {#if darkMode.current === 'dark'}
-        <FelderaModernLogoColorLight class="h-8"></FelderaModernLogoColorLight>
+        <OpenderaLogoColorLight class="h-8"></OpenderaLogoColorLight>
       {:else}
-        <FelderaModernLogoColorDark class="h-8"></FelderaModernLogoColorDark>
+        <OpenderaLogoColorDark class="h-8"></OpenderaLogoColorDark>
       {/if}
     </span>
     <span class="inline lg:hidden">
       {#if darkMode.current === 'dark'}
-        <FelderaModernLogomarkColorLight class="h-8"></FelderaModernLogomarkColorLight>
+        <OpenderaLogomarkColorLight class="h-8"></OpenderaLogomarkColorLight>
       {:else}
-        <FelderaModernLogomarkColorDark class="h-8"></FelderaModernLogomarkColorDark>
+        <OpenderaLogomarkColorDark class="h-8"></OpenderaLogomarkColorDark>
       {/if}
     </span>
   </a>

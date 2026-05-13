@@ -5,7 +5,7 @@ use crate::test::{
 };
 use crate::transport::InputReader;
 use anyhow::{Error as AnyError, Result as AnyResult};
-use feldera_types::program_schema::Relation;
+use opendera_types::program_schema::Relation;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

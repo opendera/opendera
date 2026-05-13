@@ -5,7 +5,7 @@ use crate::test::{TestStruct, init_test_logger, test_circuit, wait};
 use crate::{Controller, PipelineConfig};
 use anyhow::Result as AnyResult;
 use csv::ReaderBuilder as CsvReaderBuilder;
-use feldera_types::memory_pressure::MemoryPressure;
+use opendera_types::memory_pressure::MemoryPressure;
 use serde_json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -268,7 +268,7 @@ outputs:
                 serde_json::to_string_pretty(&controller.status().to_api_type(
                     ControllerStatusContext {
                         suspend_error: Ok(()),
-                        checkpoint_activity: feldera_types::checkpoint::CheckpointActivity::Idle,
+                        checkpoint_activity: opendera_types::checkpoint::CheckpointActivity::Idle,
                         permanent_checkpoint_errors: None,
                         pipeline_complete: false,
                         transaction_info: TransactionInfo::default(),

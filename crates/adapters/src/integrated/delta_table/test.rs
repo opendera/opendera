@@ -20,16 +20,16 @@ use deltalake::kernel::{DataType, StructField};
 use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::SaveMode;
 use deltalake::{DeltaTable, DeltaTableBuilder, ensure_table_uri};
-use feldera_sqllib::Variant;
-use feldera_types::config::PipelineConfig;
-use feldera_types::format::json::JsonFlavor;
-use feldera_types::program_schema::{Field, SqlIdentifier};
-use feldera_types::serde_with_context::serde_config::DecimalFormat;
-use feldera_types::serde_with_context::serialize::SerializeWithContextWrapper;
-use feldera_types::serde_with_context::{
+use opendera_sqllib::Variant;
+use opendera_types::config::PipelineConfig;
+use opendera_types::format::json::JsonFlavor;
+use opendera_types::program_schema::{Field, SqlIdentifier};
+use opendera_types::serde_with_context::serde_config::DecimalFormat;
+use opendera_types::serde_with_context::serialize::SerializeWithContextWrapper;
+use opendera_types::serde_with_context::{
     DateFormat, DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, TimestampFormat,
 };
-use feldera_types::transport::delta_table::DeltaTableTransactionMode;
+use opendera_types::transport::delta_table::DeltaTableTransactionMode;
 use proptest::collection::vec;
 use proptest::prelude::{Arbitrary, ProptestConfig, Strategy};
 use proptest::proptest;
@@ -972,7 +972,7 @@ async fn test_follow(
                         .is_some_and(|h| {
                             let unhealthy = matches!(
                                 h.status,
-                                feldera_types::adapter_stats::ConnectorHealthStatus::Unhealthy
+                                opendera_types::adapter_stats::ConnectorHealthStatus::Unhealthy
                             );
                             if unhealthy {
                                 println!("unhealthy: {:?}", h);
@@ -999,7 +999,7 @@ async fn test_follow(
                         .is_some_and(|h| {
                             matches!(
                                 h.status,
-                                feldera_types::adapter_stats::ConnectorHealthStatus::Healthy
+                                opendera_types::adapter_stats::ConnectorHealthStatus::Healthy
                             )
                         })
                 },

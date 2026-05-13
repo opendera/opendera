@@ -16,8 +16,8 @@ use chrono::{
 use chrono_tz::Tz;
 use core::fmt::Formatter;
 use dbsp::num_entries_scalar;
-use feldera_macros::IsNone;
-use feldera_types::serde_with_context::{
+use opendera_macros::IsNone;
+use opendera_types::serde_with_context::{
     DateFormat, DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, TimeFormat,
     TimestampFormat,
 };
@@ -2921,11 +2921,11 @@ mod test {
     use std::sync::LazyLock;
 
     use super::{Date, Time, Timestamp};
-    use feldera_types::format::json::JsonFlavor;
-    use feldera_types::serde_with_context::{
+    use opendera_types::format::json::JsonFlavor;
+    use opendera_types::serde_with_context::{
         DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
     };
-    use feldera_types::{deserialize_table_record, serialize_table_record};
+    use opendera_types::{deserialize_table_record, serialize_table_record};
 
     #[derive(Debug, Eq, PartialEq, serde::Serialize)]
     #[allow(non_snake_case)]

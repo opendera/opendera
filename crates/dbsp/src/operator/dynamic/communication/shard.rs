@@ -4,8 +4,8 @@
 // TODOs:
 // - different sharding modes.
 
-use feldera_storage::fbuf::{FBuf, FBufSerializer};
 use itertools::Itertools;
+use opendera_storage::fbuf::{FBuf, FBufSerializer};
 use rkyv::{archived_root, ser::Serializer as _};
 
 use crate::{

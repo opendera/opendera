@@ -3,7 +3,7 @@ use super::NatsTestRecord;
 use super::util;
 use crate::test::mock_input_pipeline;
 use async_nats::jetstream;
-use feldera_types::program_schema::Relation;
+use opendera_types::program_schema::Relation;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------

@@ -13,9 +13,9 @@ paste = { version = "1.0.12" }
 derive_more = { version = "1.0.0", features = ["add", "not", "from"] }
 dbsp = { path = "../../crates/dbsp", features = ["backend-mode"] }
 dbsp_adapters = { path = "../../crates/adapters", default-features = false }
-feldera-types = { path = "../../crates/feldera-types" }
-feldera-sqllib = { path = "../../crates/sqllib" }
-feldera-macros = { path = "../../crates/feldera-macros" }
+opendera-types = { path = "../../crates/opendera-types" }
+opendera-sqllib = { path = "../../crates/sqllib" }
+opendera-macros = { path = "../../crates/opendera-macros" }
 serde = { version = "1.0.213", features = ["derive"] }
 compare = { version = "0.1.0" }
 size-of = { version = "0.1.7", package = "feldera-size-of" }

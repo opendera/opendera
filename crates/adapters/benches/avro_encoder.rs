@@ -6,7 +6,7 @@ use bench_common::{
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use dbsp_adapters::Encoder;
 use dbsp_adapters::format::avro::output::AvroEncoder;
-use feldera_types::format::avro::{AvroEncoderConfig, AvroUpdateFormat};
+use opendera_types::format::avro::{AvroEncoderConfig, AvroUpdateFormat};
 
 // ---------------------------------------------------------------------------
 // Avro-specific helpers

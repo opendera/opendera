@@ -16,11 +16,11 @@ use arrow::array::RecordBatch;
 use dbsp::{DBData, operator::StagedBuffers};
 use erased_serde::Deserializer as ErasedDeserializer;
 #[cfg(feature = "with-avro")]
-use feldera_adapterlib::catalog::AvroSchemaRefs;
-use feldera_adapterlib::format::{BufferSize, flatten_nested};
+use opendera_adapterlib::catalog::AvroSchemaRefs;
+use opendera_adapterlib::format::{BufferSize, flatten_nested};
 
-use feldera_sqllib::Variant;
-use feldera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
+use opendera_sqllib::Variant;
+use opendera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 use serde_arrow::Deserializer as ArrowDeserializer;
 use std::{
     fmt::Debug,

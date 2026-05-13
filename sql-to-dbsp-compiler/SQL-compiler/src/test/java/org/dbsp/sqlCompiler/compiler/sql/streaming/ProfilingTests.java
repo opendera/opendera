@@ -70,7 +70,7 @@ public class ProfilingTests extends StreamingTestBase {
                     zset,
                 };
 
-                use feldera_sqllib::{
+                use opendera_sqllib::{
                     append_to_collection_handle,
                     append_to_map_handle,
                     read_output_spine,
@@ -141,7 +141,7 @@ public class ProfilingTests extends StreamingTestBase {
         String main = """
                 use dbsp::{algebra::F64, circuit::CircuitConfig, utils::Tup1, zset};
 
-                use feldera_sqllib::{
+                use opendera_sqllib::{
                     append_to_collection_handle, append_to_map_handle,
                     casts::{cast_to_Timestamp_s, handle_error},
                     read_output_spine,

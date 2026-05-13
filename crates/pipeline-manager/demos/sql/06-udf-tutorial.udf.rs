@@ -1,7 +1,7 @@
 // Implement the function signatures from stubs.rs
 
 use crate::*;
-use feldera_sqllib::*;
+use opendera_sqllib::*;
 use base64::prelude::*; // Able to use external crates declared in udf.toml
 
 pub fn base64(s: Option<ByteArray>) -> Result<Option<SqlString>, Box<dyn std::error::Error>> {

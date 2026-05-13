@@ -26,8 +26,8 @@ in a final commit.
 
 The features removed in commit 1 and slated for reimplementation:
 
-1. **Object-store `StorageBackend`** — concrete `feldera_storage::StorageBackend` implementation backed by S3 / GCS / Azure via the `object_store` crate. The trait, factory, and `inventory::collect!()` registration site already exist in OSS; only the concrete backend was proprietary.
-2. **Checkpoint synchronization** — the `CheckpointSynchronizer` trait (in `feldera_storage::checkpoint_synchronizer`) had its sole registered implementation behind the feature flag. Provides push/pull of pipeline checkpoints to/from object storage, GC of older checkpoints, and standby-mode continuous pull.
+1. **Object-store `StorageBackend`** — concrete `opendera_storage::StorageBackend` implementation backed by S3 / GCS / Azure via the `object_store` crate. The trait, factory, and `inventory::collect!()` registration site already exist in OSS; only the concrete backend was proprietary.
+2. **Checkpoint synchronization** — the `CheckpointSynchronizer` trait (in `opendera_storage::checkpoint_synchronizer`) had its sole registered implementation behind the feature flag. Provides push/pull of pipeline checkpoints to/from object storage, GC of older checkpoints, and standby-mode continuous pull.
 3. **`/checkpoint`, `/checkpoint/sync`, `/checkpoint/sync_status`, `/activate` endpoints** — manager-side HTTP forwarding endpoints. Currently restored as unconditional forwarders, but the pipeline-side handlers (which receive the forwarded requests) need to actually do something. The pipeline-side handler logic is what was gated; reimplementation makes it real.
 4. **Graceful stop (`/stop?force=false`)** — pipeline-manager endpoint that initiates a checkpointed suspend before shutting down. Currently restored as an unconditional forwarder; pipeline-side suspend logic is what gated it.
 5. **Fault tolerance** — `RuntimeConfig.fault_tolerance` and the supporting circuit-level replay/recovery infrastructure. Today the manager rejects fault-tolerance configs at validation time.
@@ -49,14 +49,14 @@ touching the engine code.
 
 ### Public interface (already in OSS)
 
-- Trait: `feldera_storage::StorageBackend` (see `crates/storage/src/lib.rs`,
+- Trait: `opendera_storage::StorageBackend` (see `crates/storage/src/lib.rs`,
   around line 52). Methods: `create_named`, `create`, `create_with_prefix`,
   `open`, `delete`, `list`, `exists`, `read_json`, `write_json`, and the
   trait's helper methods.
-- Factory: `feldera_storage::StorageBackendFactory` (line 40).
+- Factory: `opendera_storage::StorageBackendFactory` (line 40).
 - Registration: `inventory::collect!(&'static dyn StorageBackendFactory)`.
   Each backend submits a `&'static` instance via `inventory::submit!`.
-- Configuration: `feldera_types::config::StorageBackendConfig` already has
+- Configuration: `opendera_types::config::StorageBackendConfig` already has
   the necessary variants. The object-store-backed variant is selected when
   the user supplies an `object_store` URL such as `s3://bucket/prefix`.
 
@@ -95,7 +95,7 @@ touching the engine code.
   Azure). No proprietary credential schema.
 - Optional: bucket-side SSE/KMS settings, customer-supplied keys, prefix
   override, retry/timeout knobs — all exposed via the
-  `StorageBackendConfig` variants already in `feldera-types`.
+  `StorageBackendConfig` variants already in `opendera-types`.
 
 ### Integration points
 
@@ -137,13 +137,13 @@ synchronizer is the bridge between the local working state (managed by
 
 ### Public interface (already in OSS)
 
-- Trait: `feldera_storage::checkpoint_synchronizer::CheckpointSynchronizer`
+- Trait: `opendera_storage::checkpoint_synchronizer::CheckpointSynchronizer`
   (see `crates/storage/src/checkpoint_synchronizer.rs`). Methods (inferred
   from call sites preserved in commit 1):
   - `pull(storage: Arc<dyn StorageBackend>, sync: SyncConfig) -> Result<(CheckpointMetadata, Option<TransferMetrics>), Error>` — fetch the most recent checkpoint named by the sync config and place it in local storage.
   - `push(uuid: Uuid, storage: Arc<dyn StorageBackend>, sync: SyncConfig) -> Result<Option<TransferMetrics>, Error>` — upload the local checkpoint identified by `uuid` to the durable location.
 - Registration: `inventory::collect!(&'static dyn CheckpointSynchronizer)`.
-- Config: `feldera_types::config::SyncConfig` (`pull_interval`, `standby`,
+- Config: `opendera_types::config::SyncConfig` (`pull_interval`, `standby`,
   `start_from_checkpoint`, `fail_if_no_checkpoint`, `validate()`).
 - Metrics: pull/push success / failure / duration / transferred-bytes /
   transfer-speed counters live in `crates/adapters/src/controller/sync.rs`
@@ -175,7 +175,7 @@ synchronizer is the bridge between the local working state (managed by
 
 ### Configuration
 
-- `SyncConfig` in `feldera-types`. Fields already exist (URL, credentials,
+- `SyncConfig` in `opendera-types`. Fields already exist (URL, credentials,
   pull interval, standby flag, start_from_checkpoint, fail_if_no_checkpoint).
 - Wired into pipeline runtime config under
   `storage.backend.File(FileBackendConfig { sync: Some(...) })`.
@@ -229,7 +229,7 @@ Pipeline HTTP server, served by `crates/adapters/src/server.rs`:
 
 - `POST /checkpoint` — initiates a checkpoint; returns
   `CheckpointResponse { checkpoint_sequence_number: u64, ... }` (already
-  defined in `feldera-types`). Caller polls `/checkpoint_status` to see
+  defined in `opendera-types`). Caller polls `/checkpoint_status` to see
   when complete.
 - `POST /checkpoint/sync` — triggers a one-shot push of the latest
   checkpoint to the configured object-store sync target.
@@ -342,7 +342,7 @@ last checkpoint up to the failure point.
 
 ### Public interface
 
-- Config: `feldera_types::config::RuntimeConfig.fault_tolerance` —
+- Config: `opendera_types::config::RuntimeConfig.fault_tolerance` —
   enabling this is currently rejected by validation (commit 1 left the
   rejection in place; it must continue to reject until this section is
   implemented).

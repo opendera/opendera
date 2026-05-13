@@ -14,7 +14,7 @@ use dbsp::{
     typed_batch::BatchReader as TypedBatchReader,
     utils::{Tup2, Tup10},
 };
-use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
+use opendera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256StarStar;
 use std::hint::black_box;

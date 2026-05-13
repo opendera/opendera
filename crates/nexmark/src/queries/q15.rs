@@ -4,7 +4,7 @@ use dbsp::{
     OrdIndexedZSet, OrdZSet, RootCircuit, Stream, ZWeight,
     utils::{Tup2, Tup3, Tup4, Tup5, Tup6, Tup7, Tup8, Tup9, Tup10},
 };
-use feldera_macros::IsNone;
+use opendera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 use std::{

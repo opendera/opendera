@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/state'
-  import FelderaModernLogomarkBlack from '$assets/images/feldera-modern/Feldera Logomark Black.svg?component'
+  import OpenderaLogomarkBlack from '$assets/images/opendera/Opendera Logomark Black.svg?component'
   import { Popover } from '$lib/components/common/Popover.svelte'
   import Tooltip from '$lib/components/common/Tooltip.svelte'
   import ClipboardCopyButton from '$lib/components/other/ClipboardCopyButton.svelte'
@@ -16,7 +16,7 @@
 </script>
 
 {#snippet logo(className: string)}
-  <FelderaModernLogomarkBlack class="inline w-5 {className}"></FelderaModernLogomarkBlack>
+  <OpenderaLogomarkBlack class="inline w-5 {className}"></OpenderaLogomarkBlack>
 {/snippet}
 
 <div class="relative text-surface-600-400">

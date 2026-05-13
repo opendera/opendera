@@ -16,11 +16,11 @@ use dbsp::circuit::NodeId;
 use dbsp::dynamic::{ClonableTrait, DynData, DynVec, Factory};
 use dbsp::operator::StagedBuffers;
 use dyn_clone::DynClone;
-use feldera_sqllib::Variant;
-use feldera_types::format::csv::CsvParserConfig;
-use feldera_types::format::json::JsonFlavor;
-use feldera_types::program_schema::{Relation, SqlIdentifier};
-use feldera_types::serde_with_context::SqlSerdeConfig;
+use opendera_sqllib::Variant;
+use opendera_types::format::csv::CsvParserConfig;
+use opendera_types::format::json::JsonFlavor;
+use opendera_types::program_schema::{Relation, SqlIdentifier};
+use opendera_types::serde_with_context::SqlSerdeConfig;
 use serde_arrow::ArrayBuilder;
 #[cfg(feature = "with-avro")]
 use std::collections::HashMap;

@@ -1,5 +1,5 @@
-use feldera_adapterlib::errors::journal::ControllerError;
-use feldera_types::{
+use opendera_adapterlib::errors::journal::ControllerError;
+use opendera_types::{
     config::PipelineConfig,
     pipeline_diff::{PipelineDiff, ProgramDiff, program_diff},
 };

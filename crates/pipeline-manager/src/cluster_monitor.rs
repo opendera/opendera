@@ -6,7 +6,7 @@ use crate::db::types::monitor::{MonitorStatus, NewClusterMonitorEvent};
 use crate::error::source_error;
 use crate::unstable_features;
 use async_trait::async_trait;
-use feldera_observability::ReqwestTracingExt;
+use opendera_observability::ReqwestTracingExt;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{error, info};

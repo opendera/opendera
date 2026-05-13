@@ -15,7 +15,7 @@ use dbsp::{
     mimalloc::MiMalloc,
     utils::{Tup2, Tup3, Tup4, Tup5},
 };
-use feldera_types::config::{FileBackendConfig, StorageBackendConfig};
+use opendera_types::config::{FileBackendConfig, StorageBackendConfig};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;

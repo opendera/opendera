@@ -18,7 +18,7 @@ use dbsp::storage::file::format::{Compression, VERSION_NUMBER};
 use dbsp::utils::Tup8;
 use uuid::Uuid as RawUuid;
 
-use feldera_sqllib::{
+use opendera_sqllib::{
     to_array, to_map, Array, ByteArray, Date, GeoPoint, LongInterval, Map, ShortInterval,
     SqlDecimal, SqlString, Time, Timestamp, Uuid, Variant,
 };
@@ -28,7 +28,7 @@ type Dec12_2 = SqlDecimal<12, 2>;
 type Dec10_0 = SqlDecimal<10, 0>;
 type Dec18_4 = SqlDecimal<18, 4>;
 
-feldera_macros::declare_tuple! {
+opendera_macros::declare_tuple! {
     Tup65<
         T0, T1, T2, T3, T4, T5, T6, T7, T8, T9,
         T10, T11, T12, T13, T14, T15, T16, T17, T18, T19,
@@ -512,7 +512,7 @@ mod tests {
     use dbsp::storage::file::FilterKind;
     use dbsp::trace::BatchFilters;
     use dbsp::DBData;
-    use feldera_types::config::{StorageConfig, StorageOptions};
+    use opendera_types::config::{StorageConfig, StorageOptions};
     use rand::{thread_rng, Rng};
 
     fn validate_key_range<T, N>(

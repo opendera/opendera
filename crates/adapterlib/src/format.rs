@@ -12,9 +12,9 @@ use actix_web::HttpRequest;
 use anyhow::Result as AnyResult;
 use dbsp::operator::input::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
-use feldera_types::config::ConnectorConfig;
-use feldera_types::program_schema::Relation;
-use feldera_types::serde_with_context::FieldParseError;
+use opendera_types::config::ConnectorConfig;
+use opendera_types::program_schema::Relation;
+use opendera_types::serde_with_context::FieldParseError;
 use serde::Serialize;
 use serde::de::StdError;
 

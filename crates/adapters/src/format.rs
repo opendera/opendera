@@ -22,7 +22,7 @@ use self::{
     raw::RawInputFormat,
 };
 
-pub use feldera_adapterlib::format::*;
+pub use opendera_adapterlib::format::*;
 
 /// Static map of supported input formats.
 // TODO: support for registering new formats at runtime in order to allow

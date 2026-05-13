@@ -1,5 +1,5 @@
 [package]
-name = "feldera-observability"
+name = "opendera-observability"
 description = "Shared observability utilities for Feldera services"
 publish = true
 edition = "2024"

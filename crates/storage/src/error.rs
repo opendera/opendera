@@ -1,5 +1,5 @@
-use feldera_types::config::StorageBackendConfig;
 use object_store::Error as ObjectStoreError;
+use opendera_types::config::StorageBackendConfig;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use std::io::ErrorKind;

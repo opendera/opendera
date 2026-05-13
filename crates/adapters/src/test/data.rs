@@ -4,12 +4,12 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use dbsp::utils::Tup2;
-use feldera_macros::IsNone;
-use feldera_sqllib::{
+use opendera_macros::IsNone;
+use opendera_sqllib::{
     ByteArray, Date, F32, F64, SqlDecimal, SqlString, Time, Timestamp, Uuid, Variant,
 };
-use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
-use feldera_types::{
+use opendera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
+use opendera_types::{
     deserialize_table_record, deserialize_without_context, serialize_struct, serialize_table_record,
 };
 use prop::sample::SizeRange;

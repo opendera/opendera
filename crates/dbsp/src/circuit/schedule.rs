@@ -4,8 +4,8 @@
 
 use super::{Circuit, GlobalNodeId, NodeId, trace::SchedulerEvent};
 use crate::{DetailedError, Position};
-use feldera_types::transaction::CommitProgressSummary;
 use itertools::Itertools;
+use opendera_types::transaction::CommitProgressSummary;
 use serde::Serialize;
 use std::{
     borrow::Cow,

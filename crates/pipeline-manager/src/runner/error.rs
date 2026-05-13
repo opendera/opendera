@@ -3,8 +3,8 @@ use crate::db::types::utils::ValidationError;
 use actix_web::{
     body::BoxBody, http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError,
 };
-use feldera_types::error::{DetailedError, ErrorResponse};
 use indoc::writedoc;
+use opendera_types::error::{DetailedError, ErrorResponse};
 use serde::Serialize;
 use std::{borrow::Cow, error::Error as StdError, fmt, fmt::Display, time::Duration};
 

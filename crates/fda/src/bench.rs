@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
-use feldera_rest_api::Client;
-use feldera_rest_api::types::{CompilationProfile, Configuration, ProgramConfig};
-use feldera_types::error::ErrorResponse;
 use log::{error, info, warn};
+use opendera_rest_api::Client;
+use opendera_rest_api::types::{CompilationProfile, Configuration, ProgramConfig};
+use opendera_types::error::ErrorResponse;
 use progenitor_client::Error as ProgenitorError;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -91,8 +91,8 @@ struct PipelineStats {
     suspend_error: Option<Value>,
 }
 
-impl From<&feldera_rest_api::types::ControllerStatus> for RawMetrics {
-    fn from(stats: &feldera_rest_api::types::ControllerStatus) -> Self {
+impl From<&opendera_rest_api::types::ControllerStatus> for RawMetrics {
+    fn from(stats: &opendera_rest_api::types::ControllerStatus) -> Self {
         let global_metrics = &stats.global_metrics;
 
         // Check for input errors
@@ -362,7 +362,7 @@ async fn collect_metrics(
     pipeline_name: &str,
     duration: Option<u64>,
     needs_commit: bool,
-) -> Vec<feldera_rest_api::types::ControllerStatus> {
+) -> Vec<opendera_rest_api::types::ControllerStatus> {
     enum PipelineStatus<T> {
         Ingesting,
         Committing(T),
@@ -451,7 +451,7 @@ async fn transform_to_bmf(
     client: &Client,
     name: String,
     format: OutputFormat,
-    metrics: Vec<feldera_rest_api::types::ControllerStatus>,
+    metrics: Vec<opendera_rest_api::types::ControllerStatus>,
 ) -> Benchmark {
     // Convert raw JSON metrics to structured data
     let raw_metrics: Vec<RawMetrics> = metrics.iter().map(RawMetrics::from).collect();

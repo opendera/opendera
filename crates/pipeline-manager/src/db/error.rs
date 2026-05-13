@@ -11,8 +11,8 @@ use actix_web::{
     body::BoxBody, http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError,
 };
 use deadpool_postgres::PoolError;
-use feldera_types::error::DetailedError;
-use feldera_types::error::ErrorResponse;
+use opendera_types::error::DetailedError;
+use opendera_types::error::ErrorResponse;
 use refinery::Error as RefineryError;
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use std::{backtrace::Backtrace, borrow::Cow, error::Error as StdError, fmt, fmt::Display};

@@ -77,7 +77,7 @@ public class StubsWriter extends BaseRustCodeGenerator {
 
 #![allow(non_snake_case)]
 
-use feldera_sqllib::*;
+use opendera_sqllib::*;
 use crate::*;
 """);
         List<DBSPFunction> extern = new ArrayList<>();

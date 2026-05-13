@@ -14,7 +14,7 @@ use dbsp::{
     trace::{BatchReader, BatchReaderFactories, Cursor},
     utils::Tup2,
 };
-use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
+use opendera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256StarStar;

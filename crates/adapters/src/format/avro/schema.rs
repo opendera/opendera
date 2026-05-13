@@ -9,8 +9,8 @@ use apache_avro::{
         UnionSchema,
     },
 };
-use feldera_adapterlib::catalog::AvroSchemaRefs;
-use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier, SqlType};
+use opendera_adapterlib::catalog::AvroSchemaRefs;
+use opendera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier, SqlType};
 use tracing::warn;
 
 use crate::format::avro::resolve_ref;

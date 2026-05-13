@@ -23,9 +23,9 @@ use crate::{
 };
 use binrw::{BinRead, BinWrite};
 use crossbeam_utils::CachePadded;
-use feldera_samply::Span;
-use feldera_storage::fbuf::FBuf;
 use itertools::Itertools;
+use opendera_samply::Span;
+use opendera_storage::fbuf::FBuf;
 use rkyv::AlignedVec;
 use size_of::HumanBytes;
 use std::{
@@ -1588,8 +1588,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use feldera_storage::tokio::TOKIO;
     use itertools::Itertools;
+    use opendera_storage::tokio::TOKIO;
 
     use super::Exchange;
     use crate::{

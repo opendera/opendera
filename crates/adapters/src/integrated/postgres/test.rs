@@ -1,6 +1,6 @@
 use dbsp::{Runtime, utils::Tup1};
-use feldera_sqllib::Variant;
-use feldera_types::{
+use opendera_sqllib::Variant;
+use opendera_types::{
     deserialize_table_record,
     program_schema::{ColumnType, Field, Relation, SqlIdentifier},
     serde_with_context::{SerializeWithContext, SqlSerdeConfig},
@@ -62,9 +62,9 @@ mod pg {
 
     use chrono::SubsecRound;
     use dbsp::{Runtime, utils::Tup1};
-    use feldera_macros::IsNone;
-    use feldera_sqllib::{F32, F64, SqlDecimal, SqlString, Variant};
-    use feldera_types::{
+    use opendera_macros::IsNone;
+    use opendera_sqllib::{F32, F64, SqlDecimal, SqlString, Variant};
+    use opendera_types::{
         config::PipelineConfig,
         deserialize_table_record,
         program_schema::{ColumnType, Field, Relation, SqlIdentifier},
@@ -124,16 +124,16 @@ mod pg {
         pub float_: F32,
         pub double_: F64,
         pub varchar_: SqlString,
-        pub time_: feldera_sqllib::Time,
-        pub date_: feldera_sqllib::Date,
-        pub timestamp_: feldera_sqllib::Timestamp,
-        pub variant_: feldera_sqllib::Variant,
-        pub uuid_: feldera_sqllib::Uuid,
-        pub varbinary_: feldera_sqllib::ByteArray,
+        pub time_: opendera_sqllib::Time,
+        pub date_: opendera_sqllib::Date,
+        pub timestamp_: opendera_sqllib::Timestamp,
+        pub variant_: opendera_sqllib::Variant,
+        pub uuid_: opendera_sqllib::Uuid,
+        pub varbinary_: opendera_sqllib::ByteArray,
         pub struct_: TestStruct,
-        pub string_array_: Vec<feldera_sqllib::SqlString>,
+        pub string_array_: Vec<opendera_sqllib::SqlString>,
         pub struct_array_: Vec<TestStruct>,
-        pub map_: BTreeMap<feldera_sqllib::SqlString, TestStruct>,
+        pub map_: BTreeMap<opendera_sqllib::SqlString, TestStruct>,
     }
 
     #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -147,18 +147,18 @@ mod pg {
         pub float_: F32,
         pub double_: F64,
         pub varchar_: SqlString,
-        pub time_: feldera_sqllib::Time,
-        pub date_: feldera_sqllib::Date,
-        pub timestamp_: feldera_sqllib::Timestamp,
-        pub variant_: feldera_sqllib::Variant,
-        pub uuid_: feldera_sqllib::Uuid,
-        pub varbinary_: feldera_sqllib::ByteArray,
+        pub time_: opendera_sqllib::Time,
+        pub date_: opendera_sqllib::Date,
+        pub timestamp_: opendera_sqllib::Timestamp,
+        pub variant_: opendera_sqllib::Variant,
+        pub uuid_: opendera_sqllib::Uuid,
+        pub varbinary_: opendera_sqllib::ByteArray,
         pub struct_: TestStruct,
-        pub string_array_: Vec<feldera_sqllib::SqlString>,
+        pub string_array_: Vec<opendera_sqllib::SqlString>,
         pub struct_array_: Vec<TestStruct>,
-        pub map_: BTreeMap<feldera_sqllib::SqlString, TestStruct>,
+        pub map_: BTreeMap<opendera_sqllib::SqlString, TestStruct>,
         pub __feldera_op: String,
-        pub __feldera_ts: feldera_sqllib::Timestamp,
+        pub __feldera_ts: opendera_sqllib::Timestamp,
     }
 
     impl PartialEq<PostgresTestStruct> for PostgresTestStructCdc {
@@ -195,16 +195,16 @@ mod pg {
         float_["float_"]: F32,
         double_["double_"]: F64,
         varchar_["varchar_"]: SqlString,
-        time_["time_"]: feldera_sqllib::Time,
-        date_["date_"]: feldera_sqllib::Date,
-        timestamp_["timestamp_"]: feldera_sqllib::Timestamp,
-        variant_["variant_"]: feldera_sqllib::Variant,
-        uuid_["uuid_"]: feldera_sqllib::Uuid,
-        varbinary_["varbinary_"]: feldera_sqllib::ByteArray,
+        time_["time_"]: opendera_sqllib::Time,
+        date_["date_"]: opendera_sqllib::Date,
+        timestamp_["timestamp_"]: opendera_sqllib::Timestamp,
+        variant_["variant_"]: opendera_sqllib::Variant,
+        uuid_["uuid_"]: opendera_sqllib::Uuid,
+        varbinary_["varbinary_"]: opendera_sqllib::ByteArray,
         struct_["struct_"]: TestStruct,
-        string_array_["string_array_"]: Vec<feldera_sqllib::SqlString>,
+        string_array_["string_array_"]: Vec<opendera_sqllib::SqlString>,
         struct_array_["struct_array_"]: Vec<TestStruct>,
-        map_["map_"]: BTreeMap<feldera_sqllib::SqlString, TestStruct>
+        map_["map_"]: BTreeMap<opendera_sqllib::SqlString, TestStruct>
     });
 
     deserialize_table_record!(PostgresTestStruct["PostgresTestStruct", Variant, 19] {
@@ -217,16 +217,16 @@ mod pg {
         (float_, "float_", false, F32, |_| None),
         (double_, "double_", false, F64, |_| None),
         (varchar_, "varchar_", false, SqlString, |_| None),
-        (time_, "time_", false, feldera_sqllib::Time, |_| None),
-        (date_, "date_", false, feldera_sqllib::Date, |_| None),
-        (timestamp_, "timestamp_", false, feldera_sqllib::Timestamp, |_| None),
-        (variant_, "variant_", false, feldera_sqllib::Variant, |_| None),
-        (uuid_, "uuid_", false, feldera_sqllib::Uuid, |_| None),
-        (varbinary_, "varbinary_", false, feldera_sqllib::ByteArray, |_| None),
+        (time_, "time_", false, opendera_sqllib::Time, |_| None),
+        (date_, "date_", false, opendera_sqllib::Date, |_| None),
+        (timestamp_, "timestamp_", false, opendera_sqllib::Timestamp, |_| None),
+        (variant_, "variant_", false, opendera_sqllib::Variant, |_| None),
+        (uuid_, "uuid_", false, opendera_sqllib::Uuid, |_| None),
+        (varbinary_, "varbinary_", false, opendera_sqllib::ByteArray, |_| None),
         (struct_, "struct_", false, TestStruct, |_| None),
-        (string_array_, "string_array_", false, Vec<feldera_sqllib::SqlString>, |_| None),
+        (string_array_, "string_array_", false, Vec<opendera_sqllib::SqlString>, |_| None),
         (struct_array_, "struct_array_", false, Vec<TestStruct>, |_| None),
-        (map_, "map_", false, BTreeMap<feldera_sqllib::SqlString, TestStruct>, |_| None)
+        (map_, "map_", false, BTreeMap<opendera_sqllib::SqlString, TestStruct>, |_| None)
     });
 
     pub(super) struct TempPgTable {
@@ -346,15 +346,15 @@ CREATE TABLE {name} (
                 float_: F32::new(r.get("float_")),
                 double_: F64::new(r.get("double_")),
                 varchar_: SqlString::from_ref(r.get("varchar_")),
-                time_: feldera_sqllib::Time::from_time(r.get("time_")),
-                date_: feldera_sqllib::Date::from_date(r.get("date_")),
-                timestamp_: feldera_sqllib::Timestamp::from_naiveDateTime(r.get("timestamp_")),
-                variant_: feldera_sqllib::from_json_string(
+                time_: opendera_sqllib::Time::from_time(r.get("time_")),
+                date_: opendera_sqllib::Date::from_date(r.get("date_")),
+                timestamp_: opendera_sqllib::Timestamp::from_naiveDateTime(r.get("timestamp_")),
+                variant_: opendera_sqllib::from_json_string(
                     &r.get::<_, serde_json::Value>("variant_").to_string(),
                 )
                 .unwrap(),
                 uuid_: r.get::<_, uuid::Uuid>("uuid_").into(),
-                varbinary_: feldera_sqllib::ByteArray::from_vec(r.get::<_, Vec<u8>>("varbinary_")),
+                varbinary_: opendera_sqllib::ByteArray::from_vec(r.get::<_, Vec<u8>>("varbinary_")),
                 struct_: { r.get::<_, TempTestStruct>("struct_").into() },
                 string_array_: r
                     .get::<_, Vec<String>>("string_array_")
@@ -386,15 +386,15 @@ CREATE TABLE {name} (
                 float_: F32::new(r.get("float_")),
                 double_: F64::new(r.get("double_")),
                 varchar_: SqlString::from_ref(r.get("varchar_")),
-                time_: feldera_sqllib::Time::from_time(r.get("time_")),
-                date_: feldera_sqllib::Date::from_date(r.get("date_")),
-                timestamp_: feldera_sqllib::Timestamp::from_naiveDateTime(r.get("timestamp_")),
-                variant_: feldera_sqllib::from_json_string(
+                time_: opendera_sqllib::Time::from_time(r.get("time_")),
+                date_: opendera_sqllib::Date::from_date(r.get("date_")),
+                timestamp_: opendera_sqllib::Timestamp::from_naiveDateTime(r.get("timestamp_")),
+                variant_: opendera_sqllib::from_json_string(
                     &r.get::<_, serde_json::Value>("variant_").to_string(),
                 )
                 .unwrap(),
                 uuid_: r.get::<_, uuid::Uuid>("uuid_").into(),
-                varbinary_: feldera_sqllib::ByteArray::from_vec(r.get::<_, Vec<u8>>("varbinary_")),
+                varbinary_: opendera_sqllib::ByteArray::from_vec(r.get::<_, Vec<u8>>("varbinary_")),
                 struct_: { r.get::<_, TempTestStruct>("struct_").into() },
                 string_array_: r
                     .get::<_, Vec<String>>("string_array_")
@@ -408,7 +408,7 @@ CREATE TABLE {name} (
                     .collect(),
                 map_: serde_json::from_value(r.get::<_, serde_json::Value>("map_")).unwrap(),
                 __feldera_op: r.get("__feldera_op"),
-                __feldera_ts: feldera_sqllib::Timestamp::from_dateTime(
+                __feldera_ts: opendera_sqllib::Timestamp::from_dateTime(
                     chrono::DateTime::from_timestamp_micros(r.get::<_, i64>("__feldera_ts"))
                         .unwrap(),
                 ),
@@ -569,16 +569,16 @@ CREATE TABLE {name} (
                 float_: F32::new((rng.r#gen::<f32>() * 1000.0).trunc() / 1000.0),
                 double_: F64::new((rng.r#gen::<f64>() * 1000.0).trunc() / 1000.0),
                 varchar_: rng.r#gen::<u32>().to_string().into(),
-                time_: feldera_sqllib::Time::from_time(
+                time_: opendera_sqllib::Time::from_time(
                     chrono::Utc::now().naive_utc().time().round_subsecs(5),
                 ),
-                date_: feldera_sqllib::Date::from_date(chrono::Utc::now().date_naive()),
-                timestamp_: feldera_sqllib::Timestamp::from_naiveDateTime(
+                date_: opendera_sqllib::Date::from_date(chrono::Utc::now().date_naive()),
+                timestamp_: opendera_sqllib::Timestamp::from_naiveDateTime(
                     chrono::Utc::now().naive_utc(),
                 ),
-                variant_: feldera_sqllib::Variant::String(rng.r#gen::<u32>().to_string().into()),
+                variant_: opendera_sqllib::Variant::String(rng.r#gen::<u32>().to_string().into()),
                 uuid_: uuid::Uuid::new_v4().into(),
-                varbinary_: feldera_sqllib::ByteArray::from_vec(vec![rng.gen_range(0..127)]),
+                varbinary_: opendera_sqllib::ByteArray::from_vec(vec![rng.gen_range(0..127)]),
                 struct_: rng.r#gen(),
                 string_array_: vec![],
                 struct_array_: vec![rng.r#gen()],
@@ -2398,7 +2398,7 @@ mod cdc_tests {
         rkyv::Archive,
         rkyv::Serialize,
         rkyv::Deserialize,
-        feldera_macros::IsNone,
+        opendera_macros::IsNone,
     )]
     #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
     struct CdcAllTypesStruct {
@@ -2407,54 +2407,54 @@ mod cdc_tests {
         col_integer: Option<i32>,
         col_bigint: Option<i64>,
         col_boolean: Option<bool>,
-        col_real: Option<feldera_sqllib::F32>,
-        col_double: Option<feldera_sqllib::F64>,
+        col_real: Option<opendera_sqllib::F32>,
+        col_double: Option<opendera_sqllib::F64>,
         col_date: Option<String>,
         col_time: Option<String>,
         col_timestamp: Option<String>,
         col_timestamptz: Option<String>,
         col_uuid: Option<String>,
-        col_jsonb: Option<feldera_sqllib::Variant>,
+        col_jsonb: Option<opendera_sqllib::Variant>,
         col_bytea: Option<String>,
         col_numeric: Option<String>,
         col_smallint: Option<i16>,
         col_int_array: Option<Vec<Option<i32>>>,
     }
 
-    feldera_types::deserialize_table_record!(CdcAllTypesStruct["CdcAllTypesStruct", Variant, 17] {
+    opendera_types::deserialize_table_record!(CdcAllTypesStruct["CdcAllTypesStruct", Variant, 17] {
         (id, "id", false, i32, |_| None),
         (col_text, "col_text", true, Option<String>, |_| Some(None)),
         (col_integer, "col_integer", true, Option<i32>, |_| Some(None)),
         (col_bigint, "col_bigint", true, Option<i64>, |_| Some(None)),
         (col_boolean, "col_boolean", true, Option<bool>, |_| Some(None)),
-        (col_real, "col_real", true, Option<feldera_sqllib::F32>, |_| Some(None)),
-        (col_double, "col_double", true, Option<feldera_sqllib::F64>, |_| Some(None)),
+        (col_real, "col_real", true, Option<opendera_sqllib::F32>, |_| Some(None)),
+        (col_double, "col_double", true, Option<opendera_sqllib::F64>, |_| Some(None)),
         (col_date, "col_date", true, Option<String>, |_| Some(None)),
         (col_time, "col_time", true, Option<String>, |_| Some(None)),
         (col_timestamp, "col_timestamp", true, Option<String>, |_| Some(None)),
         (col_timestamptz, "col_timestamptz", true, Option<String>, |_| Some(None)),
         (col_uuid, "col_uuid", true, Option<String>, |_| Some(None)),
-        (col_jsonb, "col_jsonb", true, Option<feldera_sqllib::Variant>, |_| Some(None)),
+        (col_jsonb, "col_jsonb", true, Option<opendera_sqllib::Variant>, |_| Some(None)),
         (col_bytea, "col_bytea", true, Option<String>, |_| Some(None)),
         (col_numeric, "col_numeric", true, Option<String>, |_| Some(None)),
         (col_smallint, "col_smallint", true, Option<i16>, |_| Some(None)),
         (col_int_array, "col_int_array", true, Option<Vec<Option<i32>>>, |_| Some(None))
     });
 
-    feldera_types::serialize_table_record!(CdcAllTypesStruct[17]{
+    opendera_types::serialize_table_record!(CdcAllTypesStruct[17]{
         id["id"]: i32,
         col_text["col_text"]: Option<String>,
         col_integer["col_integer"]: Option<i32>,
         col_bigint["col_bigint"]: Option<i64>,
         col_boolean["col_boolean"]: Option<bool>,
-        col_real["col_real"]: Option<feldera_sqllib::F32>,
-        col_double["col_double"]: Option<feldera_sqllib::F64>,
+        col_real["col_real"]: Option<opendera_sqllib::F32>,
+        col_double["col_double"]: Option<opendera_sqllib::F64>,
         col_date["col_date"]: Option<String>,
         col_time["col_time"]: Option<String>,
         col_timestamp["col_timestamp"]: Option<String>,
         col_timestamptz["col_timestamptz"]: Option<String>,
         col_uuid["col_uuid"]: Option<String>,
-        col_jsonb["col_jsonb"]: Option<feldera_sqllib::Variant>,
+        col_jsonb["col_jsonb"]: Option<opendera_sqllib::Variant>,
         col_bytea["col_bytea"]: Option<String>,
         col_numeric["col_numeric"]: Option<String>,
         col_smallint["col_smallint"]: Option<i16>,

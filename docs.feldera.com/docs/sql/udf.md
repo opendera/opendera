@@ -108,7 +108,7 @@ Copy the declaration from `stubs.rs` to `udf.rs` and replace its body with the a
 
 ```rust
 /* udf.rs */
-use feldera_sqllib::*;
+use opendera_sqllib::*;
 use base64::prelude::*;
 
 pub fn base64(s: Option<ByteArray>) -> Result<Option<SqlString>, Box<dyn std::error::Error>> {
@@ -116,7 +116,7 @@ pub fn base64(s: Option<ByteArray>) -> Result<Option<SqlString>, Box<dyn std::er
 }
 ```
 
-The `use feldera_sqllib::*` directive imports the definitions of the
+The `use opendera_sqllib::*` directive imports the definitions of the
 Rust types that the compiler uses to implement some of the SQL
 datatypes.  The next section explains what these types are.
 
@@ -162,7 +162,7 @@ FROM
 
 # UDF implementation in Rust.
 udf_rust = """
-use feldera_sqllib::*;
+use opendera_sqllib::*;
 use base64::prelude::*;
 
 pub fn base64(s: Option<ByteArray>) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -215,7 +215,7 @@ FROM
 " > program.sql
 
 echo "
-use feldera_sqllib::*;
+use opendera_sqllib::*;
 use base64::prelude::*;
 
 pub fn base64(s: Option<ByteArray>) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -256,7 +256,7 @@ The following table shows the Rust representation of standard SQL data
 types.  A nullable SQL type is represented by the corresponding rust
 `Option<>` type.  Notice that some of these types are not standard
 Rust types, but are defined in the
-[feldera-sqllib](https://docs.rs/feldera-sqllib/0.27.0/feldera_sqllib/)
+[opendera-sqllib](https://docs.rs/opendera-sqllib/0.27.0/opendera_sqllib/)
 crate, which is part of the Feldera SQL runtime.
 
 | SQL                      | Rust                                    |
@@ -270,21 +270,21 @@ crate, which is part of the Feldera SQL runtime.
 | `SMALLINT UNSIGNED`      | `u16`                                   |
 | `INT UNSIGNED`           | `u32`                                   |
 | `BIGINT UNSIGNED`        | `u64`                                   |
-| `DECIMAL(p, s)`          | `feldera_sqllib::SqlDecimal<P, S>`      |
-| `REAL`                   | `feldera_sqllib::F32`                   |
-| `DOUBLE`                 | `feldera_sqllib::F64`                   |
-| `CHAR`, `CHAR(n)`        | `feldera_sqllib::SqlString`             |
-| `VARCHAR`, `VARCHAR(n)`  | `feldera_sqllib::SqlString`             |
-| `BINARY`, `BINARY(n)`, `VARBINARY`, `VARBINARY(n)` | `feldera_sqllib::ByteArray`           |
+| `DECIMAL(p, s)`          | `opendera_sqllib::SqlDecimal<P, S>`      |
+| `REAL`                   | `opendera_sqllib::F32`                   |
+| `DOUBLE`                 | `opendera_sqllib::F64`                   |
+| `CHAR`, `CHAR(n)`        | `opendera_sqllib::SqlString`             |
+| `VARCHAR`, `VARCHAR(n)`  | `opendera_sqllib::SqlString`             |
+| `BINARY`, `BINARY(n)`, `VARBINARY`, `VARBINARY(n)` | `opendera_sqllib::ByteArray`           |
 | `NULL`                   | `()`                                    |
-| `INTERVAL`               | `feldera_sqllib::ShortInterval`, `feldera_sqllib::LongInterval` |
-| `TIME`                   | `feldera_sqllib::Time`                  |
-| `TIMESTAMP`              | `feldera_sqllib::Timestamp`             |
-| `DATE`                   | `feldera_sqllib::Date`                  |
-| `T ARRAY`                | `feldera_sqllib::Array<T>`              |
-| `MAP<K, V>`              | `feldera_sqllib::Map<K, V>`             |
-| `UUID`                   | `feldera_sqllib::Uuid`                  |
-| `VARIANT`                | `feldera_sqllib::Variant`               |
+| `INTERVAL`               | `opendera_sqllib::ShortInterval`, `opendera_sqllib::LongInterval` |
+| `TIME`                   | `opendera_sqllib::Time`                  |
+| `TIMESTAMP`              | `opendera_sqllib::Timestamp`             |
+| `DATE`                   | `opendera_sqllib::Date`                  |
+| `T ARRAY`                | `opendera_sqllib::Array<T>`              |
+| `MAP<K, V>`              | `opendera_sqllib::Map<K, V>`             |
+| `UUID`                   | `opendera_sqllib::Uuid`                  |
+| `VARIANT`                | `opendera_sqllib::Variant`               |
 | `ROW`                    | `Tup`N                                  |
 | User-defined struct type | `Tup`N                                  |
 
@@ -321,7 +321,7 @@ And here is a possible implementation of the used-defined functions
 
 ```rust
 use crate::{Tup1, Tup2};
-use feldera_sqllib::*;
+use opendera_sqllib::*;
 pub fn f(x: Option<Tup1<Option<i32>>>) ->
    Result<Option<Tup1<Option<i32>>>, Box<dyn std::error::Error>> {
    match x {
@@ -352,13 +352,13 @@ bounds, arithmetic overflows, etc.
 While many useful UDFs can be implemented with just a few lines of Rust,
 some may require more complex code that is easier to develop
 using a full-featured Rust IDE.  To support the development of such
-UDFs, we made the `feldera-sqllib` crate available on
-[crates.io](https://crates.io/crates/feldera-sqllib).
+UDFs, we made the `opendera-sqllib` crate available on
+[crates.io](https://crates.io/crates/opendera-sqllib).
 In order to implement a complex Rust UDF (or a library of UDFs) using
 a Rust IDE:
 
 * Create a new Rust crate to serve as the container for your UDFs.
-* Add `feldera-sqllib` as a dependency to `udf.toml` (use the crate
+* Add `opendera-sqllib` as a dependency to `udf.toml` (use the crate
   version that matches the version of Feldera you are working with).
 * Implement and test your UDFs within this crate.
 * Copy the final Rust code and dependencies to the Feldera Web Console.
@@ -506,7 +506,7 @@ The user would add the following implementation to the `udf.rs` file:
 
 ```rust
 use i256::I256;
-use feldera_sqllib::*;
+use opendera_sqllib::*;
 use crate::{AddAssignByRef, AddByRef, HasZero, MulByRef, SizeOf, Tup3};
 use derive_more::Add;
 use num_traits::Zero;
@@ -679,9 +679,9 @@ Preprocessors are useful for:
 
 To add a custom preprocessor, implement three Rust traits:
 
-- `feldera_adapterlib::preprocess::Preprocessor`
-- `feldera_adapterlib::preprocess::PreprocessorFactory`,
-- `feldera_adapterlib::format::Splitter`.
+- `opendera_adapterlib::preprocess::Preprocessor`
+- `opendera_adapterlib::preprocess::PreprocessorFactory`,
+- `opendera_adapterlib::format::Splitter`.
 
 Preprocessors can only be used with certain classes of input
 connectors, which accept raw data as byte arrays and perform their own parsing.
@@ -797,7 +797,7 @@ trait implementations in the udf.rs file:
 - `ExamplePreprocessor` that implements the `Preprocessor` trait
 - `ExamplePreprocessorFactory` that implements the `PreprocessorFactory` trait
 
-You will need to add `feldera-adapterlib` to the `udf.toml` file.
+You will need to add `opendera-adapterlib` to the `udf.toml` file.
 
 ### Example: logging preprocessor
 
@@ -809,11 +809,11 @@ This is the content of the `udf.rs` file:
 ```rust
 use tracing::info;
 use std::sync::{Arc, Mutex};
-use feldera_adapterlib::format::{ParseError, Splitter};
-use feldera_adapterlib::preprocess::{
+use opendera_adapterlib::format::{ParseError, Splitter};
+use opendera_adapterlib::preprocess::{
     Preprocessor, PreprocessorCreateError, PreprocessorFactory,
 };
-use feldera_types::preprocess::PreprocessorConfig;
+use opendera_types::preprocess::PreprocessorConfig;
 
 pub struct LoggerPreprocessor {
    count: Arc<Mutex<u64>>,

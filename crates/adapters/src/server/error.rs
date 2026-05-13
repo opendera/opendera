@@ -19,7 +19,7 @@
 //!
 //!      * [`dbsp::Error`], which indicates invalid pipeline or endpoint
 //!        configuration.
-//!      * [`ConfigError`](feldera_adapterlib::errors::controller::ConfigError)
+//!      * [`ConfigError`](opendera_adapterlib::errors::controller::ConfigError)
 //!      * [`ControllerError::InputTransportError`]<br>
 //!        [`ControllerError::OutputTransportError`]<br>
 //!        [`ControllerError::ParseError`]<br>
@@ -47,7 +47,7 @@ use anyhow::Error as AnyError;
 use arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
 use dbsp::DetailedError;
-use feldera_types::runtime_status::RuntimeDesiredStatus;
+use opendera_types::runtime_status::RuntimeDesiredStatus;
 use parquet::errors::ParquetError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};

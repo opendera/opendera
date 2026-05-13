@@ -7,10 +7,10 @@ use crate::{
 };
 use anyhow::Result as AnyResult;
 use dbsp::{DBData, DBSPHandle, OrdZSet, Runtime};
-use feldera_adapterlib::format::InputBuffer;
-use feldera_sqllib::Variant;
-use feldera_types::secret_resolver::default_secrets_directory;
-use feldera_types::serde_with_context::{
+use opendera_adapterlib::format::InputBuffer;
+use opendera_sqllib::Variant;
+use opendera_types::secret_resolver::default_secrets_directory;
+use opendera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
 };
 use serde_json::json;
@@ -63,14 +63,14 @@ pub use data::{
 };
 use dbsp::circuit::{CircuitConfig, NodeId};
 use dbsp::utils::Tup2;
-use feldera_types::format::json::{JsonFlavor, JsonLines, JsonParserConfig, JsonUpdateFormat};
-use feldera_types::program_schema::{Field, Relation, SqlIdentifier};
 pub use mock_dezset::{
     MockDeZSet, MockUpdate, wait_for_output_count, wait_for_output_ordered,
     wait_for_output_unordered,
 };
 pub use mock_input_consumer::{MockInputConsumer, MockInputParser};
 pub use mock_output_consumer::MockOutputConsumer;
+use opendera_types::format::json::{JsonFlavor, JsonLines, JsonParserConfig, JsonUpdateFormat};
+use opendera_types::program_schema::{Field, Relation, SqlIdentifier};
 
 pub static DEFAULT_TIMEOUT_MS: u128 = 600_000;
 

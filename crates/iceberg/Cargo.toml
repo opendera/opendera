@@ -1,5 +1,5 @@
 [package]
-name = "feldera-iceberg"
+name = "opendera-iceberg"
 edition = { workspace = true }
 version = { workspace = true }
 homepage = { workspace = true }
@@ -11,8 +11,8 @@ readme = { workspace = true }
 publish = false
 
 [dependencies]
-feldera-types = { workspace = true }
-feldera-adapterlib = { workspace = true }
+opendera-types = { workspace = true }
+opendera-adapterlib = { workspace = true }
 dbsp = { workspace = true }
 anyhow = { workspace = true, features = ["backtrace"] }
 tokio = { workspace = true, features = ["sync", "rt"] }

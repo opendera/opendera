@@ -6,7 +6,7 @@ use datafusion::logical_expr::sqlparser::parser::ParserError;
 use datafusion::prelude::{SQLOptions, SessionContext};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
-use feldera_types::program_schema::{ColumnType, Field, Relation, SqlType};
+use opendera_types::program_schema::{ColumnType, Field, Relation, SqlType};
 
 /// Execute a SQL query and collect all results in a vector of `RecordBatch`'s.
 pub async fn execute_query_collect(

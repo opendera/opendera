@@ -21,7 +21,7 @@ use crate::{
     dynamic::DataTrait,
     trace::{Batch, BatchReader, Filter, Spine, SpineSnapshot, Trace},
 };
-use feldera_storage::{FileCommitter, StoragePath};
+use opendera_storage::{FileCommitter, StoragePath};
 use ouroboros::self_referencing;
 use size_of::SizeOf;
 use std::sync::Arc;

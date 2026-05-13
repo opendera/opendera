@@ -13,11 +13,11 @@ use crate::runner::error::RunnerError;
 use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
 use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use async_trait::async_trait;
-use feldera_observability::ReqwestTracingExt;
-use feldera_types::config::{
+use opendera_observability::ReqwestTracingExt;
+use opendera_types::config::{
     PipelineConfig, PipelineConfigProgramInfo, StorageCacheConfig, StorageConfig,
 };
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
+use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
 use reqwest::StatusCode;
 use serde_json::json;
 use std::io::ErrorKind;

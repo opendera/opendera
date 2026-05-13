@@ -7,9 +7,9 @@ use crate::test::{DEFAULT_TIMEOUT_MS, MockDeZSet, MockUpdate, TestStruct, wait};
 use anyhow::{Result as AnyResult, anyhow, bail};
 use csv::WriterBuilder as CsvWriterBuilder;
 use dbsp::circuit::NodeId;
-use feldera_types::program_schema::Relation;
-use feldera_types::transport::kafka::default_redpanda_server;
 use futures::executor::block_on;
+use opendera_types::program_schema::Relation;
+use opendera_types::transport::kafka::default_redpanda_server;
 use rdkafka::message::{BorrowedMessage, Header, OwnedHeaders};
 use rdkafka::{
     ClientConfig, ClientContext, Message,

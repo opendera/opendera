@@ -1,4 +1,4 @@
-use feldera_types::config::StorageConfig;
+use opendera_types::config::StorageConfig;
 
 use crate::{
     CmpFunc, DBData, OrdZSet, OutputHandle, RootCircuit, Runtime, Stream, ZSetHandle, ZWeight,

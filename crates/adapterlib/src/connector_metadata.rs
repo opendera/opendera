@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use feldera_sqllib::{SqlString, Variant};
+use opendera_sqllib::{SqlString, Variant};
 
 /// Connector metadata attached to each input record.
 ///

@@ -6,8 +6,8 @@ use crate::{
 };
 use crossbeam::channel::Receiver;
 use dbsp::DBData;
-use feldera_sqllib::{ByteArray, F32, F64, Variant};
-use feldera_types::{
+use opendera_sqllib::{ByteArray, F32, F64, Variant};
+use opendera_types::{
     program_schema::Field,
     serde_with_context::{DeserializeWithContext, SerializeWithContext, SqlSerdeConfig},
 };
@@ -169,10 +169,10 @@ fn data(n_records: usize) -> Vec<IcebergTestStruct> {
             l: i as i64,
             r: F32::from(i as f32),
             d: F64::from(i as f64),
-            dec: feldera_sqllib::SqlDecimal::<10, 3>::new(i as i128, 2).unwrap(),
-            dt: feldera_sqllib::Date::from_date(time.date()),
-            tm: feldera_sqllib::Time::from_time(time.time()),
-            ts: feldera_sqllib::Timestamp::from_naiveDateTime(time),
+            dec: opendera_sqllib::SqlDecimal::<10, 3>::new(i as i128, 2).unwrap(),
+            dt: opendera_sqllib::Date::from_date(time.date()),
+            tm: opendera_sqllib::Time::from_time(time.time()),
+            ts: opendera_sqllib::Timestamp::from_naiveDateTime(time),
             s: format!("s{i}"),
             // uuid: ByteArray::new([0u8; 16].as_slice()),
             fixed: ByteArray::new([0u8; 5].as_slice()),

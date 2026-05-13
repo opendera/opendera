@@ -125,17 +125,21 @@ impl ActivityBus {
 
     /// Internal helper for callers that want to construct an event
     /// with a non-`Utc::now()` timestamp (replay, deterministic tests).
-    pub fn emit_with_ts(
-        &self,
-        kind: &str,
-        pipeline_id: Uuid,
-        ts: DateTime<Utc>,
-    ) {
+    pub fn emit_with_ts(&self, kind: &str, pipeline_id: Uuid, ts: DateTime<Utc>) {
         let pid = pipeline_id.to_string();
         let event = match kind {
-            "ingested" => ActivityEvent::Ingested { pipeline_id: pid, ts },
-            "queried" => ActivityEvent::Queried { pipeline_id: pid, ts },
-            "woke" => ActivityEvent::Woke { pipeline_id: pid, ts },
+            "ingested" => ActivityEvent::Ingested {
+                pipeline_id: pid,
+                ts,
+            },
+            "queried" => ActivityEvent::Queried {
+                pipeline_id: pid,
+                ts,
+            },
+            "woke" => ActivityEvent::Woke {
+                pipeline_id: pid,
+                ts,
+            },
             _ => return,
         };
         self.emit(event);

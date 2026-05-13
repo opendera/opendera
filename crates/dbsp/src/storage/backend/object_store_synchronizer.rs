@@ -1,6 +1,6 @@
 //! Object-store-backed `CheckpointSynchronizer`.
 //!
-//! Implements `feldera_storage::checkpoint_synchronizer::CheckpointSynchronizer`
+//! Implements `opendera_storage::checkpoint_synchronizer::CheckpointSynchronizer`
 //! by reading and writing checkpoint files through a second
 //! `ObjectStoreBackend` constructed from the pipeline's `SyncConfig`.
 //!
@@ -27,12 +27,12 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
-use feldera_storage::checkpoint_synchronizer::CheckpointSynchronizer;
-use feldera_storage::error::StorageError;
-use feldera_storage::{StorageBackend, StoragePath};
-use feldera_types::checkpoint::{CheckpointMetadata, CheckpointSyncMetrics};
-use feldera_types::config::{ObjectStorageConfig, StartFromCheckpoint, SyncConfig};
-use feldera_types::constants::CHECKPOINT_FILE_NAME;
+use opendera_storage::checkpoint_synchronizer::CheckpointSynchronizer;
+use opendera_storage::error::StorageError;
+use opendera_storage::{StorageBackend, StoragePath};
+use opendera_types::checkpoint::{CheckpointMetadata, CheckpointSyncMetrics};
+use opendera_types::config::{ObjectStorageConfig, StartFromCheckpoint, SyncConfig};
+use opendera_types::constants::CHECKPOINT_FILE_NAME;
 
 use crate::storage::backend::object_store_impl::ObjectStoreBackend;
 
@@ -152,8 +152,7 @@ fn remote_backend(sync: &SyncConfig) -> anyhow::Result<ObjectStoreBackend> {
             // object_store's GCS builder reads. `region` is meaningless
             // on GCS and is dropped silently.
             if let Some(secret) = &sync.secret_key {
-                other_options
-                    .insert("service_account_key".to_string(), secret.clone());
+                other_options.insert("service_account_key".to_string(), secret.clone());
             }
         }
         CloudKind::Azure => {
@@ -169,10 +168,7 @@ fn remote_backend(sync: &SyncConfig) -> anyhow::Result<ObjectStoreBackend> {
         }
     }
 
-    let cfg = ObjectStorageConfig {
-        url,
-        other_options,
-    };
+    let cfg = ObjectStorageConfig { url, other_options };
     ObjectStoreBackend::from_config(&cfg)
         .map_err(|e| anyhow!("failed to construct remote object store: {e}"))
 }
@@ -205,8 +201,7 @@ fn copy_file(
                     attempt = attempt + 1
                 );
                 // Full-jitter backoff: random in [0, backoff].
-                let jitter_ns =
-                    rand::random::<u64>() % (backoff.as_nanos() as u64).max(1);
+                let jitter_ns = rand::random::<u64>() % (backoff.as_nanos() as u64).max(1);
                 sleep(Duration::from_nanos(jitter_ns));
                 backoff = backoff.saturating_mul(2);
                 last_err = Some(err);
@@ -237,7 +232,10 @@ fn copy_file_once(
 }
 
 /// List every file in `src` under `prefix`. Returns relative paths.
-fn list_files(src: &Arc<dyn StorageBackend>, prefix: &StoragePath) -> anyhow::Result<Vec<StoragePath>> {
+fn list_files(
+    src: &Arc<dyn StorageBackend>,
+    prefix: &StoragePath,
+) -> anyhow::Result<Vec<StoragePath>> {
     let mut out = Vec::new();
     src.list(prefix, &mut |path, _| out.push(path.clone()))?;
     Ok(out)
@@ -259,7 +257,7 @@ fn metrics(start: Instant, bytes: u64) -> CheckpointSyncMetrics {
 
 /// Object-store-backed checkpoint synchronizer. Singleton: registered via
 /// `inventory::submit!` and resolved through the `SYNCHRONIZER` static in
-/// `feldera_storage::checkpoint_synchronizer`.
+/// `opendera_storage::checkpoint_synchronizer`.
 pub struct ObjectStoreSynchronizer;
 
 impl CheckpointSynchronizer for ObjectStoreSynchronizer {
@@ -315,10 +313,12 @@ impl CheckpointSynchronizer for ObjectStoreSynchronizer {
             .as_ref()
             .ok_or_else(|| anyhow!("pull called without start_from_checkpoint"))?
         {
-            StartFromCheckpoint::Latest => checkpoints
-                .last()
-                .ok_or_else(|| anyhow!("remote manifest has no checkpoints"))?
-                .uuid,
+            StartFromCheckpoint::Latest => {
+                checkpoints
+                    .last()
+                    .ok_or_else(|| anyhow!("remote manifest has no checkpoints"))?
+                    .uuid
+            }
             StartFromCheckpoint::Uuid(u) => *u,
         };
         let target_meta = checkpoints
@@ -345,17 +345,20 @@ inventory::submit! {
 mod tests {
     use super::*;
     use crate::storage::backend::object_store_impl::ObjectStoreBackend;
-    use feldera_storage::fbuf::FBuf;
-    use feldera_types::checkpoint::CheckpointMetadata;
     use object_store::ObjectStore;
     use object_store::path::Path as ObjPath;
+    use opendera_storage::fbuf::FBuf;
+    use opendera_types::checkpoint::CheckpointMetadata;
     use std::sync::Arc;
 
     /// Build an `ObjectStoreBackend` backed by an in-memory store so we
     /// can exercise the synchronizer without touching S3.
     fn in_memory_backend(prefix: &str) -> Arc<dyn StorageBackend> {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        Arc::new(ObjectStoreBackend::new_with_store(store, ObjPath::from(prefix)))
+        Arc::new(ObjectStoreBackend::new_with_store(
+            store,
+            ObjPath::from(prefix),
+        ))
     }
 
     fn write_text(backend: &Arc<dyn StorageBackend>, path: &str, body: &[u8]) {
@@ -367,10 +370,7 @@ mod tests {
         writer.complete().expect("complete");
     }
 
-    fn cfg(
-        provider: Option<&str>,
-        endpoint: Option<&str>,
-    ) -> SyncConfig {
+    fn cfg(provider: Option<&str>, endpoint: Option<&str>) -> SyncConfig {
         SyncConfig {
             provider: provider.map(String::from),
             endpoint: endpoint.map(String::from),
@@ -419,10 +419,7 @@ mod tests {
             CloudKind::Gcs
         ));
         assert!(matches!(
-            CloudKind::detect(&cfg(
-                None,
-                Some("https://myaccount.blob.core.windows.net")
-            )),
+            CloudKind::detect(&cfg(None, Some("https://myaccount.blob.core.windows.net"))),
             CloudKind::Azure
         ));
         assert!(matches!(
@@ -524,7 +521,10 @@ mod tests {
         let synchronizer = ObjectStoreSynchronizer;
         let sync_cfg = SyncConfig {
             endpoint,
-            bucket: format!("{bucket}/opendera-sync-it/{}", uuid::Uuid::now_v7().simple()),
+            bucket: format!(
+                "{bucket}/opendera-sync-it/{}",
+                uuid::Uuid::now_v7().simple()
+            ),
             region,
             provider: Some("Minio".to_string()),
             access_key,

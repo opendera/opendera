@@ -167,7 +167,7 @@ pub mod test;
 pub use integrated::{IntegratedOutputEndpoint, create_integrated_output_endpoint};
 
 pub use dbsp::DetailedError;
-pub use feldera_adapterlib::PipelineState;
+pub use opendera_adapterlib::PipelineState;
 
 pub use server::{ErrorResponse, PipelineError, PipelinePhase};
 
@@ -175,7 +175,7 @@ pub use catalog::{
     Catalog, CircuitCatalog, DeCollectionHandle, DeCollectionStream, RecordFormat, SerBatch,
     SerCursor,
 };
-pub use feldera_adapterlib::format::{
+pub use opendera_adapterlib::format::{
     Encoder, InputBuffer, InputFormat, OutputConsumer, OutputFormat, ParseError, Parser,
 };
 

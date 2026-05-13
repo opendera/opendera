@@ -1,6 +1,6 @@
 use std::{borrow::Cow, sync::Arc};
 
-use feldera_storage::{FileCommitter, StoragePath};
+use opendera_storage::{FileCommitter, StoragePath};
 use size_of::SizeOf;
 
 use crate::{

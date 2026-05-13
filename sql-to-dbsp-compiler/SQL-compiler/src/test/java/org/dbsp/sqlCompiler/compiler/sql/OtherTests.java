@@ -436,7 +436,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 #[test]
                 pub fn test() {
                     use dbsp_adapters::{CircuitCatalog, RecordFormat};
-                    use feldera_types::format::csv::CsvParserConfig;
+                    use opendera_types::format::csv::CsvParserConfig;
 
                     let (mut circuit, catalog) = circuit(CircuitConfig::with_workers(2))
                         .expect("Failed to build circuit");
@@ -515,7 +515,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 #[test]
                 pub fn test0() {
                     use dbsp_adapters::{CircuitCatalog, RecordFormat};
-                    use feldera_types::format::json::JsonFlavor;
+                    use opendera_types::format::json::JsonFlavor;
                 
                     let mut circuitAndStreams = circuit(CircuitConfig::with_workers(2usize)).unwrap();
                     let streams: Catalog = circuitAndStreams.1;

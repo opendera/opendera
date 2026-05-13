@@ -9,8 +9,8 @@ use crate::{
     timestamp::{extract_epoch_Date, extract_quarter_Date},
 };
 use dbsp::{algebra::F64, num_entries_scalar};
-use feldera_macros::IsNone;
-use feldera_types::serde_with_context::{
+use opendera_macros::IsNone;
+use opendera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
 };
 use serde::{Deserialize, Serialize, de::Error as _, ser::Error as _};

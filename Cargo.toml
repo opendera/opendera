@@ -18,11 +18,11 @@ members = [
   "crates/adapterlib",
   "crates/adapters",
   "crates/dbsp",
-  "crates/feldera-macros",
-  "crates/feldera-observability",
+  "crates/opendera-macros",
+  "crates/opendera-observability",
   "crates/fda",
   "crates/nexmark",
-  "crates/feldera-types",
+  "crates/opendera-types",
   "crates/pipeline-manager",
   "crates/sqllib",
   "sql-to-dbsp-compiler/lib/readers",
@@ -128,19 +128,19 @@ erased-serde = "0.3.31"
 fake = "2.10"
 fastbloom = "0.14.0"
 fdlimit = "0.3.0"
-feldera-buffer-cache = { version = "0.296.0", path = "crates/buffer-cache" }
-feldera-datagen = { path = "crates/datagen" }
-feldera-fxp = { version = "0.296.0", path = "crates/fxp", features = ["dbsp"] }
-feldera-iceberg = { path = "crates/iceberg" }
-feldera-observability = { version = "0.296.0", path = "crates/feldera-observability" }
-feldera-macros = { version = "0.296.0", path = "crates/feldera-macros" }
-feldera-sqllib = { version = "0.296.0", path = "crates/sqllib" }
-feldera-storage = { version = "0.296.0", path = "crates/storage" }
-feldera-types = { version = "0.296.0", path = "crates/feldera-types" }
-feldera-rest-api = { version = "0.296.0", path = "crates/rest-api" }
-feldera-ir = { version = "0.296.0", path = "crates/ir" }
-feldera-adapterlib = { version = "0.296.0", path = "crates/adapterlib" }
-feldera-samply = { version = "0.296.0", path = "crates/samply" }
+opendera-buffer-cache = { version = "0.296.0", path = "crates/buffer-cache" }
+opendera-datagen = { path = "crates/datagen" }
+opendera-fxp = { version = "0.296.0", path = "crates/fxp", features = ["dbsp"] }
+opendera-iceberg = { path = "crates/iceberg" }
+opendera-observability = { version = "0.296.0", path = "crates/opendera-observability" }
+opendera-macros = { version = "0.296.0", path = "crates/opendera-macros" }
+opendera-sqllib = { version = "0.296.0", path = "crates/sqllib" }
+opendera-storage = { version = "0.296.0", path = "crates/storage" }
+opendera-types = { version = "0.296.0", path = "crates/opendera-types" }
+opendera-rest-api = { version = "0.296.0", path = "crates/rest-api" }
+opendera-ir = { version = "0.296.0", path = "crates/ir" }
+opendera-adapterlib = { version = "0.296.0", path = "crates/adapterlib" }
+opendera-samply = { version = "0.296.0", path = "crates/samply" }
 flate2 = "1.1.0"
 form_urlencoded = "1.2.0"
 futures = "0.3.30"

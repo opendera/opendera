@@ -5,7 +5,7 @@
 use super::{BlockLocation, FileId, FileReader, FileRw, FileWriter, StorageBackend, StorageError};
 use crate::circuit::metrics::FILES_CREATED;
 use crate::storage::buffer_cache::FBuf;
-use feldera_storage::{FileCommitter, StorageFileType, StoragePath};
+use opendera_storage::{FileCommitter, StorageFileType, StoragePath};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{
@@ -284,7 +284,7 @@ impl StorageBackend for MemoryBackend {
 
 #[cfg(test)]
 mod tests {
-    use feldera_storage::StorageBackend;
+    use opendera_storage::StorageBackend;
     use std::{path::Path, sync::Arc};
 
     use crate::storage::backend::{

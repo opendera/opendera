@@ -47,15 +47,15 @@ use chrono::{DateTime, Utc};
 use cpu_time::ProcessTime;
 use crossbeam::sync::Unparker;
 use dbsp::utils::process_rss_bytes;
-use feldera_adapterlib::{
+use opendera_adapterlib::{
     errors::journal::ControllerError,
     format::{BufferSize, ParseError},
     metrics::ConnectorMetrics,
     transport::{InputReader, Resume, Step, Watermark},
 };
-use feldera_samply::Event;
-use feldera_storage::histogram::SlidingHistogram;
-use feldera_types::{
+use opendera_samply::Event;
+use opendera_storage::histogram::SlidingHistogram;
+use opendera_types::{
     adapter_stats::{
         CompletedWatermark, ConnectorError, ConnectorHealth, ExternalInputEndpointMetrics,
         ExternalInputEndpointStatus, ExternalOutputEndpointMetrics, ExternalOutputEndpointStatus,
@@ -153,7 +153,7 @@ impl CompletionToken {
     }
 }
 
-// Keep in sync with feldera_types::ExternalGlobalControllerMetrics
+// Keep in sync with opendera_types::ExternalGlobalControllerMetrics
 #[derive(Default)]
 pub struct GlobalControllerMetrics {
     /// State of the pipeline: running, paused, or terminating.
@@ -435,7 +435,7 @@ type OutputsStatus = RwLock<BTreeMap<EndpointId, OutputEndpointStatus>>;
 
 /// Controller statistics.
 ///
-/// Keep in sync with feldera_types::ExternalControllerStatus
+/// Keep in sync with opendera_types::ExternalControllerStatus
 pub struct ControllerStatus {
     /// Global controller configuration.
     pub pipeline_config: PipelineConfig,
@@ -1207,15 +1207,15 @@ impl ControllerStatus {
         true
     }
 
-    /// Convert from internal `ControllerStatus` to the public API type in `feldera_types`.
+    /// Convert from internal `ControllerStatus` to the public API type in `opendera_types`.
     ///
-    /// This function ensures that the "duplicate" types in `feldera_types::adapter_stats`
+    /// This function ensures that the "duplicate" types in `opendera_types::adapter_stats`
     /// stay correlated with the original types and won't go out of sync.
     pub fn to_api_type(
         &self,
         ctx: ControllerStatusContext,
-    ) -> feldera_types::adapter_stats::ExternalControllerStatus {
-        use feldera_types::adapter_stats;
+    ) -> opendera_types::adapter_stats::ExternalControllerStatus {
+        use opendera_types::adapter_stats;
 
         let total_processed_records = self
             .global_metrics
@@ -1354,7 +1354,7 @@ impl ControllerStatus {
     }
 }
 
-/// Keep in sync with feldera_types::ExternalInputEndpointMetrics
+/// Keep in sync with opendera_types::ExternalInputEndpointMetrics
 pub struct InputEndpointMetrics {
     /// Total bytes pushed to the endpoint since it was created.
     pub total_bytes: AtomicU64,
@@ -1905,7 +1905,7 @@ struct WatermarkListEntry {
 
 /// Input endpoint status information.
 ///
-/// Keep in sync with [feldera_types::adapter_stats::ExternalInputEndpointStatus]
+/// Keep in sync with [opendera_types::adapter_stats::ExternalInputEndpointStatus]
 pub struct InputEndpointStatus {
     pub endpoint_name: String,
 
@@ -1978,7 +1978,7 @@ impl InputEndpointStatus {
     pub fn to_api_type(&self, full: bool) -> ExternalInputEndpointStatus {
         ExternalInputEndpointStatus {
             endpoint_name: self.endpoint_name.clone(),
-            config: feldera_types::adapter_stats::ShortEndpointConfig {
+            config: opendera_types::adapter_stats::ShortEndpointConfig {
                 stream: self.config.stream.clone().into_owned(),
             },
             metrics: self.metrics.to_api_type(),
@@ -2228,7 +2228,7 @@ impl InputEndpointStatus {
     }
 }
 
-// Keep in sync with feldera_types::ExternalOutputEndpointMetrics
+// Keep in sync with opendera_types::ExternalOutputEndpointMetrics
 #[derive(Default)]
 pub struct OutputEndpointMetrics {
     /// Records and bytes sent on the underlying transport (HTTP, Kafka, etc.)
@@ -2476,7 +2476,7 @@ impl ConnectorErrorList {
 }
 
 /// Output endpoint status information.
-/// // Keep in sync with feldera_types::ExternalOutputEndpointStatus
+/// // Keep in sync with opendera_types::ExternalOutputEndpointStatus
 pub struct OutputEndpointStatus {
     pub endpoint_name: String,
 

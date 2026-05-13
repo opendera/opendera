@@ -1,4 +1,4 @@
-use feldera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
+use opendera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
 
 use crate::{BufferCacheBuilder, CacheEntry, ThreadType};
 use std::sync::Arc;

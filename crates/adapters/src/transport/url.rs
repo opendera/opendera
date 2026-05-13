@@ -13,12 +13,12 @@ use awc::error::HeaderValue;
 use awc::{Client, ClientResponse, Connector, http::header::HeaderMap};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use feldera_adapterlib::format::BufferSize;
-use feldera_adapterlib::transport::{InputCommandReceiver, Resume, Watermark};
-use feldera_types::config::FtModel;
-use feldera_types::program_schema::Relation;
-use feldera_types::transport::url::UrlInputConfig;
 use futures::{StreamExt, future::OptionFuture};
+use opendera_adapterlib::format::BufferSize;
+use opendera_adapterlib::transport::{InputCommandReceiver, Resume, Watermark};
+use opendera_types::config::FtModel;
+use opendera_types::program_schema::Relation;
+use opendera_types::transport::url::UrlInputConfig;
 use serde::{Deserialize, Serialize};
 use std::thread;
 use std::{
@@ -489,9 +489,9 @@ mod test {
         web::{self, Bytes},
     };
     use async_stream::stream;
-    use feldera_types::deserialize_without_context;
-    use feldera_types::program_schema::Relation;
     use futures_timer::Delay;
+    use opendera_types::deserialize_without_context;
+    use opendera_types::program_schema::Relation;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::{

@@ -107,10 +107,10 @@ bun run generate-openapi
 If you get an error like this:
 
 ```
-error: failed to run custom build command for `feldera-rest-api v0.252.0 (/__w/feldera/feldera/crates/rest-api)`
+error: failed to run custom build command for `opendera-rest-api v0.252.0 (/__w/feldera/feldera/crates/rest-api)`
 
 Caused by:
-  process didn't exit successfully: `/__w/feldera/feldera/target/debug/build/feldera-rest-api-a075935d8e5b212d/build-script-build` (exit status: 101)
+  process didn't exit successfully: `/__w/feldera/feldera/target/debug/build/opendera-rest-api-a075935d8e5b212d/build-script-build` (exit status: 101)
   --- stdout
   cargo:rerun-if-changed=../../openapi.json
 

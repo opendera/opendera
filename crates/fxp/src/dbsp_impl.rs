@@ -1,7 +1,7 @@
 use dbsp::NumEntries;
 use dbsp::algebra::{HasOne, HasZero, MulByRef, OptionWeightType};
 use dbsp::utils::{IsNone, SupportsRoaring};
-use feldera_types::serde_with_context::{
+use opendera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, serde_config::DecimalFormat,
 };
 use serde::{Deserializer, Serialize, Serializer};

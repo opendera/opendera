@@ -14,5 +14,5 @@ dbsp = { path = "../../../crates/dbsp" }
 size-of = { version = "0.1.5", package = "feldera-size-of" }
 async-std = { workspace = true, features = ["attributes"] }
 rkyv = { workspace = true, features = ["size_64"] }
-feldera-sqllib = { workspace = true }
-feldera-macros = { workspace = true }
+opendera-sqllib = { workspace = true }
+opendera-macros = { workspace = true }

@@ -1,10 +1,10 @@
 use anyhow::{Error as AnyError, Result as AnyResult};
 use chrono::{DateTime, Utc};
 use dyn_clone::DynClone;
-use feldera_types::adapter_stats::ConnectorHealth;
-use feldera_types::config::FtModel;
-use feldera_types::coordination::Completion;
-use feldera_types::program_schema::Relation;
+use opendera_types::adapter_stats::ConnectorHealth;
+use opendera_types::config::FtModel;
+use opendera_types::coordination::Completion;
+use opendera_types::program_schema::Relation;
 use rmpv::{Value as RmpValue, ext::Error as RmpDecodeError};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;

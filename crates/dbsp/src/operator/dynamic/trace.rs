@@ -21,7 +21,7 @@ use crate::{
     trace::{Batch, BatchReader, Filter, Spine, SpineSnapshot, Trace},
 };
 use dyn_clone::clone_box;
-use feldera_storage::{FileCommitter, StoragePath};
+use opendera_storage::{FileCommitter, StoragePath};
 use ouroboros::self_referencing;
 use size_of::SizeOf;
 use std::any::TypeId;

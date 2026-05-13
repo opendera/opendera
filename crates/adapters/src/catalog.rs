@@ -1,11 +1,11 @@
-use feldera_adapterlib::{errors::controller::ControllerError, preprocess::PreprocessorRegistry};
-use feldera_types::program_schema::SqlIdentifier;
+use opendera_adapterlib::{errors::controller::ControllerError, preprocess::PreprocessorRegistry};
+use opendera_types::program_schema::SqlIdentifier;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
-pub use feldera_adapterlib::catalog::*;
+pub use opendera_adapterlib::catalog::*;
 
 /// Circuit catalog implementation.
 pub struct Catalog {

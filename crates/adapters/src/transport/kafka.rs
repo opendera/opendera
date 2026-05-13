@@ -1,7 +1,7 @@
 use anyhow::{Error as AnyError, Result as AnyResult, anyhow, bail};
 use aws_msk_iam_sasl_signer::generate_auth_token;
 use dbsp::circuit::tokio::TOKIO;
-use feldera_types::transport::kafka::{KafkaHeader, KafkaLogLevel};
+use opendera_types::transport::kafka::{KafkaHeader, KafkaLogLevel};
 use parquet::data_type::AsBytes;
 use rdkafka::Statistics;
 use rdkafka::client::OAuthToken;

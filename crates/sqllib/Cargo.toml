@@ -1,5 +1,5 @@
 [package]
-name = "feldera-sqllib"
+name = "opendera-sqllib"
 description = "SQL runtime library for Feldera"
 keywords = ["DBSP", "streaming", "analytics", "database", "sql"]
 categories = ["database", "api-bindings", "network-programming"]
@@ -23,9 +23,9 @@ blake3 = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 dbsp = { workspace = true }
-feldera-types = { workspace = true }
+opendera-types = { workspace = true }
 flate2 = { workspace = true }
-feldera-fxp = { workspace = true }
+opendera-fxp = { workspace = true }
 geo = { workspace = true }
 hex = { workspace = true }
 itertools = { workspace = true }
@@ -50,7 +50,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 typedmap = { workspace = true }
 uuid = { workspace = true, features = ["v4", "std"] }
-feldera-macros = { workspace = true }
+opendera-macros = { workspace = true }
 xxhash-rust = { workspace = true, features = ["xxh64"] }
 
 [dev-dependencies]

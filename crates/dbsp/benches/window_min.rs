@@ -8,7 +8,7 @@ use dbsp::circuit::CircuitConfig;
 use dbsp::operator::Min;
 use dbsp::utils::Tup2;
 use dbsp::{Runtime, TypedBox, ZWeight};
-use feldera_types::config::DevTweaks;
+use opendera_types::config::DevTweaks;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::time::{Duration, Instant};

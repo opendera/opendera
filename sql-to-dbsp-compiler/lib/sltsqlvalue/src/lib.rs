@@ -7,7 +7,7 @@
 #![allow(non_snake_case)]
 
 use dbsp::algebra::{F32, F64};
-use feldera_sqllib::{DynamicDecimal, SqlDecimal, SqlString};
+use opendera_sqllib::{DynamicDecimal, SqlDecimal, SqlString};
 use std::fmt;
 
 #[derive(Clone)]

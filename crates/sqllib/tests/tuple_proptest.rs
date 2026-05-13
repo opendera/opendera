@@ -12,21 +12,21 @@ use dbsp::storage::file::{
     format::BatchMetadata,
     writer::{Parameters, Writer1},
 };
-use feldera_sqllib::{
+use opendera_sqllib::{
     Array, ByteArray, Date, GeoPoint, LongInterval, Map, ShortInterval, SqlDecimal, SqlString,
     Time, Timestamp, Uuid, Variant, to_array, to_map,
 };
 use proptest::prelude::*;
 
 use dbsp::utils::{Tup0, Tup1, Tup2, Tup3, Tup4, Tup5, Tup6, Tup7, Tup8, Tup9, Tup10};
-feldera_macros::declare_tuple! { Tup11<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> }
-feldera_macros::declare_tuple! { Tup12<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> }
-feldera_macros::declare_tuple! { Tup13<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> }
-feldera_macros::declare_tuple! { Tup14<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> }
-feldera_macros::declare_tuple! { Tup15<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> }
-feldera_macros::declare_tuple! { Tup16<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> }
-feldera_macros::declare_tuple! { Tup17<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17> }
-feldera_macros::declare_tuple! { Tup65<
+opendera_macros::declare_tuple! { Tup11<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> }
+opendera_macros::declare_tuple! { Tup12<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> }
+opendera_macros::declare_tuple! { Tup13<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> }
+opendera_macros::declare_tuple! { Tup14<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> }
+opendera_macros::declare_tuple! { Tup15<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> }
+opendera_macros::declare_tuple! { Tup16<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> }
+opendera_macros::declare_tuple! { Tup17<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16, T17> }
+opendera_macros::declare_tuple! { Tup65<
     T1, T2, T3, T4, T5, T6, T7, T8, T9, T10,
     T11, T12, T13, T14, T15, T16, T17, T18, T19, T20,
     T21, T22, T23, T24, T25, T26, T27, T28, T29, T30,

@@ -46,14 +46,14 @@ use async_nats::{
 use chrono::Utc;
 use config_utils::{translate_connect_options, translate_consumer_options};
 use dbsp::circuit::tokio::TOKIO;
-use feldera_adapterlib::format::BufferSize;
-use feldera_adapterlib::transport::{InputCommandReceiver, Resume, Watermark};
-use feldera_types::{
+use futures::StreamExt;
+use opendera_adapterlib::format::BufferSize;
+use opendera_adapterlib::transport::{InputCommandReceiver, Resume, Watermark};
+use opendera_types::{
     config::FtModel,
     program_schema::Relation,
     transport::nats::{self as cfg, NatsInputConfig},
 };
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::cmp;

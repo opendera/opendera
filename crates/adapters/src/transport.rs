@@ -25,8 +25,8 @@ use std::path::Path;
 use adhoc::AdHocInputEndpoint;
 use anyhow::Result as AnyResult;
 use clock::ClockEndpoint;
-use feldera_types::secret_resolver::resolve_secret_references_via_json;
 use http::HttpInputEndpoint;
+use opendera_types::secret_resolver::resolve_secret_references_via_json;
 #[cfg(feature = "with-pubsub")]
 use pubsub::PubSubInputEndpoint;
 
@@ -54,7 +54,7 @@ mod pubsub;
 #[cfg(feature = "with-redis")]
 mod redis;
 
-use feldera_types::config::TransportConfig;
+use opendera_types::config::TransportConfig;
 
 #[cfg(feature = "with-redis")]
 use redis::output::RedisOutputEndpoint;
@@ -72,9 +72,9 @@ use crate::transport::nats::NatsInputEndpoint;
 use crate::transport::nexmark::NexmarkEndpoint;
 use crate::transport::s3::S3InputEndpoint;
 use crate::transport::url::UrlInputEndpoint;
-use feldera_datagen::GeneratorEndpoint;
+use opendera_datagen::GeneratorEndpoint;
 
-pub use feldera_adapterlib::transport::*;
+pub use opendera_adapterlib::transport::*;
 
 /// Creates an input transport endpoint instance using an input transport
 /// configuration, resolving secrets by reading `secrets_dir`.

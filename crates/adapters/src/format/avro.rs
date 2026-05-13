@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use apache_avro::{Schema as AvroSchema, schema::Name as AvroName};
-use feldera_adapterlib::catalog::AvroSchemaRefs;
-use feldera_types::format::avro::AvroSchemaRegistryConfig;
+use opendera_adapterlib::catalog::AvroSchemaRefs;
+use opendera_types::format::avro::AvroSchemaRegistryConfig;
 use schema_registry_converter::blocking::schema_registry::SrSettings;
 
 pub mod deserializer;

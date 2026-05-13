@@ -22,12 +22,12 @@ use deltalake::logstore::ObjectStoreRef;
 use deltalake::operations::create::CreateBuilder;
 use deltalake::operations::write::writer::{DeltaWriter, WriterConfig};
 use deltalake::protocol::{DeltaOperation, SaveMode};
-use feldera_types::serde_with_context::serde_config::{
+use opendera_types::serde_with_context::serde_config::{
     BinaryFormat, DecimalFormat, UuidFormat, VariantFormat,
 };
-use feldera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimeFormat, TimestampFormat};
-use feldera_types::transport::delta_table::DeltaTableWriteMode;
-use feldera_types::{
+use opendera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimeFormat, TimestampFormat};
+use opendera_types::transport::delta_table::DeltaTableWriteMode;
+use opendera_types::{
     adapter_stats::ConnectorHealth, program_schema::Relation,
     transport::delta_table::DeltaTableWriterConfig,
 };
@@ -957,12 +957,12 @@ mod parallel {
 
     use dbsp::utils::Tup2;
     use dbsp::{OrdIndexedZSet, OrdZSet};
-    use feldera_sqllib::{
+    use opendera_sqllib::{
         ByteArray, Date, F32, F64, SqlDecimal, SqlString, Timestamp, Uuid, Variant,
     };
-    use feldera_types::deserialize_table_record;
-    use feldera_types::program_schema::{ColumnType, Relation, SqlIdentifier};
-    use feldera_types::transport::delta_table::{DeltaTableWriteMode, DeltaTableWriterConfig};
+    use opendera_types::deserialize_table_record;
+    use opendera_types::program_schema::{ColumnType, Relation, SqlIdentifier};
+    use opendera_types::transport::delta_table::{DeltaTableWriteMode, DeltaTableWriterConfig};
     use tempfile::TempDir;
 
     use crate::catalog::SerBatch;
@@ -1060,7 +1060,7 @@ mod parallel {
     fn key_relation() -> Relation {
         Relation {
             name: SqlIdentifier::new("test_idx", false),
-            fields: vec![feldera_types::program_schema::Field::new(
+            fields: vec![opendera_types::program_schema::Field::new(
                 "bigint".into(),
                 ColumnType::bigint(false),
             )],

@@ -83,7 +83,7 @@
   https://www.feldera.com/blog/nexmark-vs-flink
 
 * Meet the Feldera storage engine
-  https://www.feldera.com/blog/feldera-storage
+  https://www.feldera.com/blog/opendera-storage
 
 * Rolling Aggregates: the Most Important Feature in Your Real-Time Fraud Detection Pipeline
   https://www.feldera.com/blog/rolling-aggregates

@@ -1,8 +1,8 @@
 use crate::db::error::DBError;
 use crate::db::types::program::{ProgramConfig, ProgramInfo};
 use crate::pipeline_env::validate_pipeline_env;
-use feldera_types::config::{PipelineConfig, RuntimeConfig};
-use feldera_types::runtime_status::StorageStatusDetails;
+use opendera_types::config::{PipelineConfig, RuntimeConfig};
+use opendera_types::runtime_status::StorageStatusDetails;
 use regex::Regex;
 use serde::Serialize;
 use thiserror::Error as ThisError;
@@ -164,8 +164,8 @@ mod tests {
     };
     use crate::db::error::DBError;
     use crate::db::types::program::{CompilationProfile, ProgramConfig, ProgramInfo};
-    use feldera_types::config::{PipelineConfig, RuntimeConfig};
-    use feldera_types::program_schema::ProgramSchema;
+    use opendera_types::config::{PipelineConfig, RuntimeConfig};
+    use opendera_types::program_schema::ProgramSchema;
     use serde_json::json;
 
     #[test]

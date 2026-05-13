@@ -5,7 +5,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use dbsp_adapters::Encoder;
 use dbsp_adapters::SerBatch;
 use dbsp_adapters::integrated::PostgresOutputEndpoint;
-use feldera_types::transport::postgres::{
+use opendera_types::transport::postgres::{
     PostgresTlsConfig, PostgresWriteMode, PostgresWriterConfig,
 };
 use postgres::NoTls;

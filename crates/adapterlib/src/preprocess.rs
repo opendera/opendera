@@ -10,7 +10,7 @@
 //! ```
 
 use crate::format::{ParseError, Splitter};
-use feldera_types::preprocess::PreprocessorConfig;
+use opendera_types::preprocess::PreprocessorConfig;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::sync::Arc;

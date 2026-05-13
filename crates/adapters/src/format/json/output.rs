@@ -9,9 +9,9 @@ use crate::{
 use actix_web::HttpRequest;
 use anyhow::{Result as AnyResult, bail};
 use erased_serde::Serialize as ErasedSerialize;
-use feldera_types::config::{ConnectorConfig, TransportConfig};
-use feldera_types::format::json::{JsonEncoderConfig, JsonFlavor, JsonUpdateFormat};
-use feldera_types::program_schema::{Relation, canonical_identifier};
+use opendera_types::config::{ConnectorConfig, TransportConfig};
+use opendera_types::format::json::{JsonEncoderConfig, JsonFlavor, JsonUpdateFormat};
+use opendera_types::program_schema::{Relation, canonical_identifier};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::Deserialize;
 use serde_json::json;
@@ -519,8 +519,8 @@ mod test {
     };
     use dbsp::typed_batch::IndexedZSetReader;
     use dbsp::{OrdZSet, utils::Tup2};
-    use feldera_types::format::json::JsonUpdateFormat;
-    use feldera_types::program_schema::Relation;
+    use opendera_types::format::json::JsonUpdateFormat;
+    use opendera_types::program_schema::Relation;
     use proptest::prelude::*;
     use serde::{Deserialize, Serialize};
     use serde_json::json;

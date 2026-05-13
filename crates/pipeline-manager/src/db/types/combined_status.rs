@@ -1,6 +1,6 @@
 use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
 use chrono::{DateTime, Utc};
-use feldera_types::runtime_status::{RuntimeDesiredStatus, RuntimeStatus};
+use opendera_types::runtime_status::{RuntimeDesiredStatus, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 use utoipa::ToSchema;

@@ -139,7 +139,7 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
                 typed_batch::SpineSnapshot,
             };
             use dbsp_adapters::{Catalog, CircuitCatalog};
-            use feldera_types::{
+            use opendera_types::{
                 program_schema::SqlIdentifier,
                 deserialize_table_record, serialize_table_record,
             };
@@ -155,7 +155,7 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
                 sync::Arc,
             };
             use core::cmp::Ordering;
-            use feldera_sqllib::*;
+            use opendera_sqllib::*;
             use std::sync::OnceLock;
             use arcstr::ArcStr;
             """ +

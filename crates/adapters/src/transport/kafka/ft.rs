@@ -9,7 +9,7 @@ mod input;
 mod output;
 
 use anyhow::{Context, Result as AnyResult, bail};
-use feldera_types::transport::kafka::{KafkaLogLevel, default_redpanda_server};
+use opendera_types::transport::kafka::{KafkaLogLevel, default_redpanda_server};
 use rdkafka::{
     ClientConfig, ClientContext, Offset, TopicPartitionList,
     client::Client as KafkaClient,

@@ -1,5 +1,5 @@
 use chrono::{SecondsFormat, Utc};
-use feldera_observability::json_logging::use_json_log_format;
+use opendera_observability::json_logging::use_json_log_format;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::time::Duration;

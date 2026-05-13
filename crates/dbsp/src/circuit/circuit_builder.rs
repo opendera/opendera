@@ -55,9 +55,9 @@ use crate::{
 };
 use anyhow::Error as AnyError;
 use dyn_clone::{DynClone, clone_box};
-use feldera_ir::{LirCircuit, LirNodeId};
-use feldera_samply::Span;
-use feldera_storage::{FileCommitter, StoragePath};
+use opendera_ir::{LirCircuit, LirNodeId};
+use opendera_samply::Span;
+use opendera_storage::{FileCommitter, StoragePath};
 use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
 use std::{

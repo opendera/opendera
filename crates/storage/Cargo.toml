@@ -1,5 +1,5 @@
 [package]
-name = "feldera-storage"
+name = "opendera-storage"
 description = "Storage crate for feldera"
 readme = "README.md"
 
@@ -14,7 +14,7 @@ rust-version = { workspace = true }
 [dependencies]
 anyhow = { workspace = true }
 crossbeam = { workspace = true }
-feldera-types = { workspace = true }
+opendera-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 libc = { workspace = true }
 rkyv = { workspace = true, features = ["std", "size_64", "validation", "uuid"] }
