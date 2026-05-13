@@ -94,5 +94,8 @@ playwright/.cache/
 
 .vite/
 
+# Build staging dir created by pipeline-manager build (real source is js-packages/web-console)
+/web-console/
+
 # Claude Code
 /.claude/settings.local.json
