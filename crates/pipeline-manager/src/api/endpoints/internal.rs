@@ -251,7 +251,7 @@ pub async fn put_tenant_billing(
 /// Stringify a `RuntimeStatus` for the cloud-side controller. Kept
 /// inline rather than relying on `Display` so the wire format is
 /// stable independent of any future `Display` change.
-fn runtime_status_to_str(s: RuntimeStatus) -> String {
+pub fn runtime_status_to_str(s: RuntimeStatus) -> String {
     match s {
         RuntimeStatus::Unavailable => "Unavailable",
         RuntimeStatus::Coordination => "Coordination",

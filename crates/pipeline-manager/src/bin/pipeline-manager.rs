@@ -4,6 +4,7 @@ use clap::{Args, Command, FromArgMatches};
 
 use colored::Colorize;
 use feldera_observability as observability;
+use pipeline_manager::api::activity_bus::ActivityBus;
 use pipeline_manager::api::main::ApiDoc;
 use pipeline_manager::cluster_monitor::{cluster_monitor, LocalResourcesPoller};
 use pipeline_manager::compiler::main::{compiler_main, compiler_precompile};
@@ -124,14 +125,23 @@ fn main() -> anyhow::Result<()> {
                 .expect("Compiler server main failed");
             });
 
+            // Shared activity bus: the api-server and the runner both
+            // emit into it (api hot paths emit ingest/query/woke; the
+            // automaton emits state_changed). The internal SSE
+            // endpoint multiplexes both producers onto the cloud
+            // activity controller.
+            let activity_bus = ActivityBus::new();
+
             // Spawn local runner
             let db_clone = db.clone();
             let common_config_clone = common_config.clone();
+            let activity_bus_clone = activity_bus.clone();
             let _local_runner = tokio::spawn(async move {
                 runner_main::<LocalRunner>(
                     db_clone,
                     common_config_clone,
                     local_runner_config.clone(),
+                    activity_bus_clone,
                 )
                 .await;
             });
@@ -155,6 +165,7 @@ fn main() -> anyhow::Result<()> {
                 db,
                 common_config,
                 api_config,
+                activity_bus,
             )
             .await
             .expect("API server main failed");

@@ -1,3 +1,4 @@
+use crate::api::activity_bus::ActivityBus;
 use crate::api::error::ApiError;
 use crate::api::util::parse_url_parameter;
 use crate::config::CommonConfig;
@@ -137,6 +138,11 @@ pub async fn runner_main<E: PipelineExecutor + 'static>(
     common_config: CommonConfig,
     // Pipeline executor configuration
     config: E::Config,
+    // Broadcast bus for activity events, shared with the api-server.
+    // Each spawned `PipelineAutomaton` gets a clone and emits
+    // `state_changed` whenever it persists an observable status
+    // transition.
+    activity_bus: ActivityBus,
 ) {
     // Mapping of the present pipelines to how to reach them:
     // - A notification mechanism for the automata to act quickly on change
@@ -193,7 +199,7 @@ pub async fn runner_main<E: PipelineExecutor + 'static>(
     let client = common_config.reqwest_client().await;
 
     // Launch the reconciliation loop
-    reconcile::<E>(db, client, pipelines, common_config, config).await;
+    reconcile::<E>(db, client, pipelines, common_config, config, activity_bus).await;
 }
 
 /// For each of the rows in the pipeline table, the runner spawns an automaton, also referred to as
@@ -215,6 +221,7 @@ async fn reconcile<E: PipelineExecutor + 'static>(
     pipelines: Arc<Mutex<PipelinesState>>,
     common_config: CommonConfig,
     config: E::Config,
+    activity_bus: ActivityBus,
 ) {
     // Listen to the pipeline table in order to be able to send quick notification to the pipeline
     // runner that something changed in the pipeline, and it might need to take action
@@ -305,6 +312,7 @@ async fn reconcile<E: PipelineExecutor + 'static>(
                                     follow_request_receiver,
                                     logs_sender,
                                     logs_receiver,
+                                    activity_bus.clone(),
                                 )
                                 .run(),
                             );

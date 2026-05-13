@@ -773,6 +773,7 @@ impl ServerState {
         common_config: CommonConfig,
         config: ApiServerConfig,
         db: Arc<Mutex<StoragePostgres>>,
+        activity_bus: ActivityBus,
     ) -> AnyResult<Self> {
         let runner = RunnerInteraction::new(common_config.clone(), db.clone());
         let db_copy = db.clone();
@@ -785,7 +786,7 @@ impl ServerState {
             jwk_cache: Arc::new(Mutex::new(JwkCache::new())),
             probe: DbProbe::new(db_copy).await,
             demos,
-            activity_bus: ActivityBus::new(),
+            activity_bus,
         })
     }
 
@@ -793,7 +794,7 @@ impl ServerState {
     pub(crate) async fn test_state(db: Arc<Mutex<StoragePostgres>>) -> Self {
         let common_config = CommonConfig::test_config();
         let api_config = ApiServerConfig::test_config();
-        Self::new(common_config, api_config, db.clone())
+        Self::new(common_config, api_config, db.clone(), ActivityBus::new())
             .await
             .unwrap()
     }
@@ -842,6 +843,7 @@ pub async fn run(
     db: Arc<Mutex<StoragePostgres>>,
     common_config: CommonConfig,
     api_config: ApiServerConfig,
+    activity_bus: ActivityBus,
 ) -> AnyResult<()> {
     let listener = TcpListener::bind((common_config.bind_address.clone(), common_config.api_port))
         .unwrap_or_else(|_| {
@@ -851,7 +853,7 @@ pub async fn run(
             )
         });
     let state = WebData::new(
-        ServerState::new(common_config.clone(), api_config.clone(), db).await?,
+        ServerState::new(common_config.clone(), api_config.clone(), db, activity_bus).await?,
     );
     let auth_configuration = match api_config.auth_provider {
         crate::config::AuthProviderType::None => None,

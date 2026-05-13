@@ -1050,7 +1050,12 @@ mod test {
         }
         let db = Arc::new(Mutex::new(conn));
         let state = actix_web::web::Data::new(
-            ServerState::new(common_config, manager_config, db)
+            ServerState::new(
+                common_config,
+                manager_config,
+                db,
+                crate::api::activity_bus::ActivityBus::new(),
+            )
                 .await
                 .unwrap(),
         );

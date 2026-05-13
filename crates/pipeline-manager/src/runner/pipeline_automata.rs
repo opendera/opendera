@@ -1,3 +1,5 @@
+use crate::api::activity_bus::{ActivityBus, ActivityEvent};
+use crate::api::endpoints::internal::runtime_status_to_str;
 use crate::config::CommonConfig;
 use crate::db::error::DBError;
 use crate::db::storage::{ExtendedPipelineDescrRunner, Storage};
@@ -162,6 +164,12 @@ where
 
     /// Previously observed storage status details.
     prev_storage_status_details: Option<StorageStatusDetails>,
+
+    /// Broadcast bus for activity events. Cloned from the manager-wide
+    /// bus owned by `ServerState`; the automaton emits `state_changed`
+    /// here whenever the externally observable status changes so the
+    /// cloud activity controller stays in sync without polling.
+    activity_bus: ActivityBus,
 }
 
 impl<T: PipelineExecutor> PipelineAutomaton<T> {
@@ -217,6 +225,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         follow_request_receiver: mpsc::Receiver<mpsc::Sender<String>>,
         logs_sender: LogsSender,
         logs_receiver: mpsc::Receiver<LogMessage>,
+        activity_bus: ActivityBus,
     ) -> Self {
         let pipeline_name_for_logs = pipeline_name.clone();
         // Start the thread which composes the pipeline logs and serves them
@@ -249,6 +258,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             prev_resources_status_details: None,
             prev_runtime_status_details: None,
             prev_storage_status_details: None,
+            activity_bus,
         }
     }
 
@@ -675,6 +685,26 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                     )
                 }
             };
+
+        // Emit a `state_changed` on the activity bus when the
+        // externally observable status (the string surfaced by
+        // `/internal/v0/pipelines.observed_status`) changes. Mirrors
+        // the derivation in `list_internal_pipelines` so the cloud
+        // activity controller sees a consistent value whether it
+        // reconciles from the polling endpoint or the SSE stream.
+        let old_observed = pipeline
+            .deployment_runtime_status
+            .map(runtime_status_to_str)
+            .unwrap_or_else(|| "Unknown".to_string());
+        let new_observed = new_runtime_status
+            .map(runtime_status_to_str)
+            .unwrap_or_else(|| "Unknown".to_string());
+        if old_observed != new_observed {
+            self.activity_bus.emit(ActivityEvent::state_changed(
+                self.pipeline_id,
+                new_observed,
+            ));
+        }
 
         // Log the transition that occurred
         if transition != Action::Remain {
@@ -1808,6 +1838,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
 
 #[cfg(test)]
 mod test {
+    use crate::api::activity_bus::{ActivityBus, ActivityEvent};
     use crate::auth::TenantRecord;
     use crate::config::CommonConfig;
     use crate::db::storage::Storage;
@@ -1902,6 +1933,9 @@ mod test {
         db: Arc<Mutex<StoragePostgres>>,
         automaton: PipelineAutomaton<MockRunner>,
         _follow_request_sender: Sender<Sender<String>>,
+        /// Receiver subscribed to the automaton's `ActivityBus` before
+        /// any tick(); tests drain it to assert on emitted events.
+        activity_rx: tokio::sync::broadcast::Receiver<ActivityEvent>,
     }
 
     impl AutomatonTest {
@@ -1983,6 +2017,19 @@ mod test {
 
         async fn tick(&mut self) {
             self.automaton.do_run().await.unwrap();
+        }
+
+        /// Drains every event currently buffered on the activity-bus
+        /// receiver. Used by tests that assert which observable status
+        /// transitions the automaton has emitted so far.
+        fn drain_activity(&mut self) -> Vec<ActivityEvent> {
+            let mut out = Vec::new();
+            loop {
+                match self.activity_rx.try_recv() {
+                    Ok(evt) => out.push(evt),
+                    Err(_) => return out,
+                }
+            }
         }
     }
 
@@ -2075,6 +2122,11 @@ mod test {
         let logs_sender = LogsSender::new(logs_sender);
         let notifier = Arc::new(Notify::new());
         let client = reqwest::Client::new();
+        // Subscribe to the activity bus before handing the cloned
+        // sender to the automaton so tests don't miss the first
+        // emitted event.
+        let activity_bus = ActivityBus::new();
+        let activity_rx = activity_bus.subscribe();
 
         // Extract host and port from mock server address to simulate the compiler service
         // for testing compilation artifact existence checks
@@ -2115,11 +2167,13 @@ mod test {
             follow_request_receiver,
             logs_sender,
             logs_receiver,
+            activity_bus,
         );
         AutomatonTest {
             db: db.clone(),
             automaton,
             _follow_request_sender,
+            activity_rx,
         }
     }
 
@@ -2353,5 +2407,64 @@ mod test {
         // Remains Stopped as program is still Pending
         assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
 
+    }
+
+    /// Exercises the start/stop sequence and asserts the automaton
+    /// emits a `state_changed` event on every observable status
+    /// transition (the strings match what
+    /// `/internal/v0/pipelines.observed_status` would return).
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn activity_bus_emits_state_changed_on_observable_transitions() {
+        let (mut server, _temp, mut test) = setup_complete().await;
+        let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+        mock_endpoints(&mut server, vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))]).await;
+
+        // Helper to assert the just-emitted state_changed events.
+        fn observed(events: &[ActivityEvent]) -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    ActivityEvent::StateChanged { observed, .. } => Some(observed.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+
+        // Stopped -> Provisioning: runtime_status stays None, so
+        // observed_status stays "Unknown" -> no emission.
+        test.tick().await;
+        assert!(test.drain_activity().is_empty(), "Provisioning should not change observed_status from Unknown");
+
+        test.tick().await; // provision()
+        assert!(test.drain_activity().is_empty());
+
+        // Transition to Provisioned: runtime becomes Some(Initializing).
+        test.tick().await;
+        assert_eq!(observed(&test.drain_activity()), vec!["Initializing".to_string()]);
+
+        mock_endpoints(&mut server, vec![MockEndpoint::new("GET", "/status", 200, json!("Initializing"))]).await;
+        test.tick().await;
+        // Same status reported by /status; no further emit.
+        assert!(test.drain_activity().is_empty());
+
+        mock_endpoints(&mut server, vec![MockEndpoint::new("GET", "/status", 200, json!("Paused"))]).await;
+        test.tick().await;
+        assert_eq!(observed(&test.drain_activity()), vec!["Paused".to_string()]);
+
+        mock_endpoints(&mut server, vec![MockEndpoint::new("GET", "/status", 200, json!("Running"))]).await;
+        test.tick().await;
+        assert_eq!(observed(&test.drain_activity()), vec!["Running".to_string()]);
+
+        // Now stop: runtime_status drops back to None -> "Unknown".
+        test.desire_stopped().await;
+        test.tick().await;
+        assert_eq!(observed(&test.drain_activity()), vec!["Unknown".to_string()]);
+
+        // Stopping -> Stopped keeps observed_status "Unknown"; no emit.
+        test.tick().await;
+        assert!(test.drain_activity().is_empty());
     }
 }
