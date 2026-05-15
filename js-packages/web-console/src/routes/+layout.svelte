@@ -30,10 +30,6 @@
     })
   }
 
-  // Scarf.sh tracking disabled.
-  const shouldTrack = $derived(false)
-  const scarfTrackingUrl = $derived('')
-
   const { upsert } = useSystemMessages()
   useInterval(() => {
     if (!page.data.feldera) {
@@ -57,10 +53,6 @@
   }}
 ></Toaster>
 {@render children?.()}
-
-{#if shouldTrack}
-  <img src={scarfTrackingUrl} alt="" aria-hidden="true" style="display: none;" />
-{/if}
 
 <style lang="scss" global>
   .toast-error {

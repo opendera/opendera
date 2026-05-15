@@ -49,7 +49,6 @@ class MemoryStorage {
 // so we cast through `unknown` instead of populating every required SDK field.
 const baseConfig = {
   build_info: { build_cpu: 'x86', build_os: 'linux', build_timestamp: '2026-01-01' },
-  build_source: 'source',
   changelog_url: 'https://example/cl',
   edition: 'Open source',
   revision: 'abc123',
