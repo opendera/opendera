@@ -266,14 +266,7 @@ const config: Config = {
       },
     ],
 
-    [
-      "posthog-docusaurus",
-      {
-        apiKey: "phc_GKR68l5zo531AD1R3cnE3MCPEBPXTqgYax4q053LVBD",
-        enableInDevelopment: true,
-      },
-    ],
-    "docusaurus-plugin-hubspot",
+    // PostHog and HubSpot tracking disabled.
   ],
 
   themeConfig: {
@@ -282,11 +275,6 @@ const config: Config = {
       defaultMode: "light",
       disableSwitch: true,
       respectPrefersColorScheme: false,
-    },
-    hubspot: {
-      accountId: 45801078,
-      async: true,
-      defer: true,
     },
     algolia: {
       appId: "WX24466N8W",
