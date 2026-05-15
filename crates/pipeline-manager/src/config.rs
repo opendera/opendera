@@ -261,6 +261,22 @@ pub struct CommonConfig {
     #[arg(long, default_value_t = default_platform_version())]
     pub platform_version: String,
 
+    /// Cluster-monitor: when this service is set to auto-stop on idle (e.g.
+    /// running on a serverless platform like Fly Machines), treat
+    /// connection-refused / timeout from its `/healthz` probe as Operational
+    /// rather than Unhealthy. The service is expected to wake on the first
+    /// real request.
+    #[arg(long, default_value_t = false, env = "OPENDERA_API_AUTOSTOP")]
+    pub api_autostop: bool,
+
+    /// See `api_autostop`. Applies to the compiler service.
+    #[arg(long, default_value_t = false, env = "OPENDERA_COMPILER_AUTOSTOP")]
+    pub compiler_autostop: bool,
+
+    /// See `api_autostop`. Applies to the runner service.
+    #[arg(long, default_value_t = false, env = "OPENDERA_RUNNER_AUTOSTOP")]
+    pub runner_autostop: bool,
+
     /// IP address on which the HTTP server of the API server, compiler, runner and pipelines bind themselves.
     /// This should be set to either `127.0.0.1` (default) or `0.0.0.0`.
     #[arg(long, default_value = "127.0.0.1")]
@@ -642,6 +658,9 @@ impl CommonConfig {
             runner_host: "127.0.0.1".to_string(),
             runner_port: 8089,
             platform_version: "v0".to_string(),
+            api_autostop: false,
+            compiler_autostop: false,
+            runner_autostop: false,
             http_workers: 1,
             unstable_features: None,
             enable_https: false,

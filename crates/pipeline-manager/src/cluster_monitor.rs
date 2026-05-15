@@ -109,13 +109,33 @@ pub async fn cluster_monitor<P: ResourcesPoller>(
             }
         };
 
-        // Perform polling for self-reported info
-        let (api_self_ok, api_self_info) =
-            poll_service_health_endpoint("api", &api_url, &client).await;
-        let (compiler_self_ok, compiler_self_info) =
-            poll_service_health_endpoint("compiler", &compiler_url, &client).await;
-        let (runner_self_ok, runner_self_info) =
-            poll_service_health_endpoint("runner", &runner_url, &client).await;
+        // Perform polling for self-reported info. When a service is
+        // declared autostop=true (e.g. running on Fly Machines with
+        // auto_stop_machines), connection-refused / timeout means the
+        // service is intentionally scaled to zero and will wake on the
+        // next real request — we report it as Healthy (operational,
+        // idle) so the user-facing health page stays green.
+        let (api_self_ok, api_self_info) = poll_service_health_endpoint(
+            "api",
+            &api_url,
+            &client,
+            common_config.api_autostop,
+        )
+        .await;
+        let (compiler_self_ok, compiler_self_info) = poll_service_health_endpoint(
+            "compiler",
+            &compiler_url,
+            &client,
+            common_config.compiler_autostop,
+        )
+        .await;
+        let (runner_self_ok, runner_self_info) = poll_service_health_endpoint(
+            "runner",
+            &runner_url,
+            &client,
+            common_config.runner_autostop,
+        )
+        .await;
         let api_self_info = truncate_info(api_self_info);
         let compiler_self_info = truncate_info(compiler_self_info);
         let runner_self_info = truncate_info(runner_self_info);
@@ -270,10 +290,16 @@ fn truncate_info(mut info: String) -> String {
 
 /// Polls the service health endpoint, which is used as the service reporting its own status
 /// information.
+///
+/// When `autostop` is true, connection-refused and timeout errors are
+/// interpreted as "service is auto-stopped on idle, will wake on next
+/// request" and reported as Healthy. Other failure modes (non-2xx
+/// HTTP, generic errors) still report Unhealthy.
 async fn poll_service_health_endpoint(
     service_name: &str,
     url: &str,
     client: &reqwest::Client,
+    autostop: bool,
 ) -> (bool, String) {
     match client
         .get(url)
@@ -300,6 +326,22 @@ async fn poll_service_health_endpoint(
             );
             (false, message)
         }
+        Err(e) if e.is_connect() && autostop => (
+            true,
+            format!(
+                "Operational: {service_name} at {url} is auto-stopped on idle and will start on the next request \
+                 (connection refused on probe is expected). Underlying detail: {}.",
+                source_error(&e)
+            ),
+        ),
+        Err(e) if e.is_timeout() && autostop => (
+            true,
+            format!(
+                "Operational: {service_name} at {url} is auto-stopped on idle; probe timed out before a cold start \
+                 finished (this is expected when the service is scaled to zero). Underlying detail: {}.",
+                source_error(&e)
+            ),
+        ),
         Err(e) if e.is_connect() => (
             false,
             format!(
