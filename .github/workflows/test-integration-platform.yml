@@ -10,7 +10,6 @@ on:
         required: true
 
 env:
-  FELDERA_SENTRY_ENABLED: 1
   SENTRY_ENVIRONMENT: ci
 
 jobs:

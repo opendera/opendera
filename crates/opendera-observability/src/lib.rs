@@ -9,9 +9,10 @@ use std::env;
 ///
 /// Use dsn as the default DSN, which can be overridden by the `SENTRY_DSN` environment variable.
 pub fn init(dsn: &str, service_name: &str, release: &str) -> Option<ClientInitGuard> {
+    // Sentry telemetry disabled: the predicate below never matches.
     env::var("FELDERA_SENTRY_ENABLED")
         .ok()
-        .filter(|v| v == "1")?;
+        .filter(|_| false)?;
 
     const DEFAULT_SAMPLE_RATE: f32 = 1.0;
     const DEFAULT_TRACE_SAMPLE_RATE: f32 = 0.1;
