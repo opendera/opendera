@@ -115,13 +115,9 @@ pub async fn cluster_monitor<P: ResourcesPoller>(
         // service is intentionally scaled to zero and will wake on the
         // next real request — we report it as Healthy (operational,
         // idle) so the user-facing health page stays green.
-        let (api_self_ok, api_self_info) = poll_service_health_endpoint(
-            "api",
-            &api_url,
-            &client,
-            common_config.api_autostop,
-        )
-        .await;
+        let (api_self_ok, api_self_info) =
+            poll_service_health_endpoint("api", &api_url, &client, common_config.api_autostop)
+                .await;
         let (compiler_self_ok, compiler_self_info) = poll_service_health_endpoint(
             "compiler",
             &compiler_url,

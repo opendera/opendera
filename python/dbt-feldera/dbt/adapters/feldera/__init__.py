@@ -1,6 +1,7 @@
 import os
 
 from dbt.adapters.base import AdapterPlugin
+
 from dbt.adapters.feldera.__version__ import version as version  # noqa: PLC0414 — re-exported as public API
 
 __version__ = version

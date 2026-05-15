@@ -1064,8 +1064,8 @@ mod test {
                 db,
                 crate::api::activity_bus::ActivityBus::new(),
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
         );
         if let Some(decoding_key) = decoding_key {
             state
