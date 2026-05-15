@@ -135,15 +135,9 @@ fn main() -> anyhow::Result<()> {
                     // API, runner, monitors, usage collector.
                     let worker_id = 0;
                     let total_workers = 1;
-                    compiler_main(
-                        common_config,
-                        compiler_config,
-                        db,
-                        worker_id,
-                        total_workers,
-                    )
-                    .await
-                    .expect("Compiler server main failed");
+                    compiler_main(common_config, compiler_config, db, worker_id, total_workers)
+                        .await
+                        .expect("Compiler server main failed");
                     Ok(())
                 }
                 ServiceMode::Full | ServiceMode::Manager => {

@@ -700,10 +700,8 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             .map(runtime_status_to_str)
             .unwrap_or_else(|| "Unknown".to_string());
         if old_observed != new_observed {
-            self.activity_bus.emit(ActivityEvent::state_changed(
-                self.pipeline_id,
-                new_observed,
-            ));
+            self.activity_bus
+                .emit(ActivityEvent::state_changed(self.pipeline_id, new_observed));
         }
 
         // Log the transition that occurred
