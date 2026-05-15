@@ -83,8 +83,6 @@ pub(crate) struct Configuration {
     pub update_info: Option<UpdateInformation>,
     /// Information about the build environment
     pub build_info: BuildInformation,
-    /// Build source: "ci" for GitHub Actions builds, "source" for local builds
-    pub build_source: String,
 }
 
 impl Configuration {
@@ -109,7 +107,6 @@ impl Configuration {
             changelog_url: format!("https://github.com/opendera/opendera/releases/tag/v{version}"),
             update_info: None,
             build_info: BuildInformation::from_env(),
-            build_source: env!("FELDERA_BUILD_ORIGIN").to_string(),
         }
     }
 }
