@@ -1006,31 +1006,6 @@ pub struct ApiServerConfig {
     #[arg(long, action = clap::ArgAction::Set, default_value_t = false, env = "OPENDERA_CLOUD_MODE")]
     pub cloud_mode: bool,
 
-    /// Google OAuth client id (for cloud-mode OAuth signup).
-    ///
-    /// When both this and `oauth_google_redirect_uri` are set, the
-    /// `POST /v0/signup/oauth/google/start` endpoint returns a Google
-    /// authorization URL. Either field unset → the endpoint responds
-    /// 503 and the cloud signup UI hides the Google button.
-    #[serde(default)]
-    #[arg(long, env = "OPENDERA_OAUTH_GOOGLE_CLIENT_ID")]
-    pub oauth_google_client_id: Option<String>,
-
-    /// Redirect URI registered with Google for OAuth signup.
-    #[serde(default)]
-    #[arg(long, env = "OPENDERA_OAUTH_GOOGLE_REDIRECT_URI")]
-    pub oauth_google_redirect_uri: Option<String>,
-
-    /// GitHub OAuth client id (for cloud-mode OAuth signup). Pairs
-    /// with `oauth_github_redirect_uri` exactly like the Google fields.
-    #[serde(default)]
-    #[arg(long, env = "OPENDERA_OAUTH_GITHUB_CLIENT_ID")]
-    pub oauth_github_client_id: Option<String>,
-
-    /// Redirect URI registered with GitHub for OAuth signup.
-    #[serde(default)]
-    #[arg(long, env = "OPENDERA_OAUTH_GITHUB_REDIRECT_URI")]
-    pub oauth_github_redirect_uri: Option<String>,
 }
 
 impl ApiServerConfig {
@@ -1077,10 +1052,6 @@ impl ApiServerConfig {
             authorized_groups: vec![],
             auth_audience: "feldera-api".to_string(),
             cloud_mode: false,
-            oauth_google_client_id: None,
-            oauth_google_redirect_uri: None,
-            oauth_github_client_id: None,
-            oauth_github_redirect_uri: None,
         }
     }
 }
