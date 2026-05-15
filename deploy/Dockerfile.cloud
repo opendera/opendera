@@ -1,0 +1,116 @@
+# Cloud variant of deploy/Dockerfile. Builds everything inside Docker
+# so CI doesn't need a separate host-side `cargo build` step, and uses
+# cargo-chef to keep the dependency-graph compilation as its own layer
+# (cached across rebuilds when Cargo.lock hasn't changed).
+#
+# Stages:
+#   chef        — rust + system libs + cargo-chef
+#   planner     — emits recipe.json from the full source tree
+#   deps        — compiles every workspace dep against the recipe
+#   sql         — separate Maven build of the SQL compiler jar
+#   builder     — copies real sources over deps' dummies and builds
+#                 the pipeline-manager binary
+#   runtime     — slim ubuntu:24.04 + JRE + the two artifacts
+#
+# Cold build is comparable to the old single-stage flow (~10 min).
+# Warm rebuilds where only crate sources changed land in 1–3 min:
+# the chef + deps layers come from the registry cache (cache-from=gha)
+# and the builder stage only recompiles the changed crate(s).
+
+# ---------- 1. Toolchain base ------------------------------------------------
+
+FROM rust:1.93-bookworm AS chef
+ENV DEBIAN_FRONTEND=noninteractive \
+    OPENSSL_NO_VENDOR=1 \
+    OPENSSL_STATIC=1 \
+    LC_ALL=C.UTF-8 \
+    LANG=C.UTF-8
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libclang-dev \
+        libssl-dev pkg-config \
+        cmake \
+        golang-go \
+        libsasl2-dev zlib1g-dev \
+        build-essential \
+        curl ca-certificates \
+        unzip \
+ && rm -rf /var/lib/apt/lists/*
+# bun + node — pipeline-manager's build.rs runs `bun clean-install`
+# to bundle the web-console as embedded static assets.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get update && apt-get install -y nodejs && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://bun.sh/install | bash \
+ && ln -s /root/.bun/bin/bun /usr/local/bin/bun
+RUN cargo install cargo-chef --locked --version ^0.1
+WORKDIR /src
+
+# ---------- 2. Recipe: deps-only snapshot ------------------------------------
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---------- 3. Cook: build the dep graph (the cached layer) ------------------
+
+FROM chef AS deps
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p pipeline-manager
+
+# ---------- 4. SQL compiler jar (parallelisable with stage 3) ----------------
+
+FROM maven:3.9-eclipse-temurin-21 AS sql
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /src
+COPY sql-to-dbsp-compiler/ ./sql-to-dbsp-compiler/
+WORKDIR /src/sql-to-dbsp-compiler
+RUN ./build.sh
+
+# ---------- 5. Build the manager binary --------------------------------------
+
+FROM deps AS builder
+COPY . .
+RUN cargo build --release --locked -p pipeline-manager
+# Sanity-check the binary's existence so the failure mode below is
+# obvious if the build silently produced nothing.
+RUN test -f /src/target/release/pipeline-manager
+
+# ---------- 6. Runtime: ubuntu + JRE only ------------------------------------
+
+FROM ubuntu:24.04 AS release
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        openjdk-21-jre-headless \
+        ca-certificates tzdata \
+        locales \
+        libcap2-bin \
+        git \
+        libsasl2-2 \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+      -o /usr/local/share/ca-certificates/aws-global-rds-bundle.crt \
+ && update-ca-certificates || true
+RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+ && locale-gen
+USER ubuntu
+WORKDIR /home/ubuntu
+ENV LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 LANGUAGE=en_US:en BANNER_ADDR=localhost
+# Match the existing image layout so the ENTRYPOINT below is identical
+# to deploy/Dockerfile and works for any downstream tooling that
+# assumes those paths (e.g. operator scripts).
+COPY --from=builder --chown=ubuntu /src/target/release/pipeline-manager \
+        /home/ubuntu/feldera/build/pipeline-manager
+COPY --from=sql --chown=ubuntu \
+        /src/sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar \
+        /home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar
+COPY --chown=ubuntu Cargo.lock /home/ubuntu/feldera/Cargo.lock
+COPY --chown=ubuntu sql-to-dbsp-compiler/lib /home/ubuntu/feldera/sql-to-dbsp-compiler/lib
+COPY --chown=ubuntu sql-to-dbsp-compiler/temp /home/ubuntu/feldera/sql-to-dbsp-compiler/temp
+COPY --chown=ubuntu sql-to-dbsp-compiler/SQL-compiler/sql-to-dbsp \
+        /home/ubuntu/feldera/sql-to-dbsp-compiler/SQL-compiler/sql-to-dbsp
+COPY --chown=ubuntu crates/pipeline-manager/demos/sql /home/ubuntu/feldera/demos/sql
+# `--dbsp-override-path` points at this directory so the Rust pipeline
+# can resolve dbsp sources during compile.
+COPY --chown=ubuntu crates /home/ubuntu/feldera/crates
+ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]
