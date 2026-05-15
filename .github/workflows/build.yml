@@ -100,5 +100,11 @@ jobs:
           # linux/amd64 only — Fly runs amd64 anyway. Multi-arch builds
           # would double our CI time for no runtime benefit.
           platforms: linux/amd64
+          # SKIP_PRECOMPILE=1 drops the ~1.7GB cargo precompile cache
+          # baked into the image. Required to stay under Fly's 8GB
+          # rootfs cap; trade-off is a cold cargo build on the first
+          # SQL pipeline compile.
+          build-args: |
+            SKIP_PRECOMPILE=1
           cache-from: type=gha,scope=engine
           cache-to: type=gha,scope=engine,mode=max
