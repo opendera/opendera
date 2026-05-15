@@ -869,9 +869,9 @@ pub struct ApiServerConfig {
     pub dump_openapi: bool,
 
     /// Allowed origins for CORS configuration. Cannot be used together with
-    /// --dev-mode=true.
+    /// --dev-mode=true. Comma-separated when set via OPENDERA_ALLOWED_ORIGINS.
     #[serde(default)]
-    #[arg(long)]
+    #[arg(long, env = "OPENDERA_ALLOWED_ORIGINS", value_delimiter = ',')]
     pub allowed_origins: Option<Vec<String>>,
 
     /// [Developers only] Run in development mode.
