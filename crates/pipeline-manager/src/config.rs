@@ -1043,6 +1043,7 @@ impl ApiServerConfig {
                 .allowed_headers(vec![
                     header::AUTHORIZATION,
                     header::ACCEPT,
+                    header::CONTENT_TYPE,
                     header::HeaderName::from_static(crate::auth::TENANT_HEADER),
                 ])
                 .supports_credentials()
