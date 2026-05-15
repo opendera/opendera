@@ -87,7 +87,19 @@ RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/feldera/samply/rele
 #
 FROM base AS release
 
-# Run the precompile phase to speed up Rust compilations during deployment
-RUN ./feldera/build/pipeline-manager --bind-address=0.0.0.0 --sql-compiler-path=$HOME/feldera/build/sql2dbsp-jar-with-dependencies.jar --compilation-cargo-lock-path=$HOME/feldera/Cargo.lock --dbsp-override-path=$HOME/feldera --precompile
+# Run the precompile phase to speed up Rust compilations during deployment.
+# Disable for slim cloud images (Fly's 8GB rootfs cap) by setting
+# `--build-arg SKIP_PRECOMPILE=1`; the resulting image is ~1.7GB smaller
+# but the first SQL compile in each pipeline pays a cold cargo build.
+ARG SKIP_PRECOMPILE=0
+RUN if [ "$SKIP_PRECOMPILE" = "0" ]; then \
+      ./feldera/build/pipeline-manager \
+        --bind-address=0.0.0.0 \
+        --sql-compiler-path=$HOME/feldera/build/sql2dbsp-jar-with-dependencies.jar \
+        --compilation-cargo-lock-path=$HOME/feldera/Cargo.lock \
+        --dbsp-override-path=$HOME/feldera --precompile ; \
+    else \
+      echo "Skipping --precompile per SKIP_PRECOMPILE=1" ; \
+    fi
 ENV BANNER_ADDR=localhost
 ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]
