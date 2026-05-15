@@ -5,8 +5,16 @@ name: build
 #   ghcr.io/opendera/pipeline-manager:latest   (control plane on Fly)
 #   ghcr.io/opendera/compiler:latest           (compile-pool on Fly)
 #
-# Both Fly apps consume the same image today; the entrypoint differs in
-# each fly.toml. If they diverge later, split into two build steps.
+# Both Fly apps consume the same image; the entrypoint behavior is
+# selected at runtime via OPENDERA_SERVICE_MODE in each fly.toml.
+#
+# deploy/Dockerfile expects a populated `build/` directory at the
+# context root with two artifacts:
+#
+#   build/pipeline-manager                          (Rust release binary)
+#   build/sql2dbsp-jar-with-dependencies.jar        (Java SQL compiler)
+#
+# Both are produced by the host before `docker buildx build` runs.
 
 on:
   push:
@@ -20,9 +28,43 @@ permissions:
 jobs:
   image:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.93
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: System deps for rdkafka / openssl / mold
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libclang-dev libssl-dev pkg-config \
+            libsasl2-dev zlib1g-dev cmake build-essential \
+            golang-go
+
+      - name: Build the SQL compiler jar
+        working-directory: sql-to-dbsp-compiler
+        run: ./build.sh
+
+      - name: Build the pipeline-manager binary
+        env:
+          OPENSSL_NO_VENDOR: "1"
+          OPENSSL_STATIC: "1"
+        run: cargo build --release --locked -p pipeline-manager
+
+      - name: Stage build/ directory for the Dockerfile
+        run: |
+          mkdir -p build
+          cp target/release/pipeline-manager build/
+          cp sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar build/
+          ls -lah build/
+
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -38,6 +80,7 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha,prefix=,format=short
+
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -45,5 +88,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # linux/amd64 only — Fly runs amd64 anyway. Multi-arch builds
+          # would double our CI time for no runtime benefit.
+          platforms: linux/amd64
           cache-from: type=gha,scope=engine
           cache-to: type=gha,scope=engine,mode=max
