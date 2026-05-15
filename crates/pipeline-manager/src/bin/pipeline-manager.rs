@@ -4,6 +4,7 @@ use clap::{Args, Command, FromArgMatches};
 
 use colored::Colorize;
 use opendera_observability as observability;
+use pipeline_manager::api::activity_bus::ActivityBus;
 use pipeline_manager::api::main::ApiDoc;
 use pipeline_manager::cluster_monitor::{cluster_monitor, LocalResourcesPoller};
 use pipeline_manager::compiler::main::{compiler_main, compiler_precompile};
@@ -168,10 +169,18 @@ fn main() -> anyhow::Result<()> {
                         });
                     }
 
+                    // Shared activity bus: the api-server and the runner both
+                    // emit into it (api hot paths emit ingest/query/woke; the
+                    // automaton emits state_changed). The internal SSE
+                    // endpoint multiplexes both producers onto the cloud
+                    // activity controller.
+                    let activity_bus = ActivityBus::new();
+
                     // Spawn the runner selected at startup. Only one executor
                     // runs in a given manager process; the others are inert.
                     let db_clone = db.clone();
                     let common_config_clone = common_config.clone();
+                    let activity_bus_clone = activity_bus.clone();
                     let _runner = match runner_selection.runner_kind {
                         RunnerKind::Local => {
                             info!("Starting pipeline runner: local");
@@ -180,6 +189,7 @@ fn main() -> anyhow::Result<()> {
                                     db_clone,
                                     common_config_clone,
                                     local_runner_config.clone(),
+                                    activity_bus_clone,
                                 )
                                 .await;
                             })
@@ -194,6 +204,7 @@ fn main() -> anyhow::Result<()> {
                                     db_clone,
                                     common_config_clone,
                                     fly_runner_config.clone(),
+                                    activity_bus_clone,
                                 )
                                 .await;
                             })
@@ -225,7 +236,7 @@ fn main() -> anyhow::Result<()> {
                     });
 
                     // The api-server blocks forever
-                    pipeline_manager::api::main::run(db, common_config, api_config)
+                    pipeline_manager::api::main::run(db, common_config, api_config, activity_bus)
                         .await
                         .expect("API server main failed");
                     Ok(())
