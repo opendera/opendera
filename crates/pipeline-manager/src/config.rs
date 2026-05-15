@@ -704,8 +704,19 @@ pub struct DatabaseConfig {
     /// values are `postgres://<host>:<port>` or `postgres-embed`. For
     /// postgres-embed we create a DB in the current working directory. For
     /// postgres, we use the connection string as provided.
+    ///
+    /// Reads `DATABASE_URL` from the environment when the flag isn't
+    /// passed — matches the Fly / Heroku / Render convention so cloud
+    /// deployments can wire a managed Postgres without a CLI override.
+    /// Without this, the manager silently falls back to an embedded
+    /// per-container Postgres, which means multi-machine deployments
+    /// end up with disjoint state.
     #[serde(default = "default_db_connection_string")]
-    #[arg(long, default_value_t = default_db_connection_string())]
+    #[arg(
+        long,
+        default_value_t = default_db_connection_string(),
+        env = "DATABASE_URL"
+    )]
     pub db_connection_string: String,
 
     /// Create a TLS connector by loading a certificate from the path specified argument.
