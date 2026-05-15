@@ -67,7 +67,7 @@ pub async fn list_usage_buckets(
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let dim_str: String = row.get(2);
-        let Some(dim) = UsageDimension::from_str(&dim_str) else {
+        let Some(dim) = UsageDimension::parse(&dim_str) else {
             continue;
         };
         out.push(UsageBucket {

@@ -2088,7 +2088,7 @@ async fn cleanup_rust_compilation(
     // (1) is not an artifact in use
     // (2) AND is not already in the cleanup state
     // ... will be added to the cleanup state.
-    let found = HashSet::<String>::from_iter(found.into_iter());
+    let found = HashSet::<String>::from_iter(found);
     for artifact_name in found.iter() {
         if !artifacts_in_use.contains(artifact_name) && !cleanup_state.contains_key(artifact_name) {
             let expiration_datetime: DateTime<Utc> = (current_timestamp + CLEANUP_RETENTION).into();

@@ -428,16 +428,23 @@ impl RunnerInteraction {
                         }
                     }
                     Frame::Binary(bin) => {
+                        // Cannot move `bin` into a pattern guard — keep the
+                        // nested if and silence the collapse lint.
+                        #[allow(clippy::collapsible_match)]
                         if client_tx.binary(bin).await.is_err() {
                             break;
                         }
                     }
-                    Frame::Ping(bytes) => {
+                    Frame::Ping(bytes) =>
+                    {
+                        #[allow(clippy::collapsible_match)]
                         if client_tx.ping(&bytes).await.is_err() {
                             break;
                         }
                     }
-                    Frame::Pong(bytes) => {
+                    Frame::Pong(bytes) =>
+                    {
+                        #[allow(clippy::collapsible_match)]
                         if client_tx.pong(&bytes).await.is_err() {
                             break;
                         }

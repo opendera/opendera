@@ -47,7 +47,10 @@ impl UsageDimension {
     /// Parse the column value back into a [`UsageDimension`]. Returns
     /// `None` for unknown strings — callers may want to skip
     /// forward-incompatible rows rather than fail the whole query.
-    pub fn from_str(s: &str) -> Option<Self> {
+    ///
+    /// Inherent rather than `std::str::FromStr` because we return
+    /// `Option`, not `Result<_, _>`.
+    pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "ingestion_gb" => UsageDimension::IngestionGb,
             "storage_gb_month" => UsageDimension::StorageGbMonth,

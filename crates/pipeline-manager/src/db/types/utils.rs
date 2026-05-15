@@ -217,20 +217,17 @@ mod tests {
 
         // Fault tolerance is accepted. Both supported models round-trip.
         for model in ["at_least_once", "exactly_once"] {
-            let rc = validate_runtime_config(
-                &json!({ "fault_tolerance": { "model": model } }),
-                true,
-            )
-            .unwrap_or_else(|e| panic!("fault_tolerance model {model:?} should validate: {e:?}"));
+            let rc =
+                validate_runtime_config(&json!({ "fault_tolerance": { "model": model } }), true)
+                    .unwrap_or_else(|e| {
+                        panic!("fault_tolerance model {model:?} should validate: {e:?}")
+                    });
             assert!(rc.fault_tolerance.is_enabled());
         }
 
         // Explicitly disabled fault tolerance (model: "none") is accepted and disabled.
-        let rc = validate_runtime_config(
-            &json!({ "fault_tolerance": { "model": "none" } }),
-            true,
-        )
-        .unwrap();
+        let rc = validate_runtime_config(&json!({ "fault_tolerance": { "model": "none" } }), true)
+            .unwrap();
         assert!(!rc.fault_tolerance.is_enabled());
 
         assert!(matches!(
