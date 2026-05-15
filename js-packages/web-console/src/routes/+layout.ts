@@ -82,16 +82,9 @@ export const trailingSlash = 'always'
  * branches that call `invalidateAll()` unconditionally.
  */
 
-const initPosthog = async (config: Configuration) => {
-  if (!config.telemetry) {
-    return
-  }
-  posthog.init(config.telemetry, {
-    api_host: 'https://us.i.posthog.com',
-    person_profiles: 'identified_only',
-    capture_pageview: false,
-    capture_pageleave: false
-  })
+const initPosthog = async (_config: Configuration) => {
+  // PostHog telemetry disabled.
+  return
 }
 
 export type LayoutData = {
