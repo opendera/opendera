@@ -30,15 +30,9 @@
     })
   }
 
-  // Scarf.sh tracking for OSS deployments
-  // Only track Open source edition (excludes Enterprise builds)
-  const shouldTrack = $derived(browser && page.data.feldera?.config?.edition === 'Open source')
-  const scarfPixelId = 'c5e8a21a-5f5a-424d-81c4-5ded97174900'
-  const scarfTrackingUrl = $derived(
-    shouldTrack
-      ? `https://static.scarf.sh/a.png?x-pxid=${scarfPixelId}&version=${encodeURIComponent(page.data.feldera!.config!.version)}&build_source=${encodeURIComponent(page.data.feldera!.config!.build_source)}`
-      : ''
-  )
+  // Scarf.sh tracking disabled.
+  const shouldTrack = $derived(false)
+  const scarfTrackingUrl = $derived('')
 
   const { upsert } = useSystemMessages()
   useInterval(() => {
