@@ -20,10 +20,11 @@
 //! tenant-auth middleware.
 
 use actix_web::{
-    HttpResponse, get, post,
+    get, post,
     web::{Data as WebData, Json, Path, ReqData},
+    HttpResponse,
 };
-use rand::{Rng, distributions::Alphanumeric};
+use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -162,9 +163,7 @@ pub struct BillingSnapshot {
 }
 
 #[get("/billing/snapshot")]
-pub async fn billing_snapshot(
-    _tenant_id: ReqData<TenantId>,
-) -> Result<HttpResponse, ManagerError> {
+pub async fn billing_snapshot(_tenant_id: ReqData<TenantId>) -> Result<HttpResponse, ManagerError> {
     // Zero across the board until usage aggregation
     // (REMAINING_WORK.md §3) lands. The cloud billing page renders
     // these as "$0.00" + "no usage yet" copy, which is the correct
@@ -205,9 +204,7 @@ pub struct Invoice {
 }
 
 #[get("/billing/invoices")]
-pub async fn list_invoices(
-    _tenant_id: ReqData<TenantId>,
-) -> Result<HttpResponse, ManagerError> {
+pub async fn list_invoices(_tenant_id: ReqData<TenantId>) -> Result<HttpResponse, ManagerError> {
     // Empty until the Stripe integration (REMAINING_WORK.md §10) is
     // backed by a real account; once it is, this endpoint proxies to
     // `Stripe.invoices.list({customer: stripe_customer_id})`.
@@ -219,6 +216,7 @@ pub async fn list_invoices(
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
+#[allow(dead_code)] // billing_portal endpoint is wired up later (cloud-only)
 struct PortalResponse {
     url: String,
 }
@@ -241,8 +239,7 @@ pub async fn billing_portal(
     match stripe_customer_id {
         Some(_) => Ok(HttpResponse::ServiceUnavailable()
             .body("billing portal not configured (Stripe integration pending)")),
-        None => Ok(HttpResponse::ServiceUnavailable()
-            .body("tenant has no linked Stripe customer")),
+        None => Ok(HttpResponse::ServiceUnavailable().body("tenant has no linked Stripe customer")),
     }
 }
 
@@ -262,9 +259,7 @@ pub struct UsageBucket {
 }
 
 #[get("/usage/current")]
-pub async fn current_usage(
-    _tenant_id: ReqData<TenantId>,
-) -> Result<HttpResponse, ManagerError> {
+pub async fn current_usage(_tenant_id: ReqData<TenantId>) -> Result<HttpResponse, ManagerError> {
     // Empty page until the manager's usage aggregation
     // (REMAINING_WORK.md §3) lands. The console-plugin's usage page
     // renders this as a "no data yet — start a pipeline to see usage"
@@ -383,9 +378,7 @@ pub async fn oauth_start(
 /// Until then, return 501 with that plan so the client renders a
 /// helpful message instead of a blank screen.
 #[get("/signup/oauth/{provider}/callback")]
-pub async fn oauth_callback(
-    provider: Path<String>,
-) -> Result<HttpResponse, ManagerError> {
+pub async fn oauth_callback(provider: Path<String>) -> Result<HttpResponse, ManagerError> {
     Ok(HttpResponse::NotImplemented().body(format!(
         "OAuth callback for provider '{}' is not yet implemented. \
          Real OAuth signup requires app registration with the provider \

@@ -259,7 +259,7 @@ where
         reads: &mut Vec<Fetch0Read>,
     ) -> Result<(), Error> {
         self.pending -= 1;
-        for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+        for (read, result) in results.reads.into_iter().zip(results.results) {
             let raw = result?;
             let tree_block = TreeBlock::from_raw_with_cache(
                 decompress(self.reader.file.compression, read.node.location, raw)?,
@@ -575,7 +575,7 @@ where
         reads: &mut Vec<Fetch1Read>,
     ) -> Result<(), Error> {
         self.pending -= 1;
-        for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+        for (read, result) in results.reads.into_iter().zip(results.results) {
             let raw = result?;
             let tree_block = TreeBlock::from_raw_with_cache(
                 decompress(self.reader.file.compression, read.node.location, raw)?,

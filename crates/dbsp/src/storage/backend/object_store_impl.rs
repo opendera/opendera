@@ -254,6 +254,10 @@ impl FileRw for ObjectStoreFileWriter {
     fn file_id(&self) -> FileId {
         self.id
     }
+    // The trait method is named `path` but returns the *relative* storage
+    // path; `self.path` is the full ObjPath used to address S3. Clippy
+    // can't tell the difference.
+    #[allow(clippy::misnamed_getters)]
     fn path(&self) -> &StoragePath {
         &self.relative
     }
@@ -273,7 +277,9 @@ impl ObjectStoreFileWriter {
                 return Ok(());
             }
             let payload = PutPayload::from(std::mem::take(part_buffer));
-            let mut upload = upload.lock().unwrap();
+            // We hold &mut self.state, so &mut Mutex<_> already gives us
+            // exclusive access — no need to lock.
+            let upload = upload.get_mut().unwrap();
             TOKIO_DEDICATED_IO.block_on(upload.put_part(payload))?;
         }
         Ok(())
@@ -371,7 +377,8 @@ impl Drop for ObjectStoreFileWriter {
         // in-flight multipart upload to avoid leaking S3 storage charges
         // for orphaned parts.
         if let WriterState::Streaming { upload, .. } = &mut self.state {
-            let mut upload = upload.lock().unwrap();
+            // &mut Mutex gives exclusive access; no lock needed.
+            let upload = upload.get_mut().unwrap();
             if let Err(err) = TOKIO_DEDICATED_IO.block_on(upload.abort()) {
                 tracing::debug!(
                     "ObjectStoreFileWriter for {} dropped during multipart upload; \
@@ -405,6 +412,7 @@ impl FileRw for ObjectStoreFileReader {
     fn file_id(&self) -> FileId {
         self.id
     }
+    #[allow(clippy::misnamed_getters)]
     fn path(&self) -> &StoragePath {
         &self.relative
     }

@@ -181,6 +181,10 @@ where
                     let (row_number, num_rows) = unsafe { rn.downcast::<(RankType, RankType)>() };
                     let mut row_number = *row_number;
 
+                    // row_number isn't a 0-based counter — it's an offset
+                    // carried over from a prior group, so enumerate() wouldn't
+                    // be a faithful replacement here.
+                    #[allow(clippy::explicit_counter_loop)]
                     for _ in 0..*num_rows {
                         k.clone_to(&mut out_k);
                         output_func(row_number, v, &mut out_v);
