@@ -623,7 +623,7 @@ fn internal_scope() -> Scope {
 fn public_scope(api_config: &ApiServerConfig) -> Scope {
     let openapi = ApiDoc::openapi();
 
-    let mut scope = web::scope("")
+    let scope = web::scope("")
         .service(
             web::scope("/config")
                 .wrap(api_config.cors())
@@ -631,12 +631,6 @@ fn public_scope(api_config: &ApiServerConfig) -> Scope {
         )
         .service(SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-doc/openapi.json", openapi))
         .service(healthz);
-
-    // Cloud-only unauthenticated endpoints (POST /v0/signup). Mounted
-    // BEFORE the SPA fallback below so it doesn't get shadowed.
-    if api_config.cloud_mode {
-        scope = scope.service(endpoints::cloud::register_public(web::scope("/v0")));
-    }
 
     scope.service(
         web::scope("")
@@ -716,14 +710,8 @@ fn api_scope(api_config: &ApiServerConfig) -> Scope {
         .service(endpoints::cluster::get_cluster_event)
         .service(endpoints::cluster::get_cluster_health);
 
-    // Cloud-only authenticated endpoints (account / billing / usage).
-    // Off by default — only registered when the manager is configured
-    // for cloud deployment.
-    if api_config.cloud_mode {
-        endpoints::cloud::register_authenticated(scope)
-    } else {
-        scope
-    }
+    let _ = api_config; // cloud_mode no longer toggles any /v0 routes here
+    scope
 }
 
 struct SecurityAddon;
