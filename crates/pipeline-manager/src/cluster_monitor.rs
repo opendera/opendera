@@ -287,16 +287,39 @@ fn truncate_info(mut info: String) -> String {
 /// Polls the service health endpoint, which is used as the service reporting its own status
 /// information.
 ///
-/// When `autostop` is true, connection-refused and timeout errors are
-/// interpreted as "service is auto-stopped on idle, will wake on next
-/// request" and reported as Healthy. Other failure modes (non-2xx
-/// HTTP, generic errors) still report Unhealthy.
+/// When `autostop` is true the probe is skipped entirely and the
+/// service is reported as Healthy without making an HTTP request.
+/// Background: on platforms like Fly.io, dialling an autostopped
+/// service still wakes it through the proxy's auto-start path —
+/// remapping the probe's failure interpretation to "Healthy" is not
+/// enough, because by the time the probe response arrives the
+/// underlying machine is already running, and the next probe a few
+/// seconds later finds it warm. With `MONITOR_INTERVAL = 10s` and
+/// any sane Fly idle timeout, the machine never gets back to sleep.
+/// Treating autostop=true as "we don't probe — wake-on-demand is the
+/// contract" preserves the user-visible status (the service is
+/// either running and serving, or asleep and instantly wakable) and
+/// stops the cluster monitor from accidentally driving the bill up.
+///
+/// When `autostop` is false the probe behaves as before. Non-2xx
+/// HTTP responses and generic errors still report Unhealthy.
 async fn poll_service_health_endpoint(
     service_name: &str,
     url: &str,
     client: &reqwest::Client,
     autostop: bool,
 ) -> (bool, String) {
+    if autostop {
+        return (
+            true,
+            format!(
+                "Operational: {service_name} at {url} is configured for autostop on idle; \
+                 health probes are skipped so the proxy's wake-on-connect path doesn't \
+                 keep the service warm. Status reverts to live probing as soon as a \
+                 real request lands."
+            ),
+        );
+    }
     match client
         .get(url)
         .timeout(DEFAULT_REQUEST_TIMEOUT)
@@ -322,22 +345,6 @@ async fn poll_service_health_endpoint(
             );
             (false, message)
         }
-        Err(e) if e.is_connect() && autostop => (
-            true,
-            format!(
-                "Operational: {service_name} at {url} is auto-stopped on idle and will start on the next request \
-                 (connection refused on probe is expected). Underlying detail: {}.",
-                source_error(&e)
-            ),
-        ),
-        Err(e) if e.is_timeout() && autostop => (
-            true,
-            format!(
-                "Operational: {service_name} at {url} is auto-stopped on idle; probe timed out before a cold start \
-                 finished (this is expected when the service is scaled to zero). Underlying detail: {}.",
-                source_error(&e)
-            ),
-        ),
         Err(e) if e.is_connect() => (
             false,
             format!(
@@ -366,6 +373,42 @@ async fn poll_service_health_endpoint(
             ),
 
         ),
+    }
+}
+
+#[cfg(test)]
+mod poll_service_health_endpoint_tests {
+    use super::poll_service_health_endpoint;
+    use reqwest::Client;
+
+    /// With `autostop = true` the probe must not make any network call.
+    /// We give it a URL that would be expensive (a non-routable test
+    /// address that would otherwise take the full `DEFAULT_REQUEST_TIMEOUT`
+    /// to fail) and assert the call returns immediately with Healthy.
+    /// This is the regression test for the bug where the engine's 10s
+    /// probe interval was keeping a Fly-autostopped machine warm via
+    /// the proxy's wake-on-connect path.
+    #[tokio::test]
+    async fn autostop_true_skips_dial_and_reports_healthy() {
+        let client = Client::new();
+        // RFC 5737 TEST-NET-1; routes nowhere. If the function tried
+        // to actually probe this URL, the call would block until the
+        // request timeout — well over 10ms.
+        let url = "http://192.0.2.1:9999/healthz";
+        let start = std::time::Instant::now();
+        let (ok, info) =
+            poll_service_health_endpoint("compiler", url, &client, /* autostop */ true).await;
+        let elapsed = start.elapsed();
+
+        assert!(ok, "autostop=true must report Healthy");
+        assert!(
+            info.starts_with("Operational:"),
+            "autostop=true should produce an Operational status, got: {info}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "probe must return without dialling (took {elapsed:?})"
+        );
     }
 }
 
