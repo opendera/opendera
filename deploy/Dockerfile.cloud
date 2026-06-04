@@ -75,10 +75,22 @@ RUN cargo build --release --locked -p pipeline-manager
 # obvious if the build silently produced nothing.
 RUN test -f /src/target/release/pipeline-manager
 
-# ---------- 6. Runtime: ubuntu + JRE only ------------------------------------
+# ---------- 6. Runtime: ubuntu + JRE + Rust toolchain ------------------------
+#
+# Runtime still needs a working Rust toolchain because pipeline-manager
+# invokes `cargo build` per pipeline to compile the Rust code emitted
+# by SQL-to-DBSP. The previous "slim" runtime stripped this and broke
+# every pipeline at the Rust-compile boundary ("running 'cargo build':
+# No such file or directory"). Match the upstream deploy/Dockerfile:
+# rustup with the same 1.93.1 toolchain as the chef stage, plus the
+# system dev libs the generated crate's build.rs scripts link against
+# (rdkafka -> libsasl2-dev / zlib1g-dev, openssl-sys -> libssl-dev /
+# pkg-config, bindgen -> libclang-dev, prost-build -> cmake).
 
 FROM ubuntu:24.04 AS release
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    OPENSSL_NO_VENDOR=1 \
+    OPENSSL_STATIC=1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         openjdk-21-jre-headless \
@@ -86,7 +98,13 @@ RUN apt-get update \
         locales \
         libcap2-bin \
         git \
-        libsasl2-2 \
+        curl \
+        build-essential \
+        pkg-config \
+        cmake \
+        libssl-dev \
+        libsasl2-dev zlib1g-dev \
+        libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 RUN curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
       -o /usr/local/share/ca-certificates/aws-global-rds-bundle.crt \
@@ -95,7 +113,14 @@ RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
  && locale-gen
 USER ubuntu
 WORKDIR /home/ubuntu
-ENV LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 LANGUAGE=en_US:en BANNER_ADDR=localhost
+# rustup + the exact toolchain version the binary was built against
+# (1.93.1, matching the chef stage's rust:1.93-bookworm). --profile
+# minimal keeps install at ~150 MB instead of dragging in rustfmt /
+# clippy / rust-docs.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain 1.93.1
+ENV PATH="/home/ubuntu/.cargo/bin:${PATH}" \
+    LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 LANGUAGE=en_US:en BANNER_ADDR=localhost
 # Match the existing image layout so the ENTRYPOINT below is identical
 # to deploy/Dockerfile and works for any downstream tooling that
 # assumes those paths (e.g. operator scripts).
