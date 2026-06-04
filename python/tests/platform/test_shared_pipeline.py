@@ -347,8 +347,10 @@ class TestPipeline(SharedTestPipeline):
         self.pipeline.input_json("tbl", data, wait=False)
         wait_for_condition(
             "pipeline stops with deployment error after worker panic",
-            lambda: self.pipeline.status() == PipelineStatus.STOPPED
-            and len(self.pipeline.deployment_error()) > 0,
+            lambda: (
+                self.pipeline.status() == PipelineStatus.STOPPED
+                and len(self.pipeline.deployment_error()) > 0
+            ),
             timeout_s=20.0,
             poll_interval_s=1.0,
         )

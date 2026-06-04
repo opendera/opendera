@@ -1005,7 +1005,6 @@ pub struct ApiServerConfig {
     #[serde(default)]
     #[arg(long, action = clap::ArgAction::Set, default_value_t = false, env = "OPENDERA_CLOUD_MODE")]
     pub cloud_mode: bool,
-
 }
 
 impl ApiServerConfig {
