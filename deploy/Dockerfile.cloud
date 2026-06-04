@@ -158,4 +158,8 @@ COPY --chown=ubuntu crates/pipeline-manager/demos/sql /home/ubuntu/feldera/demos
 # `--dbsp-override-path` points at this directory so the Rust pipeline
 # can resolve dbsp sources during compile.
 COPY --chown=ubuntu crates /home/ubuntu/feldera/crates
-ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]
+# Entrypoint shim. Mirrors AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+# into the OPENDAL_S3_* names sccache v0.8 needs to authenticate to
+# its S3 backend. See deploy/entrypoint.sh for the why.
+COPY --chmod=0755 deploy/entrypoint.sh /usr/local/bin/feldera-entrypoint
+ENTRYPOINT ["/usr/local/bin/feldera-entrypoint", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]
