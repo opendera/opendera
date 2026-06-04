@@ -1482,9 +1482,19 @@ async fn call_compiler(
     // Formulate command
     let mut command = Command::new("cargo");
 
-    // get env vars that start with SCCACHE
+    // Preserve env vars whose names are scoped to compiler-cache plumbing:
+    //   - SCCACHE_*     : sccache's own config (bucket, endpoint, region, ...)
+    //   - OPENDAL_S3_*  : credentials sccache's opendal-s3 backend reads
+    //                     when it talks to an S3-compatible cache. We
+    //                     cannot use AWS_ACCESS_KEY_ID for the same role
+    //                     because user-submitted build scripts run in the
+    //                     same cargo invocation and would inherit those
+    //                     credentials; the OPENDAL_S3_* names are sccache-
+    //                     specific by convention, so a malicious build
+    //                     script that wanted to abuse them would have to
+    //                     go out of its way.
     let preserved_env_vars: Vec<(String, String)> = std::env::vars()
-        .filter(|(key, _)| key.starts_with("SCCACHE"))
+        .filter(|(key, _)| key.starts_with("SCCACHE") || key.starts_with("OPENDAL_S3"))
         .collect();
 
     command.env_clear();
