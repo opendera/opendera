@@ -119,6 +119,20 @@ WORKDIR /home/ubuntu
 # clippy / rust-docs.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --profile minimal --default-toolchain 1.93.1
+# sccache is configured as RUSTC_WRAPPER on the compile-pool Fly app
+# (with a Tigris S3 backend, so per-pipeline crate compilations share
+# a cache across machines). Install the official prebuilt binary so
+# the wrapper actually exists; without it cargo aborts with
+# "could not execute process `sccache .../rustc`: No such file".
+USER root
+RUN ARCH=$(uname -m) \
+ && SCCACHE_VER=v0.8.2 \
+ && curl -sSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VER}/sccache-${SCCACHE_VER}-${ARCH}-unknown-linux-musl.tar.gz" \
+      -o /tmp/sccache.tar.gz \
+ && tar -xzf /tmp/sccache.tar.gz -C /tmp \
+ && install -m 0755 "/tmp/sccache-${SCCACHE_VER}-${ARCH}-unknown-linux-musl/sccache" /usr/local/bin/sccache \
+ && rm -rf /tmp/sccache.tar.gz "/tmp/sccache-${SCCACHE_VER}-${ARCH}-unknown-linux-musl"
+USER ubuntu
 ENV PATH="/home/ubuntu/.cargo/bin:${PATH}" \
     LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 LANGUAGE=en_US:en BANNER_ADDR=localhost
 # Match the existing image layout so the ENTRYPOINT below is identical
