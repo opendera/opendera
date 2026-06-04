@@ -124,6 +124,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # a cache across machines). Install the official prebuilt binary so
 # the wrapper actually exists; without it cargo aborts with
 # "could not execute process `sccache .../rustc`: No such file".
+#
+# mold is the linker. The per-pipeline binary is ~278 MB; linking it
+# with the default ld is the slowest single step in a fully-cached
+# warm cargo build (sccache covers rustc but not the linker). mold
+# is typically 3-8x faster than ld for binaries this size and is a
+# drop-in replacement enabled via RUSTFLAGS=-C link-arg=-fuse-ld=mold
+# (set on the compile-pool fly.toml so users' SQL pipelines link
+# faster, and on the engine build via the chef stage if we ever cold-
+# build the engine here).
 USER root
 RUN ARCH=$(uname -m) \
  && SCCACHE_VER=v0.8.2 \
@@ -132,6 +141,14 @@ RUN ARCH=$(uname -m) \
  && tar -xzf /tmp/sccache.tar.gz -C /tmp \
  && install -m 0755 "/tmp/sccache-${SCCACHE_VER}-${ARCH}-unknown-linux-musl/sccache" /usr/local/bin/sccache \
  && rm -rf /tmp/sccache.tar.gz "/tmp/sccache-${SCCACHE_VER}-${ARCH}-unknown-linux-musl"
+RUN ARCH=$(uname -m) \
+ && MOLD_VER=v2.40.1 \
+ && curl -sSL "https://github.com/rui314/mold/releases/download/${MOLD_VER}/mold-${MOLD_VER#v}-${ARCH}-linux.tar.gz" \
+      -o /tmp/mold.tar.gz \
+ && tar -xzf /tmp/mold.tar.gz -C /tmp \
+ && install -m 0755 "/tmp/mold-${MOLD_VER#v}-${ARCH}-linux/bin/mold" /usr/local/bin/mold \
+ && install -m 0755 "/tmp/mold-${MOLD_VER#v}-${ARCH}-linux/bin/ld.mold" /usr/local/bin/ld.mold \
+ && rm -rf /tmp/mold.tar.gz "/tmp/mold-${MOLD_VER#v}-${ARCH}-linux"
 USER ubuntu
 ENV PATH="/home/ubuntu/.cargo/bin:${PATH}" \
     LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 LANGUAGE=en_US:en BANNER_ADDR=localhost
