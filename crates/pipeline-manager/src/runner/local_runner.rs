@@ -383,7 +383,16 @@ impl PipelineExecutor for LocalRunner {
     type Config = LocalRunnerConfig;
 
     // Provisioning is over once the process is spawned and the port file created by it is detected.
-    const DEFAULT_PROVISIONING_TIMEOUT: Duration = Duration::from_millis(20_000);
+    //
+    // 20s was too tight in practice: the runner has to first download
+    // the per-pipeline binary (~250-300 MB compiled with opt-level=3)
+    // from the compiler service over HTTP, write it to disk, chmod +x,
+    // exec it, and wait for the worker to bind a port. A freshly-woken
+    // compile-pool machine can spend most of those 20s in HTTP setup
+    // alone. Bumped to 180s to give realistic cold-start scenarios
+    // room; users who want a tighter timeout can override per-pipeline
+    // via `runtime_config.provisioning_timeout_secs`.
+    const DEFAULT_PROVISIONING_TIMEOUT: Duration = Duration::from_secs(180);
 
     fn new(
         pipeline_id: PipelineId,
