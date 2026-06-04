@@ -130,6 +130,12 @@ COPY --from=sql --chown=ubuntu \
         /src/sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar \
         /home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar
 COPY --chown=ubuntu Cargo.lock /home/ubuntu/feldera/Cargo.lock
+# Workspace root manifest. Per-pipeline `cargo build` invocations
+# pull in crates from /home/ubuntu/feldera/crates (e.g. dbsp), and
+# those crates inherit `rust-version`, `edition`, etc. from
+# `workspace.package` in this Cargo.toml. Without it cargo errors
+# with "failed to find a workspace root" mid-resolution.
+COPY --chown=ubuntu Cargo.toml /home/ubuntu/feldera/Cargo.toml
 COPY --chown=ubuntu sql-to-dbsp-compiler/lib /home/ubuntu/feldera/sql-to-dbsp-compiler/lib
 COPY --chown=ubuntu sql-to-dbsp-compiler/temp /home/ubuntu/feldera/sql-to-dbsp-compiler/temp
 COPY --chown=ubuntu sql-to-dbsp-compiler/SQL-compiler/sql-to-dbsp \
