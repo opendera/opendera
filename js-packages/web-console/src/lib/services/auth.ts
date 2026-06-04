@@ -22,12 +22,33 @@ export const setSelectedTenant = (tenant?: string) => {
 /**
  * Core authentication request logic that adds auth headers to requests.
  * Can be used both as a middleware interceptor and directly in fetch operations.
+ *
+ * Actively obtains a valid access token via `getValidTokenAsync()` before
+ * setting the `Authorization` header. With `token_automatic_renew_mode =
+ * AutomaticOnlyWhenFetchExecuted` (see `compositions/@axa-fr/auth.ts`) this
+ * performs an on-demand refresh-token exchange whenever the access token is
+ * expired or within its renewal window, instead of relying on the background
+ * renewal timer. The background timer is a `setTimeout` loop that browsers
+ * throttle in inactive tabs and pause while the machine sleeps, so depending
+ * on it alone makes sessions silently expire "after some time". Driving the
+ * refresh from the request path removes that dependency. `getValidTokenAsync()`
+ * returns immediately when the token is still valid, so the per-request cost is
+ * negligible.
  */
-export const applyAuthToRequest = (request: Request): Request => {
+export const applyAuthToRequest = async (request: Request): Promise<Request> => {
   try {
     const oidcClient = OidcClient.get()
-    if (oidcClient.tokens?.accessToken) {
-      request.headers.set('Authorization', `Bearer ${oidcClient.tokens.accessToken}`)
+    let accessToken = oidcClient.tokens?.accessToken
+    try {
+      const valid = await oidcClient.getValidTokenAsync()
+      accessToken = valid?.tokens?.accessToken ?? accessToken
+    } catch {
+      // Renewal failed (e.g. offline or refresh token rejected). Fall back to
+      // the in-memory token and let the 401 response handler surface a hard
+      // failure if it is no longer accepted.
+    }
+    if (accessToken) {
+      request.headers.set('Authorization', `Bearer ${accessToken}`)
       const tenant = getSelectedTenant()
       if (tenant) {
         request.headers.set('Feldera-Tenant', tenant)
@@ -66,7 +87,11 @@ export const handleAuthResponse = async (
       // preserving ID token (thus, id_token_hint on logout) when 401 is due to authorization issues rather than token expiry
       const validToken = await client.getValidTokenAsync()
       if (validToken?.isTokensValid) {
-        return fetchFn(request)
+        // Re-apply auth to the request before retrying: it still carries the
+        // stale Authorization header that was set before the 401, so retrying
+        // it as-is would just send the expired token again. applyAuthToRequest
+        // overwrites the header with the freshly refreshed token.
+        return fetchFn(await applyAuthToRequest(request))
       }
 
       console.error('Unable to extend user session. refresh_token was probably not issued.')

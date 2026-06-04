@@ -835,7 +835,7 @@ export const getPipelineSupportBundle = (
 const getAuthenticatedFetch = (options?: FetchOptions): typeof globalThis.fetch => {
   const f = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     // Create a Request object and apply auth headers
-    const request = applyAuthToRequest(new Request(input, init))
+    const request = await applyAuthToRequest(new Request(input, init))
 
     // Perform the fetch
     const response = await (options?.fetch ?? globalThis.fetch)(request)

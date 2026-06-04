@@ -26,8 +26,17 @@ export const toAxaOidcConfig = (c: OidcConfig): OidcConfiguration => ({
         issuer: c.authority_configuration.issuer
       }
     : undefined,
-  // refresh_time_before_tokens_expiration_in_second: undefined,
-  // token_automatic_renew_mode: TokenAutomaticRenewMode.AutomaticOnlyWhenFetchExecuted,
+  // Refresh the access token when it is within this many seconds of expiring.
+  refresh_time_before_tokens_expiration_in_second: 120,
+  // Drive token renewal from the request path (applyAuthToRequest /
+  // handleAuthResponse call getValidTokenAsync) rather than from the background
+  // setTimeout timer used by the default AutomaticBeforeTokenExpiration mode.
+  // Browsers throttle/pause that timer in inactive tabs and during system
+  // sleep; when it misses the renewal window the default mode's
+  // getValidTokenAsync only passively waits for the (stalled) timer and never
+  // refreshes, so sessions silently expire "after some time". In this mode
+  // getValidTokenAsync performs the refresh-token exchange on demand instead.
+  token_automatic_renew_mode: TokenAutomaticRenewMode.AutomaticOnlyWhenFetchExecuted,
   // token_request_timeout: undefined,
   // service_worker_relative_url: undefined,
   // service_worker_register: undefined,
