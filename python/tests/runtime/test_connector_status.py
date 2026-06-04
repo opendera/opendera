@@ -237,8 +237,10 @@ def test_connector_status(pipeline_name):
 
         wait_for_condition(
             "output connector encode error count reaches 500",
-            lambda: output_connector_status().metrics.num_encode_errors == 500
-            and len(output_connector_status().encode_errors) == 100,
+            lambda: (
+                output_connector_status().metrics.num_encode_errors == 500
+                and len(output_connector_status().encode_errors) == 100
+            ),
             timeout_s=100.0,
             poll_interval_s=1.0,
         )
@@ -264,8 +266,10 @@ def test_connector_status(pipeline_name):
 
         wait_for_condition(
             "input connector parse error count reaches 500",
-            lambda: input_connector_status().metrics.num_parse_errors == 500
-            and len(input_connector_status().parse_errors) == 100,
+            lambda: (
+                input_connector_status().metrics.num_parse_errors == 500
+                and len(input_connector_status().parse_errors) == 100
+            ),
             timeout_s=100.0,
             poll_interval_s=1.0,
         )
