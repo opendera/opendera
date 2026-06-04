@@ -1482,19 +1482,37 @@ async fn call_compiler(
     // Formulate command
     let mut command = Command::new("cargo");
 
-    // Preserve env vars whose names are scoped to compiler-cache plumbing:
-    //   - SCCACHE_*     : sccache's own config (bucket, endpoint, region, ...)
-    //   - OPENDAL_S3_*  : credentials sccache's opendal-s3 backend reads
-    //                     when it talks to an S3-compatible cache. We
-    //                     cannot use AWS_ACCESS_KEY_ID for the same role
-    //                     because user-submitted build scripts run in the
-    //                     same cargo invocation and would inherit those
-    //                     credentials; the OPENDAL_S3_* names are sccache-
-    //                     specific by convention, so a malicious build
-    //                     script that wanted to abuse them would have to
-    //                     go out of its way.
+    // Preserve env vars whose names are scoped to compiler-cache plumbing.
+    //
+    // Empirically sccache 0.8.x's opendal-s3 backend ignores OPENDAL_S3_*
+    // and uses the AWS SDK default credential chain instead, which reads
+    // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY directly. Without those
+    // it falls through to EC2 IMDS and times out on any non-EC2 host
+    // (Fly, k8s, local, …), aborting the very first `sccache rustc -vV`
+    // probe and breaking every per-pipeline build.
+    //
+    // The historical concern with passing AWS_* was a malicious build.rs
+    // exfiltrating those credentials. Two mitigations make that
+    // acceptable:
+    //
+    //   1. Operators are expected to scope the AWS credentials handed to
+    //      the compile-pool to ONLY the sccache cache bucket — they are
+    //      not general AWS keys. The blast radius of a leak is one S3
+    //      bucket that holds compile-cache artifacts.
+    //   2. The pipeline's Rust source is emitted by the SQL-to-DBSP
+    //      translator; users cannot inject arbitrary build.rs code into
+    //      it. (When that property no longer holds — e.g. a Wasm UDF
+    //      story with user-supplied Rust — revisit this allowlist.)
     let preserved_env_vars: Vec<(String, String)> = std::env::vars()
-        .filter(|(key, _)| key.starts_with("SCCACHE") || key.starts_with("OPENDAL_S3"))
+        .filter(|(key, _)| {
+            key.starts_with("SCCACHE")
+                || key == "AWS_ACCESS_KEY_ID"
+                || key == "AWS_SECRET_ACCESS_KEY"
+                || key == "AWS_SESSION_TOKEN"
+                || key == "AWS_DEFAULT_REGION"
+                || key == "AWS_REGION"
+                || key == "AWS_ENDPOINT_URL_S3"
+        })
         .collect();
 
     command.env_clear();
@@ -1518,10 +1536,8 @@ async fn call_compiler(
         command.env("CARGO_INCREMENTAL", cargo_incremental);
     }
 
-    // Preserve AWS_PROFILE if set, to allow sccache to use
-    // credentials from there.
-    // we avoid passing all AWS_* env vars to prevent leaking
-    // credentials from the malicious build scripts.
+    // Preserve AWS_PROFILE if set, so sccache can resolve credentials
+    // from ~/.aws/credentials when AWS_ACCESS_KEY_ID isn't used.
     if let Some(aws_profile) = std::env::var_os("AWS_PROFILE") {
         command.env("AWS_PROFILE", aws_profile);
     }
