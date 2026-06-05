@@ -157,6 +157,8 @@ impl FlyRunner {
         &self,
         deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
+        program_binary_url: Option<&str>,
+        manager_url: Option<&str>,
     ) -> serde_json::Map<String, Value> {
         let mut env = serde_json::Map::new();
         env.insert(
@@ -172,6 +174,17 @@ impl FlyRunner {
             json!(self.config.tigris_endpoint),
         );
         env.insert("AWS_REGION".into(), json!("auto"));
+        // When the per-pipeline binary isn't baked into the image
+        // (image_registry path), the worker container has to fetch it
+        // at startup. Expose the URL the manager already minted and
+        // an internal-network manager URL the worker can re-resolve
+        // against if anything fails.
+        if let Some(url) = program_binary_url {
+            env.insert("OPENDERA_BINARY_URL".into(), json!(url));
+        }
+        if let Some(url) = manager_url {
+            env.insert("OPENDERA_MANAGER_URL".into(), json!(url));
+        }
         for (k, v) in &deployment_config.global.env {
             if self.is_secret_env_name(k) {
                 continue;
@@ -280,6 +293,7 @@ impl FlyRunner {
         deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
         image: Option<&str>,
+        program_binary_url: Option<&str>,
     ) -> Result<MachineResponse, ManagerError> {
         let body = CreateMachineBody {
             name: &self.machine_name(),
@@ -288,7 +302,12 @@ impl FlyRunner {
                 image: image
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| self.config.pipeline_image.clone()),
-                env: self.pipeline_env(deployment_id, deployment_config),
+                env: self.pipeline_env(
+                    deployment_id,
+                    deployment_config,
+                    program_binary_url,
+                    self.config.manager_url(),
+                ),
                 guest: GuestConfig {
                     cpu_kind: self.config.default_machine_cpu_kind.clone(),
                     cpus: self.config.default_machine_cpus,
@@ -602,12 +621,24 @@ impl PipelineExecutor for FlyRunner {
                 }
             }
             None => {
+                // Only thread the binary URL into the machine env when
+                // we haven't already baked the binary into the image.
+                // If image_registry is enabled, the worker already has
+                // the binary at /usr/local/bin/<install_path> and the
+                // OPENDERA_BINARY_URL env would be redundant (and could
+                // mislead a wrapper into trying to re-download).
+                let env_url = if machine_image.is_some() {
+                    None
+                } else {
+                    Some(program_binary_url)
+                };
                 let created = self
                     .create_machine(
                         &app_name,
                         deployment_id,
                         deployment_config,
                         machine_image.as_deref(),
+                        env_url,
                     )
                     .await?;
                 info!(
