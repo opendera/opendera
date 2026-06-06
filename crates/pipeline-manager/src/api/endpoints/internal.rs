@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::main::ServerState;
 use crate::db::storage::Storage;
+use crate::db::types::pipeline::PipelineId;
 use crate::db::types::tenant::TenantId;
 use crate::db::types::usage::UsageDimension;
 use crate::error::ManagerError;
@@ -265,6 +266,59 @@ pub async fn put_tenant_billing(
     db.set_tenant_stripe_customer_id(tenant_id, body.stripe_customer_id.as_deref())
         .await?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// Returns the rendered deployment configuration for a pipeline,
+/// serialized as YAML.
+///
+/// This endpoint is the FlyRunner-spawned worker's source of truth for
+/// its own config. The LocalRunner writes the same blob to a local
+/// file at `<working-dir>/pipeline-<id>/config.yaml` (see
+/// `runner/local_runner.rs:528-545`); the per-pipeline Fly Machine
+/// has no shared filesystem with the manager and must fetch over
+/// HTTP at startup.
+///
+/// The config blob is the value the runner state machine writes to
+/// `pipeline.deployment_config` immediately before transitioning to
+/// `Provisioning` (`runner/pipeline_automata.rs:995-1018`). It already
+/// reflects program-info merging, storage paths, runtime config, and
+/// resource resolution — the worker can pass it through to
+/// `--config-file` unchanged.
+///
+/// Returns 404 when the pipeline doesn't exist or hasn't reached
+/// `Provisioning` yet (deployment_config field is null). 503 when the
+/// internal API key is not configured. 401 on bearer mismatch.
+///
+/// No tenant required in the URL: pipeline IDs are globally unique
+/// (PRIMARY KEY on `pipeline.id`), and the worker's env only carries
+/// `OPENDERA_PIPELINE_ID`. The internal API key is the auth boundary.
+#[get("/pipelines/{pipeline_id}/deployment-config.yaml")]
+pub async fn get_pipeline_deployment_config(
+    state: WebData<ServerState>,
+    req: HttpRequest,
+    path: web::Path<uuid::Uuid>,
+) -> Result<HttpResponse, ManagerError> {
+    if let Err(resp) = check_internal_auth(&req) {
+        return Ok(resp);
+    }
+    let pipeline_id = PipelineId(path.into_inner());
+    let db = state.db.lock().await;
+    let config = match db.get_deployment_config_by_pipeline_id(pipeline_id).await? {
+        Some(c) => c,
+        None => {
+            return Ok(HttpResponse::NotFound()
+                .body("no deployment_config for this pipeline (never provisioned?)"));
+        }
+    };
+    drop(db);
+    match serde_yaml::to_string(&config) {
+        Ok(yaml) => Ok(HttpResponse::Ok()
+            .insert_header((header::CONTENT_TYPE, "application/yaml"))
+            .body(yaml)),
+        Err(e) => Ok(HttpResponse::InternalServerError().body(format!(
+            "failed to serialize deployment_config as YAML: {e}"
+        ))),
+    }
 }
 
 /// Stringify a `RuntimeStatus` for the cloud-side controller. Kept

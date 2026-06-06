@@ -1,0 +1,36 @@
+# Runtime image for a per-pipeline Fly Machine.
+#
+# Each pipeline runs as its own Fly Machine launched from this image
+# (`FLY_PIPELINE_IMAGE=ghcr.io/opendera/pipeline-runtime:latest` on the
+# manager). The image is intentionally tiny: the compiled per-pipeline
+# binary is fetched at machine startup, not baked in. The entrypoint
+# shim handles binary + config download then execs the binary.
+#
+# What we install:
+#   - Runtime libs the compiled binary dynamically links against
+#     (rdkafka -> libsasl2 + zlib; openssl-sys -> libssl3; libstdc++6
+#     for the C++ runtime symbols).
+#   - ca-certificates for HTTPS to Tigris / external connectors.
+#   - curl for the entrypoint's fetches.
+#
+# What we explicitly DO NOT install: rustc, JDK, build tools. The
+# pipeline binary is a pre-compiled artifact — nothing to build at
+# runtime. Image stays at ~120-150 MB.
+
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libsasl2-2 \
+        libssl3 \
+        zlib1g \
+        libstdc++6 \
+        tini \
+ && rm -rf /var/lib/apt/lists/*
+
+# tini as PID 1 so SIGTERM from Fly's machine-stop API propagates to
+# the pipeline binary instead of getting eaten by /bin/sh.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/pipeline-entrypoint.sh"]
+COPY --chmod=0755 deploy/pipeline-entrypoint.sh /usr/local/bin/pipeline-entrypoint.sh

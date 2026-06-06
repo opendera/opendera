@@ -1,12 +1,15 @@
 name: build
 
-# Build the engine image and publish it to GHCR under two tags:
+# Build and publish three images to GHCR:
 #
 #   ghcr.io/opendera/pipeline-manager:latest   (control plane on Fly)
 #   ghcr.io/opendera/compiler:latest           (compile-pool on Fly)
+#   ghcr.io/opendera/pipeline-runtime:latest   (per-pipeline Fly Machines)
 #
-# Both Fly apps consume the same image; the entrypoint behavior is
-# selected at runtime via OPENDERA_SERVICE_MODE in each fly.toml.
+# The first two are the SAME image (Dockerfile.cloud, ~250 MB) — the
+# entrypoint behavior is selected at runtime via OPENDERA_SERVICE_MODE
+# on each Fly app. The third (Dockerfile.pipeline-runtime, ~150 MB) is
+# a tiny base that downloads the per-pipeline binary at startup.
 #
 # deploy/Dockerfile.cloud is a multi-stage build:
 #   1. cargo-chef cooks the dep graph in its own cached layer
@@ -14,8 +17,13 @@ name: build
 #   3. cargo builds the pipeline-manager binary against the cached deps
 #   4. ubuntu+JRE runtime is assembled with just the two artifacts
 #
-# Buildx --cache-from/--cache-to=type=gha persists those layers across
-# runs, so warm builds with no Cargo.lock change land in 1–3 min.
+# deploy/Dockerfile.pipeline-runtime is single-stage: ubuntu + runtime
+# libs + curl + the entrypoint shim. No build inputs from the engine
+# source tree apart from deploy/pipeline-entrypoint.sh.
+#
+# Buildx --cache-from/--cache-to=type=gha persists layers across runs,
+# so warm engine builds with no Cargo.lock change land in 1–3 min;
+# the pipeline-runtime image is a few seconds when cached.
 
 on:
   push:
@@ -38,8 +46,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---- Engine image (pipeline-manager + compiler) ----
       - uses: docker/metadata-action@v5
-        id: meta
+        id: meta_engine
         with:
           images: |
             ghcr.io/opendera/pipeline-manager
@@ -53,10 +63,30 @@ jobs:
           context: .
           file: deploy/Dockerfile.cloud
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta_engine.outputs.tags }}
+          labels: ${{ steps.meta_engine.outputs.labels }}
           # linux/amd64 only — Fly runs amd64 anyway. Multi-arch builds
           # would double our CI time for no runtime benefit.
           platforms: linux/amd64
           cache-from: type=gha,scope=engine
           cache-to: type=gha,scope=engine,mode=max
+
+      # ---- Pipeline-runtime image ----
+      - uses: docker/metadata-action@v5
+        id: meta_runtime
+        with:
+          images: ghcr.io/opendera/pipeline-runtime
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.pipeline-runtime
+          push: true
+          tags: ${{ steps.meta_runtime.outputs.tags }}
+          labels: ${{ steps.meta_runtime.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=pipeline-runtime
+          cache-to: type=gha,scope=pipeline-runtime,mode=max

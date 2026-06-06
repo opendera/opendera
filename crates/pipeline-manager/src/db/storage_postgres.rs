@@ -300,6 +300,18 @@ impl Storage for StoragePostgres {
         Ok(pipeline_result)
     }
 
+    async fn get_deployment_config_by_pipeline_id(
+        &self,
+        pipeline_id: PipelineId,
+    ) -> Result<Option<serde_json::Value>, DBError> {
+        let client = self.pool.get().await?;
+        let stmt = client
+            .prepare_cached("SELECT deployment_config FROM pipeline WHERE id = $1")
+            .await?;
+        let row = client.query_opt(&stmt, &[&pipeline_id.0]).await?;
+        Ok(row.and_then(|r| r.get::<_, Option<serde_json::Value>>("deployment_config")))
+    }
+
     async fn new_pipeline(
         &self,
         tenant_id: TenantId,

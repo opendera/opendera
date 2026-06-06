@@ -186,6 +186,26 @@ pub(crate) trait Storage {
         provision_called: bool,
     ) -> Result<ExtendedPipelineDescrRunner, DBError>;
 
+    /// Cross-tenant lookup of a pipeline's serialized deployment_config
+    /// blob by pipeline_id alone. Pipeline IDs are globally unique
+    /// (PRIMARY KEY on `pipeline.id` in V0__ddl_base.sql), so we can
+    /// resolve from the pipeline-side identifier the worker has in its
+    /// env without first knowing the tenant.
+    ///
+    /// Consumed by `GET /internal/v0/pipelines/{pipeline_id}/deployment-config.yaml`
+    /// for the FlyRunner-spawned worker's entrypoint to fetch its
+    /// rendered config at startup.
+    ///
+    /// Returns `Ok(None)` when the pipeline doesn't exist or hasn't
+    /// generated a deployment_config yet (i.e. has never reached
+    /// `Provisioning`). The deployment_config field is populated by
+    /// the runner state machine right before transitioning to
+    /// `Provisioning` (`runner/pipeline_automata.rs:995-1018`).
+    async fn get_deployment_config_by_pipeline_id(
+        &self,
+        pipeline_id: PipelineId,
+    ) -> Result<Option<serde_json::Value>, DBError>;
+
     /// Creates a new pipeline.
     async fn new_pipeline(
         &self,
