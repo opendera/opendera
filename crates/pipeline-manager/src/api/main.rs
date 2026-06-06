@@ -609,6 +609,7 @@ fn internal_scope() -> Scope {
         .service(endpoints::internal::list_usage)
         .service(endpoints::internal::get_tenant_billing)
         .service(endpoints::internal::put_tenant_billing)
+        .service(endpoints::internal::get_pipeline_deployment_config)
 }
 
 // Unauthenticated public endpoints and static UI assets. CORS is scoped to

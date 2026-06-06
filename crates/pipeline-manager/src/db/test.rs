@@ -4332,6 +4332,21 @@ impl Storage for Mutex<DbModel> {
         }
     }
 
+    async fn get_deployment_config_by_pipeline_id(
+        &self,
+        pipeline_id: PipelineId,
+    ) -> Result<Option<serde_json::Value>, DBError> {
+        // In-memory model: scan the global pipelines map (keyed by
+        // (TenantId, PipelineId)) for the matching id. O(N) per call —
+        // fine for tests, and the live Postgres impl uses an indexed
+        // PK lookup so production isn't affected.
+        let s = self.lock().await;
+        Ok(s.pipelines
+            .iter()
+            .find_map(|((_, id), p)| (*id == pipeline_id).then(|| p.deployment_config.clone()))
+            .flatten())
+    }
+
     async fn new_pipeline(
         &self,
         tenant_id: TenantId,

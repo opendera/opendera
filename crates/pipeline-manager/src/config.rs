@@ -1304,6 +1304,19 @@ pub struct FlyRunnerConfig {
     #[arg(long = "fly-tigris-bucket", env = "TIGRIS_BUCKET", default_value = "")]
     pub tigris_bucket: String,
 
+    /// Optional manager URL exposed to per-pipeline Fly Machines via
+    /// `OPENDERA_MANAGER_URL`. A worker that needs to talk back to the
+    /// manager (e.g. to re-fetch its binary if a transient failure
+    /// truncates the cached copy) reads this. Leave unset to omit the
+    /// env var entirely — only the bundled-binary path requires it.
+    #[serde(default)]
+    #[arg(
+        long = "fly-manager-url",
+        env = "OPENDERA_MANAGER_URL",
+        default_value = ""
+    )]
+    pub manager_url_raw: String,
+
     /// Env-var name suffixes that the runner treats as secrets:
     /// entries in `PipelineConfig.global.env` whose key ends in one of
     /// these are pushed via Fly's secrets API and stripped from the
@@ -1390,6 +1403,15 @@ impl FlyImageRegistryConfig {
 }
 
 impl FlyRunnerConfig {
+    /// Optional manager URL, treating an empty string as `None`.
+    pub fn manager_url(&self) -> Option<&str> {
+        if self.manager_url_raw.is_empty() {
+            None
+        } else {
+            Some(&self.manager_url_raw)
+        }
+    }
+
     /// Validates that every required field is populated. Call this only
     /// when `RunnerKind::Fly` has been selected — when `Local` is in
     /// effect, the Fly configuration is unused and may be left empty.

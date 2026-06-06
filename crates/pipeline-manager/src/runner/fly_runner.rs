@@ -35,7 +35,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::{CommonConfig, FlyRunnerConfig};
-use crate::db::types::pipeline::PipelineId;
+use crate::db::types::pipeline::{
+    bootstrap_policy_to_string, runtime_desired_status_to_string, PipelineId,
+};
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use crate::runner::error::RunnerError;
@@ -157,6 +159,10 @@ impl FlyRunner {
         &self,
         deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
+        program_binary_url: Option<&str>,
+        manager_url: Option<&str>,
+        deployment_initial: RuntimeDesiredStatus,
+        bootstrap_policy: Option<BootstrapPolicy>,
     ) -> serde_json::Map<String, Value> {
         let mut env = serde_json::Map::new();
         env.insert(
@@ -172,6 +178,34 @@ impl FlyRunner {
             json!(self.config.tigris_endpoint),
         );
         env.insert("AWS_REGION".into(), json!("auto"));
+        // When the per-pipeline binary isn't baked into the image
+        // (image_registry path), the worker container has to fetch it
+        // at startup. Expose the URL the manager already minted and
+        // an internal-network manager URL the worker can re-resolve
+        // against if anything fails.
+        if let Some(url) = program_binary_url {
+            env.insert("OPENDERA_BINARY_URL".into(), json!(url));
+        }
+        if let Some(url) = manager_url {
+            env.insert("OPENDERA_MANAGER_URL".into(), json!(url));
+        }
+        // Initial runtime status the worker should boot into. The
+        // entrypoint shim forwards it as `--initial` to the compiled
+        // pipeline binary, mirroring LocalRunner's argv contract at
+        // `local_runner.rs:591`.
+        env.insert(
+            "OPENDERA_INITIAL_STATUS".into(),
+            json!(runtime_desired_status_to_string(deployment_initial)),
+        );
+        // Optional bootstrap policy override. None means "engine
+        // default" (AwaitApproval at the time of this commit); the
+        // shim only includes `--bootstrap-policy` when set.
+        if let Some(policy) = bootstrap_policy {
+            env.insert(
+                "OPENDERA_BOOTSTRAP_POLICY".into(),
+                json!(bootstrap_policy_to_string(policy)),
+            );
+        }
         for (k, v) in &deployment_config.global.env {
             if self.is_secret_env_name(k) {
                 continue;
@@ -190,13 +224,29 @@ impl FlyRunner {
     /// Subset of `deployment_config.global.env` that should land as
     /// Fly Secrets. Order-stable so a redeploy doesn't churn the App.
     fn collect_secrets(&self, deployment_config: &PipelineConfig) -> BTreeMap<String, String> {
-        deployment_config
+        let mut secrets: BTreeMap<String, String> = deployment_config
             .global
             .env
             .iter()
             .filter(|(k, _)| self.is_secret_env_name(k))
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect();
+
+        // The pipeline-runtime entrypoint shim needs the internal API key
+        // to authenticate against the manager's
+        // /internal/v0/pipelines/{id}/deployment-config.yaml endpoint
+        // at startup. The key is shared across all tenants, so it MUST
+        // be a Fly Secret (not plaintext env), otherwise inspecting any
+        // pipeline's Machine config would leak it across tenant
+        // boundaries. SECURITY DEBT: still shared globally — promote to
+        // a per-pipeline scoped JWT in a follow-up before opening any
+        // tenant boundary that matters.
+        if let Ok(internal_key) = std::env::var("OPENDERA_INTERNAL_API_KEY") {
+            if !internal_key.is_empty() {
+                secrets.insert("OPENDERA_INTERNAL_API_KEY".into(), internal_key);
+            }
+        }
+        secrets
     }
 
     /// Create the Fly App if it doesn't already exist. Idempotent
@@ -280,6 +330,9 @@ impl FlyRunner {
         deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
         image: Option<&str>,
+        program_binary_url: Option<&str>,
+        deployment_initial: RuntimeDesiredStatus,
+        bootstrap_policy: Option<BootstrapPolicy>,
     ) -> Result<MachineResponse, ManagerError> {
         let body = CreateMachineBody {
             name: &self.machine_name(),
@@ -288,7 +341,14 @@ impl FlyRunner {
                 image: image
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| self.config.pipeline_image.clone()),
-                env: self.pipeline_env(deployment_id, deployment_config),
+                env: self.pipeline_env(
+                    deployment_id,
+                    deployment_config,
+                    program_binary_url,
+                    self.config.manager_url(),
+                    deployment_initial,
+                    bootstrap_policy,
+                ),
                 guest: GuestConfig {
                     cpu_kind: self.config.default_machine_cpu_kind.clone(),
                     cpus: self.config.default_machine_cpus,
@@ -554,8 +614,8 @@ impl PipelineExecutor for FlyRunner {
 
     async fn provision(
         &mut self,
-        _deployment_initial: RuntimeDesiredStatus,
-        _bootstrap_policy: Option<BootstrapPolicy>,
+        deployment_initial: RuntimeDesiredStatus,
+        bootstrap_policy: Option<BootstrapPolicy>,
         deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
         _program_info: &Value,
@@ -563,10 +623,6 @@ impl PipelineExecutor for FlyRunner {
         _program_info_url: Option<&str>,
         _program_version: Version,
     ) -> Result<(), ManagerError> {
-        // Remaining TODOs (independent of image push):
-        //   - bootstrap_policy: pass to the pipeline as an env hint
-        //   - deployment_initial: communicate to the binary so it
-        //     boots in the requested initial state.
         let _ = &self.common_config;
 
         let app_name = self.app_name_for(*deployment_id);
@@ -602,12 +658,26 @@ impl PipelineExecutor for FlyRunner {
                 }
             }
             None => {
+                // Only thread the binary URL into the machine env when
+                // we haven't already baked the binary into the image.
+                // If image_registry is enabled, the worker already has
+                // the binary at /usr/local/bin/<install_path> and the
+                // OPENDERA_BINARY_URL env would be redundant (and could
+                // mislead a wrapper into trying to re-download).
+                let env_url = if machine_image.is_some() {
+                    None
+                } else {
+                    Some(program_binary_url)
+                };
                 let created = self
                     .create_machine(
                         &app_name,
                         deployment_id,
                         deployment_config,
                         machine_image.as_deref(),
+                        env_url,
+                        deployment_initial,
+                        bootstrap_policy,
                     )
                     .await?;
                 info!(
