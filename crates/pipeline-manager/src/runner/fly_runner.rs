@@ -206,6 +206,26 @@ impl FlyRunner {
                 json!(bootstrap_policy_to_string(policy)),
             );
         }
+        // Internal API key inlined as plaintext env so the entrypoint
+        // shim can authenticate against
+        // /internal/v0/pipelines/{id}/deployment-config.yaml at start-up.
+        //
+        // The /v1/apps/{app}/secrets POST returns 2xx but does not
+        // actually attach to fresh Machines in practice — `flyctl
+        // secrets list` shows the App empty even after a successful
+        // push. Until that's reverse-engineered or replaced with the
+        // GraphQL secrets API, inline the key as env. Each per-pipeline
+        // Fly App holds exactly one tenant's pipeline, so the blast
+        // radius of seeing the value in `flyctl machine list` is "abuse
+        // the manager's /internal/v0/* surface as that single tenant"
+        // — bounded, but still SECURITY DEBT. Promote to a per-pipeline
+        // scoped JWT or proper Fly Secret before opening a real
+        // multi-tenant boundary.
+        if let Ok(internal_key) = std::env::var("OPENDERA_INTERNAL_API_KEY") {
+            if !internal_key.is_empty() {
+                env.insert("OPENDERA_INTERNAL_API_KEY".into(), json!(internal_key));
+            }
+        }
         for (k, v) in &deployment_config.global.env {
             if self.is_secret_env_name(k) {
                 continue;
@@ -224,29 +244,13 @@ impl FlyRunner {
     /// Subset of `deployment_config.global.env` that should land as
     /// Fly Secrets. Order-stable so a redeploy doesn't churn the App.
     fn collect_secrets(&self, deployment_config: &PipelineConfig) -> BTreeMap<String, String> {
-        let mut secrets: BTreeMap<String, String> = deployment_config
+        deployment_config
             .global
             .env
             .iter()
             .filter(|(k, _)| self.is_secret_env_name(k))
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        // The pipeline-runtime entrypoint shim needs the internal API key
-        // to authenticate against the manager's
-        // /internal/v0/pipelines/{id}/deployment-config.yaml endpoint
-        // at startup. The key is shared across all tenants, so it MUST
-        // be a Fly Secret (not plaintext env), otherwise inspecting any
-        // pipeline's Machine config would leak it across tenant
-        // boundaries. SECURITY DEBT: still shared globally — promote to
-        // a per-pipeline scoped JWT in a follow-up before opening any
-        // tenant boundary that matters.
-        if let Ok(internal_key) = std::env::var("OPENDERA_INTERNAL_API_KEY") {
-            if !internal_key.is_empty() {
-                secrets.insert("OPENDERA_INTERNAL_API_KEY".into(), internal_key);
-            }
-        }
-        secrets
+            .collect()
     }
 
     /// Create the Fly App if it doesn't already exist. Idempotent
