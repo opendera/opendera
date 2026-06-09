@@ -309,7 +309,18 @@ impl Storage for StoragePostgres {
             .prepare_cached("SELECT deployment_config FROM pipeline WHERE id = $1")
             .await?;
         let row = client.query_opt(&stmt, &[&pipeline_id.0]).await?;
-        Ok(row.and_then(|r| r.get::<_, Option<serde_json::Value>>("deployment_config")))
+        // deployment_config is stored as varchar (JSON text), not jsonb — see
+        // operations::pipeline::set_deployment_config writing `value.to_string()`.
+        let raw = row.and_then(|r| r.get::<_, Option<String>>("deployment_config"));
+        match raw {
+            None => Ok(None),
+            Some(s) => Ok(Some(serde_json::from_str::<serde_json::Value>(&s).map_err(
+                |e| DBError::InvalidJsonData {
+                    data: s.clone(),
+                    error: format!("unable to deserialize deployment_config as JSON due to: {e}"),
+                },
+            )?)),
+        }
     }
 
     async fn new_pipeline(
