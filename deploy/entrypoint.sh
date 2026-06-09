@@ -23,4 +23,18 @@ if [ -n "${AWS_SESSION_TOKEN:-}" ] && [ -z "${OPENDAL_S3_SESSION_TOKEN:-}" ]; th
     export OPENDAL_S3_SESSION_TOKEN="$AWS_SESSION_TOKEN"
 fi
 
+# Compile-pool only: restore the cargo dependency graph from object storage
+# before the engine starts accepting jobs, and keep a background daemon that
+# snapshots it once built. This is what turns a cold (auto-stopped) machine's
+# first compile from ~10 min back into ~30 s. See deploy/compiler-cache.sh.
+# Gated on compiler mode so the control-plane (manager) app is untouched.
+if [ "${OPENDERA_SERVICE_MODE:-}" = "compiler" ] \
+   && [ -x /usr/local/bin/compiler-cache ]; then
+    # Synchronous: the first claimed job must not race a half-extracted target/.
+    /usr/local/bin/compiler-cache restore || true
+    # Background: uploads the snapshot for this Cargo.lock+toolchain key once the
+    # dep graph exists. Reparents to the engine (PID 1) after the exec below.
+    /usr/local/bin/compiler-cache snapshot-daemon &
+fi
+
 exec /home/ubuntu/feldera/build/pipeline-manager "$@"

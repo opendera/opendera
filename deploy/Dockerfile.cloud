@@ -105,6 +105,7 @@ RUN apt-get update \
         libssl-dev \
         libsasl2-dev zlib1g-dev \
         libclang-dev \
+        zstd \
  && rm -rf /var/lib/apt/lists/*
 RUN curl -sS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
       -o /usr/local/share/ca-certificates/aws-global-rds-bundle.crt \
@@ -149,6 +150,17 @@ RUN ARCH=$(uname -m) \
  && install -m 0755 "/tmp/mold-${MOLD_VER#v}-${ARCH}-linux/bin/mold" /usr/local/bin/mold \
  && install -m 0755 "/tmp/mold-${MOLD_VER#v}-${ARCH}-linux/bin/ld.mold" /usr/local/bin/ld.mold \
  && rm -rf /tmp/mold.tar.gz "/tmp/mold-${MOLD_VER#v}-${ARCH}-linux"
+# s5cmd: fast parallel S3 client used by deploy/compiler-cache.sh to push/pull
+# the multi-GB cargo dep-graph snapshot to/from the Tigris bucket. A single
+# static Go binary (zstd, from apt above, does the compression).
+RUN ARCH=$(uname -m) \
+ && case "$ARCH" in x86_64) S5_ARCH=Linux-64bit ;; aarch64) S5_ARCH=Linux-arm64 ;; *) echo "unsupported arch $ARCH" >&2; exit 1 ;; esac \
+ && S5CMD_VER=2.3.0 \
+ && curl -sSL "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VER}/s5cmd_${S5CMD_VER}_${S5_ARCH}.tar.gz" \
+      -o /tmp/s5cmd.tar.gz \
+ && tar -xzf /tmp/s5cmd.tar.gz -C /tmp s5cmd \
+ && install -m 0755 /tmp/s5cmd /usr/local/bin/s5cmd \
+ && rm -f /tmp/s5cmd.tar.gz /tmp/s5cmd
 USER ubuntu
 ENV PATH="/home/ubuntu/.cargo/bin:${PATH}" \
     LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 LANGUAGE=en_US:en BANNER_ADDR=localhost
@@ -179,4 +191,7 @@ COPY --chown=ubuntu crates /home/ubuntu/feldera/crates
 # into the OPENDAL_S3_* names sccache v0.8 needs to authenticate to
 # its S3 backend. See deploy/entrypoint.sh for the why.
 COPY --chmod=0755 deploy/entrypoint.sh /usr/local/bin/feldera-entrypoint
+# Compile-pool dependency-graph cache. The entrypoint invokes this in compiler
+# service mode to restore/snapshot target/ from the Tigris bucket.
+COPY --chmod=0755 deploy/compiler-cache.sh /usr/local/bin/compiler-cache
 ENTRYPOINT ["/usr/local/bin/feldera-entrypoint", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]
