@@ -155,7 +155,7 @@ RUN ARCH=$(uname -m) \
 # static Go binary (zstd, from apt above, does the compression).
 RUN ARCH=$(uname -m) \
  && case "$ARCH" in x86_64) S5_ARCH=Linux-64bit ;; aarch64) S5_ARCH=Linux-arm64 ;; *) echo "unsupported arch $ARCH" >&2; exit 1 ;; esac \
- && S5CMD_VER=2.2.2 \
+ && S5CMD_VER=2.3.0 \
  && curl -sSL "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VER}/s5cmd_${S5CMD_VER}_${S5_ARCH}.tar.gz" \
       -o /tmp/s5cmd.tar.gz \
  && tar -xzf /tmp/s5cmd.tar.gz -C /tmp s5cmd \
