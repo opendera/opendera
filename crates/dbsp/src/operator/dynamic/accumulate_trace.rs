@@ -1,6 +1,6 @@
-use crate::Runtime;
 use crate::circuit::circuit_builder::{StreamId, register_replay_stream};
 use crate::circuit::metadata::{INPUT_RECORDS_COUNT, MEMORY_ALLOCATIONS_COUNT, RETAINMENT_BOUNDS};
+use crate::circuit::{NodeId, splitter_output_chunk_size};
 use crate::dynamic::{Factory, Weight, WeightTrait};
 use crate::operator::dynamic::trace::{DelayedTraceId, TraceBounds};
 use crate::operator::{TraceBound, require_persistent_id};
@@ -876,7 +876,8 @@ impl<T: Trace> ReplayState<T> {
 
 pub struct AccumulateZ1Trace<C: Circuit, B: Batch, T: Trace> {
     // For error reporting.
-    global_id: GlobalNodeId,
+    local_id: NodeId,
+    name: OperatorName,
     time: T::Time,
     trace: Option<T>,
     replay_state: Option<ReplayState<T>>,
@@ -909,7 +910,8 @@ where
         bounds: TraceBounds<T::Key, T::Val>,
     ) -> Self {
         Self {
-            global_id: GlobalNodeId::root(),
+            local_id: NodeId::root(),
+            name: OperatorName::new("AccumulateZ1Trace"),
             time: <T::Time as Timestamp>::clock_start(),
             trace: None,
             replay_state: None,
@@ -952,11 +954,8 @@ where
     /// replay, `replay_stream` is active while the operator that normally write to
     /// stream is disabled.
     pub fn prepare_replay_stream(&mut self, stream: &Stream<C, B>) -> Stream<C, B> {
-        let replay_stream = Stream::with_value(
-            stream.circuit().clone(),
-            self.global_id.local_node_id().unwrap(),
-            stream.value(),
-        );
+        let replay_stream =
+            Stream::with_value(stream.circuit().clone(), self.local_id, stream.value());
 
         self.delta_stream = Some(replay_stream.clone());
         replay_stream
@@ -977,7 +976,7 @@ where
         self.dirty[scope as usize] = false;
 
         if scope == 0 && self.trace.is_none() {
-            self.trace = Some(T::new(&self.trace_factories));
+            self.trace = Some(T::new(&self.trace_factories, self.name.get()));
         }
     }
 
@@ -992,7 +991,8 @@ where
     }
 
     fn init(&mut self, global_id: &GlobalNodeId) {
-        self.global_id = global_id.clone();
+        self.name.init(global_id);
+        self.local_id = global_id.local_node_id().unwrap();
     }
 
     fn metadata(&self, meta: &mut OperatorMeta) {
@@ -1032,7 +1032,7 @@ where
         pid: Option<&str>,
         files: &mut Vec<Arc<dyn FileCommitter>>,
     ) -> Result<(), Error> {
-        let pid = require_persistent_id(pid, &self.global_id)?;
+        let pid = require_persistent_id(pid, &self.name)?;
         self.trace
             .as_mut()
             .map(|trace| trace.save(base, pid, files))
@@ -1040,7 +1040,7 @@ where
     }
 
     fn restore(&mut self, base: &StoragePath, pid: Option<&str>) -> Result<(), Error> {
-        let pid = require_persistent_id(pid, &self.global_id)?;
+        let pid = require_persistent_id(pid, &self.name)?;
 
         self.trace
             .as_mut()
@@ -1050,7 +1050,7 @@ where
 
     fn clear_state(&mut self) -> Result<(), Error> {
         // println!("AccumulateZ1Trace-{}::clear_state", &self.global_id);
-        self.trace = Some(T::new(&self.trace_factories));
+        self.trace = Some(T::new(&self.trace_factories, self.name.get()));
         self.replay_state = None;
         self.dirty = vec![false; self.root_scope as usize + 1];
 
@@ -1071,7 +1071,7 @@ where
                 .trace
                 .take()
                 .expect("AccumulateZ1Trace::start_replay: no trace");
-            self.trace = Some(T::new(&self.trace_factories));
+            self.trace = Some(T::new(&self.trace_factories, self.name.get()));
 
             //println!("AccumulateZ1Trace-{}::initializing replay_state", &self.global_id);
 
@@ -1101,6 +1101,12 @@ where
     fn is_flush_complete(&self) -> bool {
         !self.flush_output
     }
+
+    fn start_compaction(&mut self) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.initiate_compaction()
+        }
+    }
 }
 
 impl<C, B, T> StrictOperator<T> for AccumulateZ1Trace<C, B, T>
@@ -1111,7 +1117,7 @@ where
 {
     fn get_output(&mut self) -> T {
         //println!("Z1-{}::get_output", &self.global_id);
-        let replay_step_size = Runtime::replay_step_size();
+        let replay_step_size = splitter_output_chunk_size();
 
         if self.replay_mode {
             // One output per transaction.
@@ -1155,6 +1161,7 @@ where
                 self.delta_stream.as_ref().unwrap().value().put(batch);
                 if !replay.borrow_cursor().key_valid() {
                     self.replay_state = None;
+                    self.flush_output = false;
                 }
             } else {
                 // Continue producing empty outputs as long as the circuit is in the replay mode.
@@ -1163,10 +1170,11 @@ where
                     .unwrap()
                     .value()
                     .put(B::dyn_empty(&self.batch_factories));
+                self.flush_output = false;
             }
+        } else {
+            self.flush_output = false;
         }
-
-        self.flush_output = false;
 
         let mut result = self.trace.take().unwrap();
         result.clear_dirty_flag();
@@ -1231,7 +1239,7 @@ where
     }
 }
 
-use crate::circuit::operator_traits::UnaryOperator;
+use crate::circuit::operator_traits::{OperatorName, UnaryOperator};
 
 pub struct AccumulateDelayTrace<B>
 where

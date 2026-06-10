@@ -45,7 +45,7 @@ use crate::runner::fly_image_registry::FlyImagePusher;
 use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
 use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
+use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
 
 const FLY_API_BASE: &str = "https://api.machines.dev";
 
@@ -162,7 +162,7 @@ impl FlyRunner {
         program_binary_url: Option<&str>,
         manager_url: Option<&str>,
         deployment_initial: RuntimeDesiredStatus,
-        bootstrap_policy: Option<BootstrapPolicy>,
+        bootstrap_config: Option<BootstrapConfig>,
     ) -> serde_json::Map<String, Value> {
         let mut env = serde_json::Map::new();
         env.insert(
@@ -197,11 +197,14 @@ impl FlyRunner {
         // Optional bootstrap policy override. None means "engine
         // default" (AwaitApproval at the time of this commit); the
         // shim only includes `--bootstrap-policy` when set.
-        if let Some(policy) = bootstrap_policy {
+        if let Some(config) = bootstrap_config {
             env.insert(
                 "OPENDERA_BOOTSTRAP_POLICY".into(),
-                json!(bootstrap_policy_to_string(policy)),
+                json!(bootstrap_policy_to_string(config.active_bootstrap_policy())),
             );
+            if config.silent_bootstrap {
+                env.insert("OPENDERA_SILENT_BOOTSTRAP".into(), json!("1"));
+            }
         }
         // Internal API key inlined as plaintext env so the entrypoint
         // shim can authenticate against
@@ -333,7 +336,7 @@ impl FlyRunner {
         image: Option<&str>,
         program_binary_url: Option<&str>,
         deployment_initial: RuntimeDesiredStatus,
-        bootstrap_policy: Option<BootstrapPolicy>,
+        bootstrap_config: Option<BootstrapConfig>,
     ) -> Result<MachineResponse, ManagerError> {
         let body = CreateMachineBody {
             name: &self.machine_name(),
@@ -348,7 +351,7 @@ impl FlyRunner {
                     program_binary_url,
                     self.config.manager_url(),
                     deployment_initial,
-                    bootstrap_policy,
+                    bootstrap_config,
                 ),
                 guest: GuestConfig {
                     cpu_kind: self.config.default_machine_cpu_kind.clone(),
@@ -622,16 +625,25 @@ impl PipelineExecutor for FlyRunner {
         }
     }
 
+    async fn can_provision(
+        &self,
+        _deployment_config: &PipelineConfig,
+        _runtime_config: &serde_json::Value,
+    ) -> Result<(), ManagerError> {
+        Ok(())
+    }
+
     async fn provision(
         &mut self,
         deployment_initial: RuntimeDesiredStatus,
-        bootstrap_policy: Option<BootstrapPolicy>,
+        bootstrap_config: Option<BootstrapConfig>,
         deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
         _program_info: &Value,
         program_binary_url: &str,
-        _program_info_url: Option<&str>,
+        _program_info_url: &str,
         _program_version: Version,
+        _runtime_config: &serde_json::Value,
     ) -> Result<(), ManagerError> {
         let _ = &self.common_config;
 
@@ -687,7 +699,7 @@ impl PipelineExecutor for FlyRunner {
                         machine_image.as_deref(),
                         env_url,
                         deployment_initial,
-                        bootstrap_policy,
+                        bootstrap_config,
                     )
                     .await?;
                 info!(
@@ -715,7 +727,10 @@ impl PipelineExecutor for FlyRunner {
         Ok(())
     }
 
-    async fn is_provisioned(&mut self) -> Result<ProvisionStatus, ManagerError> {
+    async fn is_provisioned(
+        &mut self,
+        _runtime_config: &serde_json::Value,
+    ) -> Result<ProvisionStatus, ManagerError> {
         let handle = self
             .cached
             .clone()
@@ -748,7 +763,7 @@ impl PipelineExecutor for FlyRunner {
         }
     }
 
-    async fn check(&mut self) -> Result<Value, ManagerError> {
+    async fn check(&mut self, _runtime_config: &serde_json::Value) -> Result<Value, ManagerError> {
         let handle = match &self.cached {
             Some(h) => h.clone(),
             None => return Ok(json!({ "state": "not_provisioned" })),
@@ -760,7 +775,7 @@ impl PipelineExecutor for FlyRunner {
         }))
     }
 
-    async fn stop(&mut self) -> Result<(), ManagerError> {
+    async fn stop(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
         if let Some(handle) = self.cached.clone() {
             self.stop_machine(&handle.app_name, &handle.machine_id).await?;
         }
@@ -771,7 +786,7 @@ impl PipelineExecutor for FlyRunner {
         Ok(())
     }
 
-    async fn clear(&mut self) -> Result<(), ManagerError> {
+    async fn clear(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
         self.stop_log_streaming();
         if let Some(handle) = self.cached.take() {
             self.destroy_machine(&handle.app_name, &handle.machine_id)

@@ -77,6 +77,8 @@ MERGE INTO {target_table} AS target
 |            | - `truncate`: Existing table at the specified location will be truncated on the first pipeline start. When the pipeline resumes from a checkpoint the table is kept as-is so that data written before the restart is preserved. |
 |            | - `error_if_exists`: If a table exists at the specified location, the operation will fail. When the pipeline resumes from a checkpoint the existing table is opened without error. |
 | `checkpoint_interval` | <p>Checkpoint interval (i.e., the number of commits after which a new checkpoint should be created) for newly created Delta tables.</p><p>The option is only available when creating the Delta table (`mode = append` and there is no existing table at the target location or `mode = truncate`). It configures the `checkpointInterval` table property, which determines the number of commits after which a new checkpoint should be created.</p><p>0 means no checkpoints are created.</p><p>Default: 10.</p>|
+| `log_retention_duration` | <p>Log retention duration for newly created Delta tables.</p><p>Configures the `delta.logRetentionDuration` table property, which controls how long the table's transaction-log history is kept.  Each time a checkpoint is written, Delta Lake automatically cleans up log entries older than this interval (subject to `enable_expired_log_cleanup`).</p><p>The option is only available when creating the Delta table (`mode = append` and there is no existing table at the target location, or `mode = truncate`).</p><p>The value follows the Delta Lake interval syntax `"interval <N> <unit>"`, where `<unit>` is one of `nanosecond[s]`, `microsecond[s]`, `millisecond[s]`, `second[s]`, `minute[s]`, `hour[s]`, `day[s]`, or `week[s]`.  Examples: `"interval 30 days"`, `"interval 6 hours"`.</p><p>Default: `"interval 30 days"` (Delta Lake default).</p>|
+| `enable_expired_log_cleanup` | <p>Whether to clean up expired log entries when a checkpoint is written.</p><p>Configures the `delta.enableExpiredLogCleanup` table property.  When set to `false`, transaction-log entries are retained indefinitely regardless of `log_retention_duration`.</p><p>The option is only available when creating the Delta table (`mode = append` and there is no existing table at the target location, or `mode = truncate`).</p><p>Default: `true` (Delta Lake default).</p>|
 | `max_retries`|<p>Maximum number of retries for failed Delta Lake operations like writing Parquet files and committing transactions.</p><p>The connector performs retries on several levels: individual S3 operations, Delta Lake transaction commits, and overall operation retries. This setting controls the overall operation retries. When a write to the table fails, because of an S3 timeout or any other reason that was not resolved by lower-level retries, the connector will retry the entire operation.</p><p>When not specified, the connector performs infinite retries. When set to 0, the connector doesn't retry failed operations.</p>|
 | `threads` | Number of parallel threads used by the connector. Increasing this value can improve Delta Lake write throughput by enabling concurrent writes. Default: `1`. |
 
@@ -125,6 +127,8 @@ See [output buffer](/connectors#configuring-the-output-buffer) for details on co
 
 ## Example usage
 
+### Streaming incremental updates
+
 Create a Delta Lake output connector that writes a stream of updates to a table
 stored in an S3 bucket, truncating any existing contents of the table.
 
@@ -148,3 +152,39 @@ WITH (
 )
 AS SELECT * FROM my_table;
 ```
+
+### Sending a snapshot at startup
+
+Set `send_snapshot: true` to have the connector emit a full snapshot of a
+materialized view to the Delta table before streaming incremental updates. This
+is useful when downstream consumers need the complete current state of the
+view, not just changes since the connector was created.
+
+The snapshot is sent exactly once per connector lifetime. Resuming the
+pipeline from a checkpoint does not re-send it. Modifying the connector
+triggers a fresh snapshot on the next start, and is delivered even if the
+pipeline is started or resumed in `Paused` state.
+
+```sql
+CREATE MATERIALIZED VIEW V
+WITH (
+ 'connectors' = '[{
+    "name": "delta_sink",
+    "send_snapshot": true,
+    "transport": {
+      "name": "delta_table_output",
+      "config": {
+        "uri": "s3://my-bucket/my-table",
+        "mode": "truncate",
+        "aws_access_key_id": <AWS_ACCESS_KEY_ID>,
+        "aws_secret_access_key": <AWS_SECRET_ACCESS_KEY>,
+        "aws_region": "us-east-1"
+      }
+    },
+    "enable_output_buffer": true,
+    "max_output_buffer_time_millis": 10000
+ }]'
+)
+AS SELECT * FROM my_table;
+```
+

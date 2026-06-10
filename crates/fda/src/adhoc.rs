@@ -9,7 +9,7 @@ use feldera_rest_api::Client;
 use feldera_types::query::{AdHocResultFormat, AdhocQueryArgs};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
-use log::{debug, error, trace, warn};
+use log::{debug, error, trace};
 use reqwest_websocket::{CloseCode, Message, RequestBuilderExt};
 
 use crate::UPGRADE_NOTICE;
@@ -91,11 +91,16 @@ async fn handle_websocket_message_generic(
             if code == CloseCode::Normal {
                 trace!("Websocket normal closure.");
             } else if code == CloseCode::Error {
+                // A runtime error during query execution closes the WS
+                // with `CloseCode::Error`. The server already sent the
+                // error details in a preceding text frame, so we don't
+                // print another message here; we only need to surface a
+                // non-zero exit code for scripts and CI.
+                // Tracks https://github.com/feldera/feldera/issues/4973
                 if !reason.is_empty() {
-                    warn!("Error encountered during query processing: {}.", reason);
-                } else {
-                    warn!("Error encountered during query processing.");
+                    eprintln!("ERROR: {}.", reason);
                 }
+                std::process::exit(1);
             } else {
                 eprint!("Connection unexpectedly closed by pipeline ({})", code);
                 if !reason.is_empty() {
@@ -150,8 +155,11 @@ pub(crate) async fn handle_adhoc_query(
     let format = match format {
         OutputFormat::Text => AdHocResultFormat::Text,
         OutputFormat::Json => {
-            warn!(
-                "The JSON format is deprecated for ad-hoc queries, see https://github.com/feldera/feldera/issues/4219 for the tracking issue."
+            // JSON requested; log deprecation warning to stderr.
+            eprintln!(
+                "warning: the JSON format for ad-hoc queries is deprecated. \
+                 Prefer `--format arrow_ipc` or the default text mode. \
+                 See https://github.com/feldera/feldera/issues/4219."
             );
             AdHocResultFormat::Json
         }

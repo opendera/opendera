@@ -4,7 +4,7 @@ import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.InputColumnMetadata;
 import org.dbsp.sqlCompiler.compiler.backend.rust.multi.ProjectDeclarations;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitPostfix;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.ir.IDBSPNode;
 import org.dbsp.sqlCompiler.ir.statement.DBSPStructItem;
@@ -20,10 +20,9 @@ public class RustFileWriter extends RustWriter {
     StructuresUsed used = new StructuresUsed();
     boolean findUsed = true;
     boolean slt = false;
-    boolean test = false;
-    final LateMaterializations materializations;
+    final CircuitPostfix materializations;
 
-    public RustFileWriter(LateMaterializations materializations) {
+    public RustFileWriter(CircuitPostfix materializations) {
         this.materializations = materializations;
     }
 
@@ -34,6 +33,7 @@ public class RustFileWriter extends RustWriter {
             preamble += """
                 #[cfg(test)]
                 use sltsqlvalue::*;
+                use readers::read_csv;
                 """;
         }
         return preamble;
@@ -42,12 +42,6 @@ public class RustFileWriter extends RustWriter {
     /** Special support for running the SLT tests */
     public RustFileWriter forSlt() {
         this.slt = true;
-        this.test = true;
-        return this;
-    }
-
-    public RustFileWriter withTest(boolean test) {
-        this.test = test;
         return this;
     }
 
@@ -119,17 +113,13 @@ public class RustFileWriter extends RustWriter {
             this.outputBuilder.append(BaseRustCodeGenerator.ALLOC_PREAMBLE);
         if (this.generateUdfInclude)
             this.generateUdfInclude();
-        if (this.test)
+        if (compiler.options.ioOptions.testing)
             this.builder().append("""
                     #[cfg(test)]
                     use readers::*;""").newline();
 
         for (String dep : this.dependencies)
-            this.builder().append("use ").append(dep).append("::*;");
-
-        if (this.declareSourceMap) {
-            SourcePositionResource.generateDeclaration(this.outputBuilder);
-        }
+            this.builder().append("use ").append(dep).append("::*;").newline();
 
         ToRustInnerVisitor innerVisitor = new ToRustInnerVisitor(compiler, this.builder(), null, false);
         ProjectDeclarations declarationsDone = new ProjectDeclarations();
@@ -143,6 +133,7 @@ public class RustFileWriter extends RustWriter {
                     // If it's a struct item, it is part of the list above
                     inner.accept(innerVisitor);
             } else {
+                this.materializations.clearRegions();
                 DBSPCircuit outer = node.to(DBSPCircuit.class);
                 ToRustVisitor visitor = new ToRustVisitor(
                         compiler, this.builder(), outer.metadata, declarationsDone, this.materializations);

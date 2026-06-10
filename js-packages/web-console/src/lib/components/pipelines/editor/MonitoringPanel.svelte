@@ -4,7 +4,6 @@
     | 'Performance'
     | 'Ad-Hoc Queries'
     | 'Changes Stream'
-    | 'Profile Visualizer'
     | 'Samply'
     | 'Health'
     | 'Logs'
@@ -19,7 +18,6 @@
   import PanelChangeStream from '$lib/components/pipelines/editor/TabChangeStream.svelte'
   import * as TabPerformance from '$lib/components/pipelines/editor/TabPerformance.svelte'
   import PanelPipelineErrors from '$lib/components/pipelines/editor/TabPipelineErrors.svelte'
-  import * as TabProfileVisualizer from '$lib/components/pipelines/editor/TabProfileVisualizer.svelte'
   import * as TabSamplyProfile from '$lib/components/pipelines/editor/TabSamplyProfile.svelte'
   import PanelHealth from '$lib/components/pipelines/editor/TabHealth.svelte'
   import PanelLogs from '$lib/components/pipelines/editor/TabLogs.svelte'
@@ -29,13 +27,13 @@
   import { untrack } from 'svelte'
   import { usePipelineActionCallbacks } from '$lib/compositions/pipelines/usePipelineActionCallbacks.svelte'
   import ClipboardCopyButton from '$lib/components/other/ClipboardCopyButton.svelte'
-  import Tooltip from '$lib/components/common/Tooltip.svelte'
+  import { Tooltip } from 'common-ui'
   import DownloadSupportBundle from '$lib/components/pipelines/editor/DownloadSupportBundle.svelte'
   import {
     extractProgramErrors,
     numConnectorsWithProblems
   } from '$lib/compositions/health/systemErrors'
-  import TabsPanel from './TabsPanel.svelte'
+  import { TabsPanel, advanceSearch, emptySearchState, type SearchState } from 'common-ui'
 
   let {
     pipeline,
@@ -85,13 +83,6 @@
         tabBarEnd: TabBarEndPipelineInfo
       },
       {
-        id: TabProfileVisualizer.id,
-        label: TabProfileVisualizer.Label,
-        panel: TabProfileVisualizer.default,
-        keepAlive: true,
-        tabBarEnd: TabBarEndPipelineInfo
-      },
-      {
         id: 'Samply' as const,
         label: TabSamplyProfile.Label,
         panel: TabSamplyProfile.default,
@@ -110,7 +101,7 @@
         label: TabLogs,
         panel: PanelLogs,
         keepAlive: true,
-        tabBarEnd: TabBarEndPipelineInfo
+        tabBarEnd: TabBarEndLogs
       }
     ].filter((tab) => !hiddenTabs.includes(tab.id))
   )
@@ -149,8 +140,34 @@
 
   const connectorsWithErrorsCount = $derived(numConnectorsWithProblems(metrics.current))
 
+  // Local input binding. The committed search (what the list actually runs) lives in
+  // `logSearch` and only advances on Enter — so typing doesn't search as-you-type.
+  let logSearchInput = $state('')
+  let logSearch: SearchState = $state(emptySearchState)
+  // Bound to the search <input> so Ctrl-F / Cmd-F inside the log list can focus it.
+  let logSearchInputEl: HTMLInputElement | undefined = $state()
+  const onLogSearchShortcut = () => {
+    logSearchInputEl?.focus()
+    logSearchInputEl?.select()
+  }
+
+  // Enter on the search input: empty input clears, same pattern cycles to the next match,
+  // new pattern jumps to the first match.
+  const submitLogSearch = () => {
+    logSearch = advanceSearch(
+      logSearch,
+      logSearchInput ? { kind: 'substring', query: logSearchInput } : null
+    )
+  }
+  // Escape clears the input and the highlight — submitting an empty query resets `logSearch`
+  // to `emptySearchState` (pattern null), which un-highlights the list.
+  const clearLogSearch = () => {
+    logSearchInput = ''
+    submitLogSearch()
+  }
+
   // Updating individual properties in an $effect avoids unnecessary reactive updates within tab components
-  let tabProps = $state({ metrics, pipeline, errors, deleted })
+  let tabProps = $state({ metrics, pipeline, errors, deleted, logSearch, onLogSearchShortcut })
   $effect(() => {
     tabProps.metrics = metrics
   })
@@ -162,6 +179,9 @@
   })
   $effect(() => {
     tabProps.deleted = deleted
+  })
+  $effect(() => {
+    tabProps.logSearch = logSearch
   })
 </script>
 
@@ -197,7 +217,7 @@
 
 {#snippet TabControlChangeStream()}
   <span class="inline sm:hidden"> Changes </span>
-  <span class="hidden sm:inline"> Changes Stream </span>
+  <span class="hidden sm:inline"> Change Stream </span>
 {/snippet}
 
 {#snippet TabHealth()}
@@ -208,19 +228,41 @@
   <span>Logs</span>
 {/snippet}
 
-{#snippet TabBarEndPipelineInfo()}
-  <div class="ml-auto flex">
-    <ClipboardCopyButton
-      value={pipeline.current.id}
-      class="h-8 w-auto! gap-2 preset-tonal-surface px-4"
-    >
-      <span class="text-base font-normal text-surface-950-50"> Pipeline ID </span>
-    </ClipboardCopyButton>
-    <Tooltip placement="top">
-      {pipeline.current.id}
-    </Tooltip>
-    <DownloadSupportBundle {pipelineName} />
+{#snippet TabBarEndLogs()}
+  <div class="ml-auto flex gap-2">
+    <input
+      bind:this={logSearchInputEl}
+      bind:value={logSearchInput}
+      type="text"
+      placeholder="Search logs"
+      title="Search within logs (Enter to jump to next match, Esc to clear, Ctrl/Cmd-F to focus from the log list)"
+      onkeydown={(e) => {
+        if (e.key === 'Enter') submitLogSearch()
+        else if (e.key === 'Escape') clearLogSearch()
+      }}
+      class="input ml-auto h-8 w-28 text-sm sm:w-32"
+    />
+    {@render PipelineInfoHeader()}
   </div>
+{/snippet}
+
+{#snippet TabBarEndPipelineInfo()}
+  <div class="ml-auto flex gap-2">
+    {@render PipelineInfoHeader()}
+  </div>
+{/snippet}
+
+{#snippet PipelineInfoHeader()}
+  <ClipboardCopyButton
+    value={pipeline.current.id}
+    class="h-4! w-auto! gap-2 preset-tonal-surface px-4"
+  >
+    <span class="text-base font-normal text-surface-950-50"> Pipeline ID </span>
+  </ClipboardCopyButton>
+  <Tooltip placement="top">
+    {pipeline.current.id}
+  </Tooltip>
+  <DownloadSupportBundle {pipelineName} />
 {/snippet}
 
 {#snippet TabBarEndCompiler()}

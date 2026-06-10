@@ -17,7 +17,7 @@ import org.dbsp.sqlCompiler.compiler.backend.rust.RustFileWriter;
 import org.dbsp.sqlCompiler.compiler.backend.rust.RustWriter;
 import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
 import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitPostfix;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.util.IIndentStream;
 import org.dbsp.util.Utilities;
@@ -94,7 +94,7 @@ public final class MultiCratesWriter extends RustWriter {
                 paste = { version = "1.0.12" }
                 derive_more = { version = "1.0.0", features = ["add", "not", "from"] }
                 dbsp = { path = "$ROOT/crates/dbsp", features = ["backend-mode"] }
-                dbsp_adapters = { path = "$ROOT/crates/adapters" }
+                dbsp_adapters = { path = "$ROOT/crates/adapters"$FEATURES }
                 feldera-macros = { path = "$ROOT/crates/feldera-macros" }
                 feldera-types = { path = "$ROOT/crates/feldera-types" }
                 feldera-adapterlib = { path = "$ROOT/crates/adapterlib" }
@@ -111,7 +111,26 @@ public final class MultiCratesWriter extends RustWriter {
         if (!options.ioOptions.runtimePath.isEmpty())
             relativePath = options.ioOptions.runtimePath;
         deps = deps.replace("$ROOT", relativePath);
+        String enterpriseFeatures = options.ioOptions.enterprise ?
+                ", features = [\"feldera-enterprise\"] " : "";
+        deps = deps.replace("$FEATURES", enterpriseFeatures);
         cargoStream.println(deps);
+
+        if (options.ioOptions.enterprise) {
+            cargoStream.println("""
+                dbsp-enterprise = { path = "$ROOT/crates/dbsp-enterprise" }
+                sync-checkpoint = { path = "$ROOT/crates/sync-checkpoint" }
+            """.replace("$ROOT", relativePath));
+        }
+
+        if (options.ioOptions.testing) {
+            cargoStream.println("""
+                # Only used in tests
+                readers = { path = "../lib/readers" }
+                uuid = { version = "1.17.0" }
+                metrics = { version = "0.23.0" }
+                metrics-util = { version = "0.17.0" }""");
+        }
 
         cargoStream.close();
     }
@@ -119,7 +138,7 @@ public final class MultiCratesWriter extends RustWriter {
     @Override
     public void write(DBSPCompiler compiler) throws IOException {
         StructuresUsed used = this.analyze(compiler);
-        LateMaterializations materializations = new LateMaterializations(compiler);
+        CircuitPostfix materializations = new CircuitPostfix(compiler);
         for (var node: this.toWrite) {
             if (node.is(DBSPCircuit.class))
                 materializations.apply(node.to(DBSPCircuit.class));
@@ -134,7 +153,7 @@ public final class MultiCratesWriter extends RustWriter {
                     .withUdf(false).withMalloc(false).withGenerateTuples(false);
             CrateGenerator test = new CrateGenerator(
                     this.rootDirectory, MultiCrates.CRATES_DIRECTORY, MultiCratesWriter.getTestName(), writer,
-                    true);
+                    crates.enterprise(), true, compiler.options.ioOptions.testing);
             RustWriter.StructuresUsed locallyUsed = new RustWriter.StructuresUsed();
             FindInnerResources finder = new FindInnerResources(compiler, locallyUsed);
 

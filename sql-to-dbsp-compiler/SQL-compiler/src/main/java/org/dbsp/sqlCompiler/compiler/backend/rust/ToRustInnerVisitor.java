@@ -69,6 +69,7 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPStrLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPStringLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimeLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimestampLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimestampTzLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU128Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU16Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU32Literal;
@@ -108,6 +109,7 @@ import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeNull;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeString;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTime;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTimestamp;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTimestampTz;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeVariant;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeVoid;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeMap;
@@ -388,19 +390,23 @@ public class ToRustInnerVisitor extends InnerVisitor {
         this.builder.append("<");
         // In the type parameter we do not put the Option<>
         sequence.dataType.withMayBeNull(false).accept(this);
-        this.builder.append(", ");
-        sequence.dataConvertedType.accept(this);
-        this.builder.append(", ");
-        sequence.intermediateType.accept(this);
-        this.builder.append(", ");
-        sequence.unsignedType.accept(this);
+        if (sequence.dataConvertedType.signed) {
+            this.builder.append(", ");
+            sequence.dataConvertedType.accept(this);
+            this.builder.append(", ");
+            sequence.intermediateType.accept(this);
+        }
+        if (!sequence.unsignedType.sameType(sequence.dataType)) {
+            this.builder.append(", ");
+            sequence.unsignedType.accept(this);
+        }
         this.builder.append(">");
     }
 
     @Override
     public VisitDecision preorder(DBSPUnsignedWrapExpression expression) {
         this.push(expression);
-        this.builder.append("UnsignedWrapper")
+        this.builder.append(DBSPUnsignedWrapExpression.RUST_IMPLEMENTATION)
                 .append("::")
                 .append(expression.getMethod())
                 .append("::");
@@ -430,7 +436,7 @@ public class ToRustInnerVisitor extends InnerVisitor {
     @Override
     public VisitDecision preorder(DBSPUnsignedUnwrapExpression expression) {
         this.push(expression);
-        this.builder.append("UnsignedWrapper")
+        this.builder.append(DBSPUnsignedWrapExpression.RUST_IMPLEMENTATION)
                 .append("::")
                 .append(expression.getMethod())
                 .append("::");
@@ -463,6 +469,25 @@ public class ToRustInnerVisitor extends InnerVisitor {
                 .append(Long.toString(Objects.requireNonNull(literal.value)))
                 .append("/*")
                 .append(Objects.requireNonNull(literal.getTimestampString()).toString())
+                .append("*/")
+                .append(")");
+        if (literal.mayBeNull())
+            this.builder.append(")");
+        this.pop(literal);
+        return VisitDecision.STOP;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPTimestampTzLiteral literal) {
+        if (literal.isNull())
+            return this.doNull(literal);
+        this.push(literal);
+        if (literal.mayBeNull())
+            this.builder.append("Some(");
+        this.builder.append("TimestampTz::from_microseconds(")
+                .append(Long.toString(Objects.requireNonNull(literal).getMicros()))
+                .append("/*")
+                .append(Objects.requireNonNull(literal.getTimestampTzString()).toString())
                 .append("*/")
                 .append(")");
         if (literal.mayBeNull())
@@ -729,6 +754,17 @@ public class ToRustInnerVisitor extends InnerVisitor {
                 .append(val)
                 .append("*/");
         this.pop(literal);
+        return VisitDecision.STOP;
+    }
+
+    @Override
+    public VisitDecision preorder(DBSPWindowBoundExpression bound) {
+        String beforeAfter = bound.isPreceding ? "Before" : "After";
+        this.builder.append("RelOffset::")
+                .append(beforeAfter)
+                .append("(");
+        bound.representation.accept(this);
+        this.builder.append(")");
         return VisitDecision.STOP;
     }
 
@@ -1535,6 +1571,8 @@ public class ToRustInnerVisitor extends InnerVisitor {
     static private String typeCode(DBSPType type) {
         if (type.is(DBSPTypeTimestamp.class))
             return "Timestamp";
+        else if (type.is(DBSPTypeTimestampTz.class))
+            return "TimestampTz";
         else if (type.is(DBSPTypeTime.class))
             return "Time";
         else if (type.is(DBSPTypeDate.class))
@@ -1886,8 +1924,17 @@ public class ToRustInnerVisitor extends InnerVisitor {
             this.pop(expression);
             return VisitDecision.STOP;
         } else if (expression.opcode == DBSPOpcode.INTEGER_TO_SHORT_INTERVAL ||
-                expression.opcode == DBSPOpcode.SHORT_INTERVAL_TO_INTEGER) {
+                expression.opcode == DBSPOpcode.SHORT_INTERVAL_TO_INTEGER ||
+                expression.opcode == DBSPOpcode.INTEGER_TO_LONG_INTERVAL ||
+                expression.opcode == DBSPOpcode.LONG_INTERVAL_TO_INTEGER ||
+                expression.opcode == DBSPOpcode.INTEGER_TO_UUID ||
+                expression.opcode == DBSPOpcode.UUID_TO_INTEGER ||
+                expression.opcode == DBSPOpcode.BINARY_TO_U128 ||
+                expression.opcode == DBSPOpcode.BINARY_TO_U64 ||
+                expression.opcode == DBSPOpcode.BOOL_TO_INTEGER ||
+                expression.opcode == DBSPOpcode.INTEGER_TO_BOOL) {
             this.builder.append(expression.opcode.toString())
+                    .append(expression.getType().nullableUnderlineSuffix())
                     .append("(");
             expression.source.accept(this);
             this.builder.append(")");
@@ -2012,7 +2059,9 @@ public class ToRustInnerVisitor extends InnerVisitor {
             NeedsSourceMap finder = new NeedsSourceMap(this.compiler);
             finder.apply(function.body);
             if (finder.found) {
-                SourcePositionResource.generateReference(this.builder, CircuitWriter.SOURCE_MAP_VARIABLE_NAME);
+                SourcePositionResource.generateReference(
+                        this.builder, CircuitWriter.SOURCE_MAP_VARIABLE_NAME,
+                        Objects.requireNonNull(this.circuitContext).name);
             }
             function.body.accept(this);
             this.builder.decrease()

@@ -1,3 +1,4 @@
+use super::{OutputEndpointControl, stats::BufferedInput};
 use crate::{
     Controller, PipelineConfig,
     controller::{ControllerStatusContext, TransactionInfo},
@@ -8,7 +9,9 @@ use crate::{
     transport::set_barrier,
 };
 use anyhow::anyhow;
+use crossbeam::sync::Parker;
 use csv::{ReaderBuilder as CsvReaderBuilder, WriterBuilder as CsvWriterBuilder};
+use feldera_adapterlib::format::BufferSize;
 use feldera_types::{
     config::{InputEndpointConfig, OutputEndpointConfig},
     constants::STATE_FILE,
@@ -457,6 +460,17 @@ fn wait_for_records(controller: &Controller, expect_n: &[usize]) {
 
     // Then verify that the number is as expected.
     assert_eq!(&collect_endpoint_records(controller, n), expect_n);
+}
+
+fn assert_bounded_suspend_steps(controller: &Controller, suspend_request_step: u64) {
+    let suspend_complete_step = controller.status().global_metrics.total_initiated_steps();
+    let suspend_steps = suspend_complete_step.saturating_sub(suspend_request_step);
+
+    assert!(
+        suspend_steps <= 1000,
+        "suspend advanced {suspend_steps} steps while waiting for barriers \
+         ({suspend_request_step}..{suspend_complete_step})"
+    );
 }
 
 /// Runs a basic test of fault tolerance.
@@ -1090,6 +1104,386 @@ fn ft_modified_connectors() {
     ]);
 }
 
+/// Verifies that a `send_snapshot: true` output connector delivers the
+/// snapshot exactly once across the pipeline's lifetime.
+///
+/// If the `snapshot_sent` flag were not persisted in the checkpoint, the
+/// connector would re-send the full snapshot every time the pipeline
+/// restarts, which would overwrite the file with the cumulative view state
+/// (all records so far) instead of just the new records produced since the
+/// last checkpoint. The assertion below catches that regression: in every
+/// round after the first, the file must contain only records in
+/// `checkpointed_records..total_records`.
+///
+/// Round 0 is handled separately because that is the one round where the
+/// (empty) snapshot is sent.
+#[test]
+fn ft_send_snapshot_delivered_once() {
+    init_test_logger();
+    let tempdir = TempDir::new().unwrap();
+    let tempdir_path = tempdir.path();
+
+    let storage_dir = tempdir_path.join("storage");
+    create_dir(&storage_dir).unwrap();
+
+    let input_path = tempdir_path.join("input.csv");
+    let output_path = tempdir_path.join("output.csv");
+
+    // Pre-create the (empty) input file so `file_input` can open it on the
+    // first start; the connector keeps the file open in follow mode and we
+    // append new rows at the start of each round.
+    File::create_new(&input_path).unwrap();
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "storage_config": {
+            "path": storage_dir,
+        },
+        "storage": true,
+        "fault_tolerance": {},
+        "clock_resolution_usecs": null,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": input_path.display().to_string(),
+                        "follow": true,
+                    },
+                },
+                "format": { "name": "csv" },
+            },
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "send_snapshot": true,
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": output_path.display().to_string(),
+                    },
+                },
+                "format": { "name": "csv", "config": {} },
+            },
+        },
+    }))
+    .unwrap();
+
+    // Three rounds, each appending 500 records and taking a checkpoint.
+    let rounds: &[usize] = &[500, 500, 500];
+    let mut total_records = 0usize;
+    let mut checkpointed_records = 0usize;
+
+    for (round, n_records) in rounds.iter().copied().enumerate() {
+        let input_file = File::options().append(true).open(&input_path).unwrap();
+        let mut writer = CsvWriterBuilder::new()
+            .has_headers(false)
+            .from_writer(&input_file);
+        for id in total_records..total_records + n_records {
+            writer.serialize(TestStruct::for_id(id as u32)).unwrap();
+        }
+        writer.flush().unwrap();
+        total_records += n_records;
+
+        let controller = Controller::with_test_config(
+            |circuit_config| {
+                Ok(test_circuit::<TestStruct>(
+                    circuit_config,
+                    &[],
+                    &[Some("output")],
+                ))
+            },
+            &config,
+            Box::new(|e, _| panic!("error: {e}")),
+        )
+        .unwrap();
+        controller.start();
+
+        wait(|| !controller.is_replaying(), 10_000).unwrap();
+        wait_for_records(&controller, &[total_records]);
+        controller.checkpoint().unwrap();
+        controller.stop().unwrap();
+
+        if round == 0 {
+            // Round 0: the initial snapshot carries every record seen so
+            // far, so the file must reflect the full cumulative state.
+            check_file_contents(&output_path, 0..total_records);
+        } else {
+            // Round 1+: snapshot was already delivered in round 0 and
+            // checkpointed as `snapshot_sent = true`. The restarted
+            // connector truncates the file (FileOutputEndpoint opens with
+            // File::create) and then writes only the delta records emitted
+            // during this round. If the checkpoint-aware guard regressed
+            // and the snapshot were re-sent, we would see all
+            // `0..total_records` records here instead.
+            check_file_contents(&output_path, checkpointed_records..total_records);
+        }
+        checkpointed_records = total_records;
+    }
+}
+
+/// Verifies that flipping `send_snapshot` from `false` to `true` across a
+/// checkpoint restart re-delivers the full snapshot as the first batch
+/// the connector sees after restart, before any new deltas. Models the
+/// realistic scenario where a user decides after the fact that a sink
+/// needs a snapshot, edits the config, and restarts the pipeline.
+///
+/// Three rounds:
+/// * Round 0 (`send_snapshot: false`, 500 records in) -- only deltas land
+///   in the file; no snapshot is emitted.
+/// * Round 1 (`send_snapshot: true`, no new input) -- the flag flip counts
+///   as a connector modification, so the snapshot is re-delivered; the
+///   file is repopulated with the full view state.
+/// * Round 2 (`send_snapshot: true` unchanged, 500 more records) -- the
+///   snapshot is not re-sent; only the new deltas reach the file.
+#[test]
+fn ft_send_snapshot_resent_on_flag_flip() {
+    init_test_logger();
+    let tempdir = TempDir::new().unwrap();
+    let tempdir_path = tempdir.path();
+
+    let storage_dir = tempdir_path.join("storage");
+    create_dir(&storage_dir).unwrap();
+
+    let input_path = tempdir_path.join("input.csv");
+    let output_path = tempdir_path.join("output.csv");
+    File::create_new(&input_path).unwrap();
+
+    fn build_config(
+        input_path: &Path,
+        output_path: &Path,
+        storage_dir: &Path,
+        send_snapshot: bool,
+    ) -> PipelineConfig {
+        serde_json::from_value(json!({
+            "name": "test",
+            "workers": 4,
+            "storage_config": { "path": storage_dir },
+            "storage": true,
+            "fault_tolerance": {},
+            "clock_resolution_usecs": null,
+            "inputs": {
+                "test_input1": {
+                    "stream": "test_input1",
+                    "transport": {
+                        "name": "file_input",
+                        "config": {
+                            "path": input_path.display().to_string(),
+                            "follow": true,
+                        },
+                    },
+                    "format": { "name": "csv" },
+                },
+            },
+            "outputs": {
+                "test_output1": {
+                    "stream": "test_output1",
+                    "send_snapshot": send_snapshot,
+                    "transport": {
+                        "name": "file_output",
+                        "config": {
+                            "path": output_path.display().to_string(),
+                        },
+                    },
+                    "format": { "name": "csv", "config": {} },
+                },
+            },
+        }))
+        .unwrap()
+    }
+
+    let run_round = |config: &PipelineConfig, expected_total: usize| {
+        let controller = Controller::with_test_config(
+            |circuit_config| {
+                Ok(test_circuit::<TestStruct>(
+                    circuit_config,
+                    &[],
+                    &[Some("output")],
+                ))
+            },
+            config,
+            Box::new(|e, _| panic!("error: {e}")),
+        )
+        .unwrap();
+        controller.start();
+        wait(|| !controller.is_replaying(), 10_000).unwrap();
+        wait_for_records(&controller, &[expected_total]);
+        controller.checkpoint().unwrap();
+        controller.stop().unwrap();
+    };
+
+    // `run_round` passes an expected total `transmitted_records` count
+    // straight to `wait_for_records`. That counter is persisted across
+    // checkpoints (see `CheckpointOutputEndpointMetrics`), so every record
+    // the connector emits across all rounds contributes cumulatively.
+
+    // Round 0: send_snapshot=false, push 500 records. Only deltas hit the
+    // file; cumulative transmitted = 500.
+    {
+        let mut writer = CsvWriterBuilder::new()
+            .has_headers(false)
+            .from_writer(File::options().append(true).open(&input_path).unwrap());
+        for id in 0..500 {
+            writer.serialize(TestStruct::for_id(id as u32)).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+    let config_off = build_config(&input_path, &output_path, &storage_dir, false);
+    run_round(&config_off, 500);
+    check_file_contents(&output_path, 0..500);
+
+    // Round 1: flip send_snapshot to true with no new input. Changing the
+    // field makes pipeline_diff classify the connector as modified, which
+    // overrides the checkpointed `snapshot_sent=true` back to `false`, so
+    // the initial snapshot fires again as the first (and only) batch on
+    // the queue. The output file starts empty here because
+    // `FileOutputEndpoint::new` opens the path with `File::create` (which
+    // truncates) on every controller startup, and the fresh snapshot
+    // writes 0..500 into it. Cumulative transmitted jumps to 1000. If the
+    // modified-connector path did not clear `snapshot_sent`, nothing
+    // would land in the file on this restart and transmitted would stay
+    // at 500.
+    let config_on = build_config(&input_path, &output_path, &storage_dir, true);
+    assert_ne!(
+        config_off, config_on,
+        "flipping send_snapshot must actually change the config so pipeline_diff classifies it as modified"
+    );
+    run_round(&config_on, 1000);
+    check_file_contents(&output_path, 0..500);
+
+    // Round 2: send_snapshot=true unchanged, append 500 more records. The
+    // snapshot_sent flag was set to true at the end of round 1, so the
+    // snapshot does not fire again; only the new delta records 500..1000
+    // hit the file on this restart (cumulative transmitted 1500).
+    {
+        let mut writer = CsvWriterBuilder::new()
+            .has_headers(false)
+            .from_writer(File::options().append(true).open(&input_path).unwrap());
+        for id in 500..1000 {
+            writer.serialize(TestStruct::for_id(id as u32)).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+    run_round(&config_on, 1500);
+    check_file_contents(&output_path, 500..1000);
+}
+
+/// End-to-end: modified `send_snapshot: true` delta sink delivers its
+/// snapshot on a restart that never calls `start()` (stays paused).
+#[cfg(feature = "with-deltalake")]
+#[test]
+fn ft_send_snapshot_delta_delivered_while_paused() {
+    init_test_logger();
+    let tempdir = TempDir::new().unwrap();
+    let tempdir_path = tempdir.path();
+    let storage_dir = tempdir_path.join("storage");
+    create_dir(&storage_dir).unwrap();
+    let input_path = tempdir_path.join("input.csv");
+    let delta_dir = tempdir_path.join("delta_output");
+    let delta_uri = format!("file://{}", delta_dir.display());
+    File::create_new(&input_path).unwrap();
+
+    fn build_config(
+        input_path: &Path,
+        delta_uri: &str,
+        storage_dir: &Path,
+        send_snapshot: bool,
+    ) -> PipelineConfig {
+        serde_json::from_value(json!({
+            "name": "test",
+            "workers": 4,
+            "storage_config": { "path": storage_dir },
+            "storage": true,
+            "fault_tolerance": {},
+            "clock_resolution_usecs": null,
+            "inputs": {
+                "test_input1": {
+                    "stream": "test_input1",
+                    "transport": {
+                        "name": "file_input",
+                        "config": {
+                            "path": input_path.display().to_string(),
+                            "follow": true,
+                        },
+                    },
+                    "format": { "name": "csv" },
+                },
+            },
+            "outputs": {
+                "test_output1": {
+                    "stream": "test_output1",
+                    "send_snapshot": send_snapshot,
+                    "transport": {
+                        "name": "delta_table_output",
+                        "config": {
+                            "uri": delta_uri,
+                            "mode": "truncate",
+                        },
+                    },
+                },
+            },
+        }))
+        .unwrap()
+    }
+
+    // Round 0: send_snapshot=false; push 500 records. The delta sink writes
+    // them as CDC inserts via the normal delta path. Checkpoint, stop.
+    {
+        let mut writer = CsvWriterBuilder::new()
+            .has_headers(false)
+            .from_writer(File::options().append(true).open(&input_path).unwrap());
+        for id in 0..500 {
+            writer.serialize(TestStruct::for_id(id as u32)).unwrap();
+        }
+        writer.flush().unwrap();
+    }
+    let config_off = build_config(&input_path, &delta_uri, &storage_dir, false);
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            Ok(test_circuit::<TestStruct>(
+                circuit_config,
+                &TestStruct::schema(),
+                &[Some("output")],
+            ))
+        },
+        &config_off,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+    controller.start();
+    wait(|| !controller.is_replaying(), 10_000).unwrap();
+    wait_for_records(&controller, &[500]);
+    controller.checkpoint().unwrap();
+    controller.stop().unwrap();
+
+    // Round 1: flip send_snapshot=true and restart, but do NOT call
+    // `controller.start()` — the pipeline stays in the default `Paused`
+    // state. The connector definition changed, so `is_snapshot_pending`
+    // becomes true; with the fix, registration requests a step that fires
+    // even while paused and delivers the snapshot (500 records) to the
+    // truncated delta table. `transmitted_records` should reach 1000
+    // (500 carried over from the checkpoint seed + 500 from the snapshot).
+    let config_on = build_config(&input_path, &delta_uri, &storage_dir, true);
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            Ok(test_circuit::<TestStruct>(
+                circuit_config,
+                &TestStruct::schema(),
+                &[Some("output")],
+            ))
+        },
+        &config_on,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+    // Notably: NO `controller.start()` — pipeline stays paused.
+    wait_for_records(&controller, &[1000]);
+    controller.stop().unwrap();
+}
+
 /// Runs a basic test of suspend and resume, without fault tolerance.
 ///
 /// For each element of `rounds`, the test writes the specified number of
@@ -1471,6 +1865,54 @@ fn output_path(storage_dir: &Path, i: usize) -> PathBuf {
     storage_dir.join(format!("output{}.csv", i + 1))
 }
 
+#[test]
+fn barrier_input_batch_wakes_when_endpoint_already_has_buffered_input() {
+    init_test_logger();
+
+    // During suspend, every new batch from a barrier endpoint can be the batch
+    // that clears the barrier.
+    //
+    // https://github.com/feldera/feldera/actions/runs/26535433930/job/78166265316
+    // That test likely failed because the endpoint already had buffered
+    // barrier input, so the old > 0 condition was not enough to wake the
+    // circuit thread.
+    let tempdir = TempDir::new().unwrap();
+    let storage_dir = tempdir.path().join("storage");
+    create_dir(&storage_dir).unwrap();
+    File::create(input_path(&storage_dir, 0)).unwrap();
+
+    let controller = start_controller(&storage_dir, &[0]);
+
+    let endpoint_id = {
+        let input_status = controller.status().input_status();
+        *input_status.keys().next().unwrap()
+    };
+    {
+        let input_status = controller.status().input_status();
+        let endpoint = input_status.get(&endpoint_id).unwrap();
+        endpoint.set_barrier(true);
+        endpoint
+            .metrics
+            .buffered_records
+            .store(1, Ordering::Relaxed);
+    }
+
+    let parker = Parker::new();
+    let unparker = parker.unparker().clone();
+    let buffered_input = controller.status().input_batch_from_endpoint(
+        endpoint_id,
+        BufferSize {
+            records: 1,
+            bytes: 1,
+        },
+        &unparker,
+    );
+
+    controller.stop().unwrap();
+
+    assert_eq!(buffered_input, BufferedInput::Barrier);
+}
+
 fn start_controller(storage_dir: &Path, barriers: &[usize]) -> Controller {
     let n = barriers.len();
     for (i, barrier) in barriers.iter().copied().enumerate() {
@@ -1605,6 +2047,7 @@ fn suspend_barrier() {
     // Suspend.
     let (sender, receiver) = mpsc::channel();
     println!("start suspend");
+    let suspend_request_step = controller.status().global_metrics.total_initiated_steps();
     controller.start_suspend(Box::new(move |result| sender.send(result).unwrap()));
 
     // Suspend should not succeed, because of the barrier.
@@ -1622,6 +2065,7 @@ fn suspend_barrier() {
         .recv_timeout(Duration::from_millis(10000))
         .unwrap()
         .unwrap();
+    assert_bounded_suspend_steps(&controller, suspend_request_step);
 
     // Stop controller.
     println!("stop controller");
@@ -1744,6 +2188,7 @@ fn suspend_multiple_barriers(n_inputs: usize) {
     // barriers, since each input only has 1000 records so far.
     let (sender, receiver) = mpsc::channel();
     println!("start suspend");
+    let suspend_request_step = controller.status().global_metrics.total_initiated_steps();
     controller.start_suspend(Box::new(move |result| sender.send(result).unwrap()));
 
     // Iterate as long as we shouldn't have reached the barrier, adding records
@@ -1796,6 +2241,7 @@ fn suspend_multiple_barriers(n_inputs: usize) {
         .recv_timeout(Duration::from_millis(10000))
         .unwrap()
         .unwrap();
+    assert_bounded_suspend_steps(&controller, suspend_request_step);
 
     // Stop controller.
     println!("stop controller");
@@ -3433,4 +3879,324 @@ fn test_permanent_suspend_errors_without_storage() {
     );
 
     controller.stop().unwrap();
+}
+
+/// `send_snapshot: false` connectors never need an initial snapshot, so
+/// they start "delivered".
+#[test]
+fn send_snapshot_false_starts_delivered() {
+    let control = OutputEndpointControl::new(false, /*snapshot_already_sent=*/ false);
+    assert!(control.initial_snapshot_sent());
+    assert!(!control.is_snapshot_pending());
+}
+
+/// `send_snapshot: true` with `snapshot_already_sent: true` (resumed from a
+/// checkpoint that records the snapshot was delivered) also starts
+/// "delivered".
+#[test]
+fn send_snapshot_true_with_already_sent_starts_delivered() {
+    let control = OutputEndpointControl::new(true, /*snapshot_already_sent=*/ true);
+    assert!(control.initial_snapshot_sent());
+    assert!(!control.is_snapshot_pending());
+}
+
+/// `send_snapshot: true` with `snapshot_already_sent: false` (fresh start)
+/// is pending until `mark_snapshot_delivered` flips the flag.
+#[test]
+fn send_snapshot_true_starts_pending_then_delivered() {
+    let control = OutputEndpointControl::new(true, /*snapshot_already_sent=*/ false);
+    assert!(!control.initial_snapshot_sent());
+    assert!(control.is_snapshot_pending());
+
+    control.mark_snapshot_delivered();
+    assert!(control.initial_snapshot_sent());
+    assert!(!control.is_snapshot_pending());
+}
+
+// Tests for max_queued_records and max_queued_bytes backpressure limits.
+mod queue_limit_tests {
+    use super::*;
+    use crate::ControllerStatus;
+    use crate::controller::stats::InputEndpointStatus;
+    use feldera_types::config::InputEndpointConfig;
+    use std::sync::mpsc;
+    use std::thread;
+    use uuid::Uuid;
+
+    fn make_endpoint(
+        max_queued_records: u64,
+        max_queued_bytes: Option<u64>,
+    ) -> InputEndpointStatus {
+        let mut config = json!({
+            "stream": "test_stream",
+            "transport": {
+                "name": "file_input",
+                "config": { "path": "/dev/null" }
+            },
+            "format": { "name": "csv" },
+            "max_queued_records": max_queued_records,
+        });
+        if let Some(bytes) = max_queued_bytes {
+            config["max_queued_bytes"] = json!(bytes);
+        }
+        let config: InputEndpointConfig = serde_json::from_value(config).unwrap();
+        InputEndpointStatus::new("test_endpoint", config, None, None)
+    }
+
+    fn make_status_with_endpoint(
+        max_queued_records: u64,
+        max_queued_bytes: Option<u64>,
+    ) -> (ControllerStatus, u64) {
+        let pipeline_config = serde_json::from_value(json!({
+            "name": "test",
+            "workers": 1,
+        }))
+        .unwrap();
+        let status = ControllerStatus::new(pipeline_config, 0, None, Uuid::nil());
+        let endpoint = make_endpoint(max_queued_records, max_queued_bytes);
+        let endpoint_id: u64 = 0;
+        status.inputs.write().insert(endpoint_id, endpoint);
+        (status, endpoint_id)
+    }
+
+    // --- ConnectorConfig::max_queued_bytes() ---
+
+    /// When `max_queued_bytes` is unset, it defaults to `max_queued_records * 1000`.
+    #[test]
+    fn max_queued_bytes_defaults_to_1000x_records() {
+        let endpoint = make_endpoint(100, None);
+        assert_eq!(endpoint.config.connector_config.max_queued_bytes(), 100_000);
+    }
+
+    /// When `max_queued_bytes` is explicitly set, that value is used directly.
+    #[test]
+    fn max_queued_bytes_explicit_value() {
+        let endpoint = make_endpoint(100, Some(50_000));
+        assert_eq!(endpoint.config.connector_config.max_queued_bytes(), 50_000);
+    }
+
+    /// Saturation: very large `max_queued_records` must not overflow the default.
+    #[test]
+    fn max_queued_bytes_default_saturates() {
+        let endpoint = make_endpoint(u64::MAX / 500, None);
+        assert_eq!(
+            endpoint.config.connector_config.max_queued_bytes(),
+            u64::MAX
+        );
+    }
+
+    // --- InputEndpointStatus::is_full() for records ---
+
+    /// Below the records threshold the endpoint is not full.
+    #[test]
+    fn is_full_records_below_threshold() {
+        // Use a very high bytes limit so only the records limit matters.
+        let endpoint = make_endpoint(10, Some(u64::MAX));
+        endpoint
+            .metrics
+            .buffered_records
+            .store(9, Ordering::Relaxed);
+        assert!(!endpoint.is_full());
+    }
+
+    /// At exactly the records threshold the endpoint is full.
+    #[test]
+    fn is_full_records_at_threshold() {
+        let endpoint = make_endpoint(10, Some(u64::MAX));
+        endpoint
+            .metrics
+            .buffered_records
+            .store(10, Ordering::Relaxed);
+        assert!(endpoint.is_full());
+    }
+
+    /// Above the records threshold the endpoint remains full.
+    #[test]
+    fn is_full_records_above_threshold() {
+        let endpoint = make_endpoint(10, Some(u64::MAX));
+        endpoint
+            .metrics
+            .buffered_records
+            .store(11, Ordering::Relaxed);
+        assert!(endpoint.is_full());
+    }
+
+    // --- InputEndpointStatus::is_full() for bytes ---
+
+    /// Below the bytes threshold the endpoint is not full.
+    #[test]
+    fn is_full_bytes_below_threshold() {
+        // Use a very high records limit so only the bytes limit matters.
+        let endpoint = make_endpoint(u64::MAX, Some(500));
+        endpoint
+            .metrics
+            .buffered_bytes
+            .store(499, Ordering::Relaxed);
+        assert!(!endpoint.is_full());
+    }
+
+    /// At exactly the bytes threshold the endpoint is full.
+    #[test]
+    fn is_full_bytes_at_threshold() {
+        let endpoint = make_endpoint(u64::MAX, Some(500));
+        endpoint
+            .metrics
+            .buffered_bytes
+            .store(500, Ordering::Relaxed);
+        assert!(endpoint.is_full());
+    }
+
+    /// Exceeding the bytes limit makes the endpoint full even when the
+    /// records count is far below `max_queued_records`.
+    #[test]
+    fn is_full_bytes_triggers_independently_of_records() {
+        let endpoint = make_endpoint(1_000_000, Some(100));
+        endpoint
+            .metrics
+            .buffered_records
+            .store(1, Ordering::Relaxed);
+        endpoint
+            .metrics
+            .buffered_bytes
+            .store(100, Ordering::Relaxed);
+        assert!(endpoint.is_full());
+    }
+
+    /// With no explicit `max_queued_bytes`, the default byte threshold
+    /// (`max_queued_records * 1000`) is used for the `is_full` check.
+    #[test]
+    fn is_full_uses_default_bytes_threshold() {
+        // max_queued_records=10 → default byte threshold = 10_000.
+        let endpoint = make_endpoint(10, None);
+        endpoint
+            .metrics
+            .buffered_records
+            .store(1, Ordering::Relaxed);
+        endpoint
+            .metrics
+            .buffered_bytes
+            .store(9_999, Ordering::Relaxed);
+        assert!(!endpoint.is_full());
+
+        endpoint
+            .metrics
+            .buffered_bytes
+            .store(10_000, Ordering::Relaxed);
+        assert!(endpoint.is_full());
+    }
+
+    // --- ControllerStatus::input_batch_from_endpoint backpressure signaling ---
+
+    /// The backpressure thread is unparked when a batch causes the buffered
+    /// record count to cross `max_queued_records`.
+    #[test]
+    fn backpressure_unparked_when_records_threshold_crossed() {
+        let (status, endpoint_id) = make_status_with_endpoint(10, Some(u64::MAX));
+
+        let parker = Parker::new();
+        let unparker = parker.unparker().clone();
+        let (tx, rx) = mpsc::channel::<()>();
+
+        // Park a thread so we can observe the unpark signal.
+        thread::spawn(move || {
+            parker.park();
+            let _ = tx.send(());
+        });
+
+        // Add exactly the threshold number of records in one batch.
+        status.input_batch_from_endpoint(
+            endpoint_id,
+            BufferSize {
+                records: 10,
+                bytes: 1,
+            },
+            &unparker,
+        );
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_ok(),
+            "backpressure thread was not unparked when records threshold was crossed"
+        );
+    }
+
+    /// The backpressure thread is unparked when a batch causes the buffered
+    /// byte count to cross `max_queued_bytes`, even when the records count
+    /// remains well below `max_queued_records`.
+    #[test]
+    fn backpressure_unparked_when_bytes_threshold_crossed() {
+        let (status, endpoint_id) = make_status_with_endpoint(1_000_000, Some(500));
+
+        let parker = Parker::new();
+        let unparker = parker.unparker().clone();
+        let (tx, rx) = mpsc::channel::<()>();
+
+        thread::spawn(move || {
+            parker.park();
+            let _ = tx.send(());
+        });
+
+        // One record + exactly the byte threshold; records stays far below limit.
+        status.input_batch_from_endpoint(
+            endpoint_id,
+            BufferSize {
+                records: 1,
+                bytes: 500,
+            },
+            &unparker,
+        );
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_ok(),
+            "backpressure thread was not unparked when bytes threshold was crossed"
+        );
+    }
+
+    /// The backpressure thread is unparked only when a threshold is *crossed*,
+    /// not on every subsequent batch once already above the threshold.
+    #[test]
+    fn backpressure_unparked_only_on_threshold_crossing() {
+        let (status, endpoint_id) = make_status_with_endpoint(10, Some(u64::MAX));
+
+        // First batch: crosses the records threshold → unpark.
+        let parker1 = Parker::new();
+        let unparker1 = parker1.unparker().clone();
+        let (tx1, rx1) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            parker1.park();
+            let _ = tx1.send(());
+        });
+        status.input_batch_from_endpoint(
+            endpoint_id,
+            BufferSize {
+                records: 10,
+                bytes: 0,
+            },
+            &unparker1,
+        );
+        assert!(
+            rx1.recv_timeout(Duration::from_millis(100)).is_ok(),
+            "first batch crossing threshold should unpark"
+        );
+
+        // Second batch: already above threshold, no new crossing → no unpark.
+        let parker2 = Parker::new();
+        let unparker2 = parker2.unparker().clone();
+        let (tx2, rx2) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            parker2.park();
+            let _ = tx2.send(());
+        });
+        status.input_batch_from_endpoint(
+            endpoint_id,
+            BufferSize {
+                records: 5,
+                bytes: 0,
+            },
+            &unparker2,
+        );
+        assert!(
+            rx2.recv_timeout(Duration::from_millis(50)).is_err(),
+            "second batch above threshold should not unpark again"
+        );
+    }
 }

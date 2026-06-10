@@ -4,6 +4,7 @@ import time
 import pytest
 from http import HTTPStatus
 from feldera import PipelineBuilder, Pipeline
+from feldera.runtime_config import RuntimeConfig
 from feldera.enums import BootstrapPolicy
 from tests import TEST_CLIENT
 from .helper import (
@@ -27,7 +28,10 @@ from .helper import (
     post_no_body,
 )
 from tests import enterprise_only
-from feldera.testutils import single_host_only
+from feldera.testutils import (
+    FELDERA_TEST_NUM_WORKERS,
+    FELDERA_TEST_NUM_HOSTS,
+)
 
 
 def _wait_for_stopped_with_error(name: str, timeout_s: float = 90.0):
@@ -186,17 +190,22 @@ def test_pipeline_stop_force_after_start(pipeline_name):
     """
     Start and then force stop after varying short delays.
     """
-    create_pipeline(pipeline_name, "CREATE TABLE t1(c1 INTEGER);")
+    pipeline = PipelineBuilder(
+        TEST_CLIENT, pipeline_name, "CREATE TABLE t1(c1 INTEGER);"
+    ).create_or_replace()
 
     for delay_sec in [0, 0.1, 0.5, 1, 3, 10, 20]:
         print(f"Testing with {delay_sec} second delay")
+
         # Issue non-blocking start
-        start_pipeline(pipeline_name, wait=False)
+        pipeline.start(wait=False)
+
         # Shortly wait for the pipeline to transition to next state(s)
         time.sleep(delay_sec)
+
         # Stop force and clear the pipeline
-        stop_pipeline(pipeline_name, force=True)
-        clear_pipeline(pipeline_name)
+        pipeline.stop(force=True)
+        pipeline.clear_storage()
 
 
 @gen_pipeline_name
@@ -528,13 +537,19 @@ def test_pipeline_double_start(pipeline_name):
 
 
 @gen_pipeline_name
-@single_host_only
 def test_pipeline_storage_status_details_without_checkpoints(pipeline_name):
     """
     Validate storage_status_details transitions and clear behavior using the Python API
     without checkpoints.
     """
-    pipeline = PipelineBuilder(TEST_CLIENT, pipeline_name, "").create_or_replace()
+    pipeline = PipelineBuilder(
+        TEST_CLIENT,
+        pipeline_name,
+        "",
+        runtime_config=RuntimeConfig(
+            hosts=FELDERA_TEST_NUM_HOSTS, workers=FELDERA_TEST_NUM_WORKERS
+        ),
+    ).create_or_replace()
 
     # Initially no details
     assert pipeline.storage_status() == StorageStatus.CLEARED
@@ -570,7 +585,6 @@ def test_pipeline_storage_status_details_without_checkpoints(pipeline_name):
 
 
 @gen_pipeline_name
-@single_host_only
 @enterprise_only
 def test_pipeline_storage_status_details_with_checkpoints(pipeline_name):
     """
@@ -601,6 +615,9 @@ def test_pipeline_storage_status_details_with_checkpoints(pipeline_name):
         }]'
     );
     """,
+        runtime_config=RuntimeConfig(
+            hosts=FELDERA_TEST_NUM_HOSTS, workers=FELDERA_TEST_NUM_WORKERS
+        ),
     ).create_or_replace()
 
     # Initially no details
@@ -684,3 +701,145 @@ def test_refresh_version_due_to_status_changes(pipeline_name):
         ]
         <= 15
     )
+
+
+def helper_test_restricted_runtime_config_edit(
+    pipeline_name, pipeline, field, edit, retrieve, new_value
+):
+    pipeline.start()
+    pipeline.stop(force=True)
+
+    # Attempt to patch without cleared storage will fail
+    runtime_config: dict = TEST_CLIENT.http.get(
+        f"/pipelines/{pipeline_name}?selector=all"
+    )["runtime_config"]
+    runtime_config.update(edit)
+    error = None
+    try:
+        TEST_CLIENT.patch_pipeline(name=pipeline_name, runtime_config=runtime_config)
+    except FelderaAPIError as e:
+        error = e
+    assert error is not None, f"assert failed for: {field} -- error was: {error}"
+    assert error.error_code == "EditRestrictedToClearedStorage", (
+        f"assert failed for: {field} -- error was: {error}"
+    )
+    assert error.details["not_allowed"] == [field], (
+        f"assert failed for: {field} -- error was: {error}"
+    )
+    assert (
+        retrieve(
+            TEST_CLIENT.http.get(f"/pipelines/{pipeline_name}?selector=all")[
+                "runtime_config"
+            ]
+        )
+        != new_value
+    ), f"assert failed for: {field}"
+
+    # Clear storage
+    pipeline.clear_storage()
+
+    # After clearing storage, it should work
+    TEST_CLIENT.patch_pipeline(name=pipeline_name, runtime_config=runtime_config)
+    assert (
+        retrieve(
+            TEST_CLIENT.http.get(f"/pipelines/{pipeline_name}?selector=all")[
+                "runtime_config"
+            ]
+        )
+        == new_value
+    ), f"assert failed for: {field}"
+
+    # Clear runtime config for the next field to test
+    TEST_CLIENT.patch_pipeline(name=pipeline_name, runtime_config={})
+
+
+@gen_pipeline_name
+def test_runtime_config_edit_restricted(pipeline_name):
+    pipeline = PipelineBuilder(TEST_CLIENT, pipeline_name, "").create_or_replace()
+
+    # runtime_config.workers
+    helper_test_restricted_runtime_config_edit(
+        pipeline_name,
+        pipeline,
+        "`runtime_config.workers`",
+        {"workers": 16},
+        lambda r: r["workers"],
+        16,
+    )
+
+    # runtime_config.resources.storage_mb_max
+    helper_test_restricted_runtime_config_edit(
+        pipeline_name,
+        pipeline,
+        "`runtime_config.resources.storage_mb_max`",
+        {"resources": {"storage_mb_max": 10000}},
+        lambda r: r["resources"]["storage_mb_max"],
+        10000,
+    )
+
+    # runtime_config.resources.namespace
+    helper_test_restricted_runtime_config_edit(
+        pipeline_name,
+        pipeline,
+        "`runtime_config.resources.namespace`",
+        {"resources": {"namespace": "example"}},
+        lambda r: r["resources"]["namespace"],
+        "example",
+    )
+
+    # runtime_config.resources.storage_class
+    helper_test_restricted_runtime_config_edit(
+        pipeline_name,
+        pipeline,
+        "`runtime_config.resources.storage_class`",
+        {"resources": {"storage_class": "example"}},
+        lambda r: r["resources"]["storage_class"],
+        "example",
+    )
+
+
+@gen_pipeline_name
+@enterprise_only
+def test_runtime_config_edit_restricted_enterprise(pipeline_name):
+    pipeline = PipelineBuilder(TEST_CLIENT, pipeline_name, "").create_or_replace()
+
+    # runtime_config.hosts
+    helper_test_restricted_runtime_config_edit(
+        pipeline_name,
+        pipeline,
+        "`runtime_config.hosts`",
+        {"hosts": 2},
+        lambda r: r["hosts"],
+        2,
+    )
+
+    # runtime_config.fault_tolerance
+    helper_test_restricted_runtime_config_edit(
+        pipeline_name,
+        pipeline,
+        "`runtime_config.fault_tolerance`",
+        {"fault_tolerance": {"model": "exactly_once", "checkpoint_interval_secs": 60}},
+        lambda r: r["fault_tolerance"],
+        {"model": "exactly_once", "checkpoint_interval_secs": 60},
+    )
+
+
+@gen_pipeline_name
+def test_start_failed_compilation(pipeline_name):
+    """
+    A pipeline that failed to compile should immediately return an error when `/start` is called on it.
+    """
+    pipeline = PipelineBuilder(
+        TEST_CLIENT, pipeline_name, "INVALID SQL"
+    ).create_or_replace(wait=False)
+    try:
+        TEST_CLIENT._wait_for_compilation(pipeline_name)
+    except RuntimeError:
+        pass
+    assert pipeline.program_status() == ProgramStatus.SqlError
+    error = None
+    try:
+        pipeline.start()
+    except FelderaAPIError as e:
+        error = e
+    assert error is not None and error.error_code == "CannotStartWithCompilationError"

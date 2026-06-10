@@ -17,7 +17,7 @@ use feldera_observability::ReqwestTracingExt;
 use feldera_types::config::{
     PipelineConfig, PipelineConfigProgramInfo, StorageCacheConfig, StorageConfig,
 };
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
+use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
 use reqwest::StatusCode;
 use serde_json::json;
 use std::io::ErrorKind;
@@ -423,6 +423,16 @@ impl PipelineExecutor for LocalRunner {
         }
     }
 
+    /// The local runner should always be able to manage local processes and the pipeline working
+    /// directory irrespective of configuration, hence no checks are performed here.
+    async fn can_provision(
+        &self,
+        _deployment_config: &PipelineConfig,
+        _runtime_config: &serde_json::Value,
+    ) -> Result<(), ManagerError> {
+        Ok(())
+    }
+
     /// Provisions the process deployment.
     /// - Creates pipeline working directory
     /// - Creates pipeline storage directory
@@ -433,13 +443,14 @@ impl PipelineExecutor for LocalRunner {
     async fn provision(
         &mut self,
         deployment_initial: RuntimeDesiredStatus,
-        bootstrap_policy: Option<BootstrapPolicy>,
+        bootstrap_config: Option<BootstrapConfig>,
         deployment_id: &Uuid,
         deployment_config: &PipelineConfig,
         _program_info: &serde_json::Value,
         program_binary_url: &str,
-        program_info_url: Option<&str>,
+        program_info_url: &str,
         program_version: Version,
+        _runtime_config: &serde_json::Value,
     ) -> Result<(), ManagerError> {
         // Local runner does not support multihost.
         if deployment_config.multihost.is_some() {
@@ -483,47 +494,46 @@ impl PipelineExecutor for LocalRunner {
         // Going forward, we should be able to pass program info and deployment config files
         // as separate arguments to the pipeline instead of merging them into one JSON file.
         let mut deployment_config = deployment_config.clone();
-        if let Some(program_info_url) = program_info_url {
-            // Retrieve and store executable in pipeline working directory
-            let program_info_file_path = self.config.program_info_file_path(self.pipeline_id);
 
-            self.retrieve_pipeline_file(
-                program_info_url,
-                "program info",
-                &program_info_file_path,
-                0o660, // User: rw, Group: rw, Others: /
-            )
-            .await?;
+        // Retrieve and store program info in pipeline working directory
+        let program_info_file_path = self.config.program_info_file_path(self.pipeline_id);
 
-            // Read and parse the program info file
-            let program_info_contents =
-                fs::read_to_string(&program_info_file_path)
-                    .await
-                    .map_err(|e| {
-                        ManagerError::from(CommonError::io_error(
-                            format!(
-                                "read program info file '{}'",
-                                program_info_file_path.display()
-                            ),
-                            e,
-                        ))
-                    })?;
+        self.retrieve_pipeline_file(
+            program_info_url,
+            "program info",
+            &program_info_file_path,
+            0o660, // User: rw, Group: rw, Others: /
+        )
+        .await?;
 
-            let program_info: PipelineConfigProgramInfo =
-                serde_json::from_str(&program_info_contents).map_err(|e| {
-                    ManagerError::from(RunnerError::RunnerProvisionError {
-                        error: format!(
-                            "failed to parse program info file '{}': {e}",
+        // Read and parse the program info file
+        let program_info_contents =
+            fs::read_to_string(&program_info_file_path)
+                .await
+                .map_err(|e| {
+                    ManagerError::from(CommonError::io_error(
+                        format!(
+                            "read program info file '{}'",
                             program_info_file_path.display()
                         ),
-                    })
+                        e,
+                    ))
                 })?;
 
-            // Merge program info into deployment_config
-            deployment_config.inputs = program_info.inputs;
-            deployment_config.outputs = program_info.outputs;
-            deployment_config.program_ir = program_info.program_ir;
-        }
+        let program_info: PipelineConfigProgramInfo = serde_json::from_str(&program_info_contents)
+            .map_err(|e| {
+                ManagerError::from(RunnerError::RunnerProvisionError {
+                    error: format!(
+                        "failed to parse program info file '{}': {e}",
+                        program_info_file_path.display()
+                    ),
+                })
+            })?;
+
+        // Merge program info into deployment_config
+        deployment_config.inputs = program_info.inputs;
+        deployment_config.outputs = program_info.outputs;
+        deployment_config.program_ir = program_info.program_ir;
 
         // Write config as YAML and JSON
         //
@@ -596,10 +606,15 @@ impl PipelineExecutor for LocalRunner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            if let Some(bootstrap_policy) = bootstrap_policy {
+            if let Some(bootstrap_config) = bootstrap_config {
                 command
                     .arg("--bootstrap-policy")
-                    .arg(bootstrap_policy_to_string(bootstrap_policy));
+                    .arg(bootstrap_policy_to_string(
+                        bootstrap_config.active_bootstrap_policy(),
+                    ));
+                if bootstrap_config.silent_bootstrap {
+                    command.arg("--silent-bootstrap");
+                }
             }
 
             if let Some((https_tls_cert_path, https_tls_key_path)) =
@@ -656,7 +671,10 @@ impl PipelineExecutor for LocalRunner {
     }
 
     /// Process deployment provisioning is completed when the port file is found and read.
-    async fn is_provisioned(&mut self) -> Result<ProvisionStatus, ManagerError> {
+    async fn is_provisioned(
+        &mut self,
+        _runtime_config: &serde_json::Value,
+    ) -> Result<ProvisionStatus, ManagerError> {
         let details = self
             .inner_check()
             .await
@@ -687,14 +705,17 @@ impl PipelineExecutor for LocalRunner {
     /// Checks the process and working directory is healthy.
     /// - Pipeline working directory must exist
     /// - Process status must be checkable and not be exited
-    async fn check(&mut self) -> Result<serde_json::Value, ManagerError> {
+    async fn check(
+        &mut self,
+        _runtime_config: &serde_json::Value,
+    ) -> Result<serde_json::Value, ManagerError> {
         self.inner_check()
             .await
             .map_err(|error| ManagerError::from(RunnerError::RunnerCheckError { error }))
     }
 
     /// Kills the pipeline process and terminates the thread which follows its stdout and stderr.
-    async fn stop(&mut self) -> Result<(), ManagerError> {
+    async fn stop(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
         // Kill pipeline process
         if let Some(mut p) = self.process.take() {
             let _ = p.kill().await;
@@ -713,7 +734,7 @@ impl PipelineExecutor for LocalRunner {
     }
 
     /// Removes the pipeline working directory.
-    async fn clear(&mut self) -> Result<(), ManagerError> {
+    async fn clear(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
         if self.config.pipeline_dir(self.pipeline_id).exists() {
             match remove_dir_all(self.config.pipeline_dir(self.pipeline_id)).await {
                 Ok(_) => (),

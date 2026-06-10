@@ -39,7 +39,7 @@ import java.util.List;
  * This is only invoked in incremental compilation mode. */
 public class SeparateIntegrators extends CircuitCloneWithGraphsVisitor {
     public SeparateIntegrators(DBSPCompiler compiler, CircuitGraphs graphs) {
-        super(compiler, graphs, false);
+        super(compiler, graphs);
     }
 
     public static boolean hasPostIntegrator(DBSPSimpleOperator operator) {
@@ -106,7 +106,7 @@ public class SeparateIntegrators extends CircuitCloneWithGraphsVisitor {
 
             OutputPort source = this.mapped(input);
             if (addBuffer) {
-                DBSPNoopOperator noop = new DBSPNoopOperator(operator.getRelNode(), source, null);
+                DBSPNoopOperator noop = new DBSPNoopOperator(operator.getRelNode(), source);
                 this.addOperator(noop);
                 sources.add(noop.outputPort());
             } else {
@@ -116,7 +116,6 @@ public class SeparateIntegrators extends CircuitCloneWithGraphsVisitor {
 
         DBSPSimpleOperator result = operator.withInputs(sources, this.force)
                 .to(DBSPSimpleOperator.class);
-        result.setDerivedFrom(operator);
         this.map(operator, result);
     }
 }

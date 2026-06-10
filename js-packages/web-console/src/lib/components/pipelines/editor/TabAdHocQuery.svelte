@@ -15,14 +15,11 @@
   import Query, { type Row, type QueryData } from '$lib/components/adhoc/Query.svelte'
   import { isPipelineInteractive } from '$lib/functions/pipelines/status'
   import type { SQLValueJS } from '$lib/types/sql'
-  import {
-    CustomJSONParserTransformStream,
-    parseCancellable
-  } from '$lib/functions/pipelines/changeStream'
+  import { createBigNumberStreamParser, parseStream } from '$lib/functions/pipelines/changeStream'
   import invariant from 'tiny-invariant'
   import WarningBanner from '$lib/components/pipelines/editor/WarningBanner.svelte'
   import { enclosure, reclosureKey } from '$lib/functions/common/function'
-  import { useReverseScrollContainer } from '$lib/compositions/common/useReverseScrollContainer.svelte'
+  import { useReverseScrollContainer } from 'common-ui'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
   import { getSelectedTenant } from '$lib/services/auth'
 
@@ -117,8 +114,12 @@
           }
         }
       }
-      const { cancel } = parseCancellable(
+      const { cancel } = parseStream(
         result,
+        createBigNumberStreamParser<Record<string, SQLValueJS>>({
+          paths: ['$'],
+          separator: ''
+        }),
         {
           pushChanges,
           onBytesSkipped: (skippedBytes) => {
@@ -147,10 +148,6 @@
             injectValue({ error: e.message })
           }
         },
-        new CustomJSONParserTransformStream<Record<string, SQLValueJS>>({
-          paths: ['$'],
-          separator: ''
-        }),
         {
           bufferSize: 8 * 1024 * 1024
         }

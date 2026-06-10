@@ -5,13 +5,12 @@ use arrow::util::pretty::pretty_format_batches;
 use arrow_json::WriterBuilder;
 use arrow_json::writer::LineDelimited;
 use async_stream::{stream, try_stream};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use bytestring::ByteString;
 use datafusion::common::hash_utils::create_hashes;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
-use feldera_storage::tokio::TOKIO;
 use feldera_types::query::MAX_WS_FRAME_SIZE;
 use futures::stream::Stream;
 use futures_util::future::{BoxFuture, FutureExt};
@@ -22,10 +21,8 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
-use tokio::sync::mpsc::error::SendError;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 use super::format;
 use crate::PipelineError;
@@ -206,17 +203,18 @@ pub(crate) fn stream_json_query(
     }
 }
 
+/// Async byte sink used by the parquet writer.
+///
+/// `parquet::arrow::AsyncArrowWriter` drives this through the
+/// `AsyncFileWriter` trait, awaiting each `write` future before issuing the
+/// next, so byte ordering is preserved.
 struct ChannelWriter {
     tx: mpsc::Sender<Bytes>,
-    handles: Vec<JoinHandle<Result<(), SendError<Bytes>>>>,
 }
 
 impl ChannelWriter {
     fn new(tx: mpsc::Sender<Bytes>) -> Self {
-        Self {
-            tx,
-            handles: vec![],
-        }
+        Self { tx }
     }
 }
 
@@ -237,71 +235,60 @@ impl AsyncFileWriter for ChannelWriter {
     }
 }
 
-impl std::io::Write for ChannelWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Clone the buffer and send it
-        let bytes = Bytes::copy_from_slice(buf);
-        let len = bytes.len();
-        let tx = self.tx.clone();
-        let handle = TOKIO.spawn(async move { tx.send(bytes).await });
-        self.handles.push(handle);
-        Ok(len)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        // It's ok for this to be a no-op, we don't require a flush anywhere.
-        //
-        // The proper way to implement this is to block until everything in `handles`
-        // completed but we can't do that in a sync interface.
-        Ok(())
-    }
-}
-
+/// Streams an ad-hoc query as Arrow IPC stream-format bytes.
+///
+/// Encodes one record batch at a time into an in-memory `Vec<u8>` via the
+/// synchronous `arrow::ipc::writer::StreamWriter`, then yields the buffer
+/// as a single `Bytes` chunk. Memory is bounded by one record batch.
+///
+/// arrow-rs does not yet ship an async IPC stream writer; see
+/// <https://github.com/apache/arrow-rs/issues/7812>,
+/// <https://github.com/apache/arrow-rs/issues/9212>, and
+/// <https://github.com/apache/arrow-rs/pull/9241>. Once that lands the
+/// per-batch buffering here can be replaced with a direct async sink.
 pub(crate) fn stream_arrow_query(
     df: DataFrame,
 ) -> impl Stream<Item = Result<Bytes, DataFusionError>> {
-    let (tx, mut rx) = mpsc::channel(1024);
+    try_stream! {
+        let schema = df.schema().inner().clone();
+        let mut stream = execute_stream(df)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!(
+                "ad-hoc query worker did not return a stream: {e}"
+            )))??;
 
-    let mut stream_job = Box::pin(
-        async move {
-            let mut channel_writer = ChannelWriter::new(tx);
-            let schema = df.schema().inner().clone();
-            let mut stream = execute_stream(df)
-                .await
-                .expect("unable to receive stream")?;
-            let mut writer = StreamWriter::try_new(&mut channel_writer, &schema).unwrap();
-
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                writer.write(&batch).map_err(DataFusionError::from)?;
-            }
-            writer.flush().map_err(DataFusionError::from)?;
-            writer.finish().map_err(DataFusionError::from)?;
-            <datafusion::common::Result<_>>::Ok(())
+        // `try_new` writes the schema message to the inner buffer. The
+        // `BytesMut` behind `BufMut::writer()` is a single allocation
+        // that we slice off in O(1) chunks via `split()` after each
+        // synchronous write: encoded batches share that backing storage
+        // until it fills, and each `freeze()` hands the receiver a
+        // tight `Bytes` view without an extra allocation. The
+        // `.get_mut().get_mut()` chain reaches through the `bytes::buf::Writer`
+        // wrapper into the underlying `BytesMut`.
+        const CHUNK_CAPACITY: usize = 64 * 1024;
+        let mut writer = StreamWriter::try_new(
+            BytesMut::with_capacity(CHUNK_CAPACITY).writer(),
+            &schema,
+        )
+        .map_err(DataFusionError::from)?;
+        let header = writer.get_mut().get_mut().split();
+        if !header.is_empty() {
+            yield header.freeze();
         }
-        .fuse(),
-    );
 
-    stream! {
-        loop {
-            select! {
-                stream_res = stream_job.as_mut() => {
-                    match stream_res {
-                        Ok(()) => {}
-                        Err(err) => {
-                            yield Err(err);
-                        }
-                    }
-                },
-                maybe_bytes = rx.recv().fuse() => {
-                    if let Some(bytes) = maybe_bytes {
-                        yield Ok(bytes);
-                    } else {
-                        // Channel closed, we're done
-                        break;
-                    }
-                }
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            writer.write(&batch).map_err(DataFusionError::from)?;
+            let chunk = writer.get_mut().get_mut().split();
+            if !chunk.is_empty() {
+                yield chunk.freeze();
             }
+        }
+
+        writer.finish().map_err(DataFusionError::from)?;
+        let tail = writer.into_inner().map_err(DataFusionError::from)?.into_inner();
+        if !tail.is_empty() {
+            yield tail.freeze();
         }
     }
 }
@@ -504,5 +491,127 @@ mod tests {
         )
         .unwrap();
         assert_ne!(h_empty, hash_batches(&schema, &[one]));
+    }
+
+    /// Drives a synthetic DataFusion query through `stream_arrow_query`,
+    /// collects the streamed Arrow IPC bytes, and decodes them back. Each
+    /// iteration creates fresh state so we don't accidentally test caching.
+    ///
+    /// The synthetic query selects from a five-batch in-memory table; this
+    /// shape (multiple small batches) maximises the number of `write_all`
+    /// calls the IPC encoder makes, which is what previously surfaced the
+    /// per-call ordering race.
+    async fn round_trip_via_stream_arrow_query()
+    -> Result<Vec<RecordBatch>, arrow::error::ArrowError> {
+        use arrow::ipc::reader::StreamReader;
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batches: Vec<RecordBatch> = (0..5)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![i, i + 1, i + 2, i + 3, i + 4])),
+                        Arc::new(StringArray::from(vec!["a", "bb", "ccc", "dddd", "eeeee"])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let mem = MemTable::try_new(schema, vec![batches]).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(mem)).unwrap();
+        let df = ctx.sql("SELECT * FROM t ORDER BY id").await.unwrap();
+
+        let mut buf = Vec::<u8>::new();
+        let mut stream = Box::pin(stream_arrow_query(df));
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.expect("stream_arrow_query yielded an error"));
+        }
+
+        let reader = StreamReader::try_new(buf.as_slice(), None)?;
+        reader.collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Round-trips one query through `stream_arrow_query` + `StreamReader`.
+    #[test]
+    fn stream_arrow_query_decodes_cleanly() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let decoded = rt
+            .block_on(round_trip_via_stream_arrow_query())
+            .expect("stream_arrow_query output failed to parse");
+        let rows: usize = decoded.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 25, "expected exactly 25 rows in the result");
+        for batch in &decoded {
+            assert_eq!(batch.num_columns(), 2);
+        }
+    }
+
+    /// Regression check for #4287: 200 round trips on a 4-worker runtime,
+    /// every decoded stream must parse cleanly.
+    #[test]
+    fn stream_arrow_query_is_stable_under_contention() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for i in 0..200 {
+                round_trip_via_stream_arrow_query()
+                    .await
+                    .unwrap_or_else(|e| panic!("iteration {i} failed: {e}"));
+            }
+        });
+    }
+
+    /// Empty result must still produce a parseable Arrow IPC stream: the
+    /// schema header is emitted, the batch loop is skipped, and
+    /// `writer.finish()` writes the end-of-stream marker.
+    #[test]
+    fn stream_arrow_query_handles_empty_result() {
+        use arrow::ipc::reader::StreamReader;
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let mem = MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(mem)).unwrap();
+            let df = ctx.sql("SELECT * FROM t").await.unwrap();
+
+            let mut buf = Vec::<u8>::new();
+            let mut stream = Box::pin(stream_arrow_query(df));
+            while let Some(chunk) = stream.next().await {
+                buf.extend_from_slice(&chunk.expect("stream_arrow_query yielded an error"));
+            }
+
+            let reader = StreamReader::try_new(buf.as_slice(), None)
+                .expect("empty-result stream must carry a valid schema header");
+            let batches: Vec<RecordBatch> = reader
+                .collect::<Result<Vec<_>, _>>()
+                .expect("empty-result stream must decode without framing errors");
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 0);
+            for batch in &batches {
+                assert_eq!(batch.num_columns(), 1);
+            }
+        });
     }
 }

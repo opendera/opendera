@@ -23,7 +23,9 @@ public final class CrateGenerator {
     public final File baseDirectory;
     public final String directory;
     public final String crateName;
+    public final boolean enterprise;
     public final boolean lib;
+    public final boolean testing;
 
     /** Cargo file name */
     public static final String CARGO = "Cargo.toml";
@@ -37,13 +39,15 @@ public final class CrateGenerator {
     final ICodeGenerator codeGenerator;
 
     public CrateGenerator(File baseDirectory, String directory, String crateName, ICodeGenerator codeGenerator,
-                          boolean lib) {
+                          boolean enterprise, boolean lib, boolean testing) {
         this.crateName = crateName;
         this.directory = directory;
         this.baseDirectory = baseDirectory;
         this.dependencies = new HashSet<>();
         this.codeGenerator = codeGenerator;
+        this.enterprise = enterprise;
         this.lib = lib;
+        this.testing = testing;
     }
 
     @Override
@@ -53,7 +57,8 @@ public final class CrateGenerator {
         CrateGenerator that = (CrateGenerator) o;
         return this.baseDirectory.equals(that.baseDirectory) &&
                 this.crateName.equals(that.crateName) &&
-                this.directory.equals(that.directory);
+                this.directory.equals(that.directory) &&
+                this.testing == that.testing;
     }
 
     @Override
@@ -61,6 +66,7 @@ public final class CrateGenerator {
         int result = this.baseDirectory.hashCode();
         result = 31 * result + this.crateName.hashCode();
         result = 31 * result + this.directory.hashCode();
+        result = 31 * result + Boolean.hashCode(this.testing);
         return result;
     }
 
@@ -83,10 +89,16 @@ public final class CrateGenerator {
         stream.println("""
                 version = "0.1.0"
                 edition = "2021"
-                publish = false
-
+                publish = false""");
+        if (this.testing) {
+            stream.println("""
                 [dev-dependencies]
-                uuid = { version = "1.6.1" }""");
+                # Only used in tests
+                readers = { workspace = true }
+                uuid = { workspace = true }
+                metrics = { workspace = true }
+                metrics-util = { workspace = true }""");
+        }
         stream.println();
         if (this.lib) {
             stream.println("[lib]");
@@ -115,6 +127,10 @@ public final class CrateGenerator {
                 serde_json = { workspace = true }
                 seq-macro = { workspace = true }
                 rkyv = { workspace = true }""");
+        if (this.enterprise) {
+            stream.println("dbsp-enterprise = { workspace = true }");
+            stream.println("sync-checkpoint = { workspace = true }");
+        }
         if (isMain()) {
             stream.println("""
                     [target.'cfg(not(target_env = "msvc"))'.dependencies]

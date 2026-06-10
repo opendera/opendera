@@ -4,28 +4,31 @@ import time
 from feldera.pipeline_builder import PipelineBuilder
 from feldera.runtime_config import RuntimeConfig
 from feldera.testutils import (
-    unique_pipeline_name,
     FELDERA_TEST_NUM_WORKERS,
     FELDERA_TEST_NUM_HOSTS,
 )
 from tests import TEST_CLIENT
+from tests.platform.helper import PipelineTestCase
 from feldera.enums import PipelineStatus
 
 
 def get_result(pipeline) -> str:
     result = list(pipeline.query("SELECT * FROM v;"))
-    assert len(result) == 1
+    assert len(result) == 1, f"result length was not 1; result: {result}"
+    assert "x" in result[0], (
+        f"first entry of result did not contain column 'x'; result: {result}"
+    )
     return result[0]["x"]
 
 
-class TestNowStream(unittest.TestCase):
+class TestNowStream(PipelineTestCase):
     def test_nowstream(self):
         """
         Test the now() function:
         pipeline should produce outputs even if no new inputs are supplied.
         """
 
-        pipeline_name = unique_pipeline_name("test_now")
+        pipeline_name = self.register_for_cleanup("test_now")
 
         sql = """
         CREATE MATERIALIZED VIEW v AS SELECT NOW() as X;
@@ -45,8 +48,9 @@ class TestNowStream(unittest.TestCase):
 
         pipeline.start()
         assert pipeline.status() == PipelineStatus.RUNNING
+        time.sleep(2)
         time0 = get_result(pipeline)
-        time.sleep(1)
+        time.sleep(2)
         time1 = get_result(pipeline)
         # Time has increased; this works on string time representations too
         # due to the standard format, which looks like `2025-10-20T20:55:16.350`

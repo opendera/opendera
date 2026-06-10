@@ -127,6 +127,7 @@ pub const MERGING_MEMORY_RECORDS_COUNT: MetricId =
 pub const MERGING_STORAGE_RECORDS_COUNT: MetricId =
     MetricId(Cow::Borrowed("merging_storage_records_count"));
 pub const COMPLETED_MERGES: MetricId = MetricId(Cow::Borrowed("completed_merges"));
+pub const COMPACTION_STATE: MetricId = MetricId(Cow::Borrowed("compaction_state"));
 pub const NEGATIVE_WEIGHT_COUNT: MetricId = MetricId(Cow::Borrowed("negative_weight_count"));
 pub const BLOOM_FILTER_BITS_PER_KEY: MetricId =
     MetricId(Cow::Borrowed("bloom_filter_bits_per_key"));
@@ -150,6 +151,7 @@ pub const RANGE_FILTER_MISSES_COUNT: MetricId =
 pub const RANGE_FILTER_HIT_RATE_PERCENT: MetricId =
     MetricId(Cow::Borrowed("range_filter_hit_rate_percent"));
 pub const RANGE_FILTER_SIZE_BYTES: MetricId = MetricId(Cow::Borrowed("range_filter_size_bytes"));
+pub const SPINE_COUNT: MetricId = MetricId(Cow::Borrowed("spine_count"));
 pub const SPINE_BATCHES_COUNT: MetricId = MetricId(Cow::Borrowed("spine_batches_count"));
 pub const SPINE_STORAGE_SIZE_BYTES: MetricId = MetricId(Cow::Borrowed("spine_storage_size_bytes"));
 pub const MERGING_SIZE_BYTES: MetricId = MetricId(Cow::Borrowed("merging_size_bytes"));
@@ -175,7 +177,7 @@ pub const PREFIX_BATCHES_STATS: MetricId = MetricId(Cow::Borrowed("prefix_batche
 pub const INPUT_INTEGRAL_RECORDS_COUNT: MetricId =
     MetricId(Cow::Borrowed("input_integral_records_count"));
 
-pub const CIRCUIT_METRICS: [CircuitMetric; 74] = [
+pub const CIRCUIT_METRICS: [CircuitMetric; 75] = [
     // State
     CircuitMetric {
         name: USED_MEMORY_BYTES,
@@ -368,6 +370,12 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 74] = [
         category: CircuitMetricCategory::State,
         advanced: true,
         description: "Information about the batches that were compacted (merged).",
+    },
+    CircuitMetric {
+        name: COMPACTION_STATE,
+        category: CircuitMetricCategory::State,
+        advanced: true,
+        description: "State of the compaction process.",
     },
     // Inputs
     CircuitMetric {

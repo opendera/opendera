@@ -19,6 +19,9 @@ pub enum RunnerError {
     AutomatonCannotConstructProgramBinaryUrl {
         error: String,
     },
+    AutomatonCannotConstructProgramInfoUrl {
+        error: String,
+    },
     AutomatonMissingDeploymentId,
     AutomatonMissingDeploymentConfig,
     AutomatonMissingDeploymentLocation,
@@ -65,6 +68,9 @@ pub enum RunnerError {
         error: String,
     },
     RunnerClearError {
+        error: String,
+    },
+    RunnerConfigError {
         error: String,
     },
 
@@ -116,6 +122,9 @@ impl DetailedError for RunnerError {
             RunnerError::AutomatonCannotConstructProgramBinaryUrl { .. } => {
                 Cow::from("AutomatonCannotConstructProgramBinaryUrl")
             }
+            RunnerError::AutomatonCannotConstructProgramInfoUrl { .. } => {
+                Cow::from("AutomatonCannotConstructProgramInfoUrl")
+            }
             RunnerError::AutomatonMissingDeploymentId => Cow::from("AutomatonMissingDeploymentId"),
             RunnerError::AutomatonMissingDeploymentConfig => {
                 Cow::from("AutomatonMissingDeploymentConfig")
@@ -157,6 +166,7 @@ impl DetailedError for RunnerError {
             RunnerError::RunnerCheckError { .. } => Cow::from("RunnerCheckError"),
             RunnerError::RunnerStopError { .. } => Cow::from("RunnerStopError"),
             RunnerError::RunnerClearError { .. } => Cow::from("RunnerClearError"),
+            RunnerError::RunnerConfigError { .. } => Cow::from("RunnerConfigError"),
             RunnerError::RunnerInteractionUnreachable { .. } => {
                 Cow::from("RunnerInteractionUnreachable")
             }
@@ -195,6 +205,9 @@ impl Display for RunnerError {
             }
             Self::AutomatonCannotConstructProgramBinaryUrl { error } => {
                 write!(f, "Cannot construct program binary URL due to: {error}")
+            }
+            Self::AutomatonCannotConstructProgramInfoUrl { error } => {
+                write!(f, "Cannot construct program info URL due to: {error}")
             }
             Self::AutomatonMissingDeploymentId => {
                 write!(
@@ -314,6 +327,9 @@ impl Display for RunnerError {
             Self::RunnerClearError { error } => {
                 write!(f, "Pipeline storage clear failed (will retry): {error}")
             }
+            Self::RunnerConfigError { error } => {
+                write!(f, "Pipeline runner configuration error: {error}")
+            }
             Self::RunnerInteractionUnreachable { error } => {
                 write!(
                     f,
@@ -402,6 +418,9 @@ impl ResponseError for RunnerError {
             Self::AutomatonCannotConstructProgramBinaryUrl { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            Self::AutomatonCannotConstructProgramInfoUrl { .. } => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::AutomatonMissingDeploymentId => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonMissingDeploymentConfig => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonMissingDeploymentLocation => StatusCode::INTERNAL_SERVER_ERROR,
@@ -423,6 +442,7 @@ impl ResponseError for RunnerError {
             Self::RunnerCheckError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerStopError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerClearError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::RunnerConfigError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerInteractionUnreachable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::RunnerInteractionLogFollowRequestChannelFull { .. } => {
                 StatusCode::SERVICE_UNAVAILABLE

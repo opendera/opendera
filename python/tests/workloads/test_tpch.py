@@ -1,21 +1,26 @@
 import sys
 import time
 import unittest
+from feldera.enums import BootstrapPolicy
 from feldera.pipeline import Pipeline
 from feldera.testutils import (
     IndexSpec,
     ViewSpec,
     build_pipeline,
     check_for_endpoint_errors,
+    check_end_of_input,
     checkpoint_pipeline,
     generate_program,
     log,
     number_of_processed_records,
+    number_of_input_records,
     run_workload,
-    transaction,
+    transaction_num_records,
     unique_pipeline_name,
     validate_outputs,
+    wait_end_of_input,
 )
+from feldera.runtime_config import Resources
 import tempfile
 import os
 import argparse
@@ -31,14 +36,25 @@ class TPCHTestConfig:
         s3_prefix: Optional[str] = None,
         s3_path: Optional[str] = None,
         s3_region: Optional[str] = None,
+        s3_skip_signature: bool = False,
         input_dir: Optional[str] = None,
+        segment_size: Optional[int] = None,
+        num_segments: Optional[int] = None,
+        resources: Optional[Resources] = None,
     ):
         self.mode = mode
+        self.resources = resources
 
         if mode not in ["transaction", "stream", "checkpoint"]:
             raise ValueError(f"Unknown mode: {mode}")
 
         self.input_mode = input_mode
+        self.segment_size = segment_size
+        self.num_segments = num_segments
+
+        if self.num_segments is not None:
+            if self.num_segments <= 0 or self.num_segments > 20:
+                raise ValueError("num_segments must be between 1 and 20")
 
         if self.input_mode == "file":
             self.input_dir = input_dir
@@ -68,6 +84,7 @@ class TPCHTestConfig:
                 raise ValueError("s3_region must be specified if input_mode is 'delta'")
         else:
             raise ValueError(f"Unknown input mode: {self.input_mode}")
+        self.s3_skip_signature = s3_skip_signature
 
     def __repr__(self):
         return f"IndexSpec(name={self.name!r},columns={self.columns!r})"
@@ -117,6 +134,40 @@ def run_cli():
         help="S3 bucket region. Required if --s3-bucket or --s3-path is specified.",
     )
 
+    parser.add_argument(
+        "--s3-skip-signature",
+        action=argparse.BooleanOptionalAction,
+        help="Sometimes 'aws_skip_signature: true' is needed, but sometimes it isn't.",
+    )
+
+    parser.add_argument(
+        "--num-segments",
+        type=int,
+        nargs="?",
+        default=None,
+        help="Number of test segments. Only used in checkpoint mode. The test divides all views in the benchmark into this many groups and adds one group of views per segment to the pipeline.",
+    )
+
+    parser.add_argument(
+        "--segment-size",
+        type=int,
+        nargs="?",
+        default=None,
+        help="Approximate number of records ingested per segment. Only used in checkpoint mode.",
+    )
+
+    parser.add_argument(
+        "--memory-mb", type=int, nargs="?", default=None, help="Memory size in MB"
+    )
+
+    parser.add_argument(
+        "--storage-mb", type=int, nargs="?", default=None, help="Storage size in MB"
+    )
+
+    parser.add_argument(
+        "--storage-class", nargs="?", default=None, help="storage class name"
+    )
+
     args = parser.parse_args()
 
     if sum(x is not None for x in (args.s3_bucket, args.s3_path, args.input_dir)) > 1:
@@ -131,6 +182,7 @@ def run_cli():
     elif args.s3_bucket:
         input_mode = "s3"
         s3_region = args.s3_region
+        s3_path = None
     elif args.s3_path:
         input_mode = "delta"
         s3_path = args.s3_path
@@ -142,6 +194,13 @@ def run_cli():
 
     mode = args.mode
 
+    resources = Resources(
+        memory_mb_max=args.memory_mb,
+        memory_mb_min=args.memory_mb,
+        storage_mb_max=args.storage_mb,
+        storage_class=args.storage_class,
+    )
+
     log(f"Test mode: {mode}")
     log(f"Input mode: {input_mode}")
 
@@ -152,33 +211,44 @@ def run_cli():
         s3_prefix=args.s3_prefix,
         s3_region=s3_region,
         s3_path=s3_path,
+        s3_skip_signature=args.s3_skip_signature,
         input_dir=args.input_dir,
+        segment_size=args.segment_size,
+        num_segments=args.num_segments,
+        resources=resources,
     )
 
     tpch_test(config)
 
 
-def aws_access() -> str:
+def aws_access(s3_skip_signature: bool) -> str:
     if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
         aws_access = f"""\
                 "aws_access_key_id": "{os.environ.get("AWS_ACCESS_KEY_ID")}",
-                "aws_secret_access_key": "{os.environ.get("AWS_SECRET_ACCESS_KEY")}","""
+                "aws_secret_access_key": "{os.environ.get("AWS_SECRET_ACCESS_KEY")}",
+"""
         if os.environ.get("AWS_SESSION_TOKEN"):
             aws_access += f"""
-                "aws_session_token": "{os.environ.get("AWS_SESSION_TOKEN")}","""
-    else:
+                "aws_session_token": "{os.environ.get("AWS_SESSION_TOKEN")}",
+"""
+    elif s3_skip_signature:
         aws_access = """\
-                "aws_skip_signature": "true","""
+                "aws_skip_signature": "true",
+"""
+    else:
+        aws_access = ""
     return aws_access
 
 
-def delta_input_connector(s3_path: str, region: str, table: str) -> str:
+def delta_input_connector(
+    s3_path: str, region: str, table: str, s3_skip_signature: bool
+) -> str:
     return f"""{{
         "transport": {{
             "name": "delta_table_input",
             "config": {{
                 "uri": "{s3_path}/{table}",
-{aws_access()}
+{aws_access(s3_skip_signature)}\
                 "aws_region": "{region}",
                 "mode": "snapshot"
             }}
@@ -203,14 +273,16 @@ def file_input_connector(path: str, table: str) -> str:
     }}"""
 
 
-def s3_input_connector(bucket: str, prefix: str, region: str, table: str) -> str:
+def s3_input_connector(
+    bucket: str, prefix: str, region: str, table: str, s3_skip_signature: bool
+) -> str:
     return f"""{{
         "transport": {{
             "name": "s3_input",
             "config": {{
                 "bucket_name": "{bucket}",
                 "key": "{prefix}/{table}.csv",
-                {aws_access()}
+                {aws_access(s3_skip_signature)}\
                 "region": "{region}"
             }}
         }},
@@ -225,10 +297,16 @@ def s3_input_connector(bucket: str, prefix: str, region: str, table: str) -> str
 
 def input_connector(config: TPCHTestConfig, table: str) -> str:
     if config.input_mode == "delta":
-        return delta_input_connector(config.s3_path, config.s3_region, table)
+        return delta_input_connector(
+            config.s3_path, config.s3_region, table, config.s3_skip_signature
+        )
     elif config.input_mode == "s3":
         return s3_input_connector(
-            config.s3_bucket, config.s3_prefix, config.s3_region, table
+            config.s3_bucket,
+            config.s3_prefix,
+            config.s3_region,
+            table,
+            config.s3_skip_signature,
         )
     elif config.input_mode == "file":
         return file_input_connector(config.input_dir, table)
@@ -1297,23 +1375,33 @@ def tpch_test_segment(
     pipeline: Pipeline,
     tables: dict,
     views: List[ViewSpec],
-    expected_processed_records,
+    last_processed: int,
     segment_size: int,
-) -> tuple[bool, int]:
+    previously_non_empty_views: List[str],
+) -> tuple[bool, int, List[str]]:
     """Run a test segment.
 
-    Start the pipeline (from a checkpoint if one exists), run a series of transactions followed by streaming ingest periods,
-    until the pipeline processed segment_size records. A checkpoint is created halfway through the segment, or at the end. The
-    pipeline is then paused,outputs validated, and the pipeline stopped.
+    Start the pipeline (from a checkpoint if one exists), run a transaction to process segment_size records.
+    A checkpoint is created at the end of the segment. The pipeline is then paused, outputs validated, and
+    the pipeline stopped.
+
+    previously_non_empty_views is a list of views that were non-empty before the start of the segment.
+    This is used to check that the views are still non-empty when the pipeline is restarted, i.e.,
+    output snapshots are correctly populated by the bootstrapping process.
     """
 
     # Start pipeline.
     start_time = time.monotonic()
-    log(
-        f"Starting pipeline to process {segment_size} records, starting from (approximately) {expected_processed_records} processed records"
-    )
-    pipeline.start()
+    log(f"Starting pipeline to process {segment_size} records")
+    pipeline.start(bootstrap_policy=BootstrapPolicy.ALLOW)
     log(f"Pipeline started in {time.monotonic() - start_time} seconds")
+
+    for view_name in previously_non_empty_views:
+        count = view_row_count(pipeline, view_name)
+        if count == 0:
+            raise RuntimeError(
+                f"View {view_name} was non-empty before restart, but is empty after restart"
+            )
 
     # Current number of processed records.
     initial_processed_records = number_of_processed_records(pipeline)
@@ -1322,56 +1410,25 @@ def tpch_test_segment(
         f"Initial processed records at the start of a segment: {initial_processed_records}"
     )
 
-    if initial_processed_records < expected_processed_records:
+    if initial_processed_records < last_processed:
         raise RuntimeError(
-            f"Expected at least {expected_processed_records} processed records on startup, got {initial_processed_records}"
+            f"Expected at least {last_processed} processed records on startup, got {initial_processed_records}"
         )
 
-    # Expected number of processed records after this segment.
-    expected_processed_records = initial_processed_records + segment_size
+    # Transaction
+    transaction_num_records(pipeline, segment_size)
+    check_for_endpoint_errors(pipeline)
 
-    # Make a checkpoint halfway through the segment after processing this many records.
-    halfway_processed_records = (
-        initial_processed_records + expected_processed_records
-    ) >> 1
+    processed_before_checkpoint = number_of_processed_records(pipeline)
+    non_empty_views = [
+        view.name for view in views if view_row_count(pipeline, view.name) > 0
+    ]
+    checkpoint_pipeline(pipeline)
 
-    checkpoint = False
-
-    while not pipeline.is_complete():
-        current_processed_records = number_of_processed_records(pipeline)
-        log(
-            f"Processed {current_processed_records} total records so far (processed {current_processed_records - initial_processed_records} records in this segment)"
-        )
-
-        if current_processed_records >= expected_processed_records:
-            log("Сompleting test segment")
-            break
-
-        # Transaction
-        transaction(pipeline, 100)
-        check_for_endpoint_errors(pipeline)
-
-        # Streaming ingest (no transaction)
-        log("Running streaming ingest for 10 seconds")
-        time.sleep(10)
-        check_for_endpoint_errors(pipeline)
-
-        if not checkpoint:
-            processed_before_checkpoint = number_of_processed_records(pipeline)
-
-            if processed_before_checkpoint >= halfway_processed_records:
-                log(
-                    f"Creating checkpoint after processing {processed_before_checkpoint} records"
-                )
-                checkpoint_pipeline(pipeline)
-                checkpoint = True
-
-    if not checkpoint:
-        processed_before_checkpoint = number_of_processed_records(pipeline)
-        log(
-            f"Creating checkpoint at the end of the segment after processing {processed_before_checkpoint} records"
-        )
-        checkpoint(pipeline)
+    # Streaming ingest (no transaction)
+    log("Running streaming ingest for 10 seconds")
+    time.sleep(10)
+    check_for_endpoint_errors(pipeline)
 
     pipeline.pause()
 
@@ -1383,7 +1440,14 @@ def tpch_test_segment(
     log("Stopping pipeline")
     pipeline.stop(force=True)
 
-    return (complete, processed_before_checkpoint)
+    return (complete, processed_before_checkpoint, non_empty_views)
+
+
+def view_row_count(pipeline: Pipeline, view_name: str) -> int:
+    escaped_view_name = view_name.replace('"', '""')
+    return next(pipeline.query(f'SELECT COUNT(*) as cnt FROM "{escaped_view_name}"'))[
+        "cnt"
+    ]
 
 
 def tpch_test(config: TPCHTestConfig):
@@ -1401,29 +1465,108 @@ def tpch_test(config: TPCHTestConfig):
     views = tpch_views(q_dirs)
 
     if config.mode == "checkpoint":
+        log("Starting checkpoint mode with all tables and no views")
         pipeline = build_pipeline(
-            unique_pipeline_name("tpc-h-checkpoint"), tables, views
+            unique_pipeline_name("tpc-h-checkpoint"),
+            tables,
+            [],
+            config.resources,
+            dev_tweaks={"adaptive_joins": True},
         )
+        if config.segment_size is not None:
+            segment_size = config.segment_size
+        else:
+            segment_size = 100_000_000
+
+        if config.num_segments is not None:
+            views_per_segment = (
+                len(views) + config.num_segments - 1
+            ) // config.num_segments
+        else:
+            views_per_segment = 5
 
         last_processed = 0
-        iteration = 1
-        modified_views = views
-        while True:
-            (complete, last_processed) = tpch_test_segment(
-                pipeline, tables, modified_views, last_processed, 100000000
-            )
-            if complete:
-                break
+        complete = False
+        non_empty_views: List[str] = []
 
-            iteration += 1
-            modified_views = list(
-                map(
-                    lambda view: view.clone_with_name(f"{view.name}_{iteration}"), views
-                )
+        view_counts = list(range(views_per_segment, len(views) + 1, views_per_segment))
+        if views and (not view_counts or view_counts[-1] != len(views)):
+            view_counts.append(len(views))
+
+        for view_count in view_counts:
+            modified_views = views[:view_count]
+            log(
+                f"Checkpoint view-add phase: adding {view_count}/{len(views)} views: "
+                f"{', '.join(view.name for view in modified_views)}"
             )
 
             sql = generate_program(tables, modified_views)
             pipeline.modify(sql=sql)
+            log(
+                f"Running checkpoint segment with {view_count} views from {last_processed} processed records"
+            )
+
+            (complete, last_processed, non_empty_views) = tpch_test_segment(
+                pipeline,
+                tables,
+                modified_views,
+                last_processed,
+                segment_size,
+                non_empty_views,
+            )
+            log(
+                f"Completed checkpoint view-add segment with complete={complete}, last_processed={last_processed}"
+            )
+            if complete:
+                break
+
+        # Test a different type of pipeline change: rename all views in the program.
+        modified_views = [
+            view.clone_with_name(f"{view.name}_renamed") for view in views
+        ]
+        log(f"Renaming all views: {', '.join(view.name for view in modified_views)}")
+
+        sql = generate_program(tables, modified_views)
+        pipeline.modify(sql=sql)
+
+        # Process remaining data in one transaction.
+        pipeline.start(bootstrap_policy=BootstrapPolicy.ALLOW)
+        start_time = time.monotonic()
+
+        try:
+            pipeline.start_transaction()
+        except Exception as e:
+            log(f"Error starting transaction: {e}")
+
+        if config.segment_size is not None:
+            expected_inputs = number_of_input_records(pipeline) + config.segment_size
+            while number_of_input_records(
+                pipeline
+            ) < expected_inputs and not check_end_of_input(pipeline):
+                time.sleep(3)
+        else:
+            wait_end_of_input(pipeline, timeout_s=3600)
+
+        elapsed = time.monotonic() - start_time
+        log(f"Remaining data ingested in {elapsed}")
+
+        start_time = time.monotonic()
+        try:
+            pipeline.commit_transaction(transaction_id=None, wait=True, timeout_s=None)
+            log(f"Commit took {time.monotonic() - start_time}")
+        except Exception as e:
+            log(f"Error committing transaction: {e}")
+
+        pipeline.pause()
+
+        # log("Waiting for outputs to flush")
+        # start_time = time.monotonic()
+        # pipeline.wait_for_completion(force_stop=False, timeout_s=3600)
+        # log(f"Flushing outputs took {time.monotonic() - start_time}")
+
+        validate_outputs(pipeline, tables, modified_views)
+
+        pipeline.stop(force=True)
 
     elif config.mode == "transaction":
         pipeline = run_workload(
@@ -1432,6 +1575,7 @@ def tpch_test(config: TPCHTestConfig):
             views,
             transaction=True,
             stop=False,
+            resources=config.resources,
         )
         count = next(
             pipeline.query(
@@ -1450,6 +1594,7 @@ def tpch_test(config: TPCHTestConfig):
             views,
             transaction=False,
             stop=False,
+            resources=config.resources,
         )
         count = next(
             pipeline.query(
@@ -1472,12 +1617,17 @@ class TestTPCH(unittest.TestCase):
             "delta",
             s3_path="s3://batchtofeldera",
             s3_region="ap-southeast-2",
+            s3_skip_signature=True,
         )
         tpch_test(config)
 
     def test_tpch_stream(self):
         config = TPCHTestConfig(
-            "stream", "delta", s3_path="s3://batchtofeldera", s3_region="ap-southeast-2"
+            "stream",
+            "delta",
+            s3_path="s3://batchtofeldera",
+            s3_region="ap-southeast-2",
+            s3_skip_signature=True,
         )
         tpch_test(config)
 

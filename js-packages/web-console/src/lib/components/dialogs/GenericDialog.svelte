@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Tooltip } from '$lib/components/common/Tooltip.svelte'
+  import { Tooltip } from 'common-ui'
   import {
     type GlobalDialogContent,
     useGlobalDialog
@@ -11,6 +11,7 @@
     danger,
     disabled,
     noclose,
+    swapActions,
     children
   }: {
     content: GlobalDialogContent
@@ -18,6 +19,7 @@
     disabled?: boolean
     /** When set, the dialog has no "X" button and does not auto-close on cancel/click-away. */
     noclose?: boolean
+    swapActions?: boolean
     children?: Snippet
   } = $props()
 
@@ -42,7 +44,7 @@
     {/if}
   </div>
   <div
-    class="-mr-4 scrollbar flex max-h-[calc(90vh-96px)] flex-col gap-4 overflow-auto pr-4 sm:-mr-8"
+    class="-mr-4 scrollbar flex max-h-[calc(90vh-96px)] flex-col gap-4 overflow-visible pr-4 sm:-mr-8"
   >
     {#if content.description}
       <span class="whitespace-pre-wrap" data-testid="box-dialog-description">
@@ -67,11 +69,12 @@
       <button
         onclick={() => cancel()}
         class="btn preset-filled-surface-50-950 px-4"
+        class:order-last={swapActions}
         data-testid="btn-dialog-cancel"
       >
         {content.onCancel?.name ?? 'Cancel'}
       </button>
-      <div>
+      <div class:order-first={swapActions}>
         <button
           {disabled}
           onclick={content.onSuccess.callback}

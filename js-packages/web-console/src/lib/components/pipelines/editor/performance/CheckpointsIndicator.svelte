@@ -1,51 +1,42 @@
 <script lang="ts">
-  import { format } from 'd3-format'
   import { slide } from 'svelte/transition'
+  import ClickFeedback from '$lib/components/common/ClickFeedback.svelte'
+  import { useElapsedTime } from '$lib/compositions/common/useElapsedTime'
   import { useGlobalDialog } from '$lib/compositions/layout/useGlobalDialog.svelte'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
   import { usePremiumFeatures } from '$lib/compositions/usePremiumFeatures.svelte'
+  import { uuidV7Timestamp } from '$lib/functions/common/date'
   import { humanSize } from '$lib/functions/common/string'
-  import { useElapsedTime } from '$lib/functions/format'
+  import { formatQty } from '$lib/functions/format'
   import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
   import type { CheckpointMetadata, CheckpointStatus } from '$lib/services/manager'
   import CheckpointActivityStatus from './CheckpointActivityStatus.svelte'
   import CheckpointDialog from './CheckpointDialog.svelte'
-
-  const formatQty = (v: number) => format(',.0f')(v)
 
   const {
     pipelineName,
     checkpoints,
     metrics,
     checkpointStatus,
-    lastCheckpointAt,
     onShowCheckpoints
   }: {
     pipelineName: string
     checkpoints: CheckpointMetadata[]
     metrics: { current: PipelineMetrics }
     checkpointStatus: CheckpointStatus | null
-    lastCheckpointAt: Date | null
     onShowCheckpoints: () => void
   } = $props()
+
+  const lastCheckpointAt = $derived(
+    uuidV7Timestamp(checkpoints.at(-1)?.uuid ?? '')?.toDate() ?? null
+  )
 
   const api = usePipelineManager()
   const isEnterprise = usePremiumFeatures()
   const { formatElapsedTime } = useElapsedTime()
   const globalDialog = useGlobalDialog()
 
-  let checkpointRequested = $state(false)
-
-  const handleCheckpoint = () => {
-    checkpointRequested = true
-    api.checkpointPipeline(pipelineName).finally(() => {
-      checkpointRequested = false
-    })
-  }
-
-  const openCheckpointDialog = () => {
-    globalDialog.dialog = checkpointDialog
-  }
+  let clickFeedback = $state<() => void>()
 
   const last = $derived(checkpoints.at(-1))
   const totalBytes = $derived(checkpoints.reduce((sum, cp) => sum + (cp.size ?? 0), 0))
@@ -54,15 +45,15 @@
   const lastCheckpointSuccess = $derived(checkpointStatus?.success)
   const showCheckpointFailure = $derived(
     checkpointFailure != null &&
-      (lastCheckpointSuccess == null ||
-        checkpointFailure.sequence_number > lastCheckpointSuccess)
+      (lastCheckpointSuccess == null || checkpointFailure.sequence_number > lastCheckpointSuccess)
   )
   const isPermanentlyUnavailable = $derived.by(() => {
     const errors = metrics.current.permanent_checkpoint_errors
-    return errors != null &&
+    return (
+      errors != null &&
       errors.length > 0 &&
-      !(errors.length === 1 &&
-        errors[0] === 'EnterpriseFeature')
+      !(errors.length === 1 && errors[0] === 'EnterpriseFeature')
+    )
   })
   const activityVisible = $derived(
     isPermanentlyUnavailable ||
@@ -72,7 +63,12 @@
 </script>
 
 {#snippet checkpointDialog()}
-  <CheckpointDialog onConfirm={handleCheckpoint} />
+  <CheckpointDialog
+    onConfirm={() => {
+      clickFeedback?.()
+      api.checkpointPipeline(pipelineName)
+    }}
+  />
 {/snippet}
 
 {#snippet allCheckpoints()}
@@ -80,7 +76,9 @@
     <div class="ml-auto flex items-center gap-4">
       <span class=""
         >{checkpoints.length}
-        {checkpoints.length === 1 ? 'checkpoint' : 'checkpoints'} using {humanSize(totalBytes)}</span
+        {checkpoints.length === 1 ? 'checkpoint' : 'checkpoints'} using {humanSize(
+          totalBytes
+        )}</span
       >
       <button class="btn preset-filled-surface-100-900" onclick={onShowCheckpoints}>
         All checkpoints
@@ -138,25 +136,32 @@
       <div class="flex flex-col">
         <div class="text-sm text-nowrap">Processed records</div>
         <div class="pt-2 font-dm-mono text-nowrap">
-          {last.processed_records != null ? formatQty(last.processed_records) : '—'}
+          {formatQty(last.processed_records)}
         </div>
       </div>
       <div class="flex flex-col">
         <div class="text-sm text-nowrap">Steps</div>
         <div class="pt-2 font-dm-mono text-nowrap">
-          {last.steps != null ? formatQty(last.steps) : '—'}
+          {formatQty(last.steps)}
         </div>
       </div>
       {@render allCheckpoints()}
     {:else if isEnterprise.value}
       <div class="hr"></div>
-      <button
-        class="ml-auto btn preset-outlined-primary-500 btn-sm"
-        onclick={openCheckpointDialog}
-        disabled={checkpointRequested}
+      <ClickFeedback
+        active={metrics.current.checkpoint_activity.status !== 'idle'}
+        bind:clickFeedback
       >
-        {checkpointRequested ? 'Requesting...' : 'Create first checkpoint'}
-      </button>
+        {#snippet children({ active })}
+          <button
+            class="ml-auto btn preset-outlined-primary-500 btn-sm"
+            onclick={() => (globalDialog.dialog = checkpointDialog)}
+            disabled={active}
+          >
+            {active ? 'Creating checkpoint...' : 'Create first checkpoint'}
+          </button>
+        {/snippet}
+      </ClickFeedback>
       {@render allCheckpoints()}
     {/if}
   </div>

@@ -71,6 +71,9 @@ enum Action {
         deployment_resources_status_details: serde_json::Value,
     },
     TransitionToStopped,
+    RemainStoppedUpdateError {
+        error: ErrorResponse,
+    },
     StorageTransitionToCleared,
 }
 
@@ -436,8 +439,13 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 StorageStatus::Clearing,
                 ResourcesStatus::Stopped,
                 ResourcesDesiredStatus::Provisioned,
-            )
-            | (
+            ) => Action::RemainStoppedUpdateError {
+                error: ErrorResponse::from(&RunnerError::AutomatonImpossibleDesiredStatus {
+                    current_status: pipeline.deployment_resources_status,
+                    desired_status: pipeline.deployment_resources_desired_status,
+                }),
+            },
+            (
                 StorageStatus::Cleared | StorageStatus::Clearing,
                 ResourcesStatus::Provisioning,
                 _,
@@ -672,6 +680,19 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                         .await?;
                     (ResourcesStatus::Stopped, None, None)
                 }
+                Action::RemainStoppedUpdateError { error } => {
+                    self.db
+                        .lock()
+                        .await
+                        .remain_deployment_resources_status_stopped(
+                            self.tenant_id,
+                            pipeline.id,
+                            version_guard,
+                            error.clone(),
+                        )
+                        .await?;
+                    (ResourcesStatus::Stopped, None, None)
+                }
                 Action::StorageTransitionToCleared => {
                     self.db
                         .lock()
@@ -879,14 +900,13 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             {
                 info!("Runner cannot start pipeline {} because its runtime version ({}) is incompatible with current ({})", pipeline.id, pipeline.platform_version, self.platform_version);
 
-                Ok(Action::TransitionToStopping {
-                    error: Some(ErrorResponse::from_error_nolog(
+                Ok(Action::RemainStoppedUpdateError {
+                    error: ErrorResponse::from_error_nolog(
                         &RunnerError::AutomatonCannotProvisionUnsupportedPlatformVersion {
                             runner_platform_version: self.platform_version.clone(),
                             pipeline_platform_version: pipeline.platform_version.clone(),
                         },
-                    )),
-                    storage_status_details: None,
+                    ),
                 })
             }
             ProgramStatus::Success => {
@@ -917,16 +937,15 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 Ok(state)
             }
             ProgramStatus::SqlError | ProgramStatus::RustError | ProgramStatus::SystemError => {
-                Ok(Action::TransitionToStopping {
-                    error: Some(ErrorResponse::from_error_nolog(
+                Ok(Action::RemainStoppedUpdateError {
+                    error: ErrorResponse::from_error_nolog(
                         &DBError::StartFailedDueToFailedCompilation {
                             compiler_error: format!(
                                 "{:?} occurred (see `program_error` for more information)",
                                 pipeline.program_status
                             ),
                         },
-                    )),
-                    storage_status_details: None,
+                    ),
                 })
             }
             _ => Ok(Action::Remain),
@@ -950,39 +969,32 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         let runtime_config = match validate_runtime_config(&pipeline.runtime_config, true) {
             Ok(runtime_config) => runtime_config,
             Err(e) => {
-                return Action::TransitionToStopping {
-                    error: Some(
-                        RunnerError::AutomatonInvalidRuntimeConfig {
-                            value: pipeline.runtime_config.clone(),
-                            error: e,
-                        }
-                        .into(),
-                    ),
-                    storage_status_details: None,
+                return Action::RemainStoppedUpdateError {
+                    error: RunnerError::AutomatonInvalidRuntimeConfig {
+                        value: pipeline.runtime_config.clone(),
+                        error: e,
+                    }
+                    .into(),
                 };
             }
         };
 
-        // Input and output connectors from required program_info
-        let program_info = match &pipeline.program_info {
+        // Validate the required program_info which includes input and output connectors
+        let _program_info = match &pipeline.program_info {
             None => {
-                return Action::TransitionToStopping {
-                    error: Some(RunnerError::AutomatonMissingProgramInfo.into()),
-                    storage_status_details: None,
+                return Action::RemainStoppedUpdateError {
+                    error: RunnerError::AutomatonMissingProgramInfo.into(),
                 };
             }
             Some(program_info) => match validate_program_info(program_info) {
                 Ok(program_info) => program_info,
                 Err(e) => {
-                    return Action::TransitionToStopping {
-                        error: Some(
-                            RunnerError::AutomatonInvalidProgramInfo {
-                                value: program_info.clone(),
-                                error: e,
-                            }
-                            .into(),
-                        ),
-                        storage_status_details: None,
+                    return Action::RemainStoppedUpdateError {
+                        error: RunnerError::AutomatonInvalidProgramInfo {
+                            value: program_info.clone(),
+                            error: e,
+                        }
+                        .into(),
                     };
                 }
             },
@@ -992,36 +1004,35 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         let deployment_id = Uuid::now_v7();
 
         // Deployment configuration
-        let mut deployment_config = generate_pipeline_config(
-            pipeline.id,
-            &pipeline.name,
-            &runtime_config,
-            if pipeline.program_info_integrity_checksum.is_none() {
-                Some(&program_info)
-            } else {
-                None
-            },
-        );
+        let mut deployment_config =
+            generate_pipeline_config(pipeline.id, &pipeline.name, &runtime_config);
         deployment_config.storage_config =
             Some(self.pipeline_handle.generate_storage_config().await);
-        let deployment_config = match serde_json::to_value(&deployment_config) {
+        let deployment_config_json = match serde_json::to_value(&deployment_config) {
             Ok(deployment_config) => deployment_config,
             Err(error) => {
-                return Action::TransitionToStopping {
-                    error: Some(
-                        RunnerError::AutomatonFailedToSerializeDeploymentConfig {
-                            error: error.to_string(),
-                        }
-                        .into(),
-                    ),
-                    storage_status_details: None,
+                return Action::RemainStoppedUpdateError {
+                    error: RunnerError::AutomatonFailedToSerializeDeploymentConfig {
+                        error: error.to_string(),
+                    }
+                    .into(),
                 };
             }
         };
 
+        // Validate that the backing compute and storage resources, if they were attempted to be
+        // provisioned, can be managed
+        if let Err(e) = self
+            .pipeline_handle
+            .can_provision(&deployment_config, &pipeline.runtime_config)
+            .await
+        {
+            return Action::RemainStoppedUpdateError { error: e.into() };
+        }
+
         Action::TransitionToProvisioning {
             deployment_id,
-            deployment_config,
+            deployment_config: deployment_config_json,
         }
     }
 
@@ -1304,28 +1315,37 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             },
         );
 
-        let program_info_url = if let Some(program_info_integrity_checksum) =
+        let Some(program_info_integrity_checksum) =
             pipeline.program_info_integrity_checksum.as_ref()
-        {
-            Some(format!(
-                "{}://{}:{}/program_info/{}/{}/{}/{}",
-                if self.common_config.enable_https {
-                    "https"
-                } else {
-                    "http"
-                },
-                self.common_config.compiler_host,
-                self.common_config.compiler_port,
-                self.pipeline_id,
-                pipeline.program_version,
-                source_checksum,
-                program_info_integrity_checksum,
-            ))
-        } else {
-            None
+        else {
+            return Action::TransitionToStopping {
+                error: Some(
+                    RunnerError::AutomatonCannotConstructProgramInfoUrl {
+                        error: "integrity checksum is missing".to_string(),
+                    }
+                    .into(),
+                ),
+                storage_status_details: None,
+            };
         };
 
-        let bootstrap_policy =
+        // URL where the program info can be downloaded from
+        let program_info_url = format!(
+            "{}://{}:{}/program_info/{}/{}/{}/{}",
+            if self.common_config.enable_https {
+                "https"
+            } else {
+                "http"
+            },
+            self.common_config.compiler_host,
+            self.common_config.compiler_port,
+            self.pipeline_id,
+            pipeline.program_version,
+            source_checksum,
+            program_info_integrity_checksum,
+        );
+
+        let bootstrap_config =
             if Self::platform_version_requires_bootstrap_policy(&pipeline.platform_version) {
                 Some(pipeline.bootstrap_policy.unwrap_or_default())
             } else {
@@ -1346,13 +1366,14 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             .pipeline_handle
             .provision(
                 deployment_initial,
-                bootstrap_policy,
+                bootstrap_config,
                 &deployment_id,
                 &deployment_config,
                 program_info,
                 &program_binary_url,
-                program_info_url.as_deref(),
+                &program_info_url,
                 pipeline.program_version,
+                &pipeline.runtime_config,
             )
             .await
         {
@@ -1419,7 +1440,11 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         };
 
         // Check whether the pipeline has finished provisioning the resources
-        let provision_status = match self.pipeline_handle.is_provisioned().await {
+        let provision_status = match self
+            .pipeline_handle
+            .is_provisioned(&pipeline.runtime_config)
+            .await
+        {
             Ok(provision_status) => provision_status,
             Err(e) => {
                 error!(
@@ -1647,15 +1672,16 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         pipeline: &ExtendedPipelineDescrMonitoring,
     ) -> Action {
         // Retrieve latest resources status details
-        let latest_resources_status_details = match self.pipeline_handle.check().await {
-            Ok(details) => details,
-            Err(e) => {
-                return Action::TransitionToStopping {
-                    error: Some(e.into()),
-                    storage_status_details: None,
+        let latest_resources_status_details =
+            match self.pipeline_handle.check(&pipeline.runtime_config).await {
+                Ok(details) => details,
+                Err(e) => {
+                    return Action::TransitionToStopping {
+                        error: Some(e.into()),
+                        storage_status_details: None,
+                    }
                 }
-            }
-        };
+            };
 
         // Determine deployment location
         let deployment_location = match pipeline.deployment_location.as_ref() {
@@ -1779,12 +1805,23 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         &mut self,
         pipeline: &ExtendedPipelineDescrMonitoring,
     ) -> Action {
-        if let Err(e) = self.pipeline_handle.stop().await {
+        if let Err(e) = self.pipeline_handle.stop(&pipeline.runtime_config).await {
+            let message = format!("Pipeline could not be stopped (will retry): {e}");
             error!(
                 pipeline_id = %pipeline.id,
                 pipeline = %pipeline.name,
-                "Pipeline could not be stopped (will retry): {e}"
+                message
             );
+            self.logs_sender
+                .send(LogMessage::new_from_control_plane(
+                    module_path!(),
+                    "runner",
+                    pipeline.name.clone(),
+                    pipeline.id.to_string(),
+                    Level::ERROR,
+                    &message,
+                ))
+                .await;
             let latest_details = json!(format!("Unable to stop (will retry) due to: {e}"));
             if (Some(&latest_details) != self.prev_resources_status_details.as_ref()
                 && self
@@ -1821,7 +1858,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         &mut self,
         pipeline: &ExtendedPipelineDescrMonitoring,
     ) -> Action {
-        if let Err(e) = self.pipeline_handle.clear().await {
+        if let Err(e) = self.pipeline_handle.clear(&pipeline.runtime_config).await {
             error!(
                 pipeline_id = %pipeline.id,
                 pipeline = %pipeline.name,
@@ -1856,7 +1893,7 @@ mod test {
     use async_trait::async_trait;
     use feldera_types::config::{PipelineConfig, StorageConfig};
     use feldera_types::program_schema::ProgramSchema;
-    use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+    use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus, RuntimeStatus};
     use serde_json::json;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -1893,36 +1930,51 @@ mod test {
             }
         }
 
-        async fn provision(
-            &mut self,
-            _: RuntimeDesiredStatus,
-            _: Option<BootstrapPolicy>,
-            _: &Uuid,
+        async fn can_provision(
+            &self,
             _: &PipelineConfig,
             _: &serde_json::Value,
-            _: &str,
-            _: Option<&str>,
-            _: Version,
         ) -> Result<(), ManagerError> {
             Ok(())
         }
 
-        async fn is_provisioned(&mut self) -> Result<ProvisionStatus, ManagerError> {
+        async fn provision(
+            &mut self,
+            _: RuntimeDesiredStatus,
+            _: Option<BootstrapConfig>,
+            _: &Uuid,
+            _: &PipelineConfig,
+            _: &serde_json::Value,
+            _: &str,
+            _: &str,
+            _: Version,
+            _: &serde_json::Value,
+        ) -> Result<(), ManagerError> {
+            Ok(())
+        }
+
+        async fn is_provisioned(
+            &mut self,
+            _runtime_config: &serde_json::Value,
+        ) -> Result<ProvisionStatus, ManagerError> {
             Ok(ProvisionStatus::Provisioned {
                 location: self.deployment_location.clone(),
                 details: json!(""),
             })
         }
 
-        async fn check(&mut self) -> Result<serde_json::Value, ManagerError> {
+        async fn check(
+            &mut self,
+            _runtime_config: &serde_json::Value,
+        ) -> Result<serde_json::Value, ManagerError> {
             Ok(json!(""))
         }
 
-        async fn stop(&mut self) -> Result<(), ManagerError> {
+        async fn stop(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
             Ok(())
         }
 
-        async fn clear(&mut self) -> Result<(), ManagerError> {
+        async fn clear(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
             Ok(())
         }
     }
@@ -1953,7 +2005,7 @@ mod test {
                     automaton.tenant_id,
                     &pipeline.name,
                     initial,
-                    BootstrapPolicy::default(),
+                    BootstrapConfig::default(),
                     true,
                 )
                 .await
@@ -2075,10 +2127,11 @@ mod test {
                     messages: vec![],
                 },
                 &serde_json::to_value(ProgramInfo {
-                    schema: ProgramSchema {
+                    schema: serde_json::to_value(ProgramSchema {
                         inputs: vec![],
                         outputs: vec![],
-                    },
+                    })
+                    .unwrap(),
                     main_rust: "".to_string(),
                     udf_stubs: "".to_string(),
                     input_connectors: Default::default(),

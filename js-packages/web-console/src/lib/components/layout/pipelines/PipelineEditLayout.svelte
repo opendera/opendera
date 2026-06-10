@@ -1,10 +1,10 @@
 <script lang="ts">
   import { Progress } from '@skeletonlabs/skeleton-svelte'
+  import { Tooltip } from 'common-ui'
   import { Pane, type PaneAPI, PaneGroup, PaneResizer } from 'paneforge'
   import { untrack } from 'svelte'
   import { goto } from '$app/navigation'
   import { page } from '$app/state'
-  import Tooltip from '$lib/components/common/Tooltip.svelte'
   import DoubleClickInput from '$lib/components/input/DoubleClickInput.svelte'
   import AppHeader from '$lib/components/layout/AppHeader.svelte'
   import NavigationExtras from '$lib/components/layout/NavigationExtras.svelte'
@@ -116,7 +116,7 @@
     if (deleted) {
       return {
         header: 'This pipeline has been deleted',
-        message: 'The pipeline was deleted. All editing and monitoring has been disabled.',
+        message: 'All editing and monitoring has been disabled.',
         style: 'error' as const
       }
     }
@@ -184,7 +184,7 @@
     { icon: 'fd fd-panel-bottom', text: 'Monitoring', value: showMonitoringPanel },
     {
       icon: 'fd fd-panel-right',
-      text: 'Interaction',
+      text: 'Inspect',
       value: showInteractionPanel,
       show: isScreenLg.current
     }
@@ -257,7 +257,13 @@
               </span>
             </DoubleClickInput>
             {#if editNameDisabled}
-              <Tooltip class="">Cannot edit the pipeline's name while it's running</Tooltip>
+              <Tooltip class="">
+                {#if deleted}
+                  Cannot edit the deleted pipeline's name
+                {:else}
+                  Cannot edit the pipeline's name while it's running
+                {/if}
+              </Tooltip>
             {/if}
           {/snippet}
         </PipelineBreadcrumbs>

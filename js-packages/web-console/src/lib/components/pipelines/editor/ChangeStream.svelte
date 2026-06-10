@@ -3,7 +3,7 @@
   export type Row =
     | { relationName: string; columns: Field[] }
     | XgressEntry
-    | { skippedBytes: number }
+    | { relationName: string; skippedBytes: number }
   export type ChangeStreamData = {
     rows: Row[]
     headers: number[]
@@ -21,8 +21,7 @@
   import type { Field } from '$lib/services/manager'
   import SqlColumnHeader from '$lib/components/relationData/SQLColumnHeader.svelte'
   import { usePopoverTooltip } from '$lib/compositions/common/usePopoverTooltip.svelte'
-  import { useReverseScrollContainer } from '$lib/compositions/common/useReverseScrollContainer.svelte'
-  import ScrollDownFab from '$lib/components/other/ScrollDownFab.svelte'
+  import { ScrollDownFab, useReverseScrollContainer } from 'common-ui'
   import SQLValueTooltip from '$lib/components/other/SQLValueTooltip.svelte'
   import type { SQLValueJS } from '$lib/types/sql'
 

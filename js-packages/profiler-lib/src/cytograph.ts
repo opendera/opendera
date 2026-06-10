@@ -334,11 +334,15 @@ export class Cytograph {
                 visibleParents.has(nodeId)) {
                 let positions = complex.sourcePositions;
                 let src = sources.toString(positions);
-                let node = new GraphNode(nodeId, complex.persistentId, "region", true, true, parent, src);
+                let node = new GraphNode(nodeId, complex.persistentId, complex.operation, true, true, parent, src);
                 result.addNode(node);
             }
         }
 
+        // Keys are pairs (Simple node ID, target node ID), where target is simple or complex
+        // Used to avoid inserting the same edge twice between two complex nodes
+        // if the edge represents the same channel.
+        let insertedEdges: Set<string> = new Set();
         for (const edge of profile.edges) {
             let source = edge.source;
             let target = edge.target;
@@ -360,12 +364,24 @@ export class Cytograph {
             let sourceNode = inserted.get(source).expect(`Node ${source} not found in visible map`);
             let targetNode = inserted.get(target).expect(`Node ${target} not found in visible map`);
 
-            if (sourceNode !== targetNode) {
+            if (sourceNode === targetNode) {
                 // Induced edges can be self-edges; do not add these
-                let realEdge = result.createEdge(sourceNode.id, targetNode.id, edge.back);
-                result.edges.push(realEdge);
-                result.mapEdge(originalEdge, realEdge);
+                continue;
             }
+
+            // Detect whether an edge represents the same channel as a previous edge
+            // (only suppressed if the edge goes to a complex node)
+            if (!expandTarget) {
+                let pair = edge.source.toString() + "," + targetNode.id.toString();
+                if (insertedEdges.has(pair)) {
+                    continue;
+                }
+                insertedEdges.add(pair);
+            }
+
+            let realEdge = result.createEdge(sourceNode.id, targetNode.id, edge.back);
+            result.edges.push(realEdge);
+            result.mapEdge(originalEdge, realEdge);
         }
         return result;
     }

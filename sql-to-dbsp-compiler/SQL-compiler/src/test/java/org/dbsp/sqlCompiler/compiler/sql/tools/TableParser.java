@@ -2,6 +2,7 @@ package org.dbsp.sqlCompiler.compiler.sql.tools;
 
 import org.apache.calcite.util.ConversionUtil;
 import org.apache.calcite.util.TimeString;
+import org.apache.calcite.util.TimestampWithTimeZoneString;
 import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
 import org.dbsp.sqlCompiler.compiler.frontend.TableData;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
@@ -25,6 +26,7 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimeLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimestampLiteral;
 import org.dbsp.sqlCompiler.ir.expression.DBSPArrayExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPZSetExpression;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPTimestampTzLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU16Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU32Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU64Literal;
@@ -49,6 +51,7 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
@@ -97,8 +100,7 @@ public class TableParser {
     @Nullable
     static LocalDateTime ZERO = null;
 
-    /** Convert a timestamp from a format like Sat Feb 16 17:32:01 1996 to
-     * a format like 1996-02-16 17:32:01 */
+    /** Convert a timestamp from various formats to a {@link DBSPTimestampLiteral} */
     public static DBSPExpression convertTimestamp(@Nullable String timestamp, DBSPType type) {
         if (timestamp == null)
             return DBSPLiteral.none(type);
@@ -122,6 +124,15 @@ public class TableParser {
             return new DBSPTimestampLiteral(out, type.mayBeNull);
         }
         throw new RuntimeException("Could not parse " + timestamp + " as timestamp");
+    }
+
+    /** Convert a string to a {@link DBSPTimestampTzLiteral}.
+     * The format must be accepted by {@link TimestampWithTimeZoneString}. */
+    public static DBSPExpression convertTimestampTz(@Nullable String timestamp, DBSPType type) {
+        if (timestamp == null)
+            return DBSPLiteral.none(type);
+        TimestampWithTimeZoneString str = new TimestampWithTimeZoneString(timestamp);
+        return new DBSPTimestampTzLiteral(CalciteObject.EMPTY, type, str);
     }
 
     /** Convert a date from the MM-DD-YYYY format (which is used in the Postgres output)
@@ -259,7 +270,7 @@ public class TableParser {
         return result;
     }
 
-    static DBSPExpression parseValue(DBSPType fieldType, String data) {
+    static DBSPExpression parseValue(DBSPType fieldType, String data, boolean trimTrailingSpaces) {
         String trimmed = data.trim();
         DBSPExpression result;
         if ((fieldType.code != DBSPTypeCode.STRING && fieldType.code != DBSPTypeCode.BYTES) &&
@@ -283,6 +294,7 @@ public class TableParser {
                     yield new DBSPDecimalLiteral(fieldType, value);
                 }
                 case TIMESTAMP -> convertTimestamp(trimmed, fieldType);
+                case TIMESTAMP_TZ -> convertTimestampTz(trimmed, fieldType);
                 case DATE -> parseDate(trimmed, fieldType);
                 case TIME -> parseTime(trimmed, fieldType);
                 case INT8 -> new DBSPI8Literal(CalciteObject.EMPTY, fieldType, Byte.parseByte(trimmed));
@@ -312,8 +324,12 @@ public class TableParser {
                                     Utilities.singleQuote(data));
                     } else {
                         // replace \\n with \n, otherwise we can't represent it
-                        data = data.substring(1);
-                        data = data.replace("\\n", "\n");
+                        if (trimTrailingSpaces)
+                            data = trimmed;
+                        else {
+                            data = data.substring(1);
+                            data = data.replace("\\n", "\n");
+                        }
                         yield new DBSPStringLiteral(CalciteObject.EMPTY, fieldType, data, StandardCharsets.UTF_8);
                     }
                 }
@@ -338,7 +354,8 @@ public class TableParser {
                             String[] parts = trimmed.split(",");
                             DBSPExpression[] fields;
                             fields = Linq.map(
-                                    parts, p -> parseValue(array.getElementType(), p), DBSPExpression.class);
+                                    parts, p -> parseValue(array.getElementType(), p, trimTrailingSpaces),
+                                    DBSPExpression.class);
                             yield new DBSPArrayExpression(fieldType.mayBeNull, fields);
                         } else {
                             // empty vector
@@ -388,7 +405,7 @@ public class TableParser {
                         List<DBSPExpression> fields = new ArrayList<>(tuple.size());
                         int index = 0;
                         for (DBSPType ft : tuple.tupFields)
-                            fields.add(parseValue(ft, parts[index++]));
+                            fields.add(parseValue(ft, parts[index++], trimTrailingSpaces));
                         yield new DBSPTupleExpression(CalciteObject.EMPTY, tuple, fields);
                     }
                 }
@@ -399,7 +416,8 @@ public class TableParser {
         return result;
     }
 
-    public static DBSPTupleExpression parseRow(String line, DBSPTypeTupleBase rowType, String separatorRegex) {
+    public static DBSPTupleExpression parseRow(String line, DBSPTypeTupleBase rowType,
+                                               String separatorRegex, boolean trimTrailingSpaces) {
         String[] columns;
         if (rowType.size() > 1) {
             columns = line.split(separatorRegex, -1);
@@ -415,7 +433,7 @@ public class TableParser {
         DBSPExpression[] values = new DBSPExpression[columns.length];
         for (int i = 0; i < columns.length; i++) {
             DBSPType fieldType = rowType.getFieldType(i);
-            values[i] = parseValue(fieldType, columns[i]);
+            values[i] = parseValue(fieldType, columns[i], trimTrailingSpaces);
         }
         return new DBSPTupleExpression(values);
     }
@@ -427,12 +445,12 @@ public class TableParser {
                 Linq.list(outputType.to(DBSPTypeZSet.class).elementType.to(DBSPTypeTuple.class).tupFields);
         extraFields.add(new DBSPTypeInteger(CalciteObject.EMPTY, 64, true, false));
         DBSPType extraOutputType = new DBSPTypeTuple(extraFields);
-        Change change = parseTable(table, new DBSPTypeZSet(extraOutputType), -1);
+        Change change = parseTable(table, new DBSPTypeZSet(extraOutputType), -1, false);
         TableData[] extracted = Linq.map(change.sets, SqlIoTest::extractWeight, TableData.class);
         return new Change(extracted);
     }
 
-    public static Change parseTable(String table, DBSPType outputType, int rowCount) {
+    public static Change parseTable(String table, DBSPType outputType, int rowCount, boolean trimTrailingSpaces) {
         DBSPTypeZSet zset = outputType.to(DBSPTypeZSet.class);
         DBSPZSetExpression result = DBSPZSetExpression.emptyWithElementType(zset.elementType);
         DBSPTypeTuple tuple = zset.elementType.to(DBSPTypeTuple.class);
@@ -493,7 +511,7 @@ public class TableParser {
                 continue;
             if (mysqlStyle && line.startsWith("|") && line.endsWith("|"))
                 line = line.substring(1, line.length() - 1);
-            DBSPExpression row = parseRow(line, tuple, separator);
+            DBSPExpression row = parseRow(line, tuple, separator, trimTrailingSpaces);
             result.append(row);
             rowsFound++;
         }

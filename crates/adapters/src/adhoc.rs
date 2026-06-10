@@ -3,10 +3,8 @@ use crate::{Controller, PipelineError};
 use actix_web::{HttpRequest, HttpResponse, http::header, web::Payload};
 use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Closed, Session as WsSession};
 use datafusion::common::metadata::ScalarAndMetadata;
-use datafusion::common::{DFSchema, ParamValues, ScalarValue};
-use datafusion::execution::memory_pool::FairSpillPool;
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::{SessionState, SessionStateBuilder};
+use datafusion::common::{DFSchema, ParamValues};
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::{EmptyRelation, Execute, LogicalPlan, Prepare, Statement};
 use datafusion::prelude::*;
 use datafusion::sql::parser::{DFParserBuilder, Statement as DFStatement};
@@ -15,64 +13,17 @@ use executor::{
     hash_query_result, infallible_from_bytestring, stream_arrow_query, stream_json_query,
     stream_parquet_query, stream_text_query,
 };
-use feldera_adapterlib::errors::journal::ControllerError;
-use feldera_types::config::PipelineConfig;
 use feldera_types::query::{AdHocResultFormat, AdhocQueryArgs, MAX_WS_FRAME_SIZE};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
-use std::fs::create_dir_all;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::warn;
 
 mod executor;
 mod format;
 pub(crate) mod table;
-
-pub(crate) fn create_session_context(
-    config: &PipelineConfig,
-) -> Result<SessionContext, ControllerError> {
-    const SORT_IN_PLACE_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
-    const SORT_SPILL_RESERVATION_BYTES: usize = 64 * 1024 * 1024;
-    let session_config = SessionConfig::new()
-        .with_target_partitions(config.global.workers as usize)
-        .with_sort_in_place_threshold_bytes(SORT_IN_PLACE_THRESHOLD_BYTES)
-        .with_sort_spill_reservation_bytes(SORT_SPILL_RESERVATION_BYTES)
-        .set(
-            "datafusion.execution.planning_concurrency",
-            &ScalarValue::UInt64(Some(config.global.workers as u64)),
-        );
-    // Initialize datafusion memory limits
-    let mut runtime_env_builder = RuntimeEnvBuilder::new();
-    if let Some(memory_mb_max) = config.global.resources.memory_mb_max {
-        let memory_bytes_max = memory_mb_max * 1_000_000;
-        runtime_env_builder = runtime_env_builder
-            .with_memory_pool(Arc::new(FairSpillPool::new(memory_bytes_max as usize)));
-    }
-    // Initialize datafusion spill-to-disk directory
-    if let Some(storage) = &config.storage_config {
-        let path = PathBuf::from(storage.path.clone()).join("adhoc-tmp");
-        if !path.exists() {
-            create_dir_all(&path).map_err(|error| {
-                ControllerError::io_error(
-                    "unable to create ad-hoc scratch space directory during startup",
-                    error,
-                )
-            })?;
-        }
-        runtime_env_builder = runtime_env_builder.with_temp_file_path(path);
-    }
-
-    let runtime_env = runtime_env_builder.build_arc().unwrap();
-    let state = SessionStateBuilder::new()
-        .with_config(session_config)
-        .with_runtime_env(runtime_env)
-        .with_default_features()
-        .build();
-    Ok(SessionContext::from(state))
-}
 
 /// Helper for for closing the websocket session
 ///
@@ -297,6 +248,10 @@ pub(crate) async fn execute_sql(
 
 /// Plan and translate `sql` against `state`, applying `PREPARE`/`EXECUTE`
 /// substitution within the scope of a single ad-hoc request.
+///
+/// Only the final statement returns rows. Earlier statements may be
+/// `PREPARE`s or any non-result-producing statement (e.g. `INSERT`),
+/// executed for their side effect.
 async fn execute_sql_with_state(
     state: SessionState,
     sql: &str,
@@ -315,9 +270,6 @@ async fn execute_sql_with_state(
     let mut prepared: HashMap<String, LogicalPlan> = HashMap::new();
     let sql_options = SQLOptions::new().with_allow_ddl(false);
 
-    // For now, only the final statement may produce a result set. All
-    // preceding statements must be PREPAREs whose inner plans are stashed
-    // for a later EXECUTE in the same request.
     while statements.len() > 1 {
         let stmt = statements.pop_front().unwrap();
         let plan = state.statement_to_plan(stmt).await?;
@@ -326,13 +278,39 @@ async fn execute_sql_with_state(
                 sql_options.verify_plan(&input)?;
                 prepared.insert(name, (*input).clone());
             }
-            _ => {
+            LogicalPlan::Statement(Statement::Execute(Execute { name, parameters })) => {
+                // `EXECUTE` of a previously-prepared statement, used here
+                // for its side effects (e.g. a prepared INSERT).
+                let prepared_plan =
+                    prepared
+                        .remove(&name)
+                        .ok_or_else(|| PipelineError::AdHocQueryError {
+                            error: format!(
+                                "prepared statement '{name}' is not defined in this request"
+                            ),
+                            df: None,
+                        })?;
+                let values = execute_parameters_to_scalars(&parameters)?;
+                let bound = prepared_plan.replace_params_with_values(&ParamValues::List(values))?;
+                sql_options.verify_plan(&bound)?;
+                drain_intermediate_plan(&state, bound).await?;
+            }
+            other if is_result_producing_plan(&other) => {
                 return Err(PipelineError::AdHocQueryError {
-                    error: "only PREPARE statements may precede the final statement \
-                            in a multi-statement ad-hoc query"
+                    error: "only the final statement in a multi-statement \
+                            ad-hoc query may return a result set; \
+                            move SELECTs to the end or split into \
+                            separate requests"
                         .to_string(),
                     df: None,
                 });
+            }
+            other => {
+                // Non-result-producing intermediate statement (INSERT,
+                // UPDATE, DELETE, EXPLAIN, ...). Execute it for its side
+                // effects and discard the per-statement count row.
+                sql_options.verify_plan(&other)?;
+                drain_intermediate_plan(&state, other).await?;
             }
         }
     }
@@ -374,6 +352,26 @@ async fn execute_sql_with_state(
     Ok(DataFrame::new(state, final_plan))
 }
 
+/// True if executing this plan would surface rows to the caller. Used to
+/// reject queries like `SELECT; INSERT` where the early `SELECT` would
+/// otherwise be silently dropped.
+fn is_result_producing_plan(plan: &LogicalPlan) -> bool {
+    !matches!(plan, LogicalPlan::Dml(_) | LogicalPlan::Statement(_))
+}
+
+/// Execute an intermediate statement for its side effects and drop the
+/// resulting batches. INSERTs produce a one-row count; we keep that
+/// count out of the response stream so only the request's final
+/// statement contributes rows.
+async fn drain_intermediate_plan(
+    state: &SessionState,
+    plan: LogicalPlan,
+) -> Result<(), PipelineError> {
+    let df = DataFrame::new(state.clone(), plan);
+    let _ = df.collect().await?;
+    Ok(())
+}
+
 /// Convert `EXECUTE` positional parameters to DataFusion's `ScalarAndMetadata`
 /// list, rejecting anything that is not a literal value.
 fn execute_parameters_to_scalars(params: &[Expr]) -> Result<Vec<ScalarAndMetadata>, PipelineError> {
@@ -408,8 +406,36 @@ fn parse_sql_statements(
         .with_dialect(dialect.as_ref())
         .with_recursion_limit(recursion_limit)
         .build()?
-        .parse_statements()?;
+        .parse_statements()
+        .map_err(format_parser_error)?;
     Ok(statements)
+}
+
+/// Convert a DataFusion error coming out of the SQL parser into a
+/// `PipelineError` whose message is the parser's `Display`, not its
+/// `Debug` form. The parser already appends the location ("at Line: X,
+/// Column: Y") to its messages; preserving that string gives the user
+/// something like
+///   `sql parser error: Expected: end of statement, found: in at Line: 1, Column: 30`
+/// instead of the wrapped
+///   `SQL error: ParserError("Expected: ... at Line: 1, Column: 30")`.
+///
+/// The DataFusion parser may wrap its `DataFusionError::SQL` in a
+/// `DataFusionError::Diagnostic`; unwrap that here so the inner parser
+/// message reaches the user.
+fn format_parser_error(error: datafusion::error::DataFusionError) -> PipelineError {
+    use datafusion::error::DataFusionError;
+    let inner = match error {
+        DataFusionError::Diagnostic(_, inner) => *inner,
+        other => other,
+    };
+    match inner {
+        DataFusionError::SQL(parser_err, _) => PipelineError::AdHocQueryError {
+            error: parser_err.to_string(),
+            df: None,
+        },
+        other => PipelineError::from(other),
+    }
 }
 
 /// Stream the result of an ad-hoc query using a HTTP streaming response.
@@ -462,6 +488,8 @@ mod tests {
     use super::*;
     use datafusion::arrow;
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::ScalarValue;
+    use datafusion::execution::SessionStateBuilder;
 
     fn test_state() -> SessionState {
         SessionStateBuilder::new().with_default_features().build()
@@ -499,6 +527,33 @@ mod tests {
     fn invalid_sql_returns_error() {
         let state = test_state();
         assert!(parse_sql_statements(&state, "SELECT * FROM").is_err());
+    }
+
+    /// Parser errors must include the line/column of the offending token so
+    /// the user can locate the typo without re-reading the query in their
+    /// head.
+    #[test]
+    fn parse_error_message_carries_location() {
+        let state = test_state();
+        // 'in' is not a valid statement starter here; the parser stops on the
+        // token after the column reference, which is at line 1 / column 30.
+        let err = parse_sql_statements(&state, "select * from foo where bar = in baz")
+            .expect_err("expected a parser error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Line: 1"),
+            "missing line number in error message: {msg}"
+        );
+        assert!(
+            msg.contains("Column:"),
+            "missing column number in error message: {msg}"
+        );
+        // The `Debug`-formatted `ParserError("...")` wrapper from earlier
+        // versions of the message should be gone.
+        assert!(
+            !msg.contains("ParserError(\""),
+            "raw Debug wrapper leaked into error message: {msg}"
+        );
     }
 
     #[test]
@@ -559,15 +614,74 @@ mod tests {
         assert_eq!(total_rows, 0);
     }
 
+    /// An intermediate `SELECT` (or any other result-producing statement)
+    /// must be rejected: only one result set comes back per request, so
+    /// executing the earlier SELECT silently would discard its rows.
     #[tokio::test]
-    async fn non_prepare_intermediate_statement_errors() {
+    async fn intermediate_select_is_rejected() {
         let state = test_state();
         let err = execute_sql_with_state(state, "SELECT 1; SELECT 2")
             .await
             .unwrap_err();
-        assert!(
-            format!("{err:?}").contains("PREPARE"),
-            "unexpected error: {err:?}"
-        );
+        let msg = format!("{err}");
+        assert!(msg.contains("final statement"), "unexpected error: {msg}");
+    }
+
+    /// Multiple `INSERT`s followed by a `SELECT` must execute in order,
+    /// committing each insert's side effect, and only surface the final
+    /// `SELECT`'s rows.
+    #[tokio::test]
+    async fn intermediate_inserts_run_and_final_select_returns_rows() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use std::sync::Arc;
+
+        // Register a writable in-memory table so DML executes for real.
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let mem = MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
+        let ctx = SessionContext::new_with_state(test_state());
+        ctx.register_table("t", Arc::new(mem)).unwrap();
+        let state = ctx.state();
+
+        let batches = collect_rows(
+            state,
+            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); \
+             SELECT SUM(x) AS s FROM t",
+        )
+        .await;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1);
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 column");
+        assert_eq!(col.value(0), 3);
+    }
+
+    /// A trailing `INSERT` (no final SELECT) must still execute, and
+    /// the final statement's count row is surfaced as today.
+    #[tokio::test]
+    async fn final_insert_returns_count() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let mem = MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
+        let ctx = SessionContext::new_with_state(test_state());
+        ctx.register_table("t", Arc::new(mem)).unwrap();
+        let state = ctx.state();
+
+        let batches = collect_rows(
+            state,
+            "INSERT INTO t VALUES (10); INSERT INTO t VALUES (20)",
+        )
+        .await;
+        // The final INSERT yields a single-row count batch; check only
+        // that one row came back.
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1);
     }
 }

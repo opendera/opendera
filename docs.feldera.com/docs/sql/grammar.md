@@ -321,6 +321,8 @@ query
   |   {
           select
       |   selectWithoutFrom
+      |   selectWithExclude
+      |   selectWithReplace
       |   query UNION [ ALL | DISTINCT ] query
       |   query EXCEPT [ DISTINCT ] query
       |   query MINUS [ DISTINCT ] query
@@ -347,7 +349,7 @@ values
   :   { VALUES | VALUE } expression [, expression ]*
 
 select
-  :   SELECT [ ALL | DISTINCT ]
+  :   SELECT [ hintComment ] [ ALL | DISTINCT ]
           { projectItem [, projectItem ]* }
       FROM tableExpression
       [ WHERE booleanExpression ]
@@ -360,7 +362,7 @@ select
 ```
 tablePrimary
   :   tableName '(' TABLE tableName ')'
-  |   tablePrimary '(' columnDecl [, columnDecl ]* ')'
+  |   tablePrimary [ hintComment ] '(' columnDecl [, columnDecl ]* ')'
   |   [ LATERAL ] '(' query ')'
   |   UNNEST '(' expression ')' [ WITH ORDINALITY ]
   |   TABLE '(' functionName '(' expression [, expression ]* ')' ')'
@@ -378,6 +380,13 @@ groupItem:
 selectWithoutFrom
   :   SELECT [ ALL | DISTINCT ]
           { * | projectItem [, projectItem ]* }
+
+selectWithExclude
+  :   SELECT [ tableName '.' ] '*' [ [ 'EXCLUDE' | 'EXCEPT' ] parensColumnList ]
+
+selectWithReplace
+  :   SELECT  '*' 'REPLACE' '(' expression 'AS' column [ ',' expression 'AS' column ]* ')'
+
 ```
 
 <a id="order"></a>
@@ -390,10 +399,19 @@ orderItem
 ```
 projectItem
   :   expression [ [ AS ] columnAlias ]
-  | [ tableName '.' ] '*' [ 'EXCLUDE' parensColumnList ]
   |   ROW(*) [ [ AS ] columnAlias ]
   |   tableAlias . *
 ```
+
+The following forms of `SELECT` are supported:
+
+- `SELECT expr`: No `FROM` clause; implicitly assumes that the `SELECT` selects from a fixed table with 1 row
+- `SELECT * EXCLUDE a, b FROM T`: select all columns of table `T` except the ones named `a` and `b`
+- `SELECT * EXCEPT a, b FROM T`: `EXCEPT` is a synonym for `EXCLUDE`; this statement is equivalent to the previous statement
+- `SELECT * REPLACE (a+b AS a) FROM T`: Select all columns of table `T` and replace column `a` with the expression `a+b`
+- `SELECT` supports [lateral column aliasing](identifiers.md#lateral-column-aliasing), where
+  an identifier defined in a `SELECT` statement can be immediately used in the same statement
+  or in the associated `GROUP BY` and `HAVING` statements.
 
 <a id="join"></a>
 ```
@@ -408,7 +426,7 @@ joinCondition
   |   USING '(' column [, column ]* ')'
 
 tableReference
-  :   tablePrimary [ pivot ] [ [ AS ] alias [ '(' columnAlias [, columnAlias ]* ')' ] ]
+  :   tablePrimary [ pivot ] [ unpivot ] [ [ AS ] alias [ '(' columnAlias [, columnAlias ]* ')' ] ]
 
 pivot
   :   PIVOT '('
@@ -427,6 +445,23 @@ pivotList
 pivotExpr
   :   exprOrList [ [ AS ] alias ]
 
+unpivot
+  :   UNPIVOT [ INCLUDING NULLS | EXCLUDING NULLS ] '('
+      unpivotMeasureList
+      FOR unpivotAxisList
+      IN '(' unpivotValue [, unpivotValue ]* ')'
+      ')'
+
+unpivotMeasureList
+  :   columnOrList
+
+unpivotAxisList
+  :   columnOrList
+
+unpivotValue
+  :   column [ AS literal ]
+  |   '(' column [, column ]* ')' [ AS '(' literal [, literal ]* ')' ]
+
 columnOrList
   :   column
   |   '(' column [, column ]* ')'
@@ -441,6 +476,67 @@ the column names are *not* used to reorder columns.
 
 In `orderItem`, if expression is a positive integer n, it denotes the
 nth item in the `SELECT` clause.
+
+## SQL hints
+
+A hint is an instruction to the optimizer.  When writing SQL, you may
+know information about the data unknown to the optimizer.  Hints
+enable you to make decisions normally made by the optimizer.
+
+We support hints in two locations:
+
+- Query Hint: right after the `SELECT` keyword;
+- Table Hint: right after the referenced table or view name.
+
+```
+SELECT /*+ broadcast(S), shard(T) */
+FROM
+  T /*+ size(5) */
+JOIN
+  S
+```
+
+The syntax of hints is:
+
+```
+hintComment
+  :   '/*+' hint [, hint ]* '*/'
+
+hint:
+      hintName
+  |   hintName '(' optionKey '=' optionVal [, optionKey '=' optionVal ]* ')'
+  |   hintName '(' hintOption [, hintOption ]* ')'
+
+optionKey
+  :   simpleIdentifier
+  |   stringLiteral
+
+optionVal
+  :   simpleIdentifier
+  |   stringLiteral
+
+hintOption
+   :  simpleIdentifier
+   |  numericLiteral
+   |  stringLiteral
+```
+
+### Supported hints and their impact on query implementation
+
+:::warning
+
+These hints are considered still experimental, and they may change
+
+:::
+
+- `broadcast(`*table*`)`: Indicates that the following `JOIN` should be implemented using
+  a broadcast-join strategy by broadcasting the input with alias *table*
+- `shard(`*table*`)`: Indicates that the following `JOIN` should be implemented using
+  a hash-join strategy by sharding the input with alias *table*
+- `balance(`*table*`)`: Indicates that the following `JOIN` should be implemented using
+  a balanced strategy by hashing on all fields the input with alias *table*
+
+Note: specifying hints may inhibit some compiler optimizations.
 
 ## Creating indexes
 

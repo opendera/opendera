@@ -91,6 +91,20 @@ use utoipa::ToSchema;
 /// There are separate counters for parse and transport errors and for every tag.
 pub(crate) const MAX_CONNECTOR_ERRORS: usize = 100;
 
+/// Kind of input buffered by an endpoint.
+///
+/// Used by [ControllerStatus::input_batch_global] to decide whether input
+/// buffering should wake the circuit thread.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum BufferedInput {
+    /// Regular input buffering, with no special wakeup reason.
+    Normal,
+
+    /// Input was buffered for an endpoint currently blocking checkpoint or
+    /// suspend on a barrier.
+    Barrier,
+}
+
 /// Completion token.
 ///
 /// A completion token associated with an endpoint identifies a position in the endpoint's
@@ -452,6 +466,12 @@ pub struct ControllerStatus {
     /// Watch channel for notifying subscribers about [Completion] updates.
     pub completion_notifier: watch::Sender<Completion>,
 
+    /// Watch channel for notifying input adapters when a durable checkpoint
+    /// completes.  Carries the checkpointed step count (same semantics as
+    /// `total_completed_steps`: value `n` means steps `0..n` are durable).
+    /// Only fired when fault tolerance is enabled.
+    pub checkpoint_notifier: watch::Sender<u64>,
+
     /// Input endpoint configs and metrics.
     pub(crate) inputs: InputsStatus,
 
@@ -484,6 +504,7 @@ impl ControllerStatus {
     ) -> Self {
         let (time_series_notifier, _) = broadcast::channel(1024); // Buffer for up to 1024 time series updates
         let (completion_notifier, _) = watch::channel(Completion::default());
+        let (checkpoint_notifier, _) = watch::channel(0u64);
         Self {
             pipeline_config,
             global_metrics: GlobalControllerMetrics::new(
@@ -494,6 +515,7 @@ impl ControllerStatus {
             time_series: Mutex::new(VecDeque::with_capacity(60)),
             time_series_notifier,
             completion_notifier,
+            checkpoint_notifier,
             inputs: RwLock::new(BTreeMap::new()),
             outputs: RwLock::new(BTreeMap::new()),
         }
@@ -808,12 +830,16 @@ impl ControllerStatus {
     /// Must be invoked any time this metric can change, i.e., after every output
     /// produced by an output connector as well as after each step.
     ///
+    /// The `transaction_state` parameter indicates the state of the current transaction when the
+    /// function is invoked after a step. Otherwise, if it is invoked by an output connector, it is None.
+    ///
     /// Computes `total_completed_records` as the minimum `total_processed_input_records` across
     /// all output connectors. In case there are no output connectors attached to the pipeline,
-    /// returns `total_processed_records`.
+    /// and the transaction state is None, it returns `total_processed_records`. Otherwise, it there
+    /// is currently a transaction in progress, it returns `total_completed_records`.
     ///
     /// Also updates watermark trackers in input endpoints.
-    pub fn update_total_completed_records(&self) {
+    pub fn update_total_completed_records(&self, transaction_state: Option<TransactionState>) {
         // Compute new `total_completed_records` atomically, protected by the output status lock.
         // However we don't want to call `watermarks_update_completed` while holding the lock, as that
         // will take the input status lock. This is not necessarily a bug, but it will complicate
@@ -825,8 +851,19 @@ impl ControllerStatus {
 
         let output_status = self.output_status();
 
-        let mut total_completed_records = self.global_metrics.num_total_processed_records();
-        let mut total_completed_steps = self.global_metrics.total_initiated_steps();
+        let (mut total_completed_records, mut total_completed_steps) =
+            if transaction_state == Some(TransactionState::None) || transaction_state.is_none() {
+                (
+                    self.num_total_processed_records(),
+                    self.global_metrics.total_initiated_steps(),
+                )
+            } else {
+                (
+                    self.num_total_completed_records(),
+                    self.global_metrics.total_completed_steps(),
+                )
+            };
+
         for output_ep in output_status.values() {
             total_completed_records =
                 total_completed_records.min(output_ep.num_total_processed_input_records());
@@ -859,6 +896,21 @@ impl ControllerStatus {
                 }
             });
         }
+    }
+
+    /// Notify input adapters that a checkpoint covering `step` steps has
+    /// completed.  Wakes any watchers (e.g. the Postgres CDC connector when
+    /// fault tolerance is enabled) that are deferring slot advancement until
+    /// a durable checkpoint exists.
+    pub fn notify_checkpoint(&self, step: Step) {
+        self.checkpoint_notifier.send_if_modified(|current| {
+            if *current < step {
+                *current = step;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Notify all watermark trackers about a new value for `total_completed_records`.
@@ -919,9 +971,14 @@ impl ControllerStatus {
 
     /// Update the global counters after receiving a new input batch.
     ///
-    /// This method is used for inserts that don't belong to an endpoint, e.g.,
-    /// happen by executing an ad-hoc INSERT query.
-    pub(super) fn input_batch_global(&self, amt: BufferSize, circuit_thread_unparker: &Unparker) {
+    /// This method is used for all input batches, including inserts that don't
+    /// belong to an endpoint, e.g., happen by executing an ad-hoc INSERT query.
+    pub(super) fn input_batch_global(
+        &self,
+        amt: BufferSize,
+        buffered_input: BufferedInput,
+        circuit_thread_unparker: &Unparker,
+    ) {
         let num_records = amt.records as u64;
         // Increment buffered_records; unpark circuit thread once
         // `min_batch_size_records` is exceeded.
@@ -930,6 +987,7 @@ impl ControllerStatus {
         if old == 0
             || (old <= self.pipeline_config.global.min_batch_size_records
                 && old + num_records > self.pipeline_config.global.min_batch_size_records)
+            || buffered_input == BufferedInput::Barrier
         {
             circuit_thread_unparker.unpark();
         }
@@ -940,32 +998,52 @@ impl ControllerStatus {
     /// # Arguments
     ///
     /// * `endpoint_id` - id of the input endpoint.
-    /// * `num_bytes` - number of bytes received.
-    /// * `num_records` - number of records in the deserialized batch.
-    /// * `global_config` - global controller config.
-    /// * `circuit_thread_unparker` - unparker used to wake up the circuit
-    ///   thread if the total number of buffered records exceeds
-    ///   `min_batch_size_records`.
+    /// * `amt` - number of bytes and records in the batch.
     /// * `backpressure_thread_unparker` - unparker used to wake up the
     ///   backpressure thread if the endpoint is full.
+    ///
+    /// Returns the kind of input that was buffered, used by
+    /// [Self::input_batch_global] to decide whether to wake the circuit thread.
     pub(super) fn input_batch_from_endpoint(
         &self,
         endpoint_id: EndpointId,
         amt: BufferSize,
         backpressure_thread_unparker: &Unparker,
-    ) {
+    ) -> BufferedInput {
         // There is a potential race condition if the endpoint is currently
         // being removed. In this case, it's safe to ignore this operation.
         if !amt.is_empty() {
             let inputs = self.input_status();
             if let Some(endpoint_stats) = inputs.get(&endpoint_id) {
                 let old = endpoint_stats.add_buffered(amt);
-                let threshold = endpoint_stats.config.connector_config.max_queued_records;
-                if old < threshold && old + amt.records as u64 >= threshold {
+                // Barrier endpoints must wake the circuit thread even if they
+                // already had buffered input. Otherwise the generic wake rules
+                // can ignore an old > 0 batch, leaving a suspend request parked
+                // even though this batch may make the endpoint checkpointable.
+                let buffered_input = if endpoint_stats.is_barrier() {
+                    BufferedInput::Barrier
+                } else {
+                    BufferedInput::Normal
+                };
+                let threshold = BufferSize {
+                    records: endpoint_stats.config.connector_config.max_queued_records() as usize,
+                    bytes: endpoint_stats.config.connector_config.max_queued_bytes() as usize,
+                };
+
+                fn crossed(old: usize, increment: usize, threshold: usize) -> bool {
+                    old < threshold && old + increment >= threshold
+                }
+
+                if crossed(old.records, amt.records, threshold.records)
+                    || crossed(old.bytes, amt.bytes, threshold.bytes)
+                {
                     backpressure_thread_unparker.unpark();
                 }
+                return buffered_input;
             }
         }
+
+        BufferedInput::Normal
     }
 
     /// Update counters after receiving an end-of-input event on an input
@@ -1055,11 +1133,9 @@ impl ControllerStatus {
         circuit_thread_unparker: &Unparker,
     ) {
         if let Some(endpoint_stats) = self.output_status().get(&endpoint_id) {
+            let max = endpoint_stats.config.connector_config.max_queued_records();
             let old = endpoint_stats.buffer_batch(num_records);
-            if old - (num_records as u64)
-                <= endpoint_stats.config.connector_config.max_queued_records
-                && old >= endpoint_stats.config.connector_config.max_queued_records
-            {
+            if old - (num_records as u64) <= max && old >= max {
                 circuit_thread_unparker.unpark();
             }
         };
@@ -1076,7 +1152,7 @@ impl ControllerStatus {
         circuit_thread_unparker: &Unparker,
     ) {
         if let Some(endpoint_stats) = self.output_status().get(&endpoint_id) {
-            let threshold = endpoint_stats.config.connector_config.max_queued_records;
+            let threshold = endpoint_stats.config.connector_config.max_queued_records();
 
             let old = endpoint_stats.output_batch(processed, num_records);
 
@@ -1085,7 +1161,7 @@ impl ControllerStatus {
                 circuit_thread_unparker.unpark();
             }
         };
-        self.update_total_completed_records();
+        self.update_total_completed_records(None);
     }
 
     pub fn update_output_memory(&self, endpoint_id: EndpointId, memory: usize) {
@@ -1101,7 +1177,7 @@ impl ControllerStatus {
         if let Some(endpoint_stats) = self.output_status().get(&endpoint_id) {
             endpoint_stats.output_buffered_batches(processed);
         }
-        self.update_total_completed_records();
+        self.update_total_completed_records(None);
     }
 
     pub fn output_buffer(&self, endpoint_id: EndpointId, num_bytes: usize, num_records: usize) {
@@ -1193,14 +1269,7 @@ impl ControllerStatus {
         // All received records have been processed by the circuit.
         let total_input_records = self.num_total_input_records();
 
-        if self.num_total_processed_records() != total_input_records {
-            return false;
-        }
-
-        // Outputs have been pushed to their respective transport endpoints.
-        if !self.output_status().values().all(|endpoint_stats| {
-            endpoint_stats.num_total_processed_input_records() == total_input_records
-        }) {
+        if self.num_total_completed_records() != total_input_records {
             return false;
         }
 
@@ -2042,9 +2111,9 @@ impl InputEndpointStatus {
         }
     }
 
-    /// Increment the number of buffered bytes and records; return
-    /// the previous number of buffered records.
-    fn add_buffered(&self, amt: BufferSize) -> u64 {
+    /// Adds `amt` to the number of buffered bytes and records, and returns the
+    /// previous counts.
+    fn add_buffered(&self, amt: BufferSize) -> BufferSize {
         // We are only updating statistics here, so no need to pay for
         // strong consistency.
         self.metrics
@@ -2053,12 +2122,17 @@ impl InputEndpointStatus {
         self.metrics
             .total_records
             .fetch_add(amt.records as u64, Ordering::Relaxed);
-        self.metrics
-            .buffered_bytes
-            .fetch_add(amt.bytes as u64, Ordering::Relaxed);
-        self.metrics
-            .buffered_records
-            .fetch_add(amt.records as u64, Ordering::AcqRel)
+
+        BufferSize {
+            bytes: self
+                .metrics
+                .buffered_bytes
+                .fetch_add(amt.bytes as u64, Ordering::Relaxed) as usize,
+            records: self
+                .metrics
+                .buffered_records
+                .fetch_add(amt.records as u64, Ordering::AcqRel) as usize,
+        }
     }
 
     fn eoi(&self) {
@@ -2121,12 +2195,22 @@ impl InputEndpointStatus {
         self.paused.swap(paused, Ordering::Release)
     }
 
-    /// True if the number of records buffered by the endpoint exceeds
-    /// its `max_queued_records` config parameter.
-    pub fn is_full(&self) -> bool {
+    fn is_full_of_records(&self) -> bool {
         let buffered_records = self.metrics.buffered_records.load(Ordering::Acquire);
-        let max_queued_records = self.config.connector_config.max_queued_records;
+        let max_queued_records = self.config.connector_config.max_queued_records();
         buffered_records >= max_queued_records
+    }
+
+    fn is_full_of_bytes(&self) -> bool {
+        let buffered_bytes = self.metrics.buffered_bytes.load(Ordering::Acquire);
+        let max_queued_bytes = self.config.connector_config.max_queued_bytes();
+        buffered_bytes >= max_queued_bytes
+    }
+
+    /// True if the number of records or bytes buffered by the endpoint exceeds
+    /// the configured maximum.
+    pub fn is_full(&self) -> bool {
+        self.is_full_of_records() || self.is_full_of_bytes()
     }
 
     /// Endpoint pushed additional records to the circuit.
@@ -2151,16 +2235,18 @@ impl InputEndpointStatus {
     ) {
         let num_records = step_results.amt.records as u64;
         let num_bytes = step_results.amt.bytes as u64;
-        Event::new("input")
-            .with_category("Step")
-            .with_tooltip(|| {
-                format!(
-                    "{} submitted {num_records} records ({} bytes) for step {total_initiated_steps}",
-                    &self.endpoint_name,
-                    HumanBytes::from(num_bytes)
-                )
-            })
-            .record();
+        if num_records > 0 {
+            Event::new("input")
+                .with_category("Step")
+                .with_tooltip(|| {
+                    format!(
+                        "{} submitted {num_records} records ({} bytes) for step {total_initiated_steps}",
+                        &self.endpoint_name,
+                        HumanBytes::from(num_bytes)
+                    )
+                })
+                .record();
+        }
         *self.progress.lock().unwrap() = Some(step_results);
         self.metrics
             .buffered_records
@@ -2532,7 +2618,7 @@ impl OutputEndpointStatus {
 
     pub fn is_buffer_full(&self) -> bool {
         self.metrics.queued_records.load(Ordering::Acquire)
-            >= self.config.connector_config.max_queued_records
+            >= self.config.connector_config.max_queued_records()
     }
 
     pub fn is_busy(&self) -> bool {

@@ -206,8 +206,6 @@ It contains the following fields:
         endpoints::pipeline_interaction::post_pipeline_input_connector_action,
         endpoints::pipeline_interaction::get_pipeline_input_connector_status,
         endpoints::pipeline_interaction::get_pipeline_output_connector_status,
-        endpoints::pipeline_interaction::post_pipeline_output_connector_reset,
-        endpoints::pipeline_interaction::reset_status,
         endpoints::pipeline_interaction::get_pipeline_stats,
         endpoints::pipeline_interaction::get_pipeline_metrics,
         endpoints::pipeline_interaction::get_pipeline_circuit_profile,
@@ -231,9 +229,11 @@ It contains the following fields:
         endpoints::pipeline_interaction::completion_status,
         endpoints::pipeline_interaction::start_transaction,
         endpoints::pipeline_interaction::commit_transaction,
+        endpoints::pipeline_interaction::clock_advance,
         endpoints::pipeline_interaction::get_pipeline_time_series,
         endpoints::pipeline_interaction::get_pipeline_time_series_stream,
         endpoints::pipeline_interaction::post_pipeline_rebalance,
+        endpoints::pipeline_interaction::post_pipeline_start_compaction,
 
         // API keys
         endpoints::api_key::list_api_keys,
@@ -447,6 +447,8 @@ It contains the following fields:
         feldera_types::preprocess::PreprocessorConfig,
         feldera_types::transaction::StartTransactionResponse,
         feldera_types::transaction::CommitProgressSummary,
+        feldera_types::transport::clock::ClockAdvanceRequest,
+        feldera_types::transport::clock::ClockAdvanceResponse,
         feldera_types::time_series::TimeSeries,
         feldera_types::time_series::SampleStatistics,
         feldera_types::suspend::SuspendError,
@@ -675,8 +677,6 @@ fn api_scope(api_config: &ApiServerConfig) -> Scope {
         .service(endpoints::pipeline_interaction::post_pipeline_input_connector_action)
         .service(endpoints::pipeline_interaction::get_pipeline_input_connector_status)
         .service(endpoints::pipeline_interaction::get_pipeline_output_connector_status)
-        .service(endpoints::pipeline_interaction::post_pipeline_output_connector_reset)
-        .service(endpoints::pipeline_interaction::reset_status)
         .service(endpoints::pipeline_interaction::post_pipeline_output_connector_command)
         .service(endpoints::pipeline_interaction::get_pipeline_stats)
         .service(endpoints::pipeline_interaction::get_pipeline_metrics)
@@ -690,11 +690,13 @@ fn api_scope(api_config: &ApiServerConfig) -> Scope {
         .service(endpoints::pipeline_interaction::start_samply_profile)
         .service(endpoints::pipeline_interaction::support_bundle::get_pipeline_support_bundle)
         .service(endpoints::pipeline_interaction::post_pipeline_rebalance)
+        .service(endpoints::pipeline_interaction::post_pipeline_start_compaction)
         .service(endpoints::pipeline_interaction::pipeline_adhoc_sql)
         .service(endpoints::pipeline_interaction::completion_token)
         .service(endpoints::pipeline_interaction::completion_status)
         .service(endpoints::pipeline_interaction::start_transaction)
         .service(endpoints::pipeline_interaction::commit_transaction)
+        .service(endpoints::pipeline_interaction::clock_advance)
         // API keys endpoints
         .service(endpoints::api_key::list_api_keys)
         .service(endpoints::api_key::get_api_key)
@@ -1038,10 +1040,6 @@ mod tests {
     use super::*;
     use actix_web::http::Method;
     use actix_web::test;
-
-    async fn ok_handler() -> HttpResponse {
-        HttpResponse::Ok().body("ok")
-    }
 
     /// Content-hashed bundle paths get year-long immutable caching plus
     /// `ACAO: *` so SvelteKit's `crossorigin` script loads can be reused

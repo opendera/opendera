@@ -2,7 +2,7 @@
 
 use crate::error::{SqlResult, SqlRuntimeError};
 use crate::{
-    FromInteger, SqlString, ToInteger,
+    DynamicDecimal, F64, FromInteger, SqlDecimal, SqlString, ToInteger,
     array::Array,
     casts::*,
     interval::{LongInterval, ShortInterval},
@@ -10,12 +10,12 @@ use crate::{
 };
 use chrono::format::ParseErrorKind;
 use chrono::{
-    DateTime, Datelike, Days, Duration, FixedOffset, Months, NaiveDate, NaiveDateTime, NaiveTime,
-    TimeZone, Timelike, Utc,
+    DateTime, Datelike, Days, Duration, FixedOffset, LocalResult, Months, NaiveDate, NaiveDateTime,
+    NaiveTime, TimeZone, Timelike, Utc,
 };
 use chrono_tz::Tz;
 use core::fmt::Formatter;
-use dbsp::num_entries_scalar;
+use dbsp::{algebra::HasZero, num_entries_scalar};
 use feldera_macros::IsNone;
 use feldera_types::serde_with_context::{
     DateFormat, DeserializeWithContext, SerializeWithContext, SqlSerdeConfig, TimeFormat,
@@ -27,14 +27,16 @@ use size_of::SizeOf;
 use std::{
     borrow::Cow,
     fmt::{self, Debug},
-    ops::{Add, Sub},
+    ops::{Add, Deref, Sub},
 };
 
 use crate::{
     operators::{eq, gt, gte, lt, lte, neq},
     some_existing_operator, some_function2, some_operator, some_polymorphic_function1,
-    some_polymorphic_function2, some_polymorphic_function3,
+    some_polymorphic_function2, some_polymorphic_function3, some_polymorphic_null_function3,
 };
+
+/////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Represents a date and a time without timezone information.
 #[derive(
@@ -85,6 +87,15 @@ impl FromInteger<i64> for Timestamp {
     fn from_integer(value: &i64) -> Self {
         Timestamp {
             microseconds: *value,
+        }
+    }
+}
+
+#[doc(hidden)]
+impl From<TimestampTz> for Timestamp {
+    fn from(value: TimestampTz) -> Self {
+        Timestamp {
+            microseconds: value.microseconds,
         }
     }
 }
@@ -295,9 +306,13 @@ impl Timestamp {
     }
 
     /// Create a [Timestamp] from a chrono [NaiveDateTime].
-    pub fn from_naiveDateTime(date: NaiveDateTime) -> Self {
+    pub fn from_naiveDateTime(dt: NaiveDateTime) -> Self {
+        // round the number of microseconds
+        let utc = dt.and_utc();
+        let nanos = utc.timestamp_subsec_nanos();
+        let nanos = (nanos + 500) / 1000;
         Self {
-            microseconds: date.and_utc().timestamp_micros(),
+            microseconds: utc.timestamp() * 1_000_000 + (nanos as i64),
         }
     }
 
@@ -317,8 +332,11 @@ impl Timestamp {
 
     /// Get the [Date] part of a [Timestamp]
     pub fn get_date(&self) -> Date {
-        // Is this right for negative timestamps?
-        Date::from_days((self.microseconds / 86_400_000_000i64) as i32)
+        let dt: DateTime<Utc> = match Utc.timestamp_micros(self.microseconds) {
+            LocalResult::Single(dt) => dt,
+            _ => panic!("{self} TIMESTAMP out of range"),
+        };
+        Date::from_date(dt.date_naive())
     }
 
     /// Check if the timestamp is legal; panic if it isn't
@@ -328,6 +346,312 @@ impl Timestamp {
             panic!("Timestamp out of range {}", self);
         }
     }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Represents an instant, represented as a Timestamp in UTC timezone
+#[derive(
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    SizeOf,
+    rkyv::Archive,
+    rkyv::Serialize,
+    serde::Serialize,
+    IsNone,
+)]
+#[archive_attr(derive(Clone, Ord, Eq, PartialEq, PartialOrd))]
+#[archive(compare(PartialEq, PartialOrd))]
+#[serde(transparent)]
+pub struct TimestampTz {
+    // since unix epoch
+    microseconds: i64,
+}
+
+#[doc(hidden)]
+impl From<Timestamp> for TimestampTz {
+    fn from(value: Timestamp) -> Self {
+        TimestampTz {
+            microseconds: value.microseconds,
+        }
+    }
+}
+
+#[doc(hidden)]
+impl<D> ::rkyv::Deserialize<TimestampTz, D> for ArchivedTimestampTz
+where
+    D: ::rkyv::Fallible + ::core::any::Any,
+{
+    fn deserialize(&self, deserializer: &mut D) -> Result<TimestampTz, D::Error> {
+        let value: i64 = self.microseconds.deserialize(deserializer)?;
+        Ok(TimestampTz::from_microseconds(value))
+    }
+}
+
+#[doc(hidden)]
+impl ToInteger<i64> for TimestampTz {
+    #[doc(hidden)]
+    fn to_integer(&self) -> i64 {
+        self.microseconds
+    }
+}
+
+#[doc(hidden)]
+impl FromInteger<i64> for TimestampTz {
+    #[doc(hidden)]
+    fn from_integer(value: &i64) -> Self {
+        TimestampTz {
+            microseconds: *value,
+        }
+    }
+}
+
+impl Debug for TimestampTz {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let datetime = match Utc.timestamp_micros(self.microseconds) {
+            LocalResult::Single(v) => v,
+            LocalResult::None | LocalResult::Ambiguous(_, _) => Err(fmt::Error)?,
+        };
+        f.write_str(&datetime.format("%F %T%.f%:z").to_string())
+    }
+}
+
+impl fmt::Display for TimestampTz {
+    // The format is chosen so that CAST(CAST(ts AS VARCHAR) AS TIMESTAMP WITH TIME ZONE) = ts
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let dt = self.to_dateTime();
+        let month = dt.month();
+        let day = dt.day();
+        let year = dt.year();
+        let hr = dt.hour();
+        let min = dt.minute();
+        let sec = dt.second();
+        let micro = dt.nanosecond() / 1000;
+        if micro == 0 {
+            write!(
+                f,
+                "{}-{:02}-{:02} {:02}:{:02}:{:02} +00:00",
+                year, month, day, hr, min, sec
+            )
+        } else {
+            write!(
+                f,
+                "{}-{:02}-{:02} {:02}:{:02}:{:02}.{:06} +00:00",
+                year, month, day, hr, min, sec, micro
+            )
+        }
+    }
+}
+
+impl SerializeWithContext<SqlSerdeConfig> for TimestampTz {
+    fn serialize_with_context<S>(
+        &self,
+        serializer: S,
+        context: &SqlSerdeConfig,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match context.timestamp_tz_format {
+            TimestampFormat::Default => {
+                let datetime = self.to_dateTime();
+                serializer.serialize_str(&datetime.format("%F %T%.f%:z").to_string())
+            }
+            TimestampFormat::Rfc3339 => {
+                let datetime = self.to_dateTime();
+                serializer.serialize_str(&datetime.to_rfc3339())
+            }
+            TimestampFormat::String(format_string) => {
+                let datetime = self.to_dateTime();
+                serializer.serialize_str(&datetime.format(format_string).to_string())
+            }
+            TimestampFormat::MillisSinceEpoch => serializer.serialize_i64(self.milliseconds()),
+            TimestampFormat::MicrosSinceEpoch => serializer.serialize_i64(self.microseconds),
+        }
+    }
+}
+
+impl<'de, AUX> DeserializeWithContext<'de, SqlSerdeConfig, AUX> for TimestampTz {
+    fn deserialize_with_context<D>(
+        deserializer: D,
+        config: &'de SqlSerdeConfig,
+    ) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match config.timestamp_tz_format {
+            TimestampFormat::Default | TimestampFormat::Rfc3339 => {
+                let timestamp_str: Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+
+                let dateTime = DateTime::parse_from_rfc3339(timestamp_str.trim()).map_err(|e| {
+                    D::Error::custom(format!(
+                        "invalid RFC3339 timestamp with timezone string '{timestamp_str}': {e}"
+                    ))
+                })?;
+
+                Ok(Self::from_dateTime(dateTime.to_utc()))
+            }
+            TimestampFormat::String(format) => {
+                // `timestamp_str: &'de` doesn't work for JSON, which escapes strings
+                // and can only deserialize into an owned string.
+                let timestamp_str: Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+                let timestamp = NaiveDateTime::parse_from_str(timestamp_str.trim(), format)
+                    .map_err(|e| {
+                        D::Error::custom(format!("invalid timestamp string '{timestamp_str}': {e} (expected format: '{format}')"))
+                    })?;
+
+                Ok(Self::from_microseconds(
+                    timestamp.and_utc().timestamp_micros(),
+                ))
+            }
+            TimestampFormat::MillisSinceEpoch => {
+                let millis: i64 = Deserialize::deserialize(deserializer)?;
+                Ok(Self::from_milliseconds(millis))
+            }
+            TimestampFormat::MicrosSinceEpoch => {
+                let micros: i64 = Deserialize::deserialize(deserializer)?;
+                Ok(Self::from_microseconds(micros))
+            }
+        }
+    }
+}
+
+/// Deserialize timestamp from the `YYYY-MM-DD HH:MM:SS.fff offset` format.
+/// For a flexible deserialization framework use deserialize_with_context.
+impl<'de> Deserialize<'de> for TimestampTz {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // `timestamp_str: &'de` doesn't work for JSON, which escapes strings
+        // and can only deserialize into an owned string.
+        let timestamp_str: Cow<'de, str> = Deserialize::deserialize(deserializer)?;
+
+        let datetime =
+            DateTime::parse_from_str(timestamp_str.trim(), "%F %T%.f%:z").map_err(|e| {
+                D::Error::custom(format!(
+                    "invalid timestamp with time zone string '{timestamp_str}': {e} (expected format: '%F %T%.f%:z')"
+                ))
+            })?;
+
+        Ok(Self::from_dateTime(datetime.to_utc()))
+    }
+}
+
+impl TimestampTz {
+    /// Create a new [TimestampTz] from a number of milliseconds since the
+    /// Unix epoch (January 1, 1970)
+    pub const fn from_milliseconds(milliseconds: i64) -> Self {
+        Self {
+            microseconds: milliseconds * 1000,
+        }
+    }
+
+    /// Create a new [TimestampTz] from a number of microseconds since the
+    /// Unix epoch (January 1, 1970)
+    pub const fn from_microseconds(microseconds: i64) -> Self {
+        Self { microseconds }
+    }
+
+    /// Return the number of millliseconds elapsed since the Unix
+    /// epoch (January 1st, 1970)
+    pub fn milliseconds(&self) -> i64 {
+        self.microseconds / 1000
+    }
+
+    /// Return the number of microseconds elapsed since the Unix
+    /// epoch (January 1st, 1970)
+    pub fn microseconds(&self) -> i64 {
+        self.microseconds
+    }
+
+    /// Convert a [TimestampTz] to a chrono [DateTime] in the [Utc]
+    /// timezone.
+    pub fn to_dateTime(&self) -> DateTime<Utc> {
+        Utc.timestamp_micros(self.microseconds)
+            .single()
+            .unwrap_or_else(|| panic!("Could not convert timestamp {:?} to DateTime", self))
+    }
+
+    /// Create a [TimestampTz] from a chrono [DateTime] in the [Utc]
+    /// timezone.
+    // Cannot make this into a From trait because Rust reserved it
+    pub fn from_dateTime(date: DateTime<Utc>) -> Self {
+        Self {
+            microseconds: date.timestamp_micros(),
+        }
+    }
+
+    /// Convert a [Timestamp] to a [TimestampTz]
+    pub fn from_timestamp(ts: Timestamp) -> Self {
+        TimestampTz::from_microseconds(ts.microseconds)
+    }
+
+    /// Convert a [TimestampTz] to a chrono [NaiveDateTime]
+    pub fn to_naiveDateTime(&self) -> NaiveDateTime {
+        Utc.timestamp_micros(self.microseconds)
+            .single()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Could not convert timestamp with time zone {:?} to DateTime",
+                    self
+                )
+            })
+            .naive_utc()
+    }
+
+    /// Check if the timestamp is legal; panic if it isn't
+    pub fn check_legal(&self) {
+        let date = self.to_naiveDateTime();
+        if date.year() < 1 || date.year() > 9999 {
+            panic!("TIMESTAMP WITH TIME ZONE out of range {}", self);
+        }
+    }
+}
+
+/// Parse a timestamp of the form %Y-%m-%d %H:%M:%S %z, where %z
+/// is a IANA or offset timezone separated by a space.
+#[doc(hidden)]
+pub fn parse_timestamp_tz(st: &str) -> SqlResult<TimestampTz> {
+    fn has_exactly_two_spaces(s: &str) -> bool {
+        let mut count = 0;
+
+        for b in s.bytes() {
+            if b == b' ' {
+                count += 1;
+                if count > 2 {
+                    return false;
+                }
+            }
+        }
+
+        count == 2
+    }
+
+    if !has_exactly_two_spaces(st) {
+        return Err(SqlRuntimeError::from_string(format!(
+            "Failed to parse '{st}' as a TIMESTAMP WITH TIME ZONE: Expected format is '%Y-%m-%d %H:%M:%S%.f tz' (Timezone must be separated by a space)"
+        )));
+    }
+    let (ts, tz) = st.rsplit_once(' ').unwrap();
+
+    // This does not produce errors; errors are produced later when calling local_to_utc
+    let zone = Zone::parse(tz);
+    let dt = NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f").map_err(|e| {
+        SqlRuntimeError::from_string(format!(
+            "Failed to parse '{st}' as a TIMESTAMP WITH TIME ZONE; Error while parsing TIMESTAMP component: {}",
+            e
+        ))
+    })?;
+
+    let result = zone.local_to_utc(dt)?;
+    Ok(TimestampTz::from_dateTime(result))
 }
 
 #[doc(hidden)]
@@ -430,6 +754,38 @@ impl Zone {
 mod tests {
     use super::*;
     use chrono::FixedOffset;
+
+    #[test]
+    fn test_parse_tstz() {
+        // Check that the parsing from string accepts the same formats
+        // accepted by the SQL compiler for literals.
+        assert_eq!(
+            parse_timestamp_tz("2020-01-01 10:10:10 UTC").unwrap(),
+            TimestampTz::from_dateTime(Utc.with_ymd_and_hms(2020, 1, 1, 10, 10, 10).unwrap())
+        );
+
+        assert_eq!(
+            parse_timestamp_tz("2020-01-01 10:10:10 America/New_York").unwrap(),
+            TimestampTz::from_dateTime(Utc.with_ymd_and_hms(2020, 1, 1, 15, 10, 10).unwrap())
+        );
+
+        assert_eq!(
+            parse_timestamp_tz("2020-01-01 10:10:10 +00:00").unwrap(),
+            TimestampTz::from_dateTime(Utc.with_ymd_and_hms(2020, 1, 1, 10, 10, 10).unwrap())
+        );
+
+        let err = parse_timestamp_tz("2020-01-01T10:10:10+00:00").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Failed to parse '2020-01-01T10:10:10+00:00' as a TIMESTAMP WITH TIME ZONE: Expected format is '%Y-%m-%d %H:%M:%S%.f tz' (Timezone must be separated by a space)"
+        );
+
+        let err = parse_timestamp_tz("2020-01-01 10:10 +00:00").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Failed to parse '2020-01-01 10:10 +00:00' as a TIMESTAMP WITH TIME ZONE; Error while parsing TIMESTAMP component: premature end of input"
+        );
+    }
 
     #[test]
     fn test_valid_hours_only() {
@@ -605,6 +961,15 @@ pub fn now() -> Timestamp {
 }
 
 #[doc(hidden)]
+pub fn make_timestampNN(date: Option<Date>, time: Option<Time>) -> Option<Timestamp> {
+    // Only one variant of this function is needed
+    let date = date?;
+    let time = time?;
+    let dt = date.to_date().and_time(time.to_time());
+    Some(Timestamp::from_naiveDateTime(dt))
+}
+
+#[doc(hidden)]
 pub fn plus_Timestamp_Timestamp_ShortInterval__(
     left: Timestamp,
     right: ShortInterval,
@@ -619,6 +984,23 @@ some_function2!(
     Timestamp,
     ShortInterval,
     Timestamp
+);
+
+#[doc(hidden)]
+pub fn plus_TimestampTz_TimestampTz_ShortInterval__(
+    left: TimestampTz,
+    right: ShortInterval,
+) -> TimestampTz {
+    TimestampTz {
+        microseconds: left.microseconds + right.microseconds(),
+    }
+}
+
+some_function2!(
+    plus_TimestampTz_TimestampTz_ShortInterval,
+    TimestampTz,
+    ShortInterval,
+    TimestampTz
 );
 
 #[doc(hidden)]
@@ -641,6 +1023,22 @@ some_function2!(
 );
 
 #[doc(hidden)]
+pub fn plus_TimestampTz_TimestampTz_LongInterval__(
+    left: TimestampTz,
+    right: LongInterval,
+) -> TimestampTz {
+    let result = plus_Timestamp_Timestamp_LongInterval__(left.into(), right);
+    result.into()
+}
+
+some_function2!(
+    plus_TimestampTz_TimestampTz_LongInterval,
+    TimestampTz,
+    LongInterval,
+    TimestampTz
+);
+
+#[doc(hidden)]
 pub fn minus_Timestamp_Timestamp_LongInterval__(left: Timestamp, right: LongInterval) -> Timestamp {
     let dt = left.to_naiveDateTime();
     let months = right.months();
@@ -657,6 +1055,22 @@ some_function2!(
     Timestamp,
     LongInterval,
     Timestamp
+);
+
+#[doc(hidden)]
+pub fn minus_TimestampTz_TimestampTz_LongInterval__(
+    left: TimestampTz,
+    right: LongInterval,
+) -> TimestampTz {
+    let result = minus_Timestamp_Timestamp_LongInterval__(left.into(), right);
+    result.into()
+}
+
+some_function2!(
+    minus_TimestampTz_TimestampTz_LongInterval,
+    TimestampTz,
+    LongInterval,
+    TimestampTz
 );
 
 #[doc(hidden)]
@@ -687,6 +1101,21 @@ some_function2!(
 );
 
 #[doc(hidden)]
+pub fn minus_ShortInterval_TimestampTz_TimestampTz__(
+    left: TimestampTz,
+    right: TimestampTz,
+) -> ShortInterval {
+    ShortInterval::from_microseconds(left.microseconds - right.microseconds)
+}
+
+some_function2!(
+    minus_ShortInterval_TimestampTz_TimestampTz,
+    TimestampTz,
+    TimestampTz,
+    ShortInterval
+);
+
+#[doc(hidden)]
 pub fn minus_ShortInterval_Time_Time__(left: Time, right: Time) -> ShortInterval {
     ShortInterval::from_microseconds(
         (left.nanoseconds() as i64 - right.nanoseconds() as i64) / 1000,
@@ -708,6 +1137,21 @@ some_function2!(
     Timestamp,
     ShortInterval,
     Timestamp
+);
+
+#[doc(hidden)]
+pub fn minus_TimestampTz_TimestampTz_ShortInterval__(
+    left: TimestampTz,
+    right: ShortInterval,
+) -> TimestampTz {
+    TimestampTz::from_microseconds(left.microseconds() - right.microseconds())
+}
+
+some_function2!(
+    minus_TimestampTz_TimestampTz_ShortInterval,
+    TimestampTz,
+    ShortInterval,
+    TimestampTz
 );
 
 #[doc(hidden)]
@@ -823,9 +1267,29 @@ some_function2!(
 );
 
 #[doc(hidden)]
+pub fn minus_LongInterval_TimestampTz_TimestampTz__(
+    left: TimestampTz,
+    right: TimestampTz,
+) -> LongInterval {
+    minus_LongInterval_Timestamp_Timestamp__(left.into(), right.into())
+}
+
+some_function2!(
+    minus_LongInterval_TimestampTz_TimestampTz,
+    TimestampTz,
+    TimestampTz,
+    LongInterval
+);
+
+#[doc(hidden)]
 pub fn extract_year_Timestamp(value: Timestamp) -> i64 {
     let date = value.to_dateTime();
     date.year().into()
+}
+
+#[doc(hidden)]
+pub fn extract_year_TimestampTz(value: TimestampTz) -> i64 {
+    extract_year_Timestamp(value.into())
 }
 
 #[doc(hidden)]
@@ -835,9 +1299,19 @@ pub fn extract_month_Timestamp(value: Timestamp) -> i64 {
 }
 
 #[doc(hidden)]
+pub fn extract_month_TimestampTz(value: TimestampTz) -> i64 {
+    extract_month_Timestamp(value.into())
+}
+
+#[doc(hidden)]
 pub fn extract_day_Timestamp(value: Timestamp) -> i64 {
     let date = value.to_dateTime();
     date.day().into()
+}
+
+#[doc(hidden)]
+pub fn extract_day_TimestampTz(value: TimestampTz) -> i64 {
+    extract_day_Timestamp(value.into())
 }
 
 #[doc(hidden)]
@@ -847,9 +1321,19 @@ pub fn extract_quarter_Timestamp(value: Timestamp) -> i64 {
 }
 
 #[doc(hidden)]
+pub fn extract_quarter_TimestampTz(value: TimestampTz) -> i64 {
+    extract_quarter_Timestamp(value.into())
+}
+
+#[doc(hidden)]
 pub fn extract_decade_Timestamp(value: Timestamp) -> i64 {
     let date = value.to_dateTime();
     (date.year() / 10).into()
+}
+
+#[doc(hidden)]
+pub fn extract_decade_TimestampTz(value: TimestampTz) -> i64 {
+    extract_decade_Timestamp(value.into())
 }
 
 #[doc(hidden)]
@@ -859,9 +1343,19 @@ pub fn extract_century_Timestamp(value: Timestamp) -> i64 {
 }
 
 #[doc(hidden)]
+pub fn extract_century_TimestampTz(value: TimestampTz) -> i64 {
+    extract_century_Timestamp(value.into())
+}
+
+#[doc(hidden)]
 pub fn extract_millennium_Timestamp(value: Timestamp) -> i64 {
     let date = value.to_dateTime();
     ((date.year() + 999) / 1000).into()
+}
+
+#[doc(hidden)]
+pub fn extract_millennium_TimestampTz(value: TimestampTz) -> i64 {
+    extract_millennium_Timestamp(value.into())
 }
 
 #[doc(hidden)]
@@ -871,9 +1365,19 @@ pub fn extract_isoyear_Timestamp(value: Timestamp) -> i64 {
 }
 
 #[doc(hidden)]
+pub fn extract_isoyear_TimestampTz(value: TimestampTz) -> i64 {
+    extract_isoyear_Timestamp(value.into())
+}
+
+#[doc(hidden)]
 pub fn extract_week_Timestamp(value: Timestamp) -> i64 {
     let date = value.to_dateTime();
     date.iso_week().week().into()
+}
+
+#[doc(hidden)]
+pub fn extract_week_TimestampTz(value: TimestampTz) -> i64 {
+    extract_week_Timestamp(value.into())
 }
 
 #[doc(hidden)]
@@ -883,9 +1387,19 @@ pub fn extract_dow_Timestamp(value: Timestamp) -> i64 {
 }
 
 #[doc(hidden)]
+pub fn extract_dow_TimestampTz(value: TimestampTz) -> i64 {
+    extract_dow_Timestamp(value.into())
+}
+
+#[doc(hidden)]
 pub fn extract_isodow_Timestamp(value: Timestamp) -> i64 {
     let date = value.to_dateTime();
     (date.weekday().num_days_from_monday() as i64) + 1
+}
+
+#[doc(hidden)]
+pub fn extract_isodow_TimestampTz(value: TimestampTz) -> i64 {
+    extract_isodow_Timestamp(value.into())
 }
 
 #[doc(hidden)]
@@ -895,8 +1409,18 @@ pub fn extract_doy_Timestamp(value: Timestamp) -> i64 {
 }
 
 #[doc(hidden)]
+pub fn extract_doy_TimestampTz(value: TimestampTz) -> i64 {
+    extract_doy_Timestamp(value.into())
+}
+
+#[doc(hidden)]
 pub fn extract_epoch_Timestamp(t: Timestamp) -> i64 {
     t.microseconds() / 1_000_000
+}
+
+#[doc(hidden)]
+pub fn extract_epoch_TimestampTz(t: TimestampTz) -> i64 {
+    extract_epoch_Timestamp(t.into())
 }
 
 #[doc(hidden)]
@@ -906,9 +1430,19 @@ pub fn extract_millisecond_Timestamp(value: Timestamp) -> i64 {
 }
 
 #[doc(hidden)]
+pub fn extract_millisecond_TimestampTz(value: TimestampTz) -> i64 {
+    extract_millisecond_Timestamp(value.into())
+}
+
+#[doc(hidden)]
 pub fn extract_microsecond_Timestamp(value: Timestamp) -> i64 {
     let date = value.to_dateTime();
     (date.second() * 1_000_000 + date.timestamp_subsec_micros()).into()
+}
+
+#[doc(hidden)]
+pub fn extract_microsecond_TimestampTz(value: TimestampTz) -> i64 {
+    extract_microsecond_Timestamp(value.into())
 }
 
 #[doc(hidden)]
@@ -918,9 +1452,19 @@ pub fn extract_nanosecond_Timestamp(value: Timestamp) -> i64 {
 }
 
 #[doc(hidden)]
+pub fn extract_nanosecond_TimestampTz(value: TimestampTz) -> i64 {
+    extract_nanosecond_Timestamp(value.into())
+}
+
+#[doc(hidden)]
 pub fn extract_second_Timestamp(value: Timestamp) -> i64 {
     let date = value.to_dateTime();
     date.second().into()
+}
+
+#[doc(hidden)]
+pub fn extract_second_TimestampTz(value: TimestampTz) -> i64 {
+    extract_second_Timestamp(value.into())
 }
 
 #[doc(hidden)]
@@ -930,9 +1474,19 @@ pub fn extract_minute_Timestamp(value: Timestamp) -> i64 {
 }
 
 #[doc(hidden)]
+pub fn extract_minute_TimestampTz(value: TimestampTz) -> i64 {
+    extract_minute_Timestamp(value.into())
+}
+
+#[doc(hidden)]
 pub fn extract_hour_Timestamp(value: Timestamp) -> i64 {
     let date = value.to_dateTime();
     date.hour().into()
+}
+
+#[doc(hidden)]
+pub fn extract_hour_TimestampTz(value: TimestampTz) -> i64 {
+    extract_hour_Timestamp(value.into())
 }
 
 some_polymorphic_function1!(extract_year, Timestamp, Timestamp, i64);
@@ -955,12 +1509,39 @@ some_polymorphic_function1!(extract_second, Timestamp, Timestamp, i64);
 some_polymorphic_function1!(extract_minute, Timestamp, Timestamp, i64);
 some_polymorphic_function1!(extract_hour, Timestamp, Timestamp, i64);
 
+some_polymorphic_function1!(extract_year, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_month, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_day, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_quarter, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_decade, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_century, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_millennium, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_isoyear, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_week, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_dow, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_isodow, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_doy, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_epoch, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_millisecond, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_microsecond, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_nanosecond, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_second, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_minute, TimestampTz, TimestampTz, i64);
+some_polymorphic_function1!(extract_hour, TimestampTz, TimestampTz, i64);
+
 some_operator!(lt, Timestamp, Timestamp, bool);
 some_operator!(gt, Timestamp, Timestamp, bool);
 some_operator!(eq, Timestamp, Timestamp, bool);
 some_operator!(neq, Timestamp, Timestamp, bool);
 some_operator!(gte, Timestamp, Timestamp, bool);
 some_operator!(lte, Timestamp, Timestamp, bool);
+
+some_operator!(lt, TimestampTz, TimestampTz, bool);
+some_operator!(gt, TimestampTz, TimestampTz, bool);
+some_operator!(eq, TimestampTz, TimestampTz, bool);
+some_operator!(neq, TimestampTz, TimestampTz, bool);
+some_operator!(gte, TimestampTz, TimestampTz, bool);
+some_operator!(lte, TimestampTz, TimestampTz, bool);
 
 #[doc(hidden)]
 pub fn floor_millennium_Timestamp(value: Timestamp) -> Timestamp {
@@ -972,6 +1553,13 @@ pub fn floor_millennium_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(floor_millennium, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn floor_millennium_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_millennium_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_millennium, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn floor_century_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_dateTime();
     let naive = NaiveDate::from_ymd_opt((ts.year() / 100) * 100, 1, 1).unwrap();
@@ -979,6 +1567,13 @@ pub fn floor_century_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(floor_century, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn floor_century_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_century_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_century, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn floor_decade_Timestamp(value: Timestamp) -> Timestamp {
@@ -990,6 +1585,13 @@ pub fn floor_decade_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(floor_decade, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn floor_decade_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_decade_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_decade, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn floor_year_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_dateTime();
     let naive = NaiveDate::from_ymd_opt(ts.year(), 1, 1).unwrap();
@@ -997,6 +1599,13 @@ pub fn floor_year_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(floor_year, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn floor_year_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_year_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_year, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn floor_quarter_Timestamp(value: Timestamp) -> Timestamp {
@@ -1008,6 +1617,13 @@ pub fn floor_quarter_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(floor_quarter, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn floor_quarter_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_quarter_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_quarter, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn floor_month_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_dateTime();
     let naive = NaiveDate::from_ymd_opt(ts.year(), ts.month(), 1).unwrap();
@@ -1015,6 +1631,13 @@ pub fn floor_month_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(floor_month, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn floor_month_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_month_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_month, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn floor_week_Timestamp(value: Timestamp) -> Timestamp {
@@ -1027,6 +1650,13 @@ pub fn floor_week_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(floor_week, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn floor_week_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_week_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_week, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn floor_day_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_dateTime();
     let naive = NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day()).unwrap();
@@ -1034,6 +1664,13 @@ pub fn floor_day_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(floor_day, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn floor_day_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_day_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_day, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn floor_hour_Timestamp(value: Timestamp) -> Timestamp {
@@ -1048,6 +1685,13 @@ pub fn floor_hour_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(floor_hour, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn floor_hour_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_hour_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_hour, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn floor_minute_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_naiveDateTime();
     let naive = NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
@@ -1060,6 +1704,13 @@ pub fn floor_minute_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(floor_minute, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn floor_minute_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_minute_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_minute, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn floor_second_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_naiveDateTime();
     let naive = NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day())
@@ -1070,6 +1721,13 @@ pub fn floor_second_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(floor_second, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn floor_second_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_second_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_second, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn floor_millisecond_Timestamp(value: Timestamp) -> Timestamp {
@@ -1089,6 +1747,13 @@ pub fn floor_millisecond_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(floor_millisecond, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn floor_millisecond_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_millisecond_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_millisecond, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn floor_microsecond_Timestamp(value: Timestamp) -> Timestamp {
     // we currently don't store more than microseconds, so this is a no-op
     value
@@ -1097,12 +1762,26 @@ pub fn floor_microsecond_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(floor_microsecond, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn floor_microsecond_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_microsecond_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_microsecond, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn floor_nanosecond_Timestamp(value: Timestamp) -> Timestamp {
     // we currently don't store more than milliseconds, so this is a no-op
     value
 }
 
 some_polymorphic_function1!(floor_nanosecond, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn floor_nanosecond_TimestampTz(value: TimestampTz) -> TimestampTz {
+    floor_nanosecond_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(floor_nanosecond, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 fn is_midnight(value: DateTime<Utc>) -> bool {
@@ -1122,6 +1801,13 @@ pub fn ceil_millennium_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(ceil_millennium, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn ceil_millennium_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_millennium_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_millennium, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn ceil_century_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_dateTime();
     if ts.year() % 100 == 0 && ts.month() == 1 && ts.day() == 1 && is_midnight(ts) {
@@ -1132,6 +1818,13 @@ pub fn ceil_century_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(ceil_century, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn ceil_century_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_century_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_century, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn ceil_decade_Timestamp(value: Timestamp) -> Timestamp {
@@ -1146,6 +1839,13 @@ pub fn ceil_decade_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(ceil_decade, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn ceil_decade_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_decade_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_decade, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn ceil_year_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_dateTime();
     if ts.month() == 1 && ts.day() == 1 && is_midnight(ts) {
@@ -1156,6 +1856,13 @@ pub fn ceil_year_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(ceil_year, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn ceil_year_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_year_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_year, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn ceil_quarter_Timestamp(value: Timestamp) -> Timestamp {
@@ -1182,6 +1889,13 @@ pub fn ceil_quarter_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(ceil_quarter, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn ceil_quarter_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_quarter_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_quarter, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn ceil_month_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_dateTime();
     if ts.day() == 1 && is_midnight(ts) {
@@ -1194,6 +1908,13 @@ pub fn ceil_month_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(ceil_month, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn ceil_month_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_month_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_month, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn ceil_week_Timestamp(value: Timestamp) -> Timestamp {
@@ -1210,6 +1931,13 @@ pub fn ceil_week_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(ceil_week, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn ceil_week_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_week_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_week, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn ceil_day_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_dateTime();
     if is_midnight(ts) {
@@ -1221,6 +1949,13 @@ pub fn ceil_day_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(ceil_day, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn ceil_day_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_day_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_day, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn ceil_hour_Timestamp(value: Timestamp) -> Timestamp {
@@ -1236,6 +1971,13 @@ pub fn ceil_hour_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(ceil_hour, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn ceil_hour_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_hour_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_hour, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn ceil_minute_Timestamp(value: Timestamp) -> Timestamp {
     let ts = value.to_naiveDateTime();
     if ts.second() == 0 && ts.nanosecond() == 0 {
@@ -1247,6 +1989,13 @@ pub fn ceil_minute_Timestamp(value: Timestamp) -> Timestamp {
 }
 
 some_polymorphic_function1!(ceil_minute, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn ceil_minute_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_minute_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_minute, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn ceil_second_Timestamp(value: Timestamp) -> Timestamp {
@@ -1262,11 +2011,25 @@ pub fn ceil_second_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(ceil_second, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn ceil_second_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_second_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_second, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn ceil_millisecond_Timestamp(value: Timestamp) -> Timestamp {
     Timestamp::from_milliseconds((value.microseconds + 999) / 1000)
 }
 
 some_polymorphic_function1!(ceil_millisecond, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn ceil_millisecond_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_millisecond_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_millisecond, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn ceil_microsecond_Timestamp(value: Timestamp) -> Timestamp {
@@ -1277,12 +2040,26 @@ pub fn ceil_microsecond_Timestamp(value: Timestamp) -> Timestamp {
 some_polymorphic_function1!(ceil_microsecond, Timestamp, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn ceil_microsecond_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_microsecond_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_microsecond, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 pub fn ceil_nanosecond_Timestamp(value: Timestamp) -> Timestamp {
     // We currently do not store more than milliseconds, so this is a no-op
     value
 }
 
 some_polymorphic_function1!(ceil_nanosecond, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn ceil_nanosecond_TimestampTz(value: TimestampTz) -> TimestampTz {
+    ceil_nanosecond_Timestamp(value.into()).into()
+}
+
+some_polymorphic_function1!(ceil_nanosecond, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn tumble_Timestamp_ShortInterval(ts: Timestamp, i: ShortInterval) -> Timestamp {
@@ -1299,6 +2076,20 @@ some_polymorphic_function2!(
     ShortInterval,
     ShortInterval,
     Timestamp
+);
+
+#[doc(hidden)]
+pub fn tumble_TimestampTz_ShortInterval(ts: TimestampTz, i: ShortInterval) -> TimestampTz {
+    tumble_Timestamp_ShortInterval(ts.into(), i).into()
+}
+
+some_polymorphic_function2!(
+    tumble,
+    TimestampTz,
+    TimestampTz,
+    ShortInterval,
+    ShortInterval,
+    TimestampTz
 );
 
 #[doc(hidden)]
@@ -1319,6 +2110,26 @@ some_polymorphic_function3!(
     Time,
     Time,
     Timestamp
+);
+
+#[doc(hidden)]
+pub fn tumble_TimestampTz_ShortInterval_Time(
+    ts: TimestampTz,
+    i: ShortInterval,
+    t: Time,
+) -> TimestampTz {
+    tumble_Timestamp_ShortInterval_Time(ts.into(), i, t).into()
+}
+
+some_polymorphic_function3!(
+    tumble,
+    TimestampTz,
+    TimestampTz,
+    ShortInterval,
+    ShortInterval,
+    Time,
+    Time,
+    TimestampTz
 );
 
 #[doc(hidden)]
@@ -1343,6 +2154,26 @@ some_polymorphic_function3!(
     ShortInterval,
     ShortInterval,
     Timestamp
+);
+
+#[doc(hidden)]
+pub fn tumble_TimestampTz_ShortInterval_ShortInterval(
+    ts: TimestampTz,
+    i: ShortInterval,
+    t: ShortInterval,
+) -> TimestampTz {
+    tumble_Timestamp_ShortInterval_ShortInterval(ts.into(), i, t).into()
+}
+
+some_polymorphic_function3!(
+    tumble,
+    TimestampTz,
+    TimestampTz,
+    ShortInterval,
+    ShortInterval,
+    ShortInterval,
+    ShortInterval,
+    TimestampTz
 );
 
 // Start of first interval which contains ts, in microseconds
@@ -1389,6 +2220,21 @@ pub fn hop_Timestamp_ShortInterval_ShortInterval_ShortInterval(
 }
 
 #[doc(hidden)]
+pub fn hop_TimestampTz_ShortInterval_ShortInterval_ShortInterval(
+    ts: TimestampTz,
+    period: ShortInterval,
+    size: ShortInterval,
+    start: ShortInterval,
+) -> Array<TimestampTz> {
+    hop_Timestamp_ShortInterval_ShortInterval_ShortInterval(ts.into(), period, size, start)
+        .deref()
+        .iter()
+        .map(|t: &Timestamp| (*t).into())
+        .collect::<Vec<TimestampTz>>()
+        .into()
+}
+
+#[doc(hidden)]
 pub fn hop_TimestampN_ShortInterval_ShortInterval_ShortInterval(
     ts: Option<Timestamp>,
     period: ShortInterval,
@@ -1399,6 +2245,21 @@ pub fn hop_TimestampN_ShortInterval_ShortInterval_ShortInterval(
         None => Vec::new().into(),
         Some(ts) => {
             hop_Timestamp_ShortInterval_ShortInterval_ShortInterval(ts, period, size, start)
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn hop_TimestampTzN_ShortInterval_ShortInterval_ShortInterval(
+    ts: Option<TimestampTz>,
+    period: ShortInterval,
+    size: ShortInterval,
+    start: ShortInterval,
+) -> Array<TimestampTz> {
+    match ts {
+        None => Vec::new().into(),
+        Some(ts) => {
+            hop_TimestampTz_ShortInterval_ShortInterval_ShortInterval(ts, period, size, start)
         }
     }
 }
@@ -1437,7 +2298,8 @@ pub fn parse_timestampNN(format: Option<SqlString>, st: Option<SqlString>) -> Op
     parse_timestamp__(format, st)
 }
 
-//////////////////////////// Date
+/////////////////////////////////////////////////////////////////////////////////////////////
+// Date
 
 /// A representation of a Date in the Gregorian calendar.
 /// The range of legal dates is 0001-01-01 to 9999-12-12.
@@ -1639,6 +2501,65 @@ pub fn floor_millennium_Date(value: Date) -> Date {
 }
 
 some_polymorphic_function1!(floor_millennium, Date, Date, Date);
+
+#[doc(hidden)]
+pub fn make_date___(year: i32, month: i32, day: i32) -> Option<Date> {
+    if !(1..=9999).contains(&year) {
+        return None;
+    }
+    if month < 1 || day < 1 {
+        return None;
+    }
+    let naive = NaiveDate::from_ymd_opt(year, month as u32, day as u32)?;
+    Some(Date::from_date(naive))
+}
+
+#[doc(hidden)]
+pub fn make_dateN__(year: Option<i32>, month: i32, day: i32) -> Option<Date> {
+    let year = year?;
+    make_date___(year, month, day)
+}
+
+#[doc(hidden)]
+pub fn make_date_N_(year: i32, month: Option<i32>, day: i32) -> Option<Date> {
+    let month = month?;
+    make_date___(year, month, day)
+}
+
+#[doc(hidden)]
+pub fn make_date__N(year: i32, month: i32, day: Option<i32>) -> Option<Date> {
+    let day = day?;
+    make_date___(year, month, day)
+}
+
+#[doc(hidden)]
+pub fn make_dateNN_(year: Option<i32>, month: Option<i32>, day: i32) -> Option<Date> {
+    let year = year?;
+    let month = month?;
+    make_date___(year, month, day)
+}
+
+#[doc(hidden)]
+pub fn make_date_NN(year: i32, month: Option<i32>, day: Option<i32>) -> Option<Date> {
+    let month = month?;
+    let day = day?;
+    make_date___(year, month, day)
+}
+
+#[doc(hidden)]
+pub fn make_dateN_N(year: Option<i32>, month: i32, day: Option<i32>) -> Option<Date> {
+    let year = year?;
+    let day = day?;
+    make_date___(year, month, day)
+}
+
+#[doc(hidden)]
+pub fn make_dateNNN(year: Option<i32>, month: Option<i32>, day: Option<i32>) -> Option<Date> {
+    let year = year?;
+    let month = month?;
+    let day = day?;
+    make_date___(year, month, day)
+}
 
 #[doc(hidden)]
 pub fn floor_century_Date(value: Date) -> Date {
@@ -2134,10 +3055,20 @@ pub fn date_trunc_millennium_Timestamp(timestamp: Timestamp) -> Timestamp {
 }
 
 #[doc(hidden)]
+pub fn date_trunc_millennium_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_millennium_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
 pub fn date_trunc_century_Timestamp(timestamp: Timestamp) -> Timestamp {
     let dt = timestamp.get_date();
     let dt = date_trunc_century_Date(dt);
     Timestamp::from_date(dt)
+}
+
+#[doc(hidden)]
+pub fn date_trunc_century_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_century_Timestamp(timestamp.into()).into()
 }
 
 #[doc(hidden)]
@@ -2148,10 +3079,20 @@ pub fn date_trunc_decade_Timestamp(timestamp: Timestamp) -> Timestamp {
 }
 
 #[doc(hidden)]
+pub fn date_trunc_decade_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_decade_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
 pub fn date_trunc_year_Timestamp(timestamp: Timestamp) -> Timestamp {
     let dt = timestamp.get_date();
     let dt = date_trunc_year_Date(dt);
     Timestamp::from_date(dt)
+}
+
+#[doc(hidden)]
+pub fn date_trunc_year_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_year_Timestamp(timestamp.into()).into()
 }
 
 #[doc(hidden)]
@@ -2162,10 +3103,20 @@ pub fn date_trunc_quarter_Timestamp(timestamp: Timestamp) -> Timestamp {
 }
 
 #[doc(hidden)]
+pub fn date_trunc_quarter_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_quarter_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
 pub fn date_trunc_month_Timestamp(timestamp: Timestamp) -> Timestamp {
     let dt = timestamp.get_date();
     let dt = date_trunc_month_Date(dt);
     Timestamp::from_date(dt)
+}
+
+#[doc(hidden)]
+pub fn date_trunc_month_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_month_Timestamp(timestamp.into()).into()
 }
 
 #[doc(hidden)]
@@ -2176,10 +3127,20 @@ pub fn date_trunc_week_Timestamp(timestamp: Timestamp) -> Timestamp {
 }
 
 #[doc(hidden)]
+pub fn date_trunc_week_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_week_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
 pub fn date_trunc_day_Timestamp(timestamp: Timestamp) -> Timestamp {
     let dt = timestamp.get_date();
     let dt = date_trunc_day_Date(dt);
     Timestamp::from_date(dt)
+}
+
+#[doc(hidden)]
+pub fn date_trunc_day_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_day_Timestamp(timestamp.into()).into()
 }
 
 some_polymorphic_function1!(date_trunc_millennium, Timestamp, Timestamp, Timestamp);
@@ -2190,6 +3151,15 @@ some_polymorphic_function1!(date_trunc_quarter, Timestamp, Timestamp, Timestamp)
 some_polymorphic_function1!(date_trunc_month, Timestamp, Timestamp, Timestamp);
 some_polymorphic_function1!(date_trunc_week, Timestamp, Timestamp, Timestamp);
 some_polymorphic_function1!(date_trunc_day, Timestamp, Timestamp, Timestamp);
+
+some_polymorphic_function1!(date_trunc_millennium, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(date_trunc_century, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(date_trunc_decade, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(date_trunc_year, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(date_trunc_quarter, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(date_trunc_month, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(date_trunc_week, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(date_trunc_day, TimestampTz, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn timestamp_trunc_millennium_Timestamp(timestamp: Timestamp) -> Timestamp {
@@ -2232,6 +3202,46 @@ pub fn timestamp_trunc_day_Timestamp(timestamp: Timestamp) -> Timestamp {
 }
 
 #[doc(hidden)]
+pub fn timestamp_trunc_millennium_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_millennium_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
+pub fn timestamp_trunc_century_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_century_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
+pub fn timestamp_trunc_decade_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_decade_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
+pub fn timestamp_trunc_year_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_year_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
+pub fn timestamp_trunc_quarter_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_quarter_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
+pub fn timestamp_trunc_month_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_month_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
+pub fn timestamp_trunc_week_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_week_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
+pub fn timestamp_trunc_day_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    date_trunc_day_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
 pub fn timestamp_trunc_hour_Timestamp(timestamp: Timestamp) -> Timestamp {
     let dt = timestamp.to_dateTime();
     let nd = NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
@@ -2261,6 +3271,21 @@ pub fn timestamp_trunc_second_Timestamp(timestamp: Timestamp) -> Timestamp {
     Timestamp::from_naiveDateTime(nd)
 }
 
+#[doc(hidden)]
+pub fn timestamp_trunc_hour_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    timestamp_trunc_hour_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
+pub fn timestamp_trunc_minute_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    timestamp_trunc_minute_Timestamp(timestamp.into()).into()
+}
+
+#[doc(hidden)]
+pub fn timestamp_trunc_second_TimestampTz(timestamp: TimestampTz) -> TimestampTz {
+    timestamp_trunc_second_Timestamp(timestamp.into()).into()
+}
+
 some_polymorphic_function1!(timestamp_trunc_millennium, Timestamp, Timestamp, Timestamp);
 some_polymorphic_function1!(timestamp_trunc_century, Timestamp, Timestamp, Timestamp);
 some_polymorphic_function1!(timestamp_trunc_decade, Timestamp, Timestamp, Timestamp);
@@ -2271,6 +3296,42 @@ some_polymorphic_function1!(timestamp_trunc_day, Timestamp, Timestamp, Timestamp
 some_polymorphic_function1!(timestamp_trunc_hour, Timestamp, Timestamp, Timestamp);
 some_polymorphic_function1!(timestamp_trunc_minute, Timestamp, Timestamp, Timestamp);
 some_polymorphic_function1!(timestamp_trunc_second, Timestamp, Timestamp, Timestamp);
+
+some_polymorphic_function1!(
+    timestamp_trunc_millennium,
+    TimestampTz,
+    TimestampTz,
+    TimestampTz
+);
+some_polymorphic_function1!(
+    timestamp_trunc_century,
+    TimestampTz,
+    TimestampTz,
+    TimestampTz
+);
+some_polymorphic_function1!(
+    timestamp_trunc_decade,
+    TimestampTz,
+    TimestampTz,
+    TimestampTz
+);
+some_polymorphic_function1!(timestamp_trunc_year, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(timestamp_trunc_month, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(timestamp_trunc_week, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(timestamp_trunc_day, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(timestamp_trunc_hour, TimestampTz, TimestampTz, TimestampTz);
+some_polymorphic_function1!(
+    timestamp_trunc_minute,
+    TimestampTz,
+    TimestampTz,
+    TimestampTz
+);
+some_polymorphic_function1!(
+    timestamp_trunc_second,
+    TimestampTz,
+    TimestampTz,
+    TimestampTz
+);
 
 #[doc(hidden)]
 pub fn date_trunc_millennium_Date(date: Date) -> Date {
@@ -2343,7 +3404,8 @@ some_polymorphic_function1!(date_trunc_month, Date, Date, Date);
 some_polymorphic_function1!(date_trunc_week, Date, Date, Date);
 some_polymorphic_function1!(date_trunc_day, Date, Date, Date);
 
-//////////////////////////// Time
+/////////////////////////////////////////////////////////////////////////////////////////////
+// Time
 
 /// A time within a day, with nanoseconds precision, without timezone
 /// information.  The legal range of time values is 00:00:00 to
@@ -2559,6 +3621,69 @@ some_operator!(eq, Time, Time, bool);
 some_operator!(neq, Time, Time, bool);
 some_operator!(gte, Time, Time, bool);
 some_operator!(lte, Time, Time, bool);
+
+#[doc(hidden)]
+pub fn make_time_i32_i32_i32(hour: i32, minute: i32, second: i32) -> Option<Time> {
+    if hour < 0 || minute < 0 || second < 0 {
+        return None;
+    }
+    let result = NaiveTime::from_hms_opt(hour as u32, minute as u32, second as u32)?;
+    Some(Time::from_time(result))
+}
+
+some_polymorphic_null_function3!(make_time, i32, i32, i32, i32, i32, i32, Time);
+
+#[doc(hidden)]
+pub fn make_time_i32_i32_d(hour: i32, minute: i32, second: F64) -> Option<Time> {
+    let second = second.into_inner();
+    if !(0..=23).contains(&hour) {
+        return None;
+    }
+    if !(0..=59).contains(&minute) {
+        return None;
+    }
+    if !(0.0..60.0).contains(&second) {
+        return None;
+    }
+
+    // Split seconds into integer + fractional nanoseconds
+    let sec_int = second.trunc() as u32;
+    let nanos = ((second - second.trunc()) * 1_000_000_000.0).trunc() as u32;
+
+    let result = NaiveTime::from_hms_nano_opt(hour as u32, minute as u32, sec_int, nanos)?;
+    Some(Time::from_time(result))
+}
+
+some_polymorphic_null_function3!(make_time, i32, i32, i32, i32, d, F64, Time);
+
+#[doc(hidden)]
+pub fn make_time_i32_i32_SqlDecimal<const P: usize, const S: usize>(
+    hour: i32,
+    minute: i32,
+    second: SqlDecimal<P, S>,
+) -> Option<Time> {
+    if !(0..=23).contains(&hour) {
+        return None;
+    }
+    if !(0..=59).contains(&minute) {
+        return None;
+    }
+    if second < SqlDecimal::<P, S>::zero() {
+        return None;
+    }
+
+    // Split seconds into integer + fractional nanoseconds
+    let sec_int: u32 = second.trunc().try_into().ok()?;
+    let nanos: DynamicDecimal = (second - second.trunc()).into();
+    let bil = DynamicDecimal::new(1_000_000_000, 0);
+    let nanos = nanos * bil;
+    let nanos: u32 = nanos.try_into().ok()?;
+
+    let result = NaiveTime::from_hms_nano_opt(hour as u32, minute as u32, sec_int, nanos)?;
+    Some(Time::from_time(result))
+}
+
+some_polymorphic_null_function3!(make_time <const P: usize, const S: usize>, i32, i32, i32, i32, SqlDecimal, SqlDecimal<P, S>, Time);
 
 #[doc(hidden)]
 pub fn floor_millennium_Time(value: Time) -> Time {
@@ -2920,7 +4045,7 @@ pub fn parse_timeNN(format: Option<SqlString>, st: Option<SqlString>) -> Option<
 mod test {
     use std::sync::LazyLock;
 
-    use super::{Date, Time, Timestamp};
+    use super::{Date, Time, Timestamp, TimestampTz};
     use feldera_types::format::json::JsonFlavor;
     use feldera_types::serde_with_context::{
         DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
@@ -2933,17 +4058,20 @@ mod test {
         date: Date,
         time: Time,
         timestamp: Timestamp,
+        timestampTz: TimestampTz,
     }
 
-    deserialize_table_record!(TestStruct["TestStruct", 3] {
+    deserialize_table_record!(TestStruct["TestStruct", 4] {
         (date, "date", false, Date, |_| None),
         (time, "time", false, Time, |_| None),
-        (timestamp, "timestamp", false, Timestamp, |_| None)
+        (timestamp, "timestamp", false, Timestamp, |_| None),
+        (timestampTz, "timestampTz", false, TimestampTz, |_| None)
     });
-    serialize_table_record!(TestStruct[3] {
+    serialize_table_record!(TestStruct[4] {
         date["date"]: Date,
         time["time"]: Time,
-        timestamp["timestamp"]:  Timestamp
+        timestamp["timestamp"]:  Timestamp,
+        timestampTz["timestampTz"]:  TimestampTz
     });
 
     static DEFAULT_CONFIG: LazyLock<SqlSerdeConfig> = LazyLock::new(SqlSerdeConfig::default);
@@ -2999,13 +4127,14 @@ mod test {
     fn debezium() {
         assert_eq!(
             deserialize_with_debezium_config::<TestStruct>(
-                r#"{"date": 16816, "time": 10800000000, "timestamp": "2018-06-20T13:37:03Z"}"#
+                r#"{"date": 16816, "time": 10800000000, "timestamp": "2018-06-20T13:37:03Z", "timestampTz": "2018-06-20T13:37:03Z" }"#
             )
             .unwrap(),
             TestStruct {
                 date: Date::from_days(16816),
                 time: Time::from_nanoseconds(10800000000000),
                 timestamp: Timestamp::from_milliseconds(1529501823000),
+                timestampTz: TimestampTz::from_milliseconds(1529501823000),
             }
         );
     }
@@ -3017,9 +4146,10 @@ mod test {
                 date: Date::from_days(19628),
                 time: Time::from_nanoseconds(84075123000000),
                 timestamp: Timestamp::from_milliseconds(1529501823000),
+                timestampTz: TimestampTz::from_milliseconds(1529501823000),
             })
             .unwrap(),
-            r#"{"date":"2023-09-28","time":"23:21:15.123","timestamp":"2018-06-20T13:37:03+00:00"}"#
+            r#"{"date":"2023-09-28","time":"23:21:15.123","timestamp":"2018-06-20T13:37:03+00:00","timestampTz":"2018-06-20T13:37:03+00:00"}"#
         );
     }
 
@@ -3027,13 +4157,14 @@ mod test {
     fn default_json() {
         assert_eq!(
             deserialize_with_default_config::<TestStruct>(
-                r#"{"date": "2023-09-28", "time": "23:21:15.123", "timestamp": "2018-06-20 13:37:03"}"#
+                r#"{"date": "2023-09-28", "time": "23:21:15.123", "timestamp": "2018-06-20 13:37:03", "timestampTz": "2018-06-20 13:37:03+00:00"}"#
             )
             .unwrap(),
             TestStruct {
                 date: Date::from_days(19628),
                 time: Time::from_nanoseconds(84075123000000),
                 timestamp: Timestamp::from_milliseconds(1529501823000),
+                timestampTz: TimestampTz::from_milliseconds(1529501823000),
             }
         );
 
@@ -3042,9 +4173,10 @@ mod test {
                 date: Date::from_days(19628),
                 time: Time::from_nanoseconds(84075123000000),
                 timestamp: Timestamp::from_milliseconds(1529501823000),
+                timestampTz: TimestampTz::from_milliseconds(1529501823000),
             })
             .unwrap(),
-            r#"{"date":"2023-09-28","time":"23:21:15.123","timestamp":"2018-06-20 13:37:03"}"#
+            r#"{"date":"2023-09-28","time":"23:21:15.123","timestamp":"2018-06-20 13:37:03","timestampTz":"2018-06-20 13:37:03+00:00"}"#
         );
     }
 }
@@ -3053,6 +4185,7 @@ num_entries_scalar! {
     Timestamp,
     Date,
     Time,
+    TimestampTz,
 }
 
 #[doc(hidden)]

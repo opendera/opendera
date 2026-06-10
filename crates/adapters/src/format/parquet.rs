@@ -12,7 +12,7 @@ use bytes::Bytes;
 use dbsp::operator::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
 use feldera_adapterlib::ConnectorMetadata;
-use feldera_adapterlib::catalog::ArrowStream;
+use feldera_adapterlib::catalog::{ArrowStream, SerCursorFlattened};
 use feldera_sqllib::Variant;
 use feldera_types::config::ConnectorConfig;
 use feldera_types::serde_with_context::serde_config::{
@@ -47,6 +47,7 @@ pub mod test;
 pub const fn default_arrow_serde_config() -> &'static SqlSerdeConfig {
     &SqlSerdeConfig {
         timestamp_format: TimestampFormat::MicrosSinceEpoch,
+        timestamp_tz_format: TimestampFormat::MicrosSinceEpoch,
         time_format: TimeFormat::NanosSigned,
         date_format: DateFormat::String("%Y-%m-%d"),
         decimal_format: DecimalFormat::String,
@@ -208,8 +209,9 @@ impl OutputFormat for ParquetOutputFormat {
         key_schema: &Option<Relation>,
         value_schema: &Relation,
         consumer: Box<dyn OutputConsumer>,
+        is_index: bool,
     ) -> Result<Box<dyn Encoder>, ControllerError> {
-        if key_schema.is_some() {
+        if is_index {
             return Err(ControllerError::invalid_encoder_configuration(
                 endpoint_name,
                 "Parquet encoder cannot be attached to an index",
@@ -243,6 +245,7 @@ impl OutputFormat for ParquetOutputFormat {
             consumer,
             config,
             value_schema.clone(),
+            key_schema.is_some(),
         )?))
     }
 }
@@ -296,6 +299,7 @@ pub fn relation_to_arrow_fields(fields: &[Field], delta_lake: bool) -> Vec<Arrow
                 TimeUnit::Microsecond,
                 if delta_lake { Some("UTC".into()) } else { None },
             ),
+            SqlType::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             SqlType::Date => DataType::Date32,
             SqlType::Null => DataType::Null,
             // Today all supported connectors happen to use string encoding for UUID.
@@ -377,6 +381,7 @@ struct ParquetEncoder {
     config: ParquetEncoderConfig,
     buffer: Vec<u8>,
     max_buffer_size: usize,
+    input_is_indexed: bool,
 }
 
 impl ParquetEncoder {
@@ -384,6 +389,7 @@ impl ParquetEncoder {
         output_consumer: Box<dyn OutputConsumer>,
         config: ParquetEncoderConfig,
         _relation: Relation,
+        input_is_indexed: bool,
     ) -> Result<Self, ControllerError> {
         let max_buffer_size = output_consumer.max_buffer_size_bytes();
         Ok(Self {
@@ -393,6 +399,7 @@ impl ParquetEncoder {
             _relation,
             buffer: Vec::new(),
             max_buffer_size,
+            input_is_indexed,
         })
     }
 }
@@ -412,10 +419,20 @@ impl Encoder for ParquetEncoder {
         let mut builder = ArrayBuilder::new(self.parquet_schema.clone())?;
 
         let mut num_records = 0;
-        let mut cursor = CursorWithPolarity::new(
-            // TODO: make this configurable instead of using the default.
-            batch.cursor(RecordFormat::Parquet(default_arrow_serde_config().clone()))?,
-        );
+        let mut cursor = if self.input_is_indexed {
+            CursorWithPolarity::new(
+                // TODO: make this configurable instead of using the default.
+                Box::new(SerCursorFlattened::new(batch.cursor(
+                    RecordFormat::Parquet(default_arrow_serde_config().clone()),
+                )?)),
+            )
+        } else {
+            CursorWithPolarity::new(
+                // TODO: make this configurable instead of using the default.
+                batch.cursor(RecordFormat::Parquet(default_arrow_serde_config().clone()))?,
+            )
+        };
+
         while cursor.key_valid() {
             if !cursor.val_valid() {
                 cursor.step_key();

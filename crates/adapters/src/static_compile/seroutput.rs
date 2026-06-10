@@ -15,8 +15,9 @@ use apache_avro::types::Value as AvroValue;
 use csv::{Writer as CsvWriter, WriterBuilder as CsvWriterBuilder};
 use dbsp::{
     Batch, BatchReader, OutputHandle, Trace,
-    dynamic::Factory,
+    dynamic::{Data, Factory},
     trace::{BatchReaderFactories, Cursor},
+    typed_batch::{DynSpineSnapshot, SpineSnapshot},
 };
 use dbsp::{
     DBData,
@@ -42,7 +43,7 @@ use feldera_types::{
 use rand::thread_rng;
 use serde::Serialize;
 use serde_arrow::ArrayBuilder;
-use std::{any::Any, collections::HashSet, fmt::Debug};
+use std::{any::Any, collections::HashSet, fmt::Debug, iter::once};
 use std::{cell::RefCell, io, io::Write, marker::PhantomData, ops::DerefMut, sync::Arc};
 
 pub trait ErasedSerializeWithContext {
@@ -520,8 +521,30 @@ where
         ))))
     }
 
+    fn concat(self: Arc<Self>, other: Vec<Arc<dyn SerBatch>>) -> Arc<dyn SerBatchReader> {
+        let snapshots = once(self.batch.dyn_snapshot())
+            .chain(other.into_iter().map(|batch| {
+                batch
+                    .as_any()
+                    .downcast::<Self>()
+                    .unwrap()
+                    .batch
+                    .dyn_snapshot()
+            }))
+            .collect::<Vec<_>>();
+
+        Arc::new(SerBatchImpl::<_, KD, VD>::new(SpineSnapshot::<
+            TypedBatch<B::Key, B::Val, B::R, B::IntoBatch>,
+        >::new(
+            DynSpineSnapshot::concat(B::into_batch_factories(), &snapshots),
+        )))
+    }
+
     fn into_trace(self: Arc<Self>) -> Box<dyn SerTrace> {
-        let mut spine = TypedBatch::new(DynSpine::<B::Inner>::new(&B::factories()));
+        let mut spine = TypedBatch::new(DynSpine::<B::Inner>::new(
+            &B::factories(),
+            Arc::new(String::from("SerTrace")),
+        ));
         TOKIO.block_on(spine.insert(Arc::unwrap_or_clone(self).batch.into_inner()));
         Box::new(SerBatchImpl::<Spine<B>, KD, VD>::new(spine))
     }
@@ -649,6 +672,14 @@ where
         self.cursor.get_key()
     }
 
+    fn val(&self) -> &DynData {
+        self.cursor.val().as_data()
+    }
+
+    fn get_val(&self) -> Option<&DynData> {
+        self.cursor.get_val().map(|v| v.as_data())
+    }
+
     fn serialize_key(&mut self, dst: &mut Vec<u8>) -> AnyResult<()> {
         self.serializer.serialize(
             &SerializeWithContextWrapper::new(self.key.as_ref().unwrap(), &self.serde_config),
@@ -672,6 +703,21 @@ where
         self.serializer.serialize(
             &SerializeFieldsWithContextWrapper::new(
                 self.key.as_ref().unwrap(),
+                &self.serde_config,
+                fields,
+            ),
+            dst,
+        )
+    }
+
+    fn serialize_val_fields(
+        &mut self,
+        fields: &HashSet<String>,
+        dst: &mut Vec<u8>,
+    ) -> AnyResult<()> {
+        self.serializer.serialize(
+            &SerializeFieldsWithContextWrapper::new(
+                self.val.as_ref().unwrap(),
                 &self.serde_config,
                 fields,
             ),
@@ -731,6 +777,14 @@ where
         let w = self.weight();
         self.serializer.serialize(
             &SerializeWithContextWrapper::new(&(self.key.as_ref().unwrap(), w), &self.serde_config),
+            dst,
+        )
+    }
+
+    fn serialize_val_weight(&mut self, dst: &mut Vec<u8>) -> AnyResult<()> {
+        let w = self.weight();
+        self.serializer.serialize(
+            &SerializeWithContextWrapper::new(&(self.val.as_ref().unwrap(), w), &self.serde_config),
             dst,
         )
     }

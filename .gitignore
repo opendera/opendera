@@ -99,3 +99,8 @@ playwright/.cache/
 
 # Claude Code
 /.claude/settings.local.json
+
+# Devcontainers - the lock file should be committed when more people use them
+.devcontainer/devcontainer-lock.json
+js-packages/support-bundle-triage/
+.roc-check/

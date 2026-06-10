@@ -296,6 +296,10 @@ struct RebalanceState<B: Batch<Time = ()>> {
     /// The policy that was used to accumulate the integral before the rebalancing.
     /// This is the policy used during the previous transaction.
     trace_policy: PartitioningPolicy,
+
+    /// True if `trace_policy` differs from the current policy, i.e., the integral
+    /// must be retracted and redistributed before the transaction commits.
+    rebalance_trace: bool,
 }
 
 /// Information about the key distribution of the input stream.
@@ -365,6 +369,7 @@ where
     batch_factories: B::Factories,
 
     global_id: GlobalNodeId,
+    global_id_string: Arc<String>,
 
     /// Origin node of the input to this operator.
     input_node_id: NodeId,
@@ -446,6 +451,10 @@ where
         Self {
             batch_factories: batch_factories.clone(),
             global_id: GlobalNodeId::root(),
+            global_id_string: Arc::new(format!(
+                "RebalancingExchangeSender {}",
+                exchange.exchange_id()
+            )),
             input_node_id,
             worker_index,
             location,
@@ -571,14 +580,17 @@ where
                 retractions
                     .accumulator
                     .extend_with_batches(accumulator_batches);
+                retractions.rebalance_trace = retractions.trace_policy != new_policy;
             }
             retractions @ None => {
+                let trace_policy = old_policy.unwrap_or(PartitioningPolicy::Shard);
                 *retractions = Some(RebalanceState {
                     accumulator: SpineSnapshot::with_batches(
                         &self.batch_factories,
                         accumulator_batches,
                     ),
-                    trace_policy: old_policy.unwrap_or(PartitioningPolicy::Shard),
+                    trace_policy,
+                    rebalance_trace: trace_policy != new_policy,
                 });
             }
         }
@@ -1023,6 +1035,7 @@ where
     ) {
         self.exchange
             .send_all_with_serializer(
+                &self.global_id_string,
                 batches.into_iter().map(|batch| (batch, flush_complete)),
                 |(batch, flush)| {
                     let mut fbuf =
@@ -1130,6 +1143,10 @@ where
 
     fn init(&mut self, global_id: &GlobalNodeId) {
         self.global_id = global_id.clone();
+        self.global_id_string = Arc::new(format!(
+            "RebalancingExchangeSender {}",
+            global_id.node_identifier()
+        ));
     }
 
     fn register_ready_callback<F>(&mut self, cb: F)
@@ -1354,10 +1371,18 @@ where
             // Used to measure step duration and add it to the total rebalancing time.
             let mut step_start_time = Instant::now();
 
-            let RebalanceState { mut accumulator, trace_policy } = self.rebalance_state.borrow_mut().take().unwrap();
+            let RebalanceState {
+                mut accumulator,
+                trace_policy,
+                rebalance_trace,
+            } = self.rebalance_state.borrow_mut().take().unwrap();
 
             self.rebalance_accumulator_size.set(accumulator.len());
-            self.rebalance_integral_size.set(delayed_trace.len());
+            self.rebalance_integral_size.set(if rebalance_trace {
+                delayed_trace.len()
+            } else {
+                0
+            });
 
             let mut integral_cursor = delayed_trace.cursor();
 
@@ -1365,15 +1390,28 @@ where
 
             // Retract the contents of the integral by sending it with negated weights to the accumulator
             // in the same worker.
-            while integral_cursor.key_valid() {
-                self.process_retractions(&mut integral_cursor, &mut builders[self.worker_index], chunk_size);
+            if rebalance_trace {
+                while integral_cursor.key_valid() {
+                    self.process_retractions(
+                        &mut integral_cursor,
+                        &mut builders[self.worker_index],
+                        chunk_size,
+                    );
 
-                // println!("{}: integral retractions: {:?}", Runtime::worker_index(), batches);
-                builders = self.send_builders(builders, &mut builder_capacity, false, &mut serializer_inner).await;
-                self.update_exchange_metadata();
-                self.update_total_rebalancing_time(&step_start_time);
-                yield (false, None);
-                step_start_time = Instant::now();
+                    // println!("{}: integral retractions: {:?}", Runtime::worker_index(), batches);
+                    builders = self
+                        .send_builders(
+                            builders,
+                            &mut builder_capacity,
+                            false,
+                            &mut serializer_inner,
+                        )
+                        .await;
+                    self.update_exchange_metadata();
+                    self.update_total_rebalancing_time(&step_start_time);
+                    yield (false, None);
+                    step_start_time = Instant::now();
+                }
             }
 
             // Start new cursors.
@@ -1393,31 +1431,40 @@ where
             }
 
             // Repartition integral.
-            while integral_cursor.key_valid() {
-                self.repartition(trace_policy, &mut integral_cursor, &mut builders, chunk_size);
+            if rebalance_trace {
+                while integral_cursor.key_valid() {
+                    self.repartition(trace_policy, &mut integral_cursor, &mut builders, chunk_size);
 
-                // println!("{}: integral insertions: {:?}", Runtime::worker_index(), batches);
-                builders = self.send_builders(builders, &mut builder_capacity, !integral_cursor.key_valid(), &mut serializer_inner).await;
-                self.update_exchange_metadata();
-
-                if integral_cursor.key_valid(){
+                    // println!("{}: integral insertions: {:?}", Runtime::worker_index(), batches);
+                    builders = self
+                        .send_builders(
+                            builders,
+                            &mut builder_capacity,
+                            !integral_cursor.key_valid(),
+                            &mut serializer_inner,
+                        )
+                        .await;
                     self.update_exchange_metadata();
-                    self.update_total_rebalancing_time(&step_start_time);
-                    yield (false, None);
-                    step_start_time = Instant::now();
-                } else {
-                    // if Runtime::worker_index() == 0 {
-                    //     println!("{}: flush complete 2 ({:?})", self.input_node_id, *self.current_policy.borrow());
-                    // }
 
-                    self.flush_state.set(FlushState::FlushCompleted);
-                    self.update_exchange_metadata();
-                    self.rebalance_accumulator_size.set(0);
-                    self.rebalance_integral_size.set(0);
-                    self.update_total_rebalancing_time(&step_start_time);
-                    self.rebalance_start_time.set(None);
-                    yield (true, None);
-                    return;
+                    if integral_cursor.key_valid() {
+                        self.update_exchange_metadata();
+                        self.update_total_rebalancing_time(&step_start_time);
+                        yield (false, None);
+                        step_start_time = Instant::now();
+                    } else {
+                        // if Runtime::worker_index() == 0 {
+                        //     println!("{}: flush complete 2 ({:?})", self.input_node_id, *self.current_policy.borrow());
+                        // }
+
+                        self.flush_state.set(FlushState::FlushCompleted);
+                        self.update_exchange_metadata();
+                        self.rebalance_accumulator_size.set(0);
+                        self.rebalance_integral_size.set(0);
+                        self.update_total_rebalancing_time(&step_start_time);
+                        self.rebalance_start_time.set(None);
+                        yield (true, None);
+                        return;
+                    }
                 }
             }
 

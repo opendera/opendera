@@ -24,6 +24,7 @@ use core_affinity::{CoreId, get_core_ids};
 use crossbeam::sync::{Parker, Unparker};
 use enum_map::{Enum, EnumMap, enum_map};
 use feldera_buffer_cache::ThreadType;
+use feldera_samply::LongSpanBuilder;
 use feldera_storage::fbuf::FBuf;
 use feldera_storage::fbuf::slab::{FBufSlabs, FBufSlabsStats, set_thread_slab_pool};
 use feldera_types::config::{DevTweaks, StorageCompression, StorageConfig, StorageOptions};
@@ -63,9 +64,6 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use typedmap::TypedDashMap;
-
-/// The number of tuples a stateful operator outputs per step during replay.
-pub const DEFAULT_REPLAY_STEP_SIZE: usize = 10000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum Error {
@@ -304,7 +302,6 @@ struct RuntimeInner {
     /// Panic info collected from failed worker threads.
     panic_info: Vec<EnumMap<ThreadType, RwLock<Option<WorkerPanicInfo>>>>,
     panicked: AtomicBool,
-    replay_step_size: AtomicUsize,
 
     /// Tokio runtime that runs async merger tasks (see `AsyncMerger`).
     tokio_merger_runtime: Mutex<Option<TokioRuntime>>,
@@ -487,6 +484,12 @@ impl RuntimeInner {
             );
         }
 
+        if config.dev_tweaks.streaming_exchange() {
+            info!("dev_tweaks.streaming_exchange enabled");
+        } else {
+            info!("dev_tweaks.streaming_exchange disabled");
+        }
+
         Ok(Self {
             pin_cpus_fg,
             pin_cpus_bg,
@@ -511,7 +514,6 @@ impl RuntimeInner {
                 .map(|_| EnumMap::from_fn(|_| RwLock::new(None)))
                 .collect(),
             panicked: AtomicBool::new(false),
-            replay_step_size: AtomicUsize::new(DEFAULT_REPLAY_STEP_SIZE),
             tokio_merger_runtime: Mutex::new(None),
             exchange_listener: Mutex::new(config.exchange_listener),
         })
@@ -727,6 +729,7 @@ impl Runtime {
         runtime.spawn_aux_thread("rss-monitor", Parker::new(), |parker| {
             let runtime = Runtime::runtime().unwrap();
 
+            let mut pressure_span = None;
             while !Runtime::kill_in_progress() {
                 let process_rss = process_rss_bytes().unwrap_or_default();
                 runtime
@@ -761,6 +764,13 @@ impl Runtime {
                         current_memory_pressure
                     }
                 };
+                if pressure_span.is_none() || new_memory_pressure != previous_pressure {
+                    pressure_span = Some(
+                        LongSpanBuilder::new("memory-pressure")
+                            .with_tooltip(new_memory_pressure.to_string())
+                            .build(),
+                    );
+                }
 
                 runtime
                     .inner()
@@ -779,6 +789,7 @@ impl Runtime {
                 }
                 parker.park_timeout(Duration::from_secs(1));
             }
+            drop(pressure_span);
         });
 
         let workers = workers
@@ -1063,29 +1074,6 @@ impl Runtime {
         self.inner().step_size
     }
 
-    /// Configure the number of tuples a stateful operator outputs per step during replay.
-    ///
-    /// The default is `DEFAULT_REPLAY_STEP_SIZE`.
-    pub fn set_replay_step_size(&self, step_size: usize) {
-        self.inner()
-            .replay_step_size
-            .store(step_size, Ordering::Release);
-    }
-
-    /// Get currently configured replay step size.
-    ///
-    /// Returns `DEFAULT_REPLAY_STEP_SIZE` if the current thread doesn't have a runtime.
-    pub fn replay_step_size() -> usize {
-        RUNTIME
-            .with(|rt| Some(rt.borrow().as_ref()?.get_replay_step_size()))
-            .unwrap_or(DEFAULT_REPLAY_STEP_SIZE)
-    }
-
-    /// Get currently configured replay step size.
-    pub fn get_replay_step_size(&self) -> usize {
-        self.inner().replay_step_size.load(Ordering::Acquire)
-    }
-
     /// Returns the worker index as a string.
     ///
     /// This is useful for metric labels.
@@ -1334,16 +1322,19 @@ impl Runtime {
         self.inner().panicked.store(true, Ordering::Release);
     }
 
-    /// Tokio merger runtime associated with this DBSP runtime.
-    pub(crate) fn tokio_merger_runtime(&self) -> tokio::runtime::Handle {
+    /// Handle to the tokio merger runtime associated with this DBSP runtime.
+    ///
+    /// Returns `None` if the runtime has already been torn down. Callers may
+    /// race `RuntimeHandle::join`, which takes the runtime out of its slot
+    /// before dropping it; an in-flight merger task that reaches this accessor
+    /// after the take observes `None` and should bail out of its work.
+    pub(crate) fn tokio_merger_runtime(&self) -> Option<tokio::runtime::Handle> {
         self.inner()
             .tokio_merger_runtime
             .lock()
             .unwrap()
             .as_ref()
-            .expect("tokio merger runtime has been shut down")
-            .handle()
-            .clone()
+            .map(|rt| rt.handle().clone())
     }
 
     /// Takes and returns the TCP listener socket configured via
@@ -1378,7 +1369,10 @@ impl Consensus {
 /// a value to all other workers.
 pub(crate) enum Broadcast<T> {
     SingleThreaded,
-    MultiThreaded { exchange: Arc<Exchange<T>> },
+    MultiThreaded {
+        exchange: Arc<Exchange<T>>,
+        identifier: Arc<String>,
+    },
 }
 
 impl<T> Broadcast<T>
@@ -1390,8 +1384,12 @@ where
             Some(runtime) if Runtime::num_workers() > 1 => {
                 let exchange_id = runtime.sequence_next().try_into().unwrap();
                 let exchange = Exchange::with_runtime(&runtime, exchange_id);
+                let identifier = Arc::new(format!("broadcast {exchange_id}"));
 
-                Self::MultiThreaded { exchange }
+                Self::MultiThreaded {
+                    exchange,
+                    identifier,
+                }
             }
             _ => Self::SingleThreaded,
         }
@@ -1405,20 +1403,23 @@ where
     pub async fn collect(&self, local: T) -> Result<Vec<T>, SchedulerError> {
         match self {
             Self::SingleThreaded => Ok(vec![local]),
-            Self::MultiThreaded { exchange } => Runtime::runtime()
+            Self::MultiThreaded {
+                exchange,
+                identifier,
+            } => Runtime::runtime()
                 .unwrap()
                 .cancellation_token()
                 .run_until_cancelled_owned(async {
                     exchange
-                        .send_all_with_serializer(repeat(local.clone()), |local| {
+                        .send_all_with_serializer(identifier, repeat(local.clone()), |local| {
                             let mut fbuf = FBuf::new();
-                            rmp_serde::encode::write(&mut fbuf, &local).unwrap();
+                            serde_json::to_writer(&mut fbuf, &local).unwrap();
                             fbuf
                         })
                         .await;
 
                     exchange
-                        .receive_all(|data| rmp_serde::from_slice(&data).unwrap())
+                        .receive_all(|data| serde_json::from_slice(&data).unwrap())
                         .await
                 })
                 .await
@@ -1531,17 +1532,22 @@ impl RuntimeHandle {
             });
 
         // Terminate the tokio merger runtime.
-        if let Some(tokio_merger_runtime) = self
+        //
+        // The `MutexGuard` returned by `lock()` must be dropped before the
+        // tokio runtime: dropping the runtime blocks until every blocking-pool
+        // task yields, and those tasks may call `tokio_merger_runtime()`, which
+        // re-locks this same mutex. Holding the guard across the runtime drop
+        // would deadlock. Binding `take()` to a `let` releases the guard at the
+        // `;`, leaving an owned `Option<TokioRuntime>` whose drop runs without
+        // the mutex held.
+        let tokio_merger_runtime = self
             .runtime
             .inner()
             .tokio_merger_runtime
             .lock()
             .unwrap()
-            .take()
-        {
-            // Block until all running merger tasks have yielded. At this point, the tokio runtime will have shut down automatically.
-            drop(tokio_merger_runtime);
-        }
+            .take();
+        drop(tokio_merger_runtime);
 
         // This must happen after we wait for the background threads, because
         // they might try to initiate another merge before they exit, which

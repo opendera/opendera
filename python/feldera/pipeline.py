@@ -4,10 +4,19 @@ import time
 from collections import deque
 from datetime import datetime
 from threading import Event
-from typing import Any, Callable, Dict, Generator, List, Mapping, Optional
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Mapping,
+    Optional,
+)
 from uuid import UUID
 
 import pandas
+import pyarrow as pa
 
 from feldera._callback_runner import CallbackRunner
 from feldera._helpers import chunk_dataframe, ensure_dataframe_has_columns
@@ -497,6 +506,7 @@ metrics"""
     def start(
         self,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
+        silent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -511,6 +521,7 @@ metrics"""
         - If the pipeline is in PAUSED state, use `.meth:resume` instead.
 
         :param bootstrap_policy: The bootstrap policy to use.
+        :param silent_bootstrap: Set True to bootstrap the pipeline with output connectors disabled. False by default.
         :param timeout_s: The maximum time (in seconds) to wait for the
             pipeline to start.
         :param wait: Set True to wait for the pipeline to start. True by default
@@ -522,6 +533,7 @@ metrics"""
         self.client.start_pipeline(
             self.name,
             bootstrap_policy=bootstrap_policy,
+            silent_bootstrap=silent_bootstrap,
             wait=wait,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
@@ -530,6 +542,7 @@ metrics"""
     def start_paused(
         self,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
+        silent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -548,6 +561,7 @@ metrics"""
         return self.client.start_pipeline_as_paused(
             self.name,
             bootstrap_policy=bootstrap_policy,
+            silent_bootstrap=silent_bootstrap,
             wait=wait,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
@@ -556,6 +570,7 @@ metrics"""
     def start_standby(
         self,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
+        silent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -574,6 +589,7 @@ metrics"""
         self.client.start_pipeline_as_standby(
             self.name,
             bootstrap_policy=bootstrap_policy,
+            silent_bootstrap=silent_bootstrap,
             wait=wait,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
@@ -582,6 +598,7 @@ metrics"""
     def restart(
         self,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
+        silent_bootstrap: bool = False,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
     ):
@@ -602,6 +619,7 @@ metrics"""
         self.stop(force=True, timeout_s=timeout_s)
         self.start(
             bootstrap_policy=bootstrap_policy,
+            silent_bootstrap=silent_bootstrap,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
         )
@@ -646,7 +664,7 @@ metrics"""
 
         self.client.dismiss_error_pipeline(self.name)
 
-    def approve(self):
+    def approve(self, silent_bootstrap: bool = False):
         """
         Approves the pipeline to proceed with bootstrapping.
 
@@ -654,9 +672,13 @@ metrics"""
         `bootstrap_policy=BootstrapPolicy.AWAIT_APPROVAL` and is currently in the
         AWAITINGAPPROVAL state. The pipeline will wait for explicit user approval
         before proceeding with the bootstrapping process.
+
+        :param silent_bootstrap: Set True to bootstrap with output connectors
+            disabled, so no records are emitted during the bootstrap phase.
+            False by default.
         """
 
-        self.client.approve_pipeline(self.name)
+        self.client.approve_pipeline(self.name, silent_bootstrap=silent_bootstrap)
 
     def resume(self, wait: bool = True, timeout_s: Optional[float] = None):
         """
@@ -669,6 +691,33 @@ metrics"""
         """
 
         self.client.resume_pipeline(self.name, wait=wait, timeout_s=timeout_s)
+
+    def advance_clock(self, delta_ms: Optional[int] = None) -> Dict[str, int | str]:
+        """
+        Advance the externally-driven `NOW()` clock and return its new value.
+
+        Requires `dev_tweaks.now_http_driven = True` on this pipeline.
+        Forward-only: `delta_ms` must be non-negative.
+
+        :param delta_ms: Milliseconds to add to `NOW()`.  ``0`` reads the
+            current value without moving the clock; ``None`` (the default)
+            advances by one ``clock_resolution`` (one configured tick).
+            Any non-zero value rounds up to the next ``clock_resolution``
+            boundary, so a sub-resolution delta still moves the clock by
+            one full tick.
+
+        The returned ``now_ms`` is the value the worker will emit on its
+        next pipeline step; queries against materialized views may
+        observe the previous ``NOW()`` until that step completes.  Poll
+        the view if you need read-after-write semantics.
+
+        :return: A dict ``{"now_ms": <int>, "now": <RFC 3339 str>}``.
+
+        :raises FelderaAPIError: If the clock is not in http-driven mode,
+            the body is malformed, or the pipeline is not running.
+        """
+
+        return self.client.advance_clock(self.name, delta_ms)
 
     def start_transaction(self) -> int:
         """
@@ -687,6 +736,7 @@ metrics"""
         transaction_id: Optional[int] = None,
         wait: bool = True,
         timeout_s: Optional[float] = None,
+        poll_interval_s: float = 0.5,
     ):
         """
         Commit the currently active transaction.
@@ -700,13 +750,22 @@ metrics"""
         :param timeout_s: Maximum time (in seconds) to wait for the transaction to commit when `wait` is True.
             If None, the function will wait indefinitely.
 
+        :param poll_interval_s: Polling interval at which to check while waiting for the
+            transaction to commit (default is every 0.5 seconds). Not used if `wait=False`.
+
         :raises RuntimeError: If there is currently no transaction in progress.
         :raises ValueError: If the provided `transaction_id` does not match the current transaction.
         :raises TimeoutError: If the transaction does not commit within the specified timeout (when `wait` is True).
         :raises FelderaAPIError: If the pipeline fails to commit a transaction.
         """
 
-        self.client.commit_transaction(self.name, transaction_id, wait, timeout_s)
+        self.client.commit_transaction(
+            self.name,
+            transaction_id,
+            wait,
+            timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
 
     def transaction_status(self) -> TransactionStatus:
         """
@@ -938,8 +997,13 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         Executes an ad-hoc SQL query on this pipeline and returns a generator
         that yields the rows of the result as Python dictionaries. For
         ``INSERT`` and ``DELETE`` queries, consider using :meth:`.execute`
-        instead. All floating-point numbers are deserialized as Decimal objects
+        instead. All floating-point numbers are deserialized as ``Decimal``
         to avoid precision loss.
+
+        For new code, prefer :meth:`.query_arrow`: Arrow IPC keeps full
+        SQL type fidelity, lets ``MAP`` keys be non-string values, and
+        returns every column even when two share a name. See
+        https://github.com/feldera/feldera/issues/4219.
 
         Note:
             You can only ``SELECT`` from materialized tables and views.
@@ -958,7 +1022,9 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         :raises FelderaAPIError: If the query is invalid.
         """
 
-        return self.client.query_as_json(self.name, query)
+        # Delegate to the non-deprecated internal helper so calls through
+        # `query()` don't surface a DeprecationWarning to user code.
+        return self.client._query_json_stream(self.name, query)
 
     def query_parquet(self, query: str, path: str):
         """
@@ -979,6 +1045,47 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         """
 
         self.client.query_as_parquet(self.name, query, path)
+
+    def query_arrow(self, query: str) -> Generator[pa.RecordBatch, None, None]:
+        """
+        Executes an ad-hoc SQL query on this pipeline and returns a generator
+        that yields the result as PyArrow RecordBatches.
+
+        Note:
+            You can only ``SELECT`` from materialized tables and views.
+
+        :param query: The SQL query to be executed.
+
+        :raises FelderaAPIError: If the pipeline is not in a RUNNING or PAUSED
+            state.
+        :raises FelderaAPIError: If querying a non materialized table or view.
+        :raises FelderaAPIError: If the query is invalid.
+
+        :return: A generator that yields ``pyarrow.RecordBatch`` objects.
+        """
+        return self.client.query_as_arrow(self.name, query)
+
+    def query_arrow_dicts(self, query: str) -> Generator[Mapping[str, Any], None, None]:
+        """
+        Executes an ad-hoc SQL query on this pipeline and returns a generator
+        that yields the result as a sequence of Dictionaries.
+
+        Note:
+            You can only ``SELECT`` from materialized tables and views.
+
+        :param query: The SQL query to be executed.
+
+        :raises FelderaAPIError: If the pipeline is not in a RUNNING or PAUSED
+            state.
+        :raises FelderaAPIError: If querying a non materialized table or view.
+        :raises FelderaAPIError: If the query is invalid.
+
+        :return: A generator that yields ``pyarrow.Mapping`` objects.
+        """
+        batches = self.query_arrow(query)
+        for batch in batches:
+            for row in batch.to_pylist():
+                yield row
 
     def query_tabular(self, query: str) -> Generator[str, None, None]:
         """
@@ -1450,6 +1557,8 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         self,
         output_path: Optional[str] = None,
         *,
+        collect: bool = True,
+        limit: Optional[int] = None,
         circuit_profile: bool = True,
         heap_profile: bool = True,
         metrics: bool = True,
@@ -1458,6 +1567,7 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         pipeline_config: bool = True,
         system_config: bool = True,
         dataflow_graph: bool = True,
+        pipeline_events: bool = True,
     ) -> bytes:
         """
         Generate a support bundle containing diagnostic information from this pipeline.
@@ -1468,6 +1578,9 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
 
         :param output_path: Optional path to save the support bundle file. If None,
             the support bundle is only returned as bytes.
+        :param collect: Whether to collect fresh data from the pipeline (default: True).
+            Set to False to download only previously stored collections.
+        :param limit: If set, include only the N most recent collections.
         :param circuit_profile: Whether to collect circuit profile data (default: True)
         :param heap_profile: Whether to collect heap profile data (default: True)
         :param metrics: Whether to collect metrics data (default: True)
@@ -1476,12 +1589,17 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         :param pipeline_config: Whether to collect pipeline configuration data (default: True)
         :param system_config: Whether to collect system configuration data (default: True)
         :param dataflow_graph: Whether to collect dataflow graph (default: True)
+        :param pipeline_events: Whether to collect pipeline monitor events (default: True)
         :return: The support bundle as bytes (ZIP archive)
         :raises FelderaAPIError: If the pipeline does not exist or if there's an error
         """
 
         # Build query parameters
         params = {}
+        if not collect:
+            params["collect"] = "false"
+        if limit is not None:
+            params["limit"] = str(limit)
         if not circuit_profile:
             params["circuit_profile"] = "false"
         if not heap_profile:
@@ -1498,6 +1616,8 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
             params["system_config"] = "false"
         if not dataflow_graph:
             params["dataflow_graph"] = "false"
+        if not pipeline_events:
+            params["pipeline_events"] = "false"
 
         support_bundle_bytes = self.client.get_pipeline_support_bundle(
             self.name, params=params
@@ -1565,6 +1685,13 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         """
 
         self.client.rebalance_pipeline(self.name)
+
+    def start_compaction(self):
+        """
+        Initiate immediate compaction of the pipeline's state.
+        """
+
+        self.client.start_compaction_pipeline(self.name)
 
     def generate_completion_token(self, table_name: str, connector_name: str) -> str:
         """

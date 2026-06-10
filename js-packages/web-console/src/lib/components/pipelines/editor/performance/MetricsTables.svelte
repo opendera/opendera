@@ -1,12 +1,10 @@
 <script lang="ts">
-  import { SegmentedControl } from '@skeletonlabs/skeleton-svelte'
-  import { format } from 'd3-format'
+  import { Popover, SegmentedControl, Tooltip } from 'common-ui'
   import type { HTMLAttributes } from 'svelte/elements'
-  import Popover from '$lib/components/common/Popover.svelte'
-  import Tooltip from '$lib/components/common/Tooltip.svelte'
   import ClipboardCopyButton from '$lib/components/other/ClipboardCopyButton.svelte'
   import { count } from '$lib/functions/common/array'
   import { humanSize } from '$lib/functions/common/string'
+  import { formatQty } from '$lib/functions/format'
   import type {
     AggregatedInputEndpointMetrics,
     AggregatedMetrics,
@@ -16,8 +14,6 @@
   import type { InputEndpointMetrics, OutputEndpointMetrics } from '$lib/services/manager'
   import type { Snippet } from '$lib/types/svelte'
   import type { ConnectorErrorFilter } from './ConnectorErrors.svelte'
-
-  const formatQty = (v: number) => format(',.0f')(v)
 
   let {
     metrics,
@@ -211,7 +207,9 @@
   {#if hasErrors}
     <span
       data-testid="btn-icon-output-errors"
-      class="fd {hasFatalError ? 'fd-circle-x' : 'fd-circle-alert'} cursor-pointer text-[16px] text-error-500"
+      class="fd {hasFatalError
+        ? 'fd-circle-x'
+        : 'fd-circle-alert'} cursor-pointer text-[16px] text-error-500"
       {...onErrorClick
         ? {
             onclick: (e) => {
@@ -321,27 +319,20 @@
 )}
   <SegmentedControl
     value={filter}
-    onValueChange={(e) => setFilter(e.value as HealthFilter)}
+    onValueChange={setFilter}
+    items={healthFilterModes.map((value) => ({
+      value,
+      label: value,
+      testid: `btn-select-${value}`
+    }))}
     class="-mt-2"
+    itemTextClass="capitalize"
   >
-    <SegmentedControl.Label />
-    <SegmentedControl.Control class="w-fit flex-none rounded preset-filled-surface-50-950 p-1">
-      <SegmentedControl.Indicator class="bg-white-dark shadow" />
-      {#each healthFilterModes as mode}
-        <SegmentedControl.Item
-          value={mode}
-          class="btn h-6 cursor-pointer px-3"
-          data-testid="btn-select-{mode}"
-        >
-          <SegmentedControl.ItemText class="text-surface-950-50 capitalize">
-            {mode}{#if mode === 'unhealthy' && unhealthyCount > 0}<span
-                class="ml-2 rounded bg-error-50-950 px-2">{unhealthyCount}</span
-              >{/if}
-          </SegmentedControl.ItemText>
-          <SegmentedControl.ItemHiddenInput />
-        </SegmentedControl.Item>
-      {/each}
-    </SegmentedControl.Control>
+    {#snippet label(item)}
+      {item.value}{#if item.value === 'unhealthy' && unhealthyCount > 0}<span
+          class="ml-2 rounded bg-error-50-950 px-2">{unhealthyCount}</span
+        >{/if}
+    {/snippet}
   </SegmentedControl>
 {/snippet}
 
@@ -502,7 +493,9 @@
 {/snippet}
 
 {#snippet tableMultiConnectorCell(data: AggregatedInputEndpointMetrics, isExpanded: boolean)}
-  {@const runningCount = data.connectors.filter((c) => c.paused === false).length}
+  {@const runningCount = data.connectors.filter(
+    (c) => c.paused === false && c.metrics.end_of_input === false
+  ).length}
   {@const anyErrors = data.connectors.some(inputHasErrors)}
   {@const anyFatalError = data.connectors.some((c) => c.fatal_error != null)}
   {@const anyBarrier = data.connectors.some((c) => c.barrier === true)}

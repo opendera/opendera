@@ -14,7 +14,7 @@ use crate::db::types::tenant::TenantId;
 use crate::db::types::version::Version;
 use async_trait::async_trait;
 use feldera_types::error::ErrorResponse;
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus, RuntimeStatus};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -37,6 +37,7 @@ impl ExtendedPipelineDescrRunner {
                 created_at: pipeline.created_at,
                 version: pipeline.version,
                 platform_version: pipeline.platform_version.clone(),
+                runtime_config: pipeline.runtime_config.clone(),
                 program_config: pipeline.program_config.clone(),
                 program_version: pipeline.program_version,
                 program_status: pipeline.program_status,
@@ -359,7 +360,7 @@ pub(crate) trait Storage {
         tenant_id: TenantId,
         pipeline_name: &str,
         initial: RuntimeDesiredStatus,
-        bootstrap_policy: BootstrapPolicy,
+        bootstrap_config: BootstrapConfig,
         dismiss_error: bool,
     ) -> Result<PipelineId, DBError>;
 
@@ -451,6 +452,15 @@ pub(crate) trait Storage {
         tenant_id: TenantId,
         pipeline_id: PipelineId,
         version_guard: Version,
+    ) -> Result<(), DBError>;
+
+    /// Remain resources status `Stopped`, but set a new error.
+    async fn remain_deployment_resources_status_stopped(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        version_guard: Version,
+        deployment_error: ErrorResponse,
     ) -> Result<(), DBError>;
 
     /// Transitions storage status to `Clearing`.

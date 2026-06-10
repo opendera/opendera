@@ -12,19 +12,23 @@ use feldera_adapterlib::{
         IntegratedInputEndpoint, NonFtInputReaderCommand,
     },
     utils::datafusion::{
-        array_to_string, execute_query_collect, execute_singleton_query,
+        array_to_string, create_session_context, execute_query_collect, execute_singleton_query,
         timestamp_to_sql_expression, validate_sql_expression, validate_timestamp_column,
     },
     PipelineState,
 };
 use feldera_types::{
-    config::FtModel,
+    config::{FtModel, PipelineConfig},
     program_schema::Relation,
     transport::iceberg::{IcebergCatalogType, IcebergReaderConfig},
 };
 use futures_util::StreamExt;
 use iceberg::CatalogBuilder;
-use iceberg::{io::FileIO, spec::TableMetadata, table::Table as IcebergTable, Catalog, TableIdent};
+use iceberg::{
+    io::{FileIO, FileIOBuilder, StorageFactory},
+    table::{StaticTable, Table as IcebergTable},
+    Catalog, TableIdent,
+};
 use iceberg_catalog_glue::{
     GlueCatalogBuilder, AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME,
     AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_URI,
@@ -34,6 +38,7 @@ use iceberg_catalog_rest::{
     RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
 };
 use iceberg_datafusion::IcebergStaticTableProvider;
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use log::{debug, info, trace};
 use std::{sync::Arc, thread};
 use tokio::{
@@ -43,6 +48,13 @@ use tokio::{
         watch::{channel, Receiver, Sender},
     },
 };
+use url::Url;
+
+/// Storage backend for object stores, picked per path from its scheme
+/// (`s3`/`s3a`/`gs`/`memory`/...). Used for catalogs and remote tables.
+fn storage_factory() -> Arc<dyn StorageFactory> {
+    Arc::new(OpenDalResolvingStorageFactory::new())
+}
 
 enum SnapshotDescr {
     /// Open the latest snapshot (default)
@@ -62,12 +74,16 @@ impl IcebergInputEndpoint {
     pub fn new(
         endpoint_name: &str,
         config: &IcebergReaderConfig,
+        pipeline_config: &PipelineConfig,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
         consumer: Box<dyn InputConsumer>,
     ) -> Self {
         Self {
             inner: Arc::new(IcebergInputEndpointInner::new(
                 endpoint_name,
                 config.clone(),
+                pipeline_config,
+                runtime_env,
                 consumer,
             )),
         }
@@ -183,14 +199,20 @@ impl IcebergInputEndpointInner {
     fn new(
         endpoint_name: &str,
         config: IcebergReaderConfig,
+        pipeline_config: &PipelineConfig,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
         consumer: Box<dyn InputConsumer>,
     ) -> Self {
         let queue = InputQueue::new(consumer.clone());
+        // Share the pipeline-wide `RuntimeEnv` so that scans against the
+        // iceberg table spill to the bounded memory pool and on-disk scratch
+        // dir alongside every other datafusion user in the pipeline.
+        let datafusion = create_session_context(pipeline_config, runtime_env);
         Self {
             endpoint_name: endpoint_name.to_string(),
             config,
             consumer,
-            datafusion: SessionContext::new(),
+            datafusion,
             queue,
         }
     }
@@ -466,55 +488,32 @@ impl IcebergInputEndpointInner {
         // Safe due to checks in 'validate_catalog_config'.
         let metadata_location = self.config.metadata_location.as_ref().unwrap();
 
-        let file_io = FileIO::from_path(metadata_location)
+        // Object stores (a URL with a non-`file` scheme) need the
+        // scheme-resolving factory and its props (credentials, region).
+        let file_io = match Url::parse(metadata_location) {
+            Ok(url) if url.scheme() != "file" => FileIOBuilder::new(storage_factory())
+                .with_props(&self.config.fileio_config)
+                .build(),
+            // Local table: a `file://` URL or a bare path. The factory can't
+            // read a bare path (it URL-parses every path, and e.g.
+            // `/tmp/t/metadata.json` has no scheme), so use the plain
+            // filesystem reader, which takes the string as a file path.
+            _ => FileIO::new_with_fs(),
+        };
+
+        // `StaticTable` loads the metadata read-only and wires up the current
+        // tokio runtime for us. (Glue/REST get their table from the catalog.)
+        let table_ident = TableIdent::from_strs(["default", "table"]).unwrap();
+        let table = StaticTable::from_metadata_file(metadata_location, table_ident, file_io)
+            .await
             .map_err(|e| {
                 ControllerError::invalid_transport_configuration(
                     &self.endpoint_name,
-                    &format!("invalid 'metadata_location' value: {e}"),
-                )
-            })?
-            .with_props(&self.config.fileio_config)
-            .build()
-            .map_err(|e| {
-                ControllerError::invalid_transport_configuration(
-                    &self.endpoint_name,
-                    &format!("invalid storage configuration: {e}"),
+                    &format!("error opening Iceberg table at '{metadata_location}': {e}"),
                 )
             })?;
 
-        let metadata_file = file_io.new_input(metadata_location).map_err(|e| {
-            ControllerError::invalid_transport_configuration(
-                &self.endpoint_name,
-                &format!("error opening metadata file at '{metadata_location}': {e}"),
-            )
-        })?;
-        let metadata_content = metadata_file.read().await.map_err(|e| {
-            ControllerError::invalid_transport_configuration(
-                &self.endpoint_name,
-                &format!("error reading metadatafile '{metadata_location}': {e}"),
-            )
-        })?;
-        let metadata = serde_json::from_slice::<TableMetadata>(&metadata_content).map_err(|e| {
-            ControllerError::invalid_transport_configuration(
-                &self.endpoint_name,
-                &format!("error parsing table metadata: {e}"),
-            )
-        })?;
-
-        let table_ident = TableIdent::from_strs(["default", "table"]).unwrap();
-
-        IcebergTable::builder()
-            .file_io(file_io)
-            .metadata_location(metadata_location)
-            .metadata(metadata)
-            .identifier(table_ident)
-            .build()
-            .map_err(|e| {
-                ControllerError::invalid_transport_configuration(
-                    &self.endpoint_name,
-                    &format!("error configuring Iceberg table: {e}"),
-                )
-            })
+        Ok(table.into_table())
     }
 
     async fn open_table_glue(&self) -> Result<IcebergTable, ControllerError> {
@@ -578,6 +577,7 @@ impl IcebergInputEndpointInner {
             .map(|region_name| props.insert(AWS_REGION_NAME.to_string(), region_name.clone()));
 
         let catalog = GlueCatalogBuilder::default()
+            .with_storage_factory(storage_factory())
             .load("glue".to_string(), props)
             .await
             .map_err(|e| {
@@ -667,6 +667,7 @@ impl IcebergInputEndpointInner {
         };
 
         let catalog = RestCatalogBuilder::default()
+            .with_storage_factory(storage_factory())
             .load("rest".to_string(), props)
             .await
             .map_err(|e| {
@@ -895,4 +896,15 @@ async fn wait_running(receiver: &mut Receiver<PipelineState>) {
     let _ = receiver
         .wait_for(|state| state == &PipelineState::Running)
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_factory_constructs() {
+        // Smoke test; scheme dispatch is covered upstream in iceberg-rust.
+        let _factory = storage_factory();
+    }
 }

@@ -1,6 +1,7 @@
 use crate::api::support_data_collector::SupportBundleData;
 use crate::auth::{generate_api_key, TenantRecord};
 use crate::db::error::DBError;
+use crate::db::error::DBError::InvalidResourcesStatusNotRemain;
 use crate::db::storage::{ExtendedPipelineDescrRunner, Storage};
 use crate::db::storage_postgres::{is_pipeline_assigned_to_worker, StoragePostgres};
 use crate::db::types::api_key::{ApiKeyDescr, ApiKeyId, ApiPermission};
@@ -37,7 +38,7 @@ use feldera_types::config::{
 use feldera_types::error::ErrorResponse;
 use feldera_types::program_schema::ProgramSchema;
 use feldera_types::runtime_status::{
-    BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus, StorageStatusDetails,
+    BootstrapConfig, BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus, StorageStatusDetails,
 };
 use openssl::sha;
 use proptest::prelude::*;
@@ -300,6 +301,7 @@ fn map_val_to_limited_runtime_config(val: RuntimeConfigPropVal) -> serde_json::V
         serde_json::to_value(RuntimeConfig {
             workers: val.val0,
             max_rss_mb: val.val21,
+            datafusion_memory_mb: None,
             hosts: val.val20,
             cpu_profiler: val.val1,
             min_batch_size_records: val.val2,
@@ -361,10 +363,11 @@ fn map_val_to_limited_program_info(val: ProgramInfoPropVal) -> serde_json::Value
         json!({ "schema": 222 }) // An invalid program information
     } else {
         serde_json::to_value(ProgramInfo {
-            schema: ProgramSchema {
+            schema: serde_json::to_value(ProgramSchema {
                 inputs: vec![],
                 outputs: vec![],
-            },
+            })
+            .unwrap(),
             main_rust: format!("main-rust-{}", val.1),
             udf_stubs: format!("udf-stubs-{}", val.2),
             input_connectors: BTreeMap::new(),
@@ -515,6 +518,17 @@ fn limited_pipeline_config() -> impl Strategy<Value = serde_json::Value> {
 }
 
 /// Generates different error responses.
+fn limited_error_response() -> impl Strategy<Value = ErrorResponse> {
+    any::<u8>().prop_map(|val| ErrorResponse {
+        message: "This is an example error response".to_string(),
+        error_code: Cow::from("SomeExampleError"),
+        details: json!({
+            "extra-info": val
+        }),
+    })
+}
+
+/// Generates different optional error responses.
 fn limited_optional_error_response() -> impl Strategy<Value = Option<ErrorResponse>> {
     any::<(bool, u8)>().prop_map(|(is_some, val)| {
         if is_some {
@@ -1192,6 +1206,7 @@ async fn pipeline_versioning() {
     let new_runtime_config = serde_json::to_value(RuntimeConfig {
         workers: 100,
         max_rss_mb: None,
+        datafusion_memory_mb: None,
         hosts: 1,
         storage: None,
         fault_tolerance: FtConfig::default(),
@@ -1386,10 +1401,11 @@ async fn pipeline_program_compilation() {
                 messages: vec![],
             },
             &serde_json::to_value(ProgramInfo {
-                schema: ProgramSchema {
+                schema: serde_json::to_value(ProgramSchema {
                     inputs: vec![],
                     outputs: vec![],
-                },
+                })
+                .unwrap(),
                 main_rust: "".to_string(),
                 udf_stubs: "".to_string(),
                 input_connectors: BTreeMap::new(),
@@ -1549,10 +1565,11 @@ async fn pipeline_transition_after_quick_stop() {
                 messages: vec![],
             },
             &serde_json::to_value(ProgramInfo {
-                schema: ProgramSchema {
+                schema: serde_json::to_value(ProgramSchema {
                     inputs: vec![],
                     outputs: vec![],
-                },
+                })
+                .unwrap(),
                 main_rust: "".to_string(),
                 udf_stubs: "".to_string(),
                 input_connectors: BTreeMap::new(),
@@ -1620,7 +1637,7 @@ async fn pipeline_transition_after_quick_stop() {
             tenant_id,
             "example1",
             RuntimeDesiredStatus::Paused,
-            BootstrapPolicy::default(),
+            BootstrapConfig::default(),
             false,
         )
         .await
@@ -1664,7 +1681,6 @@ async fn pipeline_transition_after_quick_stop() {
                     pipeline1.id,
                     &pipeline1.name,
                     &serde_json::from_value(pipeline1.runtime_config.clone()).unwrap(),
-                    None,
                 ))
                 .unwrap(),
             )
@@ -1770,10 +1786,11 @@ async fn pipeline_deployment() {
                 messages: vec![],
             },
             &serde_json::to_value(ProgramInfo {
-                schema: ProgramSchema {
+                schema: serde_json::to_value(ProgramSchema {
                     inputs: vec![],
                     outputs: vec![],
-                },
+                })
+                .unwrap(),
                 main_rust: "".to_string(),
                 udf_stubs: "".to_string(),
                 input_connectors: BTreeMap::new(),
@@ -1841,7 +1858,7 @@ async fn pipeline_deployment() {
             tenant_id,
             "example1",
             RuntimeDesiredStatus::Paused,
-            BootstrapPolicy::default(),
+            BootstrapConfig::default(),
             false,
         )
         .await
@@ -1857,7 +1874,6 @@ async fn pipeline_deployment() {
                 pipeline1.id,
                 &pipeline1.name,
                 &serde_json::from_value(pipeline1.runtime_config.clone()).unwrap(),
-                None,
             ))
             .unwrap(),
         )
@@ -2047,7 +2063,7 @@ async fn pipeline_deployment() {
             tenant_id,
             "example1",
             RuntimeDesiredStatus::Paused,
-            BootstrapPolicy::default(),
+            BootstrapConfig::default(),
             false,
         )
         .await
@@ -2071,7 +2087,6 @@ async fn pipeline_deployment() {
                 pipeline1.id,
                 &pipeline1.name,
                 &serde_json::from_value(pipeline1.runtime_config.clone()).unwrap(),
-                Some(&ProgramInfo::default()),
             ))
             .unwrap(),
         )
@@ -2170,7 +2185,7 @@ async fn pipeline_deployment() {
                 tenant_id,
                 "example1",
                 RuntimeDesiredStatus::Paused,
-                BootstrapPolicy::default(),
+                BootstrapConfig::default(),
                 false,
             )
             .await
@@ -2188,7 +2203,7 @@ async fn pipeline_deployment() {
             tenant_id,
             "example1",
             RuntimeDesiredStatus::Paused,
-            BootstrapPolicy::default(),
+            BootstrapConfig::default(),
             false,
         )
         .await
@@ -2204,7 +2219,6 @@ async fn pipeline_deployment() {
                 pipeline1.id,
                 &pipeline1.name,
                 &serde_json::from_value(pipeline1.runtime_config).unwrap(),
-                Some(&ProgramInfo::default()),
             ))
             .unwrap(),
         )
@@ -2260,7 +2274,7 @@ async fn pipeline_deployment() {
                 tenant_id,
                 "example1",
                 RuntimeDesiredStatus::Paused,
-                BootstrapPolicy::default(),
+                BootstrapConfig::default(),
                 false,
             )
             .await
@@ -2278,23 +2292,22 @@ async fn pipeline_deployment() {
             tenant_id,
             "example1",
             RuntimeDesiredStatus::Paused,
-            BootstrapPolicy::default(),
+            BootstrapConfig::default(),
             false,
         )
         .await
         .unwrap();
     handle
         .db
-        .transit_deployment_resources_status_to_stopping(
+        .remain_deployment_resources_status_stopped(
             tenant_id,
             pipeline1.id,
             Version(1),
-            Some(ErrorResponse {
+            ErrorResponse {
                 message: "abc".to_string(),
                 error_code: Cow::from("Def"),
                 details: json!("ghi"),
-            }),
-            None,
+            },
         )
         .await
         .unwrap();
@@ -2307,18 +2320,24 @@ async fn pipeline_deployment() {
             .refresh_version,
         Version(21)
     );
-    handle
-        .db
-        .transit_deployment_resources_status_to_stopped(tenant_id, pipeline1.id, Version(1))
-        .await
-        .unwrap();
+    assert!(matches!(
+        handle
+            .db
+            .transit_deployment_resources_status_to_stopped(tenant_id, pipeline1.id, Version(1))
+            .await
+            .unwrap_err(),
+        InvalidResourcesStatusNotRemain {
+            current_status: ResourcesStatus::Stopped,
+            new_status: ResourcesStatus::Stopped
+        }
+    ));
     handle
         .db
         .set_deployment_resources_desired_status_provisioned(
             tenant_id,
             "example1",
             RuntimeDesiredStatus::Paused,
-            BootstrapPolicy::default(),
+            BootstrapConfig::default(),
             true,
         )
         .await
@@ -2330,7 +2349,7 @@ async fn pipeline_deployment() {
             .await
             .unwrap()
             .refresh_version,
-        Version(22)
+        Version(21)
     );
     assert_eq!(
         handle
@@ -2339,7 +2358,7 @@ async fn pipeline_deployment() {
             .await
             .unwrap()
             .len(),
-        41
+        40
     );
     assert_eq!(
         handle
@@ -2348,7 +2367,7 @@ async fn pipeline_deployment() {
             .await
             .unwrap()
             .len(),
-        41
+        40
     );
     assert_eq!(
         handle
@@ -2356,7 +2375,7 @@ async fn pipeline_deployment() {
             .delete_pipeline_monitor_events_exceeding_retention(25)
             .await
             .unwrap(),
-        16
+        15
     );
     assert_eq!(
         handle
@@ -2366,6 +2385,74 @@ async fn pipeline_deployment() {
             .unwrap()
             .len(),
         25
+    );
+}
+
+/// Deployment of a pipeline that fails to move onward to `Provisioning`.
+#[tokio::test]
+async fn pipeline_start_fails() {
+    let handle = test_setup().await;
+    let tenant_id = TenantRecord::default().id;
+    let pipeline1 = handle
+        .db
+        .new_pipeline(
+            tenant_id,
+            Uuid::now_v7(),
+            "v0",
+            PipelineDescr {
+                name: "example1".to_string(),
+                description: "d1".to_string(),
+                runtime_config: json!({}),
+                program_code: "c1".to_string(),
+                udf_rust: "r1".to_string(),
+                udf_toml: "t2".to_string(),
+                program_config: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    handle
+        .db
+        .set_deployment_resources_desired_status_provisioned(
+            tenant_id,
+            "example1",
+            RuntimeDesiredStatus::Paused,
+            BootstrapConfig::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        handle
+            .db
+            .get_pipeline_by_id(tenant_id, pipeline1.id)
+            .await
+            .unwrap()
+            .deployment_resources_desired_status,
+        ResourcesDesiredStatus::Provisioned
+    );
+    handle
+        .db
+        .remain_deployment_resources_status_stopped(
+            tenant_id,
+            pipeline1.id,
+            Version(1),
+            ErrorResponse {
+                message: "example".to_string(),
+                error_code: Default::default(),
+                details: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        handle
+            .db
+            .get_pipeline_by_id(tenant_id, pipeline1.id)
+            .await
+            .unwrap()
+            .deployment_resources_desired_status,
+        ResourcesDesiredStatus::Stopped
     );
 }
 
@@ -2413,10 +2500,11 @@ async fn pipeline_provision_version_guard() {
                 messages: vec![],
             },
             &serde_json::to_value(ProgramInfo {
-                schema: ProgramSchema {
+                schema: serde_json::to_value(ProgramSchema {
                     inputs: vec![],
                     outputs: vec![],
-                },
+                })
+                .unwrap(),
                 main_rust: "".to_string(),
                 udf_stubs: "".to_string(),
                 input_connectors: BTreeMap::new(),
@@ -2457,7 +2545,7 @@ async fn pipeline_provision_version_guard() {
             tenant_id,
             &pipeline.name,
             RuntimeDesiredStatus::Running,
-            BootstrapPolicy::default(),
+            BootstrapConfig::default(),
             false,
         )
         .await
@@ -2484,6 +2572,7 @@ async fn pipeline_provision_version_guard() {
                 serde_json::to_value(RuntimeConfig {
                     workers: 10,
                     max_rss_mb: None,
+                    datafusion_memory_mb: None,
                     hosts: 1,
                     storage: None,
                     fault_tolerance: FtConfig::default(),
@@ -2523,7 +2612,7 @@ async fn pipeline_provision_version_guard() {
             tenant_id,
             &pipeline.name,
             RuntimeDesiredStatus::Paused,
-            BootstrapPolicy::Allow,
+            BootstrapConfig::from(BootstrapPolicy::Allow),
             false,
         )
         .await
@@ -2541,7 +2630,6 @@ async fn pipeline_provision_version_guard() {
                       pipeline.id,
                       &pipeline.name,
                       &serde_json::from_value(pipeline.runtime_config.clone()).unwrap(),
-                      None,
                   )).unwrap(),
               )
               .await.unwrap_err(),
@@ -2612,7 +2700,6 @@ async fn pipeline_provision_version_guard() {
                 pipeline.id,
                 &pipeline.name,
                 &serde_json::from_value(pipeline.runtime_config.clone()).unwrap(),
-                Some(&ProgramInfo::default()),
             ))
             .unwrap(),
         )
@@ -2773,6 +2860,12 @@ enum StorageAction {
         #[proptest(strategy = "limited_resources_details()")] serde_json::Value,
     ),
     TransitDeploymentResourcesStatusToStopped(TenantId, PipelineId, Version),
+    RemainDeploymentResourcesStatusStopped(
+        TenantId,
+        PipelineId,
+        Version,
+        #[proptest(strategy = "limited_error_response()")] ErrorResponse,
+    ),
     TransitStorageStatusToClearing(
         TenantId,
         #[proptest(strategy = "limited_pipeline_name()")] String,
@@ -3475,8 +3568,8 @@ fn db_impl_behaves_like_model() {
                             }
                             StorageAction::SetDeploymentResourcesDesiredStatusProvisioned(tenant_id, pipeline_name, initial, dismiss_error) => {
                                 create_tenants_if_not_exists(&model, &handle, tenant_id).await.unwrap();
-                                let model_response = model.set_deployment_resources_desired_status_provisioned(tenant_id, &pipeline_name, initial, BootstrapPolicy::default(), dismiss_error).await;
-                                let impl_response = handle.db.set_deployment_resources_desired_status_provisioned(tenant_id, &pipeline_name, initial, BootstrapPolicy::default(), dismiss_error).await;
+                                let model_response = model.set_deployment_resources_desired_status_provisioned(tenant_id, &pipeline_name, initial, BootstrapConfig::default(), dismiss_error).await;
+                                let impl_response = handle.db.set_deployment_resources_desired_status_provisioned(tenant_id, &pipeline_name, initial, BootstrapConfig::default(), dismiss_error).await;
                                 check_responses(i, model_response, impl_response);
                             }
                             StorageAction::SetDeploymentResourcesDesiredStatusStoppedIfNotProvisioned(tenant_id, pipeline_name) => {
@@ -3525,6 +3618,12 @@ fn db_impl_behaves_like_model() {
                                 create_tenants_if_not_exists(&model, &handle, tenant_id).await.unwrap();
                                 let model_response = model.transit_deployment_resources_status_to_stopped(tenant_id, pipeline_id, version_guard).await;
                                 let impl_response = handle.db.transit_deployment_resources_status_to_stopped(tenant_id, pipeline_id, version_guard).await;
+                                check_responses(i, model_response, impl_response);
+                            }
+                            StorageAction::RemainDeploymentResourcesStatusStopped(tenant_id, pipeline_id, version_guard, deployment_error) => {
+                                create_tenants_if_not_exists(&model, &handle, tenant_id).await.unwrap();
+                                let model_response = model.remain_deployment_resources_status_stopped(tenant_id, pipeline_id, version_guard, deployment_error.clone()).await;
+                                let impl_response = handle.db.remain_deployment_resources_status_stopped(tenant_id, pipeline_id, version_guard, deployment_error).await;
                                 check_responses(i, model_response, impl_response);
                             }
                             StorageAction::TransitStorageStatusToClearing(tenant_id, pipeline_name) => {
@@ -3821,8 +3920,11 @@ impl ModelHelpers for Mutex<DbModel> {
                 if runtime_config.get("workers") != pipeline.runtime_config.get("workers") {
                     not_allowed.push("`runtime_config.workers`");
                 }
-                if runtime_config.get("storage") != pipeline.runtime_config.get("storage") {
-                    not_allowed.push("`runtime_config.storage`");
+                let one = json!(1);
+                if runtime_config.get("hosts").unwrap_or(&one)
+                    != pipeline.runtime_config.get("hosts").unwrap_or(&one)
+                {
+                    not_allowed.push("`runtime_config.hosts`");
                 }
                 if runtime_config.get("fault_tolerance")
                     != pipeline.runtime_config.get("fault_tolerance")
@@ -3839,24 +3941,24 @@ impl ModelHelpers for Mutex<DbModel> {
                 {
                     not_allowed.push("`runtime_config.resources.storage_mb_max`");
                 }
-            }
-            if program_code
-                .as_ref()
-                .is_some_and(|v| *v != pipeline.program_code)
-            {
-                not_allowed.push("`program_code`")
-            }
-            if udf_rust.as_ref().is_some_and(|v| *v != pipeline.udf_rust) {
-                not_allowed.push("`udf_rust`")
-            }
-            if udf_toml.as_ref().is_some_and(|v| *v != pipeline.udf_toml) {
-                not_allowed.push("`udf_toml`")
-            }
-            if program_config
-                .as_ref()
-                .is_some_and(|v| *v != pipeline.program_config)
-            {
-                not_allowed.push("`program_config`")
+                if runtime_config.get("resources").map(|v| v.get("namespace"))
+                    != pipeline
+                        .runtime_config
+                        .get("resources")
+                        .map(|v| v.get("namespace"))
+                {
+                    not_allowed.push("`runtime_config.resources.namespace`");
+                }
+                if runtime_config
+                    .get("resources")
+                    .map(|v| v.get("storage_class"))
+                    != pipeline
+                        .runtime_config
+                        .get("resources")
+                        .map(|v| v.get("storage_class"))
+                {
+                    not_allowed.push("`runtime_config.resources.storage_class`");
+                }
             }
             if !not_allowed.is_empty() {
                 return Err(DBError::EditRestrictedToClearedStorage {
@@ -3983,6 +4085,7 @@ fn convert_descriptor_to_monitoring(
         created_at: pipeline.created_at,
         version: pipeline.version,
         platform_version: pipeline.platform_version.clone(),
+        runtime_config: pipeline.runtime_config.clone(),
         program_config: pipeline.program_config.clone(),
         program_version: pipeline.program_version,
         program_status: pipeline.program_status,
@@ -4066,12 +4169,17 @@ fn validate_new_deployment_resources_status(
             new_status,
         });
     }
+    if !remain && pipeline.deployment_resources_status == new_status {
+        return Err(DBError::InvalidResourcesStatusNotRemain {
+            current_status: pipeline.deployment_resources_status,
+            new_status,
+        });
+    }
 
     // Check program is compiled if needed
     if !matches!(
         (pipeline.deployment_resources_status, new_status),
-        (ResourcesStatus::Stopped, ResourcesStatus::Stopping)
-            | (ResourcesStatus::Stopping, ResourcesStatus::Stopped)
+        (ResourcesStatus::Stopped, ResourcesStatus::Stopped)
     ) && pipeline.program_status != ProgramStatus::Success
     {
         return Err(DBError::TransitionRequiresCompiledProgram {
@@ -4817,7 +4925,7 @@ impl Storage for Mutex<DbModel> {
         tenant_id: TenantId,
         pipeline_name: &str,
         initial: RuntimeDesiredStatus,
-        bootstrap_policy: BootstrapPolicy,
+        bootstrap_config: BootstrapConfig,
         dismiss_error: bool,
     ) -> Result<PipelineId, DBError> {
         // Validate
@@ -4832,6 +4940,7 @@ impl Storage for Mutex<DbModel> {
             pipeline.storage_status,
             pipeline.deployment_resources_status,
             pipeline.deployment_resources_desired_status,
+            pipeline.program_status,
             new_deployment_error.clone(),
             new_resources_desired_status,
         )?;
@@ -4840,7 +4949,7 @@ impl Storage for Mutex<DbModel> {
         }
         if pipeline
             .bootstrap_policy
-            .is_some_and(|v| v != bootstrap_policy)
+            .is_some_and(|v| v != bootstrap_config)
         {
             return Err(DBError::BootstrapPolicyImmutableUnlessStopped);
         }
@@ -4865,7 +4974,7 @@ impl Storage for Mutex<DbModel> {
 
         // Apply changes: update
         pipeline.deployment_initial = Some(initial);
-        pipeline.bootstrap_policy = Some(bootstrap_policy);
+        pipeline.bootstrap_policy = Some(bootstrap_config);
         pipeline.deployment_resources_desired_status = new_resources_desired_status;
         pipeline.deployment_resources_desired_status_since = Utc::now();
         pipeline.deployment_error = new_deployment_error;
@@ -4891,6 +5000,7 @@ impl Storage for Mutex<DbModel> {
                 pipeline.storage_status,
                 pipeline.deployment_resources_status,
                 pipeline.deployment_resources_desired_status,
+                pipeline.program_status,
                 pipeline.deployment_error.clone(),
                 new_resources_desired_status,
             )?;
@@ -4928,6 +5038,7 @@ impl Storage for Mutex<DbModel> {
             pipeline.storage_status,
             pipeline.deployment_resources_status,
             pipeline.deployment_resources_desired_status,
+            pipeline.program_status,
             pipeline.deployment_error.clone(),
             new_resources_desired_status,
         )?;
@@ -5218,6 +5329,61 @@ impl Storage for Mutex<DbModel> {
         pipeline.deployment_resources_status = new_resources_status;
         pipeline.deployment_resources_status_details = None;
         pipeline.deployment_resources_status_since = Utc::now();
+        pipeline.deployment_runtime_status = None;
+        pipeline.deployment_runtime_status_since = None;
+        pipeline.deployment_runtime_desired_status = None;
+        pipeline.deployment_runtime_desired_status_since = None;
+        pipeline.refresh_version = Version(pipeline.refresh_version.0 + 1);
+        self.lock()
+            .await
+            .pipelines
+            .insert((tenant_id, pipeline.id), pipeline.clone());
+        self.new_pipeline_monitor_event(tenant_id, pipeline_id)
+            .await?;
+        Ok(())
+    }
+
+    async fn remain_deployment_resources_status_stopped(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        version_guard: Version,
+        deployment_error: ErrorResponse,
+    ) -> Result<(), DBError> {
+        // Validate
+        let mut pipeline = self.get_pipeline_by_id(tenant_id, pipeline_id).await?;
+        let new_resources_status = ResourcesStatus::Stopped;
+        validate_new_deployment_resources_status(
+            &pipeline,
+            version_guard,
+            new_resources_status,
+            true,
+        )?;
+
+        // Apply changes
+
+        // Set resources desired status to Stopped
+        pipeline.deployment_initial = None;
+        pipeline.bootstrap_policy = None;
+        pipeline.deployment_resources_desired_status = ResourcesDesiredStatus::Stopped;
+        pipeline.deployment_resources_desired_status_since = Utc::now();
+        self.lock()
+            .await
+            .pipelines
+            .insert((tenant_id, pipeline.id), pipeline.clone());
+        self.new_pipeline_monitor_event(tenant_id, pipeline_id)
+            .await?;
+
+        // Set deployment resources status to Stopped
+        pipeline.deployment_id = None;
+        pipeline.deployment_initial = None;
+        pipeline.bootstrap_policy = None;
+        pipeline.deployment_config = None;
+        pipeline.deployment_location = None;
+        pipeline.deployment_error = Some(deployment_error);
+        pipeline.deployment_resources_status = new_resources_status;
+        pipeline.deployment_resources_status_details = None;
+        // Retain: pipeline.deployment_resources_status_since = Utc::now();
         pipeline.deployment_runtime_status = None;
         pipeline.deployment_runtime_status_since = None;
         pipeline.deployment_runtime_desired_status = None;

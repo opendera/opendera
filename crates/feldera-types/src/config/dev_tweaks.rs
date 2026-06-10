@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -56,11 +57,9 @@ pub struct DevTweaks {
     pub merger: Option<MergerType>,
 
     /// If set, the maximum amount of storage, in MiB, for the POSIX backend to
-    /// allow to be in use before failing all writes with [StorageFull].  This
+    /// allow to be in use before failing all writes with `StorageFull`.  This
     /// is useful for testing on top of storage that does not implement its own
     /// quota mechanism.
-    ///
-    /// [StorageFull]: std::io::ErrorKind::StorageFull
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_mb_max: Option<u64>,
 
@@ -228,6 +227,47 @@ pub struct DevTweaks {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_auto_transaction: Option<bool>,
 
+    /// Override the timestamp returned by SQL `NOW()` at pipeline start.
+    ///
+    /// When set, the clock connector anchors `NOW()` to this RFC 3339
+    /// timestamp the first time the pipeline starts and advances at
+    /// wall-clock cadence from there:
+    /// `NOW() = now_offset + (wall_clock - wall_clock_at_start)`.
+    ///
+    /// Any RFC 3339 timestamp parseable by `chrono::DateTime<Utc>` is
+    /// accepted (years `0001` through `9999`), in the past or future
+    /// relative to wall clock.
+    ///
+    /// This is a testing knob for queries that depend on `NOW()`.
+    ///
+    /// On resume the clock continues from the last journaled `NOW()`;
+    /// `now_offset`'s value is honored only on a fresh start:
+    ///
+    /// | Initial run | Resume from checkpoint | Post-replay `NOW()` |
+    /// |---|---|---|
+    /// | no offset | no offset | wall clock (unchanged) |
+    /// | offset    | offset    | wall-clock pace from the last journaled value; the new offset value is ignored |
+    /// | offset    | no offset | jumps to wall clock (explicit opt-out of the anchor) |
+    /// | no offset | offset    | wall-clock pace from the last journaled value; the new offset value is ignored |
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now_offset: Option<DateTime<Utc>>,
+
+    /// Drive `NOW()` from an external HTTP endpoint instead of wall clock.
+    ///
+    /// When `true`, the clock connector emits one initial tick (using
+    /// `now_offset` if set, otherwise wall clock) and then holds that
+    /// value.  Subsequent calls to `POST /clock/advance` move `NOW()`
+    /// forward by the requested delta.  Negative deltas are rejected;
+    /// the clock is forward-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now_http_driven: Option<bool>,
+
+    /// Enable streaming exchange.
+    ///
+    /// `false`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming_exchange: Option<bool>,
+
     /// Options not understood by this particular version.
     ///
     /// This allows the pipeline manager to take options that a custom or old
@@ -297,6 +337,20 @@ impl DevTweaks {
     pub fn disable_auto_transaction(&self) -> bool {
         self.disable_auto_transaction.unwrap_or(false)
     }
+
+    /// Configured `now_offset` as milliseconds since the Unix epoch,
+    /// or `None` if no override is set.
+    pub fn now_offset_ms(&self) -> Option<i64> {
+        self.now_offset.map(|target| target.timestamp_millis())
+    }
+
+    pub fn now_http_driven(&self) -> bool {
+        self.now_http_driven.unwrap_or(false)
+    }
+
+    pub fn streaming_exchange(&self) -> bool {
+        self.streaming_exchange.unwrap_or(true)
+    }
 }
 
 /// Selects which eviction strategy backs a cache instance.
@@ -356,12 +410,14 @@ mod tests {
     /// workaround on each `Option<f64>` field fixes this.
     #[test]
     fn dev_tweaks_f64_roundtrip_through_pipeline_config() {
-        let mut rc = RuntimeConfig::default();
-        rc.dev_tweaks = DevTweaks {
-            bloom_false_positive_rate: Some(0.0),
-            balancer_balance_tax: Some(1.1),
-            balancer_min_relative_improvement_threshold: Some(1.2),
-            balancer_key_distribution_refresh_threshold: Some(0.1),
+        let rc = RuntimeConfig {
+            dev_tweaks: DevTweaks {
+                bloom_false_positive_rate: Some(0.0),
+                balancer_balance_tax: Some(1.1),
+                balancer_min_relative_improvement_threshold: Some(1.2),
+                balancer_key_distribution_refresh_threshold: Some(0.1),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let pc = PipelineConfig {

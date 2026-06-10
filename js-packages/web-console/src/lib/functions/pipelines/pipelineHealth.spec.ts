@@ -329,20 +329,63 @@ describe('formatPipelineEventDescription', () => {
       makeEvent({
         recorded_at: '2026-05-01T12:00:00Z',
         program_status: 'Success',
+        storage_status: 'InUse',
         deployment_resources_status: 'Provisioned',
+        deployment_resources_desired_status: 'Provisioned',
         deployment_runtime_status: null,
+        deployment_runtime_desired_status: 'Running',
         deployment_has_error: false
       })
     )
     expect(out).toContain('recorded_at: 2026-05-01T12:00:00Z')
     expect(out).toContain('program_status: Success')
-    expect(out).toContain('deployment_resources_status: Provisioned')
-    expect(out).toContain('deployment_runtime_status: (none)')
+    expect(out).toContain('storage_status: InUse')
     expect(out).toContain('deployment_has_error: false')
     expect(out).toContain('deployment_error.message: (none)')
     expect(out).toContain('deployment_error.error_code: (none)')
+    expect(out).toContain('storage_status_details: (none)')
     expect(out).toContain('deployment_resources_status_details: (none)')
     expect(out).toContain('deployment_runtime_status_details: (none)')
+  })
+
+  it('still appends the desired suffix when desired matches the current status', () => {
+    const out = formatPipelineEventDescription(
+      makeEvent({
+        deployment_resources_status: 'Provisioned',
+        deployment_resources_desired_status: 'Provisioned'
+      })
+    )
+    expect(out).toContain('deployment_resources_status: Provisioned, desired is Provisioned')
+  })
+
+  it('appends ", desired is X" when desired differs from the current status', () => {
+    const out = formatPipelineEventDescription(
+      makeEvent({
+        deployment_resources_status: 'Provisioned',
+        deployment_resources_desired_status: 'Stopped',
+        deployment_runtime_status: 'Running',
+        deployment_runtime_desired_status: 'Suspended'
+      })
+    )
+    expect(out).toContain('deployment_resources_status: Provisioned, desired is Stopped')
+    expect(out).toContain('deployment_runtime_status: Running, desired is Suspended')
+  })
+
+  it('renders the desired suffix verbatim when the desired status is nullish', () => {
+    // The suffix is now unconditional, so a nullish desired status is
+    // stringified ("null"/"undefined") rather than suppressed.
+    const out = formatPipelineEventDescription(
+      makeEvent({
+        storage_status: undefined,
+        deployment_resources_status: 'Stopped',
+        deployment_resources_desired_status: undefined,
+        deployment_runtime_status: null,
+        deployment_runtime_desired_status: null
+      })
+    )
+    expect(out).toContain('storage_status: (none)')
+    expect(out).toContain('deployment_resources_status: Stopped, desired is (none)')
+    expect(out).toContain('deployment_runtime_status: (none), desired is (none)')
   })
 
   it('renders deployment_error fields when present', () => {
@@ -363,10 +406,12 @@ describe('formatPipelineEventDescription', () => {
   it('renders status detail blocks as pretty JSON when provided', () => {
     const out = formatPipelineEventDescription(
       makeEvent({
+        storage_status_details: { backend: 'file' },
         deployment_resources_status_details: { phase: 'Pending' },
         deployment_runtime_status_details: { reason: 'Initializing' }
       })
     )
+    expect(out).toContain('"backend": "file"')
     expect(out).toContain('"phase": "Pending"')
     expect(out).toContain('"reason": "Initializing"')
   })

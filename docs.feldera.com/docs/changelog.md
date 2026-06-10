@@ -14,6 +14,44 @@ import TabItem from '@theme/TabItem';
 
         ## Unreleased
 
+        - Casts of strings to Boolean and floating point values will
+        produce runtime errors instead of legal values for illegal string
+        values.  The set of strings that can be legally converted to
+        Booleans has been changed.
+
+        - No longer allowed to edit `runtime_config.resources.storage_class` if the pipeline storage is not cleared.
+
+        - Calling `/start` on a pipeline that already failed to compile will directly return an error instead of
+          the runner later on setting the `deployment_error` during its check whether to proceed to provisioning.
+
+        - New `max_queued_bytes` setting for input connectors.  The default is 1,000 times
+          `max_queued_records`, whether that is explicitly set or the default of 1,000,000.
+          This is a change in behavior, since previously there was no byte limit.  We
+          believe that the new behavior is generally an improvement that will prevent using
+          excessive memory or even running out of memory but, to restore the previous
+          behavior, specify a large number for `max_queued_bytes`.
+
+        - Delta Lake output connector:
+
+        `log_retention_duration` and
+        `enable_expired_log_cleanup` config options to control transaction-log retention on newly created
+        tables.
+
+        Both are only applied at table creation ( i.e. new table or truncate mode ); against an existing table they
+        are ignored. Defaults are unchanged (Delta Lake's own: 30 days, cleanup enabled).
+
+        The connector now logs a warning at startup when `checkpoint_interval`,
+        `log_retention_duration`, or `enable_expired_log_cleanup` in the connector config
+        differs from the existing table's metadata.
+
+        - Large Delta Lake, Iceberg scans (e.g. Delta CDC `ORDER BY`) and ad-hoc queries now share a bounded memory pool
+        and spill to disk under `<storage>/datafusion-tmp/`.
+
+        A new `runtime_config.datafusion_memory_mb` setting controls the pool size
+        (defaults to 5% of the pipeline's memory budget, capped at 2 GB).
+
+        ## v0.294.0
+
         The HTTP egress API endpoint now accepts a connector configuration as the JSON body.
         This allows more control over connector configuration.  For example:
 

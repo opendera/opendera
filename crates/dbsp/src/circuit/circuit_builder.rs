@@ -58,6 +58,7 @@ use dyn_clone::{DynClone, clone_box};
 use feldera_ir::{LirCircuit, LirNodeId};
 use feldera_samply::Span;
 use feldera_storage::{FileCommitter, StoragePath};
+use itertools::Itertools;
 use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
 use std::{
@@ -1098,6 +1099,9 @@ pub trait Node: Any {
     /// from a checkpoint must be backfilled from clean state.
     fn clear_state(&mut self) -> Result<(), DbspError>;
 
+    /// Call [`Operator::start_compaction`](super::operator_traits::Operator::start_compaction) on the operator this node encapsulates.
+    fn start_compaction(&mut self);
+
     /// Place operator in the replay mode.
     ///
     /// In the replay mode the operator streams its stored state to a temporary
@@ -1192,7 +1196,7 @@ impl NodeId {
         self.0
     }
 
-    pub(super) fn root() -> Self {
+    pub fn root() -> Self {
         Self(0)
     }
 }
@@ -1201,6 +1205,41 @@ impl Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_char('n')?;
         Debug::fmt(&self.0, f)
+    }
+}
+
+/// Identifies a circuit region by name and a numeric ID; each pair is supposed to be unique.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct RegionName {
+    /// ID for a region used to distinguish multiple regions with the same name.
+    id: u64,
+    pub name: Cow<'static, str>,
+}
+
+impl RegionName {
+    fn new(name: &str, id: u64) -> Self {
+        Self {
+            id,
+            name: Cow::Owned(name.to_string()),
+        }
+    }
+
+    /// Returns the identifier for this region.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Returns the name of this region.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Display for RegionName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name.as_ref())?;
+        f.write_char(':')?;
+        write!(f, "{}", self.id)
     }
 }
 
@@ -1221,7 +1260,7 @@ impl Serialize for GlobalNodeId {
     where
         S: Serializer,
     {
-        let s = self.node_identifier();
+        let s = self.node_identifier().to_string();
         serializer.serialize_str(&s)
     }
 }
@@ -1276,16 +1315,14 @@ impl GlobalNodeId {
     }
 
     /// Generate unique name to use as a node label in a visual graph.
-    pub fn node_identifier(&self) -> String {
-        let mut node_ident = "n".to_string();
-
-        for i in 0..self.path().len() {
-            node_ident.push_str(&self.path()[i].to_string());
-            if i < self.path().len() - 1 {
-                node_ident.push('_');
+    pub fn node_identifier(&self) -> impl Display {
+        struct NodeIdentifier<'a>(&'a GlobalNodeId);
+        impl<'a> Display for NodeIdentifier<'a> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "n{}", self.0.path().iter().format("_"))
             }
         }
-        node_ident
+        NodeIdentifier(self)
     }
 
     /// Returns local node id of `self` or `None` if `self` is the root node.
@@ -1494,10 +1531,20 @@ pub(crate) fn register_replay_stream<C, B>(
     // We currently only support using operators in the top-level circuit
     // as replay sources.
     if TypeId::of::<()>() == TypeId::of::<C::Time>() {
-        circuit.cache_insert(
-            ReplaySource::new(stream.stream_id()),
-            Box::new(replay_stream.clone()),
-        );
+        // If a replay source already exists, don't overwrite it. This normally shouldn't
+        // happen as we should not have more than one integral for each stream. One situation
+        // where this does happen today is for input streams that have an integral without
+        // an accumulator as part of input_upsert, and another integral with an accumulator
+        // created by a downstream join or aggregate. In this case, we want to use the former
+        // for replay, as the latter may have been added in the new version of the program
+        // and may be empty, while the former can have state (conversely, if the input integral
+        // is empty, the downstream integral is guaranteed to be empty too).
+        if !circuit.cache_contains(&ReplaySource::new(stream.stream_id())) {
+            circuit.cache_insert(
+                ReplaySource::new(stream.stream_id()),
+                Box::new(replay_stream.clone()),
+            );
+        }
     }
 }
 
@@ -1836,6 +1883,8 @@ pub trait CircuitBase: 'static {
     ) -> Result<PartitioningPolicy, DbspError>;
 
     fn rebalance(&self);
+
+    fn start_compaction(&self);
 }
 
 /// The circuit interface.  All DBSP computation takes place within a circuit.
@@ -1986,6 +2035,39 @@ pub trait Circuit: CircuitBase + Clone + WithClock {
     fn region<F, T>(&self, name: &str, f: F) -> T
     where
         F: FnOnce() -> T;
+
+    /// Create a named region identifier for incremental region construction.
+    /// 'name' is the name displayed for the region.
+    /// 'id' is an identifier which distinguishes between regions with the same name.
+    ///
+    /// Returns a [`RegionName`] that can be passed to [`Circuit::open_region`]
+    /// and [`Circuit::close_region`] to associate operators with the region
+    /// from multiple call sites.
+    fn create_region_name(&self, name: &str, id: u64) -> RegionName {
+        RegionName::new(name, id)
+    }
+
+    /// Open the circuit region identified by `name`.
+    ///
+    /// Emits an `OpenRegion` event.  Every operator or subcircuit created after
+    /// this call (in the same thread) will be inserted in the named region until
+    /// [`Circuit::close_region`] is called with the same `name`.  Saves the previously
+    /// active region.
+    ///
+    /// # Panics
+    ///
+    /// The caller is responsible for pairing every `open_region` with a
+    /// matching `close_region`; failing to do so will leave the region stack
+    /// in an inconsistent state.
+    #[track_caller]
+    fn open_region(&self, name: RegionName);
+
+    /// Close the circuit region identified by `name`.  Restores the previously
+    /// active region saved by [`Circuit::open_region`].
+    ///
+    /// Emits a `CloseRegion` event which should use the same name as the most recent
+    /// [`Circuit::open_region`] call.
+    fn close_region(&self, name: RegionName);
 
     /// Add a dependency from `preprocessor_node_id` to all input operators in the
     /// circuit, making sure that this node and all its predecessors
@@ -3506,6 +3588,13 @@ where
     fn rebalance(&self) {
         self.inner().balancer.rebalance()
     }
+
+    fn start_compaction(&self) {
+        let _ = self.map_local_nodes_mut(&mut |node| {
+            node.start_compaction();
+            Ok(())
+        });
+    }
 }
 
 impl<P, T> Circuit for ChildCircuit<P, T>
@@ -3699,7 +3788,7 @@ where
             .with_tooltip(|| {
                 let nodes = circuit.nodes.borrow();
                 let node = nodes[id.0].borrow();
-                format!("{} {}", node.name(), node.global_id())
+                format!("{} {}", node.name(), node.global_id().node_identifier())
             });
         let (result, duration) = Timed::new(circuit.nodes.borrow()[id.0].borrow_mut().eval()).await;
         let progress = result?;
@@ -3752,6 +3841,15 @@ where
         let res = f();
         self.log_circuit_event(&CircuitEvent::pop_region());
         res
+    }
+
+    #[track_caller]
+    fn open_region(&self, name: RegionName) {
+        self.log_circuit_event(&CircuitEvent::open_region(name, Some(Location::caller())));
+    }
+
+    fn close_region(&self, name: RegionName) {
+        self.log_circuit_event(&CircuitEvent::close_region(name));
     }
 
     fn add_preprocessor(&self, preprocessor_node_id: NodeId) {
@@ -4673,6 +4771,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -4818,6 +4920,10 @@ where
 
     fn restore(&mut self, base: &StoragePath) -> Result<(), DbspError> {
         self.operator.restore(base, self.persistent_id().as_deref())
+    }
+
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -4981,6 +5087,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -5133,6 +5243,10 @@ where
 
     fn restore(&mut self, base: &StoragePath) -> Result<(), DbspError> {
         self.operator.restore(base, self.persistent_id().as_deref())
+    }
+
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -5346,6 +5460,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -5531,6 +5649,10 @@ where
 
     fn restore(&mut self, base: &StoragePath) -> Result<(), DbspError> {
         self.operator.restore(base, self.persistent_id().as_deref())
+    }
+
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -5744,6 +5866,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -5927,6 +6053,10 @@ where
 
     fn restore(&mut self, base: &StoragePath) -> Result<(), DbspError> {
         self.operator.restore(base, self.persistent_id().as_deref())
+    }
+
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -6135,6 +6265,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -6326,6 +6460,10 @@ where
         self.operator.restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -6507,6 +6645,10 @@ where
             .restore(base, self.persistent_id().as_deref())
     }
 
+    fn start_compaction(&mut self) {
+        self.operator.borrow_mut().start_compaction()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.borrow_mut().clear_state()
     }
@@ -6671,6 +6813,8 @@ where
         // See comment in `commit`.
         Ok(())
     }
+
+    fn start_compaction(&mut self) {}
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
         Ok(())
@@ -6900,6 +7044,10 @@ where
         Ok(())
     }
 
+    fn start_compaction(&mut self) {
+        self.circuit.start_compaction();
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.circuit
             .map_local_nodes_mut(&mut |node| node.clear_state())
@@ -7124,6 +7272,19 @@ impl CircuitHandle {
         let mut need_backfill: BTreeSet<GlobalNodeId> = BTreeSet::new();
 
         // debug!("CircuitHandle::restore: restoring from checkpoint {}", base);
+
+        // In persistent mode, refuse to silently treat a vanished state
+        // file as backfill. dependencies.json records every state file at
+        // commit time; if any are gone, the corruption is structural and
+        // operators need to see it. A missing backend in persistent mode is
+        // an invariant violation, surface it rather than skipping verify.
+        if Runtime::mode() == Mode::Persistent {
+            let backend = Runtime::storage_backend()?;
+            crate::circuit::checkpointer::Checkpointer::verify_checkpoint_intact(
+                backend.as_ref(),
+                base,
+            )?;
+        }
 
         // Initialize `need_backfill` to operators without a checkpoint.
         // Fail if there are any errors other than NotFound.
@@ -7535,10 +7696,15 @@ impl CircuitHandle {
             return true;
         };
 
-        replay_info.replay_sources.keys().all(|node_id| {
+        // Bootstrapping is finished when all replay sources have completed their replay and the
+        // transaction has been committed.
+
+        let all_complete = replay_info.replay_sources.keys().all(|node_id| {
             self.circuit
                 .map_local_node_mut(*node_id, &mut |node| node.is_replay_complete())
-        })
+        });
+
+        all_complete && self.is_commit_complete()
     }
 
     /// Finalize the replay phase of the circuit.
@@ -7668,6 +7834,10 @@ impl CircuitHandle {
 
     pub fn rebalance(&self) {
         self.circuit.rebalance()
+    }
+
+    pub fn start_compaction(&self) {
+        self.circuit.start_compaction()
     }
 }
 
@@ -7873,6 +8043,98 @@ mod tests {
 
     fn my_factorial(n: usize) -> usize {
         if n == 1 { 1 } else { n * my_factorial(n - 1) }
+    }
+
+    /// Verify that operators added across multiple `open_region`/`close_region`
+    /// calls on the same [`RegionName`] all land in the same region tree node.
+    #[test]
+    fn open_close_region() {
+        const REGION: &str = "my_region";
+
+        let monitor = TraceMonitor::new_panic_on_error();
+        let region: Rc<RefCell<Option<super::RegionName>>> = Rc::new(RefCell::new(None));
+
+        let _circuit = RootCircuit::build({
+            let monitor = monitor.clone();
+            let region = region.clone();
+            move |circuit| {
+                monitor.attach(circuit, "monitor");
+
+                let r = circuit.create_region_name(REGION, 0);
+
+                circuit.open_region(r.clone());
+                let source1 = circuit.add_source(Generator::new(|| 1_i32));
+                circuit.close_region(r.clone());
+
+                circuit.open_region(r.clone());
+                let source2 = circuit.add_source(Generator::new(|| 2_i32));
+                circuit.close_region(r.clone());
+
+                circuit.open_region(r.clone());
+                source1
+                    .apply2(&source2, |a: &i32, b: &i32| a + b)
+                    .inspect(|_| {});
+                circuit.close_region(r.clone());
+
+                *region.borrow_mut() = Some(r);
+                Ok(())
+            }
+        })
+        .unwrap()
+        .0;
+
+        // source1, source2, apply2, inspect — all in the single "my_region" node.
+        let region = region.borrow();
+        assert_eq!(
+            monitor.count_nodes_in_region(region.as_ref().unwrap()),
+            Some(4)
+        );
+    }
+
+    /// Verify that two separate `create_region` calls with the same name
+    /// produce independent region nodes: operators added via each handle
+    /// land in different nodes, not the same one.
+    #[test]
+    fn separate_create_region_same_name() {
+        const REGION: &str = "my_region";
+
+        let monitor = TraceMonitor::new_panic_on_error();
+        // RegionNames are created inside the build closure; smuggle them out via Rc<RefCell>.
+        let r1: Rc<RefCell<Option<super::RegionName>>> = Rc::new(RefCell::new(None));
+        let r2: Rc<RefCell<Option<super::RegionName>>> = Rc::new(RefCell::new(None));
+
+        let _circuit = RootCircuit::build({
+            let monitor = monitor.clone();
+            let r1 = r1.clone();
+            let r2 = r2.clone();
+            move |circuit| {
+                monitor.attach(circuit, "monitor");
+
+                let region1 = circuit.create_region_name(REGION, 0);
+                let region2 = circuit.create_region_name(REGION, 1);
+
+                circuit.open_region(region1.clone());
+                circuit.add_source(Generator::new(|| 1_i32));
+                circuit.close_region(region1.clone());
+
+                circuit.open_region(region2.clone());
+                circuit.add_source(Generator::new(|| 2_i32));
+                circuit.close_region(region2.clone());
+
+                *r1.borrow_mut() = Some(region1);
+                *r2.borrow_mut() = Some(region2);
+                Ok(())
+            }
+        })
+        .unwrap()
+        .0;
+
+        let r1 = r1.borrow();
+        let r2 = r2.borrow();
+        // Two distinct region nodes, each containing one operator.
+        assert_eq!(monitor.count_regions_with_name(REGION), 2);
+        assert_eq!(monitor.count_nodes_in_region(r1.as_ref().unwrap()), Some(1));
+        assert_eq!(monitor.count_nodes_in_region(r2.as_ref().unwrap()), Some(1));
     }
 
     #[test]

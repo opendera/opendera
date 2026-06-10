@@ -24,7 +24,8 @@ The compiler supports the following SQL data types:
 | `NULL`                      | A type comprising only the `NULL` value.                                                                                                                           |                            |
 | `INTERVAL`                  | A SQL interval. Two types of intervals are supported: long intervals (comprising years and months), and short intervals, comprising days, hours, minutes, seconds. |                            |
 | `TIME`                      | A time of the day.                                                                                                                                                 |                            |
-| `TIMESTAMP`                 | A value containing a date and a time without a timezone.                                                                                                           | `DATETIME`                 |
+| `TIMESTAMP`                 | A value containing a date and a time without a timezone.                                                                                                           | `DATETIME`, `TIMESTAMP WITHOUT TIME ZONE` |
+| `TIMESTAMP WITH TIME ZONE`  | An instant in time (represented internally as a TIMESTAMP in the UTC time zone)                                                                                    |                            |
 | `DATE`                      | A date value.                                                                                                                                                      |                            |
 | `GEOMETRY`                  | A geographic data type (only rudimentary support at this point).                                                                                                   |                            |
 | `ROW`                       | A tuple (anonymous struct with named fields) with 1 or more elements.  Example `ROW(left int null, right varchar)`                                                 |                            |
@@ -163,15 +164,6 @@ the same program):
 ```sql
 CREATE TABLE T(street VARCHAR, city VARCHAR, year INT);
 CREATE VIEW V AS SELECT address_typ(T.street, city, 'CA', 94087) as address, T.year as year FROM T;
-```
-
-Tables can have structure-valued columns, but these have to be fully
-qualified using both the table name and the column name in programs:
-
-```sql
-CREATE TABLE PERS(p0 employee_typ, p1 employee_typ);
-CREATE VIEW V AS SELECT PERS.p0.address FROM PERS
-WHERE PERS.p0.first_name = 'Mike'
 ```
 
 ## Grammar for specifying types

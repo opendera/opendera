@@ -1,53 +1,48 @@
 <script lang="ts">
   import { slide } from 'svelte/transition'
+  import ClickFeedback from '$lib/components/common/ClickFeedback.svelte'
   import InlineDropdown from '$lib/components/common/InlineDropdown.svelte'
+  import { useElapsedTime } from '$lib/compositions/common/useElapsedTime'
   import { useGlobalDialog } from '$lib/compositions/layout/useGlobalDialog.svelte'
   import { uuidV7Timestamp } from '$lib/functions/common/date'
   import { humanSize } from '$lib/functions/common/string'
-  import { formatDateTime, useElapsedTime } from '$lib/functions/format'
+  import { formatDateTime } from '$lib/functions/format'
   import type { CheckpointMetadata } from '$lib/services/manager'
   import CheckpointDialog from './CheckpointDialog.svelte'
 
   const {
     checkpoints,
     onClose,
-    onCheckpoint
+    onCheckpoint,
+    checkpointInProgress = false
   }: {
     checkpoints: CheckpointMetadata[]
     onClose: () => void
     onCheckpoint?: () => void
+    checkpointInProgress?: boolean
   } = $props()
 
   const globalDialog = useGlobalDialog()
-
-  let requested = $state(false)
-  const handleCheckpoint = () => {
-    if (!onCheckpoint) {
-      return
-    }
-    requested = true
-    onCheckpoint()
-    // Reset after a short delay so the button becomes clickable again
-    setTimeout(() => (requested = false), 3_000)
-  }
-
-  const openCheckpointDialog = () => {
-    globalDialog.dialog = checkpointDialog
-  }
-
   const elapsed = useElapsedTime()
+
+  let clickFeedback = $state<() => void>()
 </script>
 
 {#snippet checkpointDialog()}
-  <CheckpointDialog onConfirm={handleCheckpoint} />
+  <CheckpointDialog
+    onConfirm={() => {
+      clickFeedback?.()
+      onCheckpoint?.()
+    }}
+  />
 {/snippet}
 
-<div class="bg-white-dark flex h-full flex-col gap-2 rounded pt-4 px-4">
+<div class="bg-white-dark flex h-full flex-col gap-2 rounded px-4 pt-4">
   <div class="flex items-start justify-between">
     <div class="text-lg font-medium">Checkpoints</div>
     <button class="fd fd-x text-[20px]" onclick={onClose} aria-label="Close"></button>
   </div>
-  <div class="scrollbar flex-1 overflow-y-auto pr-4 -mr-4">
+  <div class="-mr-4 scrollbar flex-1 overflow-y-auto pr-4">
     {#if checkpoints.length === 0}
       <div class="p-2 text-surface-500">No checkpoints</div>
     {:else}
@@ -98,13 +93,17 @@
     {/if}
   </div>
   {#if onCheckpoint}
-    <button
-      class="btn w-full preset-outlined-primary-500 btn-sm"
-      data-testid="btn-make-checkpoint"
-      onclick={openCheckpointDialog}
-      disabled={requested}
-    >
-      {requested ? 'Requesting checkpoint...' : 'Create checkpoint'}
-    </button>
+    <ClickFeedback active={checkpointInProgress} bind:clickFeedback>
+      {#snippet children({ active })}
+        <button
+          class="btn w-full preset-outlined-primary-500 btn-sm"
+          data-testid="btn-make-checkpoint"
+          onclick={() => (globalDialog.dialog = checkpointDialog)}
+          disabled={active}
+        >
+          {active ? 'Creating checkpoint...' : 'Create checkpoint'}
+        </button>
+      {/snippet}
+    </ClickFeedback>
   {/if}
 </div>

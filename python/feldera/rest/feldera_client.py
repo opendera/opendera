@@ -2,10 +2,13 @@ import json
 import logging
 import pathlib
 import time
+import warnings
 from decimal import Decimal
 from typing import Any, Dict, Generator, Mapping, Optional
 from urllib.parse import quote
 
+import pyarrow as pa
+import pyarrow.ipc
 import requests
 
 from feldera.enums import BootstrapPolicy, PipelineFieldSelector, PipelineStatus
@@ -483,6 +486,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         pipeline_name: str,
         initial: str = "running",
         bootstrap_policy: Optional[BootstrapPolicy] = None,
+        silent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -510,6 +514,9 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         if bootstrap_policy is not None:
             start_params["bootstrap_policy"] = bootstrap_policy.value
 
+        if silent_bootstrap:
+            start_params["silent_bootstrap"] = "true"
+
         self.http.post(
             path=f"/pipelines/{pipeline_name}/start",
             params=start_params,
@@ -528,6 +535,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         self,
         pipeline_name: str,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
+        silent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -547,6 +555,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             pipeline_name,
             "running",
             bootstrap_policy,
+            silent_bootstrap,
             wait,
             timeout_s,
             dismiss_error,
@@ -556,6 +565,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         self,
         pipeline_name: str,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
+        silent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: float | None = None,
         dismiss_error: bool = True,
@@ -574,6 +584,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             pipeline_name,
             "paused",
             bootstrap_policy,
+            silent_bootstrap,
             wait,
             timeout_s,
             dismiss_error,
@@ -583,6 +594,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         self,
         pipeline_name: str,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
+        silent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -601,6 +613,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             pipeline_name,
             "standby",
             bootstrap_policy,
+            silent_bootstrap,
             wait,
             timeout_s,
             dismiss_error,
@@ -659,9 +672,22 @@ Reason: The pipeline is in a STOPPED state due to the following error:
     def approve_pipeline(
         self,
         pipeline_name: str,
+        silent_bootstrap: bool = False,
     ):
+        """
+        Approve a pipeline awaiting approval to proceed with bootstrapping.
+
+        :param pipeline_name: The name of the pipeline to approve.
+        :param silent_bootstrap: Set True to bootstrap with output connectors
+            disabled, so no records are emitted during the bootstrap phase.
+            False by default.
+        """
+
+        params = {"silent_bootstrap": "true"} if silent_bootstrap else {}
+
         self.http.post(
             path=f"/pipelines/{pipeline_name}/approve",
+            params=params,
         )
 
     def stop_pipeline(
@@ -785,12 +811,49 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 
         return int(resp.get("transaction_id"))
 
+    def advance_clock(
+        self,
+        pipeline_name: str,
+        delta_ms: Optional[int] = None,
+    ) -> Dict[str, int | str]:
+        """
+        Advance the externally-driven `NOW()` clock and return its new value.
+
+        Requires `dev_tweaks.now_http_driven = True` on the pipeline.  The
+        clock is forward-only.
+
+        :param pipeline_name: The name of the pipeline.
+
+        :param delta_ms: Milliseconds to add to `NOW()`.  ``0`` reads the
+            current value without moving the clock; ``None`` (the default)
+            advances by one ``clock_resolution`` (one configured tick).
+            Must be non-negative.  Non-zero values round up to the next
+            ``clock_resolution`` boundary, so a sub-resolution delta still
+            moves the clock by one full tick.
+
+        The returned ``now_ms`` is the value the worker will emit on its
+        next pipeline step; queries against materialized views may
+        observe the previous ``NOW()`` until that step completes.  Poll
+        the view if you need read-after-write semantics.
+
+        :return: A dict ``{"now_ms": <int>, "now": <RFC 3339 str>}``.
+
+        :raises FelderaAPIError: If the clock is not in http-driven mode,
+            the body is malformed, or the pipeline is not running.
+        """
+
+        return self.http.post(
+            path=f"/pipelines/{pipeline_name}/clock/advance",
+            body={"delta_ms": delta_ms},
+        )
+
     def commit_transaction(
         self,
         pipeline_name: str,
         transaction_id: Optional[int] = None,
         wait: bool = True,
         timeout_s: Optional[float] = None,
+        poll_interval_s: float = 0.5,
     ):
         """
         Commits the currently active transaction.
@@ -805,6 +868,9 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 
         :param timeout_s: Maximum time (in seconds) to wait for the transaction to commit when `wait` is True.
             If None, the function will wait indefinitely.
+
+        :param poll_interval_s: Polling interval at which to check while waiting for the
+            transaction to commit (default is every 0.5 seconds). Not used if `wait=False`.
 
         :raises RuntimeError: If there is currently no transaction in progress.
         :raises ValueError: If the provided `transaction_id` does not match the current transaction.
@@ -847,8 +913,11 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             if stats["global_metrics"]["transaction_id"] != transaction_id:
                 return
 
-            logging.debug("commit hasn't completed, waiting for 1 more second")
-            time.sleep(1.0)
+            logging.debug(
+                "commit hasn't completed, waiting for %.1f more seconds",
+                poll_interval_s,
+            )
+            time.sleep(poll_interval_s)
 
     def checkpoint_pipeline(self, pipeline_name: str) -> int:
         """
@@ -1088,6 +1157,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         pipeline_name: str,
         table_name: str,
         format: str,
+        send_snapshot: Optional[bool] = None,
         backpressure: bool = True,
         array: bool = False,
         timeout: Optional[float] = None,
@@ -1099,6 +1169,9 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         :param pipeline_name: The name of the pipeline
         :param table_name: The name of the table to listen to
         :param format: The format of the data, either "json" or "csv"
+        :param send_snapshot: When True, the connector delivers a full snapshot
+            of the materialized view before streaming incremental updates. The
+            view must be materialized. Defaults to False.
         :param backpressure: When the flag is True (the default), this method waits for the consumer to receive each
             chunk and blocks the pipeline if the consumer cannot keep up. When this flag is False, the pipeline drops
             data chunks if the consumer is not keeping up with its output. This prevents a slow consumer from slowing
@@ -1114,6 +1187,9 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             "format": format,
             "backpressure": _prepare_boolean_input(backpressure),
         }
+
+        if send_snapshot is not None:
+            params["send_snapshot"] = _prepare_boolean_input(send_snapshot)
 
         if format == "json":
             params["array"] = _prepare_boolean_input(array)
@@ -1223,18 +1299,47 @@ Reason: The pipeline is in a STOPPED state due to the following error:
                 file.write(chunk)
         file.close()
 
-    def query_as_json(
+    def query_as_arrow(
         self, pipeline_name: str, query: str
-    ) -> Generator[Mapping[str, Any], None, None]:
+    ) -> Generator[pa.RecordBatch, None, None]:
         """
-        Executes an ad-hoc query on the specified pipeline and returns the result as a generator that yields
-        rows of the query as Python dictionaries.
-        All floating-point numbers are deserialized as Decimal objects to avoid precision loss.
+        Executes an ad-hoc query on the specified pipeline and returns the result
+        as a generator that yields PyArrow RecordBatches.
+
+        Arrow IPC preserves SQL type fidelity that the JSON format cannot:
+        integers wider than 53 bits, ``MAP`` keys that are not strings, and
+        result sets where two columns share a name. Prefer this method over
+        :meth:`.query_as_json` when programmatically inspecting results.
 
         :param pipeline_name: The name of the pipeline to query.
         :param query: The SQL query to be executed.
-        :return: A generator that yields each row of the result as a Python dictionary, deserialized from JSON.
+        :return: A generator that yields each query batch as a ``pyarrow.RecordBatch``.
         """
+        params = {
+            "pipeline_name": pipeline_name,
+            "sql": query,
+            "format": "arrow_ipc",
+        }
+        resp: requests.Response = self.http.get(
+            path=f"/pipelines/{pipeline_name}/query",
+            params=params,
+            stream=True,
+        )
+
+        try:
+            with pyarrow.ipc.open_stream(resp.raw) as reader:
+                for batch in reader:
+                    yield batch
+        finally:
+            resp.close()
+
+    def _query_json_stream(
+        self, pipeline_name: str, query: str
+    ) -> Generator[Mapping[str, Any], None, None]:
+        """Internal JSON streaming used by both `query_as_json` and the
+        higher-level dict-returning APIs. Does not emit a deprecation
+        warning so callers within Feldera can keep delegating to it
+        without making user code noisy."""
         params = {
             "pipeline_name": pipeline_name,
             "sql": query,
@@ -1250,6 +1355,39 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         for chunk in resp.iter_lines(chunk_size=1024):
             if chunk:
                 yield json.loads(chunk, parse_float=Decimal)
+
+    def query_as_json(
+        self, pipeline_name: str, query: str
+    ) -> Generator[Mapping[str, Any], None, None]:
+        """
+        Executes an ad-hoc query on the specified pipeline and returns the result as a generator that yields
+        rows of the query as Python dictionaries.
+
+        Finite floating-point numbers are decoded with ``decimal.Decimal``
+        so the digits printed on the JSON line round-trip exactly. JSON
+        cannot represent ``NaN``, ``Infinity`` or ``-Infinity``; the
+        server emits those as ``null`` and they arrive here as ``None``.
+
+        .. deprecated::
+            The JSON format coerces numbers to ``f64`` (losing precision for
+            wide integers), drops ``NaN`` and infinities, cannot represent
+            SQL ``MAP`` keys that are not strings, and silently drops
+            result columns that share a name. Use
+            :meth:`.query_as_arrow` instead. See
+            https://github.com/feldera/feldera/issues/4219.
+
+        :param pipeline_name: The name of the pipeline to query.
+        :param query: The SQL query to be executed.
+        :return: A generator that yields each row of the result as a Python dictionary, deserialized from JSON.
+        """
+        warnings.warn(
+            "query_as_json is deprecated; switch to query_as_arrow for "
+            "type-faithful results. See "
+            "https://github.com/feldera/feldera/issues/4219.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        yield from self._query_json_stream(pipeline_name, query)
 
     def input_connector_stats(
         self, pipeline_name: str, table_name: str, connector_name: str
@@ -1469,6 +1607,9 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 
     def rebalance_pipeline(self, pipeline_name: str):
         self.http.post(path=f"/pipelines/{pipeline_name}/rebalance")
+
+    def start_compaction_pipeline(self, pipeline_name: str):
+        self.http.post(path=f"/pipelines/{pipeline_name}/start_compaction")
 
     def get_checkpoints(self, pipeline_name: str):
         return self.http.get(path=f"/pipelines/{pipeline_name}/checkpoints")

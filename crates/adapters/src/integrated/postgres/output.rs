@@ -18,7 +18,7 @@ use crate::{
 };
 use anyhow::{Context, Result as AnyResult, anyhow, bail};
 use feldera_adapterlib::catalog::SplitCursorBuilder;
-use feldera_adapterlib::transport::{AsyncErrorCallback, CommandHandler, Step};
+use feldera_adapterlib::transport::{AsyncErrorCallback, CommandHandler, OutputBatchType, Step};
 use feldera_types::{
     format::json::JsonFlavor,
     program_schema::{Relation, SqlIdentifier},
@@ -748,6 +748,7 @@ impl PostgresOutputEndpoint {
         key_schema: &Option<Relation>,
         value_schema: &Relation,
         controller: Weak<ControllerInner>,
+        is_index: bool,
     ) -> Result<Self, ControllerError> {
         config.validate().map_err(|e| {
             ControllerError::invalid_transport_configuration(endpoint_name, &e.to_string())
@@ -755,11 +756,13 @@ impl PostgresOutputEndpoint {
 
         validate_extra_columns_against_value_schema(endpoint_name, config, value_schema)?;
 
-        let key_schema = key_schema
-            .to_owned()
-            .ok_or(ControllerError::not_supported(
-                "Postgres output connector requires the view to have a unique key. Please specify the `index` property in the connector configuration. For more details, see: https://docs.feldera.com/connectors/unique_keys"
-            ))?;
+        if !is_index || key_schema.is_none() {
+            return Err(ControllerError::not_supported(
+                "Postgres output connector requires the view to have a unique key. Please specify the `index` property in the connector configuration. For more details, see: https://docs.feldera.com/connectors/unique_keys",
+            ));
+        }
+
+        let key_schema = key_schema.as_ref().unwrap().clone();
 
         let num_threads = config.threads;
         let mut handles = Vec::with_capacity(num_threads);
@@ -870,7 +873,7 @@ impl OutputConsumer for PostgresOutputEndpoint {
         self.config.max_buffer_size_bytes
     }
 
-    fn batch_start(&mut self, _step: Step) {
+    fn batch_start(&mut self, _step: Step, _batch_type: OutputBatchType) {
         self.txn_start = std::time::Instant::now();
         self.records_written.store(0, Ordering::Relaxed);
 
@@ -1036,7 +1039,7 @@ impl OutputEndpoint for PostgresOutputEndpoint {
         false
     }
 
-    fn batch_start(&mut self, _step: Step) -> AnyResult<()> {
+    fn batch_start(&mut self, _step: Step, _batch_type: OutputBatchType) -> AnyResult<()> {
         todo!()
     }
 
@@ -1092,12 +1095,7 @@ mod tests {
     }
 
     fn relation(name: &str, fields: Vec<Field>, materialized: bool) -> Relation {
-        Relation {
-            name: name.into(),
-            fields,
-            materialized,
-            properties: Default::default(),
-        }
+        Relation::new(name.into(), fields, materialized, Default::default())
     }
 
     fn postgres_url() -> String {
@@ -1133,6 +1131,7 @@ mod tests {
             &idx_rel,
             &main_rel,
             Weak::new(),
+            true,
         )
     }
 
@@ -1282,6 +1281,7 @@ mod tests {
         use crate::controller::EndpointId;
         use crate::format::Encoder;
         use crate::static_compile::seroutput::SerBatchImpl;
+        use feldera_adapterlib::transport::OutputBatchType;
 
         use super::super::PostgresOutputEndpoint;
         use feldera_types::transport::postgres::{
@@ -1377,6 +1377,7 @@ mod tests {
                 fields: vec![Field::new("id".into(), ColumnType::int(false))],
                 materialized: false,
                 properties: BTreeMap::new(),
+                primary_key: None,
             }
         }
 
@@ -1391,6 +1392,7 @@ mod tests {
                 ],
                 materialized: true,
                 properties: BTreeMap::new(),
+                primary_key: Some(vec!["id".into()]),
             }
         }
 
@@ -1480,6 +1482,7 @@ mod tests {
                 &Some(key_relation()),
                 &value_relation(),
                 Weak::new(),
+                true,
             )
             .expect("failed to create endpoint")
         }
@@ -1519,7 +1522,7 @@ mod tests {
         }
 
         fn encode_batch(endpoint: &mut PostgresOutputEndpoint, batch: &Arc<dyn SerBatch>) {
-            endpoint.consumer().batch_start(0);
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
             endpoint
                 .encode(batch.clone().arc_as_batch_reader())
                 .unwrap();
@@ -1842,6 +1845,7 @@ mod tests {
                 &Some(key_relation()),
                 &value_relation(),
                 Weak::new(),
+                true,
             ) {
                 Ok(_) => panic!("expected duplicate extra_columns to be rejected"),
                 Err(e) => e,
@@ -1862,6 +1866,7 @@ mod tests {
                 &Some(key_relation()),
                 &value_relation(),
                 Weak::new(),
+                true,
             ) {
                 Ok(_) => panic!("expected extra column name clash with view to be rejected"),
                 Err(e) => e,
@@ -2065,6 +2070,7 @@ mod tests {
                 &Some(key_relation()),
                 &value_relation(),
                 Weak::new(),
+                true,
             )
             .expect("failed to create endpoint")
         }
@@ -2078,7 +2084,7 @@ mod tests {
             let mut endpoint = make_endpoint(threads);
 
             assert_eq!(records_written(&endpoint), 0);
-            endpoint.consumer().batch_start(0);
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
             assert_eq!(records_written(&endpoint), 0);
             endpoint
                 .encode(batch.clone().arc_as_batch_reader())
@@ -2113,7 +2119,7 @@ mod tests {
             let batch = build_insert_batch(&[]);
             let mut endpoint = make_endpoint(1);
 
-            endpoint.consumer().batch_start(0);
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
             endpoint
                 .encode(batch.clone().arc_as_batch_reader())
                 .unwrap();
@@ -2133,7 +2139,7 @@ mod tests {
             // Force flushes during encode so the counter advances mid-batch.
             let mut endpoint = make_endpoint_flush_every(1, 10);
 
-            endpoint.consumer().batch_start(0);
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
             endpoint
                 .encode(batch.clone().arc_as_batch_reader())
                 .unwrap();
@@ -2162,7 +2168,7 @@ mod tests {
             // Simulate a stale counter value from an earlier (presumably
             // crashed) batch and verify that batch_start clears it.
             endpoint.records_written.store(99, Ordering::Relaxed);
-            endpoint.consumer().batch_start(0);
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
             assert_eq!(records_written(&endpoint), 0);
 
             // Close out cleanly so the worker transaction doesn't leak.
@@ -2211,7 +2217,7 @@ mod tests {
             let records = make_records(100);
             let batch = build_insert_batch(&records);
 
-            endpoint.consumer().batch_start(0);
+            endpoint.consumer().batch_start(0, OutputBatchType::Delta);
             endpoint
                 .encode(batch.clone().arc_as_batch_reader())
                 .unwrap();

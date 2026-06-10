@@ -4,9 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import org.apache.calcite.adapter.jdbc.JdbcSchema;
-import org.apache.calcite.jdbc.CalciteConnection;
-import org.apache.calcite.schema.SchemaPlus;
 import org.dbsp.sqlCompiler.CompilerMain;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
@@ -23,15 +20,13 @@ import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
+import org.dbsp.util.NullPrintStream;
 import org.dbsp.util.Utilities;
 import org.junit.Assert;
-import org.junit.Ignore;
 import org.junit.Test;
 
-import javax.sql.DataSource;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -41,10 +36,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
-import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
@@ -154,7 +146,7 @@ public class MetadataTests extends BaseSQLTests {
     }
 
     @Test
-    public void issue4626() throws SQLException {
+    public void issue4626() {
         PrintStream savedOut = System.out;
         ByteArrayOutputStream capture = new ByteArrayOutputStream();
         System.setOut(new PrintStream(capture));
@@ -207,13 +199,6 @@ public class MetadataTests extends BaseSQLTests {
             }
         }
         Assert.assertTrue(found);
-    }
-
-    DBSPCompiler chattyCompiler() {
-        DBSPCompiler compiler = this.testCompiler();
-        compiler.options.languageOptions.throwOnError = false;
-        compiler.options.ioOptions.quiet = false;
-        return compiler;
     }
 
     @Test
@@ -1236,6 +1221,9 @@ public class MetadataTests extends BaseSQLTests {
                       Default: <empty string>
                     --dataflow
                       Emit the Dataflow graph of the program in the specified JSON file
+                    --enterprise
+                      Generate code supporting enterprise features
+                      Default: false
                     --errors
                       Error output file; stderr if not specified
                       Default: <empty string>
@@ -1390,8 +1378,11 @@ public class MetadataTests extends BaseSQLTests {
                 );""";
         File file = createInputScript(sql);
         File json = this.createTempJsonFile();
+        PrintStream savedOut = System.out;
+        System.setOut(NullPrintStream.INSTANCE);
         CompilerMessages msg = CompilerMain.execute(
                 "-v", "1", "--dataflow", json.getPath(), "--noRust", file.getPath());
+        System.setOut(savedOut);
         Assert.assertEquals(0, msg.exitCode);
         String jsonContents = Utilities.readFile(json.toPath());
         String expected = TestUtil.readStringFromResourceFile("metadataTests-generateDFRecursive.json");

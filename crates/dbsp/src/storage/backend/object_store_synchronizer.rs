@@ -239,7 +239,7 @@ fn copy_file_once(
 /// List every file in `src` under `prefix`. Returns relative paths.
 fn list_files(src: &Arc<dyn StorageBackend>, prefix: &StoragePath) -> anyhow::Result<Vec<StoragePath>> {
     let mut out = Vec::new();
-    src.list(prefix, &mut |path, _| out.push(path.clone()))?;
+    src.list(prefix, &mut |entry| out.push(entry.name.clone()))?;
     Ok(out)
 }
 

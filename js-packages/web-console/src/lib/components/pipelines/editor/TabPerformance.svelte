@@ -5,8 +5,7 @@
 </script>
 
 <script lang="ts">
-  import { SegmentedControl } from '@skeletonlabs/skeleton-svelte'
-  import { format } from 'd3-format'
+  import { SegmentedControl } from 'common-ui'
   import Dayjs from 'dayjs'
   import PipelineMemoryGraph from '$lib/components/layout/pipelines/PipelineMemoryGraph.svelte'
   import PipelineStorageGraph from '$lib/components/layout/pipelines/PipelineStorageGraph.svelte'
@@ -21,11 +20,12 @@
     type PipelineManagerApi,
     usePipelineManager
   } from '$lib/compositions/usePipelineManager.svelte'
-  import { formatDateTime, useElapsedTime } from '$lib/functions/format'
+  import { formatDateTime, formatQty } from '$lib/functions/format'
+  import { useElapsedTime } from '$lib/compositions/common/useElapsedTime'
   import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
   import {
-    CustomJSONParserTransformStream,
-    parseCancellable,
+    createBigNumberStreamParser,
+    parseStream,
     pushAsCircularBuffer
   } from '$lib/functions/pipelines/changeStream'
   import { getDeploymentStatusLabel, isMetricsAvailable } from '$lib/functions/pipelines/status'
@@ -35,9 +35,6 @@
   import CheckpointsIndicator from './performance/CheckpointsIndicator.svelte'
   import TransactionStatus from './performance/TransactionStatus.svelte'
   import Drawer from '$lib/components/layout/Drawer.svelte'
-
-  const formatQty = (v: number) =>
-    typeof v === 'number' && Number.isFinite(v) ? format(',.0f')(v) : 'unknown'
 
   const {
     pipeline,
@@ -71,17 +68,6 @@
   let openDrawer = $state<DrawerState | null>(null)
   let checkpoints = $state<CheckpointMetadata[]>([])
   let checkpointStatus = $state<CheckpointStatus | null>(null)
-  let lastCheckpointAt = $state<Date | null>(null)
-  let prevActivityStatus = $state<string | null>(null)
-
-  $effect(() => {
-    const status = metrics.current.checkpoint_activity.status
-    if (prevActivityStatus === 'in_progress' && status === 'idle') {
-      lastCheckpointAt = new Date()
-    }
-    prevActivityStatus = status
-  })
-
   const handleConnectorSelect = (
     relationName: string,
     connectorName: string,
@@ -104,8 +90,12 @@
       cancelStream = undefined
       return undefined
     }
-    const { cancel } = parseCancellable(
+    const { cancel } = parseStream(
       result,
+      createBigNumberStreamParser<TimeSeriesEntry>({
+        paths: ['$'],
+        separator: ''
+      }),
       {
         pushChanges: (rows: TimeSeriesEntry[]) => {
           pushAsCircularBuffer(
@@ -134,10 +124,6 @@
           }
         }
       },
-      new CustomJSONParserTransformStream<TimeSeriesEntry>({
-        paths: ['$'],
-        separator: ''
-      }),
       {
         bufferSize: 8 * 1024 * 1024
       }
@@ -197,8 +183,7 @@
 </script>
 
 {#snippet label()}
-  <span class="inline sm:hidden"> Perf </span>
-  <span class="hidden sm:inline"> Performance </span>
+  Runtime
 {/snippet}
 
 {#if isMetricsAvailable(pipeline.current.status) === 'no'}
@@ -294,30 +279,13 @@
               <div>
                 <SegmentedControl
                   value={statusTab}
-                  onValueChange={(e) => (statusTab = e.value as typeof statusTab)}
-                >
-                  <SegmentedControl.Label />
-                  <SegmentedControl.Control
-                    class="-mt-3 w-fit flex-none overflow-visible rounded preset-filled-surface-50-950 p-1"
-                  >
-                    <SegmentedControl.Indicator class="bg-white-dark shadow" />
-                    <SegmentedControl.Item value="age" class="z-1 btn h-6 cursor-pointer px-5 py-4">
-                      <SegmentedControl.ItemText class="text-surface-950-50">
-                        <div class="text-start text-sm">Age</div>
-                      </SegmentedControl.ItemText>
-                      <SegmentedControl.ItemHiddenInput />
-                    </SegmentedControl.Item>
-                    <SegmentedControl.Item
-                      value="updated"
-                      class="z-1 btn h-6 cursor-pointer px-5 py-4"
-                    >
-                      <SegmentedControl.ItemText class="text-surface-950-50">
-                        <div class="text-start text-sm">Last status update</div>
-                      </SegmentedControl.ItemText>
-                      <SegmentedControl.ItemHiddenInput />
-                    </SegmentedControl.Item>
-                  </SegmentedControl.Control>
-                </SegmentedControl>
+                  onValueChange={(v) => (statusTab = v)}
+                  items={[
+                    { value: 'age', label: 'Age' },
+                    { value: 'updated', label: 'Last status update' }
+                  ]}
+                  class="-mt-3"
+                />
                 {#if statusTab === 'age'}
                   {@render age()}
                 {:else if statusTab === 'updated'}
@@ -353,7 +321,6 @@
           {checkpoints}
           {metrics}
           {checkpointStatus}
-          {lastCheckpointAt}
           onShowCheckpoints={() => (openDrawer = { kind: 'checkpoints' })}
         />
         <TransactionStatus {metrics} class="w-full"></TransactionStatus>
@@ -379,6 +346,7 @@
           {checkpoints}
           onClose={() => (openDrawer = null)}
           onCheckpoint={() => api.checkpointPipeline(pipelineName)}
+          checkpointInProgress={metrics.current.checkpoint_activity.status !== 'idle'}
         />
       {/if}
     </Drawer>

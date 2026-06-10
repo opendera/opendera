@@ -12,7 +12,7 @@ use crate::{
         max_level0_batch_size_records,
         metadata::{
             BLOOM_FILTER_BITS_PER_KEY, BLOOM_FILTER_HIT_RATE_PERCENT, BLOOM_FILTER_HITS_COUNT,
-            BLOOM_FILTER_MISSES_COUNT, BLOOM_FILTER_SIZE_BYTES, COMPLETED_MERGES,
+            BLOOM_FILTER_MISSES_COUNT, BLOOM_FILTER_SIZE_BYTES, COMPACTION_STATE, COMPLETED_MERGES,
             LOOSE_BATCHES_COUNT, LOOSE_MEMORY_RECORDS_COUNT, LOOSE_STORAGE_RECORDS_COUNT,
             MERGE_BACKPRESSURE_WAIT_TIME_SECONDS, MERGE_REDUCTION_PERCENT, MERGING_BATCHES_COUNT,
             MERGING_MEMORY_RECORDS_COUNT, MERGING_SIZE_BYTES, MERGING_STORAGE_RECORDS_COUNT,
@@ -78,7 +78,11 @@ use std::{
 };
 use std::{ops::RangeInclusive, sync::Mutex};
 use textwrap::indent;
-use tokio::{sync::Notify, task::yield_now};
+use tokio::{
+    sync::{Notify, futures::OwnedNotified},
+    task::yield_now,
+};
+use tracing::trace;
 mod index_set;
 mod list_merger;
 mod push_merger;
@@ -134,6 +138,59 @@ impl<B: Batch + Send + Sync> From<(Vec<String>, &Spine<B>)> for CommittedSpine {
     }
 }
 
+/// State of the compaction process in a slot.
+///
+/// ```text
+///      │
+///      ▼
+///    ┌──────┐                            ┌─────────┐
+///    │ none ├───────────────────────────►│requested│
+///    └──────┘                            └────┬────┘
+///       ▲                                     │
+///       │                                     │
+///       │                                     │
+///       │                                     │
+///       │         ┌───────────┐               │
+///       └─────────┤in progress│◄──────────────┘
+///                 └───────────┘
+/// ```
+///
+/// * none -> requested:
+///   - triggered by the `initiate_compaction` method in the first non-empty slot of the spine.
+///   - triggered when compaction completes in the previous slot.
+/// * requested -> in progress:
+///   - triggered when the slot finishes processing any ongoing merge and discovers that
+///     compaction status has been set to requested. It starts a new merge including _all_
+///     batches at the current level.
+/// * in progress -> none:
+///   - the merge completes; the resulting batch is pushed to the next slot regardless of
+///     its size; compaction is initiated at the next slot.
+/// * requested -> none:
+///   - there is <=1 batches in the current slot. Compaction completes instantly and the
+///     batch is pushed to the next slot; compaction is initiated at the next slot.
+///
+/// The following invariant guarantees that the compaction process completes after processing all
+/// batches in the spine:
+/// Each slot must:
+/// 1. Complete its own compaction (which may be a noop if there's <=1 batches on this level)
+/// 2. Trigger compaction at the next level after local compaction is done
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionStatus {
+    None,
+    Requested,
+    InProgress,
+}
+
+impl Display for CompactionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompactionStatus::None => write!(f, "none"),
+            CompactionStatus::Requested => write!(f, "requested"),
+            CompactionStatus::InProgress => write!(f, "in progress"),
+        }
+    }
+}
+
 /// A group of batches with similar sizes (as determined by [size_from_level]).
 #[derive(Clone, SizeOf)]
 struct Slot<B>
@@ -166,6 +223,10 @@ where
     /// Wake up the task that handles merges at this level.
     #[size_of(skip)]
     notify: Arc<Notify>,
+
+    /// State of the compaction process in this slot.
+    #[size_of(skip)]
+    compaction_status: CompactionStatus,
 }
 
 impl<B> Default for Slot<B>
@@ -181,6 +242,7 @@ where
             n_merged_batches: 0,
             n_steps: 0,
             notify: Arc::new(Notify::new()),
+            compaction_status: CompactionStatus::None,
         }
     }
 }
@@ -202,7 +264,7 @@ where
         /// The minimum number of batches to merge is key to performance.  The
         /// maximum number seems much less important.
         const MERGE_COUNTS: [RangeInclusive<usize>; MAX_LEVELS] = [
-            8..=64,
+            8..=128,
             8..=64,
             3..=64,
             3..=64,
@@ -216,12 +278,23 @@ where
         let merge_counts = &MERGE_COUNTS[level];
 
         // Start a merge if there is no ongoing merge and there are either enough loose batches to start a merge,
-        // or we are under high memory pressure and there's at least one in-memory batch in this slot.
+        // or we are under high memory pressure and there's at least one in-memory batch in this slot, or
+        // compaction has been requested and there are more than one batches in the slot.
         if self.merging_batches.is_none()
             && (self.loose_batches.len() >= *merge_counts.start()
-                || self.must_relieve_memory_pressure())
+                || self.must_relieve_memory_pressure()
+                || (self.compaction_status == CompactionStatus::Requested
+                    && self.loose_batches.len() > 1))
         {
-            let n = std::cmp::min(*merge_counts.end(), self.loose_batches.len());
+            // Compaction requested - merge all batches in the slot.
+            let max_batches = if self.compaction_status == CompactionStatus::Requested {
+                self.compaction_status = CompactionStatus::InProgress;
+                usize::MAX
+            } else {
+                *merge_counts.end()
+            };
+
+            let n = std::cmp::min(max_batches, self.loose_batches.len());
             let batches = self.loose_batches.drain(..n).collect::<Vec<_>>();
             self.merging_batches = Some(batches.clone());
             Some(batches)
@@ -270,6 +343,7 @@ where
 {
     #[size_of(skip)]
     factories: B::Factories,
+    name: Arc<String>,
     #[size_of(skip)]
     key_filter: Option<Filter<B::Key>>,
     #[size_of(skip)]
@@ -287,9 +361,10 @@ impl<B> SharedState<B>
 where
     B: Batch,
 {
-    pub fn new(factories: &B::Factories) -> Self {
+    pub fn new(factories: &B::Factories, name: Arc<String>) -> Self {
         Self {
             factories: factories.clone(),
+            name,
             key_filter: None,
             value_filter: None,
             frontier: B::Time::minimum(),
@@ -318,22 +393,13 @@ where
         self.slots[level].notify.notify_one();
     }
 
-    fn should_apply_backpressure(&self) -> bool {
-        const HIGH_THRESHOLD: usize = 128;
-        self.slots
-            .iter()
-            .map(|s| s.loose_batches.len())
-            .sum::<usize>()
-            >= HIGH_THRESHOLD
-    }
-
-    fn should_relieve_backpressure(&self) -> bool {
-        const LOWER_THRESHOLD: usize = 127;
-        self.slots
-            .iter()
-            .map(|s| s.loose_batches.len())
-            .sum::<usize>()
-            <= LOWER_THRESHOLD
+    fn batch_count(&self) -> BatchCount {
+        BatchCount(
+            self.slots
+                .iter()
+                .map(|s| s.loose_batches.len())
+                .sum::<usize>(),
+        )
     }
 
     fn get_filters(&self) -> (Option<Filter<B::Key>>, Option<GroupFilter<B::Val>>) {
@@ -402,13 +468,36 @@ where
             .with_start(start)
             .with_tooltip(|| {
                 format!(
-                    "Merged {} batches ({pre_len} -> {post_len}) in {n_steps} steps using {:.1} ms CPU",
+                    "{} in worker {} merged {} batches ({pre_len} -> {post_len}) in {n_steps} steps using {:.1} ms CPU",
+                    &self.name,
+                    Runtime::worker_index(),
                     batches.len(),
                     elapsed.as_secs_f64() * 1000.0
                 )
             })
             .record();
-        if !new_batch.is_empty() {
+
+        if slot.compaction_status == CompactionStatus::InProgress {
+            // We finished merging all batches in the slot as part of compaction.
+            slot.compaction_status = CompactionStatus::None;
+
+            // If there are more non-empty slots above, push compaction results to the next slot
+            // and initiate compaction there; otherwise, compaction is finished for the spine.
+            if let Some(last_level) = self.last_non_empty_slot()
+                && last_level > level
+            {
+                self.initiate_compaction_at_level(
+                    level + 1,
+                    if new_batch.is_empty() {
+                        vec![]
+                    } else {
+                        vec![new_batch]
+                    },
+                );
+            } else if !new_batch.is_empty() {
+                self.add_batch(new_batch, new_level);
+            }
+        } else if !new_batch.is_empty() {
             self.add_batch(new_batch, new_level);
         }
     }
@@ -420,6 +509,64 @@ where
     /// of that is measuring the size of the batches, which can require I/O.
     fn metadata_snapshot(&self) -> ([Slot<B>; MAX_LEVELS], SpineStats) {
         (self.slots.clone(), self.spine_stats.clone())
+    }
+
+    /// Non-empty slot with the smallest index.
+    fn first_non_empty_slot(&self) -> Option<usize> {
+        for (i, slot) in self.slots.iter().enumerate() {
+            if !slot.loose_batches.is_empty() || slot.merging_batches.is_some() {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Non-empty slot with the largest index.
+    fn last_non_empty_slot(&self) -> Option<usize> {
+        for (i, slot) in self.slots.iter().enumerate().rev() {
+            if !slot.loose_batches.is_empty() || slot.merging_batches.is_some() {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn initiate_compaction(&mut self) {
+        let Some(level) = self.first_non_empty_slot() else {
+            return;
+        };
+
+        self.initiate_compaction_at_level(level, Vec::new());
+    }
+
+    /// Push batches to the slot at the given level and initiate compaction.
+    fn initiate_compaction_at_level(&mut self, level: usize, batches: Vec<Arc<B>>) {
+        let slot = &mut self.slots[level];
+        slot.loose_batches.extend(batches);
+
+        // Note: if compaction is already in progress in this slot, this means that the
+        // user triggered a new compaction run before the previous one completed. In this
+        // case, we reset the state back to Requested, which will cause the slot to start a new
+        // round of merging right after the current one before pushing the results to the next
+        // slot.
+        // Effectively, we are merging the two compaction sweeps into one.
+        slot.compaction_status = CompactionStatus::Requested;
+        slot.notify.notify_one();
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct BatchCount(usize);
+
+impl BatchCount {
+    const HIGH_THRESHOLD: usize = 128;
+
+    fn should_apply_backpressure(&self) -> bool {
+        self.0 >= Self::HIGH_THRESHOLD
+    }
+
+    fn should_relieve_backpressure(&self) -> bool {
+        !self.should_apply_backpressure()
     }
 }
 
@@ -509,10 +656,15 @@ impl<B> AsyncMerger<B>
 where
     B: Batch,
 {
-    pub fn new(runtime: Runtime, worker_index: usize, factories: &B::Factories) -> Self {
+    pub fn new(
+        runtime: Runtime,
+        worker_index: usize,
+        factories: &B::Factories,
+        name: Arc<String>,
+    ) -> Self {
         let idle = Arc::new(Condvar::new());
         let no_backpressure = Arc::new(Notify::new());
-        let state = Arc::new(Mutex::new(SharedState::new(factories)));
+        let state = Arc::new(Mutex::new(SharedState::new(factories, name)));
 
         let max_level0_batch_size_records = max_level0_batch_size_records() as usize;
         assert!(
@@ -552,38 +704,73 @@ where
     }
 
     /// Adds `batch` to the shared merging state and wakes up the merger.
-    /// Returns true if the spine contains "too many" batches.
-    fn add_batch(&mut self, batch: Arc<B>, merge: bool) -> bool {
+    fn add_batch(
+        &mut self,
+        batch: Arc<B>,
+        merge: bool,
+    ) -> std::sync::MutexGuard<'_, SharedState<B>> {
         debug_assert!(!batch.is_empty());
         let level = Spine::<B>::size_to_level(&batch, self.max_level0_batch_size_records, merge);
         self.merge_workers.start(level);
 
         let mut state = self.state.lock().unwrap();
         state.add_batch(batch, level);
-        state.should_apply_backpressure()
+        state
     }
 
     /// Blocks until the number of batches in the spine has declined below the
     /// backpressure threshold.
     async fn backpressure_wait(&self) {
-        let start = Instant::now();
-        loop {
+        let start_time = Instant::now();
+
+        // Do an initial check of the batch count.  If it's already dropped,
+        // exit early, otherwise save the name and the initial number of
+        // batches for later recording.
+        let (name, initial_batches);
+        {
+            let state = self.state.lock().unwrap();
+            let batch_count = state.batch_count();
+            if batch_count.should_relieve_backpressure() {
+                return;
+            }
+            name = state.name.clone();
+            initial_batches = batch_count.0;
+        }
+
+        // Wait for the batch count to drop below the threshold.
+        let final_batches = loop {
             let notify = self.no_backpressure.notified();
             {
                 let mut state = self.state.lock().unwrap();
-                if state.should_relieve_backpressure() {
-                    state.spine_stats.backpressure_wait += start.elapsed();
-                    break;
+                let batch_count = state.batch_count();
+                if batch_count.should_relieve_backpressure() {
+                    state.spine_stats.backpressure_wait += start_time.elapsed();
+                    break batch_count.0;
                 }
             }
             notify.await;
-        }
+        };
+
+        // Record the wait.
         COMPACTION_STALL_TIME_NANOSECONDS
-            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            .fetch_add(start_time.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Span::new("backpressure-wait")
             .with_category("Spine")
-            .with_start(start)
+            .with_start(start_time)
+            .with_tooltip(|| {
+                format!("{name} wait for drop from {initial_batches} to {final_batches} batches")
+            })
             .record();
+    }
+
+    fn backpressure_waiter(&self) -> Option<OwnedNotified> {
+        let notify = self.no_backpressure.clone().notified_owned();
+        self.state
+            .lock()
+            .unwrap()
+            .batch_count()
+            .should_apply_backpressure()
+            .then_some(notify)
     }
 
     /// Adds `batches` to the shared merging state and wakes up the merger.
@@ -709,6 +896,11 @@ where
                     ])),
                 )]);
             }
+            meta.extend([MetricReading::new(
+                COMPACTION_STATE,
+                vec![(Cow::Borrowed("slot"), index.to_string().into())],
+                MetaItem::String(slot.compaction_status.to_string()),
+            )]);
 
             let mut negative_weight_count = 0;
             let mut has_negative_weight_counts = false;
@@ -883,6 +1075,11 @@ where
 
         cache_stats.metadata(meta);
     }
+
+    fn initiate_compaction(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.initiate_compaction();
+    }
 }
 
 impl<B> Drop for AsyncMerger<B>
@@ -890,6 +1087,7 @@ where
     B: Batch,
 {
     fn drop(&mut self) {
+        self.no_backpressure.notify_waiters();
         self.state.lock().unwrap().request_exit = true;
 
         for level in 0..MAX_LEVELS {
@@ -956,7 +1154,15 @@ where
 
     fn run(self: Arc<Self>, level: usize) {
         let local_worker_offset = self.worker_index - self.runtime.layout().local_workers().start;
-        self.runtime.tokio_merger_runtime().spawn(async move {
+        // The merger runtime may have been torn down already if a concurrent
+        // `RuntimeHandle::join` reached the take of its slot first. In that case
+        // there is no work to do: workers exiting will set `request_exit` and
+        // any new spawn would just observe it and quit.
+        let Some(handle) = self.runtime.tokio_merger_runtime() else {
+            trace!(level, "merger spawn skipped: runtime torn down");
+            return;
+        };
+        handle.spawn(async move {
             let buffer_cache = self
                 .runtime
                 .get_buffer_cache(local_worker_offset, ThreadType::Background);
@@ -976,7 +1182,7 @@ where
                     let notify = self.state.lock().unwrap().slots[level].notify.clone();
 
                     loop {
-                        self.merge_step(&mut merger, merger_type, level);
+                        let work = self.merge_step(&mut merger, merger_type, level);
 
                         {
                             let state = self.state.lock().unwrap();
@@ -984,12 +1190,12 @@ where
                                 self.no_backpressure.notify_waiters();
                                 break;
                             }
-                            if state.should_relieve_backpressure() {
+                            if state.batch_count().should_relieve_backpressure() {
                                 self.no_backpressure.notify_waiters();
                             }
                         }
 
-                        if merger.is_none() {
+                        if !work {
                             // No more merge work currently available -- wait for the next merges to be started
                             // or for a global memory pressure notification.
                             self.idle.notify_all();
@@ -1009,76 +1215,96 @@ where
         });
     }
 
+    /// Tries to do some merging at the given `level`, using `opt_merger` to
+    /// maintain state.  Creates mergers of type `merger_type`.
+    ///
+    /// Returns true if some merging work was done, false if there was no work
+    /// to do.
     fn merge_step(
         self: &Arc<Self>,
         opt_merger: &mut Option<Merge<B>>,
         merger_type: MergerType,
         level: usize,
-    ) {
-        // Run in-progress merges.
-        let ((key_filter, value_filter), frontier) = {
-            let shared = self.state.lock().unwrap();
-            (shared.get_filters(), shared.frontier.clone())
-        };
-
-        if let Some(merger) = opt_merger.as_mut() {
-            // Run level-0 merges to completion.  For other levels, we
-            // supply as much fuel as the average level-0 merge.  Along with
-            // round-robinning between levels, this means that we invest
-            // about the same amount of effort into merges at each level,
-            // which should ensure that the higher-level merges complete in
-            // time to keep batches from piling up.
-            let fuel = if level == 0 {
-                isize::MAX
-            } else {
-                self.worker_state.avg_slot0_merge_fuel()
-            };
-            merger.merge(&frontier, fuel);
-            if merger.done {
-                if level == 0 {
-                    self.worker_state.report_slot0_merge(merger.fuel);
-                }
-                let merger = opt_merger.take().unwrap();
-                let new_batch = Arc::new(merger.builder.done());
-                let new_level =
-                    Spine::<B>::size_to_level(&new_batch, self.max_level0_batch_size_records, true);
-                self.state.lock().unwrap().merge_complete(
-                    level,
-                    new_batch,
-                    new_level,
-                    merger.start,
-                    merger.elapsed,
-                    merger.n_steps,
-                );
-                self.start(new_level);
-            }
-        }
-
-        // Start new merges out of loose batches.
-        //
-        // Figuring out what merges to start requires the lock. Then we drop
-        // the lock to actually start them, in case that's expensive (it
-        // might require creating a file, for example).
-        let start_merge = self.state.lock().unwrap().slots[level].try_start_merge(level);
-
-        let snapshot = if value_filter
-            .as_ref()
-            .map(|f| f.requires_snapshot())
-            .unwrap_or(false)
-        {
-            Some(Arc::new(self.state.lock().unwrap().get_snapshot()))
+    ) -> bool {
+        let merger = if let Some(merger) = opt_merger {
+            merger
         } else {
-            None
-        };
-        if let Some(batches) = start_merge {
-            *opt_merger = Some(Merge::new(
+            // Get all the state we need to create the merger, then drop the
+            // lock.
+            let mut state = self.state.lock().unwrap();
+            let batches = if let Some(batches) = state.slots[level].try_start_merge(level) {
+                batches
+            } else {
+                // There is nothing to merge at the current level - initiate compaction at the next level.
+                if state.slots[level].compaction_status == CompactionStatus::Requested {
+                    state.slots[level].compaction_status = CompactionStatus::None;
+
+                    if let Some(last_level) = state.last_non_empty_slot()
+                        && last_level > level
+                    {
+                        // There can still be 1 batch in the current slot - move this batch to the next level.
+                        let batches = state.slots[level].loose_batches.drain(..).collect();
+
+                        state.initiate_compaction_at_level(level + 1, batches);
+                    }
+                }
+                return false;
+            };
+
+            let key_filter = state.key_filter.clone();
+            let value_filter = state.value_filter.clone();
+            let frontier = state.frontier.clone();
+            let snapshot = value_filter
+                .as_ref()
+                .is_some_and(|value_filter| value_filter.requires_snapshot())
+                .then(|| Arc::new(state.get_snapshot()));
+            drop(state);
+
+            // Create the merger.
+            //
+            // Creating the merger might require doing I/O, so it's important
+            // not to hold the lock.
+            opt_merger.insert(Merge::new(
                 merger_type,
                 batches,
                 &key_filter,
                 &value_filter,
-                snapshot.clone(),
-            ));
+                snapshot,
+                frontier,
+            ))
+        };
+
+        // Run level-0 merges to completion.  For other levels, we
+        // supply as much fuel as the average level-0 merge.  Along with
+        // round-robinning between levels, this means that we invest
+        // about the same amount of effort into merges at each level,
+        // which should ensure that the higher-level merges complete in
+        // time to keep batches from piling up.
+        let fuel = if level == 0 {
+            isize::MAX
+        } else {
+            self.worker_state.avg_slot0_merge_fuel()
+        };
+        merger.merge(fuel);
+        if merger.done {
+            if level == 0 {
+                self.worker_state.report_slot0_merge(merger.fuel);
+            }
+            let merger = opt_merger.take().unwrap();
+            let new_batch = Arc::new(merger.builder.done());
+            let new_level =
+                Spine::<B>::size_to_level(&new_batch, self.max_level0_batch_size_records, true);
+            self.state.lock().unwrap().merge_complete(
+                level,
+                new_batch,
+                new_level,
+                merger.start,
+                merger.elapsed,
+                merger.n_steps,
+            );
+            self.start(new_level);
         }
+        true
     }
 }
 
@@ -1126,10 +1352,17 @@ where
     /// Done?
     done: bool,
 
+    /// Creation time.
     start: Instant,
+
+    /// Time spent running merge steps.
     elapsed: Duration,
 
+    /// Number of merge steps executed.
     n_steps: usize,
+
+    /// Frontier.
+    frontier: B::Time,
 
     /// The merger itself.
     inner: MergeInner<B>,
@@ -1153,6 +1386,7 @@ where
         key_filter: &Option<Filter<B::Key>>,
         value_filter: &Option<GroupFilter<B::Val>>,
         snapshot: Option<Arc<SpineSnapshot<B>>>,
+        frontier: B::Time,
     ) -> Self {
         let factories = batches[0].factories();
         let batch_refs: Vec<&B> = batches.iter().map(|b| b.as_ref()).collect();
@@ -1164,6 +1398,7 @@ where
             elapsed: Duration::ZERO,
             n_steps: 0,
             done: false,
+            frontier,
             inner: match merger_type {
                 MergerType::ListMerger => MergeInner::ListMerger(ArcListMerger::new(
                     &factories,
@@ -1182,18 +1417,20 @@ where
         }
     }
 
-    fn merge(&mut self, frontier: &B::Time, mut fuel: isize) -> isize {
+    fn merge(&mut self, mut fuel: isize) -> isize {
         debug_assert!(fuel > 0);
         let supplied_fuel = fuel;
         let start = Instant::now();
         match &mut self.inner {
             MergeInner::ListMerger(merger) => {
-                merger.work(&mut self.builder, frontier, &mut fuel);
+                merger.work(&mut self.builder, &self.frontier, &mut fuel);
                 self.done = fuel > 0;
             }
             MergeInner::PushMerger(merger) => {
-                self.done =
-                    merger.merge(&mut self.builder, frontier, &mut fuel).is_ok() && fuel > 0;
+                self.done = merger
+                    .merge(&mut self.builder, &self.frontier, &mut fuel)
+                    .is_ok()
+                    && fuel > 0;
                 if !self.done {
                     merger.run();
                 }
@@ -1661,13 +1898,18 @@ where
 {
     type Batch = B;
 
-    fn new(factories: &B::Factories) -> Self {
+    fn new(factories: &B::Factories, name: Arc<String>) -> Self {
         Self::with_runtime(
             Runtime::runtime()
                 .expect("Attempting to create a spine merger outside of a DBSP runtime"),
             Runtime::worker_index(),
             factories,
+            name,
         )
+    }
+
+    fn set_name(&mut self, name: Arc<String>) {
+        self.merger.state.lock().unwrap().name = name;
     }
 
     fn set_frontier(&mut self, frontier: &B::Time) {
@@ -1699,8 +1941,16 @@ where
         let batch = Self::maybe_flush_batch(batch, &self.factories, || {
             self.merger.state.lock().unwrap().get_filters()
         });
-        if self.insert_without_blocking(batch) {
-            self.merger.backpressure_wait().await;
+        if !batch.is_empty() {
+            self.dirty = true;
+            if self
+                .merger
+                .add_batch(batch, false)
+                .batch_count()
+                .should_apply_backpressure()
+            {
+                self.merger.backpressure_wait().await;
+            }
         }
     }
 
@@ -1779,7 +2029,13 @@ where
         let backend = Runtime::storage_backend().unwrap();
         let committed: CommittedSpine = (ids, self as &Self).into();
         let as_bytes = to_bytes(&committed).expect("Serializing CommittedSpine should work.");
-        backend.write(&Self::checkpoint_file(base, persistent_id), as_bytes)?;
+        // Push the pspine state file committer into the shared list so the
+        // checkpoint commit phase calls `.commit()` on it. Otherwise the
+        // file is fsynced inside `complete()` but never explicitly
+        // committed alongside the rest of the checkpoint, leaving its
+        // durability guarantee tied to the implementation detail.
+        let pspine_writer = backend.write(&Self::checkpoint_file(base, persistent_id), as_bytes)?;
+        files.push(pspine_writer);
 
         // Write the batches as a separate file, this allows to parse it
         // in `Checkpointer` without the need to know the exact Spine type.
@@ -1797,17 +2053,32 @@ where
         let pspine_path = Self::checkpoint_file(base, persistent_id);
 
         let content = Runtime::storage_backend().unwrap().read(&pspine_path)?;
-        let archived = unsafe { rkyv::archived_root::<CommittedSpine>(&content) };
+        let archived = rkyv::check_archived_root::<CommittedSpine>(&content).map_err(|e| {
+            crate::circuit::checkpointer::checkpoint_invalid_data_error(
+                "Spine checkpoint validation failed",
+                format!("{pspine_path}: {e}"),
+            )
+        })?;
 
-        let committed: CommittedSpine = archived.deserialize(&mut Deserializer::default()).unwrap();
+        let committed: CommittedSpine = archived
+            .deserialize(&mut Deserializer::default())
+            .map_err(|e| {
+                crate::circuit::checkpointer::checkpoint_invalid_data_error(
+                    "Spine checkpoint deserialize failed",
+                    format!("{pspine_path}: {e:?}"),
+                )
+            })?;
         self.dirty = committed.dirty;
         self.key_filter = None;
         self.value_filter = None;
         for batch in committed.batches {
-            let batch = B::from_path(&self.factories.clone(), &batch.clone().into())
-                .unwrap_or_else(|error| {
-                    panic!("Failed to read batch {batch} for checkpoint ({error}).")
-                });
+            let batch =
+                B::from_path(&self.factories.clone(), &batch.clone().into()).map_err(|error| {
+                    crate::circuit::checkpointer::checkpoint_invalid_data_error(
+                        "Spine batch read failed",
+                        format!("{batch}: {error}"),
+                    )
+                })?;
             self.insert_without_blocking(batch);
         }
 
@@ -1816,6 +2087,10 @@ where
 
     fn metadata(&self, meta: &mut OperatorMeta) {
         self.merger.metadata(meta);
+    }
+
+    fn initiate_compaction(&self) {
+        self.merger.initiate_compaction();
     }
 }
 
@@ -1868,13 +2143,18 @@ where
     ///
     /// In the common case, [Spine::new] uses the current thread's runtime and
     /// worker index.
-    pub fn with_runtime(runtime: Runtime, worker_index: usize, factories: &B::Factories) -> Self {
+    pub fn with_runtime(
+        runtime: Runtime,
+        worker_index: usize,
+        factories: &B::Factories,
+        name: Arc<String>,
+    ) -> Self {
         Spine {
             factories: factories.clone(),
             dirty: false,
             key_filter: None,
             value_filter: None,
-            merger: AsyncMerger::new(runtime, worker_index, factories),
+            merger: AsyncMerger::new(runtime, worker_index, factories, name),
         }
     }
 
@@ -1908,7 +2188,7 @@ where
                 .with_category("Spine")
                 .with_tooltip(|| {
                     format!(
-                        "Eagerly spilling {} batch with {} keys and {} values",
+                        "Eagerly spill {} batch with {} keys and {} values",
                         HumanBytes::from(batch.approximate_byte_size()),
                         batch.key_count(),
                         batch.len()
@@ -1948,13 +2228,17 @@ where
     ///   may do this beforehand by calling [Spine::maybe_flush_batch].
     ///
     /// - Waiting until the number of batches in the spine falls below the level
-    ///   at which we impose backpressure.  The caller may do so afterward by
-    ///   calling [Spine::backpressure_wait].
+    ///   at which we impose backpressure.  The function returns true if
+    ///   backpressure is warranted.  The caller may do so afterward by calling
+    ///   [Spine::backpressure_wait].
     pub fn insert_without_blocking(&mut self, batch: impl Into<Arc<B>>) -> bool {
         let batch = batch.into();
         if !batch.is_empty() {
             self.dirty = true;
-            self.merger.add_batch(batch, false)
+            self.merger
+                .add_batch(batch, false)
+                .batch_count()
+                .should_apply_backpressure()
         } else {
             false
         }
@@ -1964,6 +2248,12 @@ where
     /// which we impose backpressure.
     pub async fn backpressure_wait(&self) {
         self.merger.backpressure_wait().await;
+    }
+
+    /// Returns an object that can be used to wait for backpressure to be
+    /// relieved.  Returns `None` if no backpressure is needed.
+    pub fn backpressure_waiter(&self) -> Option<OwnedNotified> {
+        self.merger.backpressure_waiter()
     }
 }
 

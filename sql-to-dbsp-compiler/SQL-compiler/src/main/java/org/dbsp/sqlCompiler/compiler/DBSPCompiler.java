@@ -84,7 +84,7 @@ import org.dbsp.util.IWritesLogs;
 import org.dbsp.util.IndentStream;
 import org.dbsp.util.Linq;
 import org.dbsp.util.Logger;
-import org.dbsp.util.RelJsonWriter;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.RelJsonWriter;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
@@ -780,6 +780,11 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
                     message = message.replace("TIMESTAMPDIFF", "DATEDIFF");
                     return new CompilationError(message, range);
                 }
+            }
+            String newMessage = message.replace(":PEEK_NO_EXPAND", "");
+            newMessage = newMessage.replace("RECORDTYPE", "ROW");
+            if (!newMessage.equals(message)) {
+                return new CompilationError(newMessage, getRange(e));
             }
         }
         return new CompilationError(e);

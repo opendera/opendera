@@ -23,6 +23,7 @@ import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDate;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDecimal;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTimestamp;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTimestampTz;
 import org.dbsp.util.Linq;
 
 import java.io.File;
@@ -109,6 +110,12 @@ public record TableData(ProgramIdentifier name, DBSPZSetExpression data, List<In
         }
 
         @Override
+        public VisitDecision preorder(DBSPTypeTimestampTz node) {
+            this.found = true;
+            return VisitDecision.STOP;
+        }
+
+        @Override
         public VisitDecision preorder(DBSPTypeDecimal node) {
             this.found = true;
             return VisitDecision.STOP;
@@ -116,8 +123,10 @@ public record TableData(ProgramIdentifier name, DBSPZSetExpression data, List<In
     }
 
     /** Create an expression that will evaluate to the contents of this table.
-     * If necessary and possible, write the data to a file and generate code to read it. */
-    public DBSPExpression createOutput(DBSPCompiler compiler, String name, String directory) throws IOException {
+     * If necessary and possible, write the data to a file and generate code to read it.
+     * * @param executionDirectory  Relative directory where executable will run */
+    public DBSPExpression createOutput(DBSPCompiler compiler, String name,
+                                       String directory, String executionDirectory) throws IOException {
         HasDecimalOrDate hd = new HasDecimalOrDate(compiler);
         hd.apply(this.data);
         if (this.data().size() > 30 && !hd.found) {
@@ -129,7 +138,7 @@ public record TableData(ProgramIdentifier name, DBSPZSetExpression data, List<In
             ToCsvVisitor.toCsv(compiler, file, this.data());
             return new DBSPApplyExpression(CalciteObject.EMPTY, "read_csv",
                     this.data().getType(),
-                    new DBSPStrLiteral(fileName, false));
+                    new DBSPStrLiteral(executionDirectory + "/" + fileName, false));
         } else {
             return this.data();
         }
@@ -140,9 +149,11 @@ public record TableData(ProgramIdentifier name, DBSPZSetExpression data, List<In
      * @param name    Name for the created function.
      * @param tables  Values that produce the input
      * @param directory  Directory where temporary files can be written
+     * @param executionDirectory  Relative directory where executable will run
      */
-    public static DBSPFunction createInputFunction(DBSPCompiler compiler, String name,
-                                                   TableData[] tables, String directory) throws IOException {
+    public static DBSPFunction createInputFunction(
+            DBSPCompiler compiler, String name,
+            TableData[] tables, String directory, String executionDirectory) throws IOException {
         DBSPExpression[] fields = new DBSPExpression[tables.length];
         Set<ProgramIdentifier> seen = new HashSet<>();
         for (int i = 0; i < tables.length; i++) {
@@ -168,7 +179,7 @@ public record TableData(ProgramIdentifier name, DBSPZSetExpression data, List<In
             ToCsvVisitor.toCsv(compiler, file, tables[i].data);
             fields[i] = new DBSPApplyExpression(CalciteObject.EMPTY, "read_csv",
                     tables[i].data.getType(),
-                    new DBSPStrLiteral(fileName, false));
+                    new DBSPStrLiteral(executionDirectory + "/" + fileName, false));
         }
         DBSPRawTupleExpression result = new DBSPRawTupleExpression(fields);
         return new DBSPFunction(CalciteObject.EMPTY, name, new ArrayList<>(),

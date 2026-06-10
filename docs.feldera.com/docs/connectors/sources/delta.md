@@ -26,7 +26,7 @@ exactly once fault tolerance.
 |-----------------------------|--------|------------|---------------|
 | `uri`*                      | string |            | Table URI, e.g., `s3://feldera-fraud-detection-data/demographics_train`. Supported URI schemes include: <ul><li>AWS S3: `s3://`, `s3a://`</li><li>Azure Blob Storage: `az://`, `adl://`, `azure://`, `abfs://`, `abfss://`</li><li>Google Cloud Storage: `gs://`</li><li>`uc://` - Unity catalog</li></ul> |
 | `mode`*                     | enum   |            | Table read mode. Four options are available: <ul> <li>`snapshot` - read a snapshot of the table and stop.</li> <li>`follow` - follow the changelog of the table, only ingesting changes (new and deleted rows)</li> <li>`snapshot_and_follow` - Read a snapshot of the table before switching to the `follow` mode.  This mode implements the backfill pattern where we load historical data for the table before ingesting the stream of real-time updates.</li><li>`cdc` - Change-Data-Capture (CDC) mode. The connector treats the table as an append-only log where every row represents an insert or delete action. The order of actions is determined by the `cdc_order_by` property, and the type of each action is determined by the `cdc_delete_filter` property. Removed rows are ignored, so users can clean up old log entries without affecting the contents of the ingested stream. In this mode, the connector does not read the initial snapshot of the table and follows the transaction log starting from the version of the table specified by the `version` or `datetime` property.</li> </ul>|
-| `transaction_mode`          | enum   | `none`     | Determines how the connector breaks up its input into transactions. Supported values are `none`, `snapshot`, and `always`. See [below](#transactions) for details. |
+| `transaction_mode`          | enum   | `none`     | Determines how the connector breaks up its input into transactions. Supported values are `none`, `snapshot`, `catchup`, and `always`. See [below](#transactions) for details. |
 | `timestamp_column`          | string |            | Table column that serves as an event timestamp. When this option is specified, and `mode` is one of `snapshot` or `snapshot_and_follow`, table rows are ingested in the timestamp order, respecting the [`LATENESS`](/sql/streaming#lateness-expressions) property of the column: each ingested row has a timestamp no more than `LATENESS` time units earlier than the most recent timestamp of any previously ingested row.  See details [below](#ingesting-time-series-data-from-a-delta-lake). |
 | `filter`                    | string |            | <p>Optional row filter.</p> <p>When specified, only rows that satisfy the filter condition are read from the delta table. The condition must be a valid SQL Boolean expression that can be used in the `where` clause of the `select * from my_table where ...` query.</p> |
 | `snapshot_filter`           | string |            | <p>Optional snapshot filter.</p><p>This option is only valid when `mode` is set to `snapshot` or `snapshot_and_follow`. When specified, only rows that satisfy the filter condition are included in the snapshot.</p> <p>The condition must be a valid SQL Boolean expression that can be used in  the `where` clause of the `select * from snapshot where ...` query.</p><p>Unlike the `filter` option, which applies to all records retrieved from the table, this filter only applies to rows in the initial snapshot of the table. For instance, it can be used to specify the range of event times to include in the snapshot, e.g.: `ts BETWEEN TIMESTAMP '2005-01-01 00:00:00' AND TIMESTAMP '2010-12-31 23:59:59'`. This option can be used together with the `filter` option. During the initial snapshot, only rows that satisfy both `filter` and `snapshot_filter` are retrieved from the Delta table. When subsequently following changes in the the transaction log (`mode = snapshot_and_follow`), all rows that meet the `filter` condition are ingested, regardless of `snapshot_filter`. </p> |
@@ -35,7 +35,7 @@ exactly once fault tolerance.
 | `end_version`               | integer|            | <p>Optional final table version.</p><p>Valid only when the connector is configured in `follow`, `snapshot_and_follow`, or `cdc` mode.</p><p>When set, the connector will stop scanning the table’s transaction log after reaching this version or any greater version.</p><p>This bound is inclusive: if the specified version appears in the log, it will be processed before signaling end-of-input.</p>|
 | `cdc_delete_filer`          | string |            | <p>A predicate that determines whether the record represents a deletion.</p><p>This setting is only valid in the `cdc` mode. It specifies a predicate applied to each row in the Delta table to determine whether the row represents a deletion event. Its value must be a valid Boolean SQL expression that can be used in a query of the form `SELECT * from <table> WHERE <cdc_delete_filter>`.</p>|
 | `cdc_order_by`              | string |            | <p>An expression that determines the ordering of updates in the Delta table.</p><p>This setting is only valid in the `cdc` mode. It specifies a predicate applied to each row in the Delta table to determine the order in which updates in the table should be applied. Its value must be a valid SQL expression that can be used in a query of the form `SELECT * from <table> ORDER BY <cdc_order_by>`.</p>|
-| `num_parsers`               | string |            | The number of parallel parsing tasks the connector uses to process data read from the table. Increasing this value can enhance performance by allowing more concurrent processing. Recommended range: 1–10. The default is 4.|
+| `num_parsers`               | integer| 4          | The number of parallel parsing tasks the connector uses to process data read from the table. Increasing this value can enhance performance by allowing more concurrent processing. Recommended range: 1–10.|
 | `max_retries`               | integer| unlimited retries| <p>Maximum number of retries for failed object store operations.</p><p>Controls how many times the connector retries high-level storage operations, such as reading a Delta log entry or a Parquet file.</p><p>This is in addition to lower-level retries (e.g., individual S3 operation retries governed by storage options like `retry_timeout`). If those retries are exhausted or the failure is otherwise unrecoverable at the storage layer, the connector retries the entire operation.</p><p>Defaults to unlimited retries. Set to 0 to disable retries.</p><p>See [retries and at-least-once delivery](#retries-and-at-least-once-delivery)</p>|
 | `skip_unused_columns` (<b>DEPRECATED</b>) | bool   | false | <p>This property is deprecated. Use the [table-level `skip_unused_columns` property](/sql/grammar#ignoring-unused-columns) instead.</p><p>Don't read unused columns from the Delta table.  When set to `true`, this option instructs the connector to avoid reading columns from the Delta table that are not used in any view definitions. To be skipped, the columns must be either nullable or have default values. This can improve ingestion performance, especially for wide tables.</p><p>Note: The simplest way to exclude unused columns is to omit them from the Feldera SQL table declaration. The connector never reads columns that aren't declared in the SQL schema. Additionally, the SQL compiler emits warnings for declared but unused columns—use these as a guide to optimize your schema.</p>|
 | `max_concurrent_readers`    | integer| 6          | <p>Maximum number of concurrent object store reads performed by all Delta Lake connectors.</p><p>This setting is used to limit the number of concurrent reads of the object store in a pipeline with a large number of Delta Lake connectors. When multiple connectors are simultaneously reading from the object store, this can lead to transport timeouts.</p><p>When enabled, this setting limits the number of concurrent reads across all connectors. This is a global setting that affects all Delta Lake connectors, and not just the connector where it is specified. It should therefore be used at most once in a pipeline.  If multiple connectors specify this setting, they must all use the same value.</p><p>The default value is 6.</p>|
@@ -212,13 +212,18 @@ The `transaction_mode` property configures this feature:
 
 * `none` - the connector does not group inputs into transactions.
 * `snapshot` - ingest the initial snapshot of the table in one or several transactions.
+* `catchup` - all updates generated by the connector are grouped into transactions, both when reading the initial snapshot
+  and when following the transaction log (in `follow`, `snapshot_and_follow`, or `cdc` mode). The connector
+  batches multiple Delta table versions into a single Feldera transaction. See
+  [below](#ingesting-the-delta-transaction-log-using-transactions).
 * `always` - all updates generated by the connector are grouped into transactions, both when reading the initial snapshot
-  and when following the transaction log.
+  and when following the transaction log, with one Feldera transaction per Delta log entry.
+  See [below](#ingesting-the-delta-transaction-log-using-transactions).
 
 ### Ingesting table snapshot using transactions
 
 If the connector is configured in the `snapshot` or `snapshot_and_follow` mode, and its
-`transaction_mode` is set to `snapshot` or `always`, it will ingest the snapshot of the
+`transaction_mode` is set to `snapshot`, `catchup`, or `always`, it will ingest the snapshot of the
 table in one or several transactions. The exact behavior depends on the value of the `timestamp_column` option.
 If `timestamp_column` is not set, the connector will ingest the snapshot of the table in one big transaction.
 
@@ -231,11 +236,18 @@ See `timestamp_column` documentation for more details.
 ### Ingesting the Delta transaction log using transactions
 
 If the connector is configured in the `follow`, `snapshot_and_follow`, or `cdc` mode, and its
-`transaction_mode` is set to `always`, it will ingest the transaction log of the table in a series of transactions,
-generating exactly one transaction for each entry in the table's transaction log.
+`transaction_mode` is set to `catchup`, it ingests the transaction log in batches. When it starts a
+Feldera transaction, it reads the latest available version of the Delta table (capped by `end_version` if set) and
+ingests all log entries up to and including that version in a single Feldera transaction before committing. It then
+repeats for subsequent versions as they appear in the log.
 
-In other words, Feldera transaction boundaries will precisely match the transaction boundaries of the Delta Lake table:
-as long as the table keeps changing, each log entry will initiate a new Feldera transaction.
+The `catchup` mode offers the most efficient way for the connector to process the entire contents
+of the table during backfill and keep up with table changes in steady state.
+
+If `transaction_mode` is set to `always`, the connector ingests the transaction log in a series of transactions,
+generating exactly one Feldera transaction for each entry in the table's transaction log. Feldera transaction
+boundaries then match the transaction boundaries of the Delta Lake table: as long as the table keeps changing, each log
+entry initiates a new Feldera transaction. Use `always` when that one-to-one alignment is required.
 
 ## Ingesting time series data from a Delta Lake
 

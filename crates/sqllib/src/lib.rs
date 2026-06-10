@@ -9,6 +9,9 @@ pub use array::*;
 pub mod binary;
 pub use binary::*;
 #[doc(hidden)]
+pub mod boolean;
+pub use boolean::*;
+#[doc(hidden)]
 pub mod casts;
 pub use casts::*;
 #[doc(hidden)]
@@ -77,12 +80,107 @@ use dbsp::{
     typed_batch::{SpineSnapshot, TypedBatch},
     utils::*,
 };
-use num::PrimInt;
+use num::{PrimInt, Signed};
 use num_traits::Pow;
 use std::marker::PhantomData;
 use std::ops::{Deref, Neg};
 use std::sync::OnceLock;
 use std::{fmt::Debug, sync::atomic::Ordering};
+
+#[allow(dead_code)]
+#[doc(hidden)]
+pub(crate) fn div_round_nearest<T>(a: T, b: T) -> T
+where
+    T: PrimInt + Signed,
+{
+    // Code tries to avoid overflows
+    debug_assert!(b > T::zero());
+    let q = a / b;
+    let r = (a % b).abs();
+    if r.is_zero() {
+        return q;
+    }
+
+    if r > b - r {
+        q + a.signum()
+    } else if r < b - r {
+        q
+    } else {
+        // Tie
+        let two = T::one() + T::one();
+        if (q % two).is_zero() {
+            q
+        } else {
+            q + a.signum()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------
+    // divisor = 1000
+    // -----------------------------
+    #[test]
+    fn test_rounding_1000() {
+        assert_eq!(div_round_nearest(0, 1000), 0);
+        assert_eq!(div_round_nearest(1, 1000), 0);
+        assert_eq!(div_round_nearest(499, 1000), 0);
+        assert_eq!(div_round_nearest(500, 1000), 0);
+        assert_eq!(div_round_nearest(501, 1000), 1);
+        assert_eq!(div_round_nearest(999, 1000), 1);
+        assert_eq!(div_round_nearest(1000, 1000), 1);
+        assert_eq!(div_round_nearest(1499, 1000), 1);
+        assert_eq!(div_round_nearest(1500, 1000), 2);
+        assert_eq!(div_round_nearest(1501, 1000), 2);
+
+        assert_eq!(div_round_nearest(-1, 1000), 0);
+        assert_eq!(div_round_nearest(-499, 1000), 0);
+        assert_eq!(div_round_nearest(-500, 1000), 0);
+        assert_eq!(div_round_nearest(-501, 1000), -1);
+        assert_eq!(div_round_nearest(-999, 1000), -1);
+        assert_eq!(div_round_nearest(-1000, 1000), -1);
+        assert_eq!(div_round_nearest(-1499, 1000), -1);
+        assert_eq!(div_round_nearest(-1500, 1000), -2);
+        assert_eq!(div_round_nearest(-1501, 1000), -2);
+    }
+
+    #[test]
+    fn test_extremes() {
+        assert_eq!(div_round_nearest(i64::MAX, 1000), 9_223_372_036_854_776);
+        assert_eq!(div_round_nearest(i64::MIN, 1000), -9_223_372_036_854_776);
+    }
+
+    #[test]
+    fn test_rounding_7() {
+        assert_eq!(div_round_nearest(0, 7), 0);
+        assert_eq!(div_round_nearest(1, 7), 0);
+        assert_eq!(div_round_nearest(2, 7), 0);
+        assert_eq!(div_round_nearest(3, 7), 0);
+        assert_eq!(div_round_nearest(4, 7), 1);
+        assert_eq!(div_round_nearest(5, 7), 1);
+        assert_eq!(div_round_nearest(6, 7), 1);
+        assert_eq!(div_round_nearest(7, 7), 1);
+        assert_eq!(div_round_nearest(8, 7), 1);
+        assert_eq!(div_round_nearest(9, 7), 1);
+        assert_eq!(div_round_nearest(10, 7), 1);
+        assert_eq!(div_round_nearest(11, 7), 2);
+
+        assert_eq!(div_round_nearest(-1, 7), 0);
+        assert_eq!(div_round_nearest(-2, 7), 0);
+        assert_eq!(div_round_nearest(-3, 7), 0);
+        assert_eq!(div_round_nearest(-4, 7), -1);
+        assert_eq!(div_round_nearest(-5, 7), -1);
+        assert_eq!(div_round_nearest(-6, 7), -1);
+        assert_eq!(div_round_nearest(-7, 7), -1);
+        assert_eq!(div_round_nearest(-8, 7), -1);
+        assert_eq!(div_round_nearest(-9, 7), -1);
+        assert_eq!(div_round_nearest(-10, 7), -1);
+        assert_eq!(div_round_nearest(-11, 7), -2);
+    }
+}
 
 /// Convert a value of a SQL data type to an integer
 /// that preserves ordering.  Used for partitioned_rolling_aggregates
@@ -135,10 +233,10 @@ pub type WSet<D> = OrdZSet<D>;
 #[doc(hidden)]
 pub type IndexedWSet<K, D> = OrdIndexedZSet<K, D>;
 
-// Macro to create variants of a function with 1 argument
-// If there exists a function is f_(x: T) -> S, this creates a function
-// fN(x: Option<T>) -> Option<S>, defined as
-// fN(x) { let x = x?; Some(f_(x)) }.
+/// Macro to create variants of a function with 1 argument
+/// If there exists a function is f_(x: T) -> S, this creates a function
+/// fN(x: Option<T>) -> Option<S>, defined as
+/// fN(x) { let x = x?; Some(f_(x)) }.
 macro_rules! some_function1 {
     ($func_name:ident, $arg_type:ty, $ret_type:ty) => {
         ::paste::paste! {
@@ -153,10 +251,10 @@ macro_rules! some_function1 {
 
 pub(crate) use some_function1;
 
-// Macro to create variants of a function with 1 argument
-// If there exists a function is f_type(x: T) -> S, this creates a function
-// f_typeN(x: Option<T>) -> Option<S>
-// { let x = x?; Some(f_type(x)) }.
+/// Macro to create variants of a function with 1 argument
+/// If there exists a function is f_type(x: T) -> S, this creates a function
+/// f_typeN(x: Option<T>) -> Option<S>
+/// { let x = x?; Some(f_type(x)) }.
 macro_rules! some_polymorphic_function1 {
     ($func_name:ident $(< $( const $var : ident : $ty: ty),* >)?, $type_name: ident, $arg_type:ty, $ret_type:ty) => {
         ::paste::paste! {
@@ -171,13 +269,14 @@ macro_rules! some_polymorphic_function1 {
 
 pub(crate) use some_polymorphic_function1;
 
-// Macro to create variants of a function with 2 arguments
-// If there exists a function is f__(x: T, y: S) -> U, this creates
-// three functions:
-// - f_N(x: T, y: Option<S>) -> Option<U>
-// - fN_(x: Option<T>, y: S) -> Option<U>
-// - fNN(x: Option<T>, y: Option<S>) -> Option<U>
-// The resulting functions return Some only if all arguments are 'Some'.
+/// Macro to create variants of a function with 2 arguments
+/// If there exists a function is f__(x: T, y: S) -> U, this creates
+/// three functions:
+/// - f_N(x: T, y: Option<S>) -> Option<U>
+/// - fN_(x: Option<T>, y: S) -> Option<U>
+/// - fNN(x: Option<T>, y: Option<S>) -> Option<U>
+///
+/// The resulting functions return Some only if all arguments are 'Some'.
 macro_rules! some_function2 {
     ($func_name:ident, $arg_type0:ty, $arg_type1:ty, $ret_type:ty) => {
         ::paste::paste! {
@@ -205,13 +304,14 @@ macro_rules! some_function2 {
 
 pub(crate) use some_function2;
 
-// Macro to create variants of a polymorphic function with 2 arguments
-// If there exists a function is f_type1_type2(x: T, y: S) -> U, this
-// creates three functions:
-// - f_type1_type2N(x: T, y: Option<S>) -> Option<U>
-// - f_type1N_type2(x: Option<T>, y: S) -> Option<U>
-// - f_type1N_type2N(x: Option<T>, y: Option<S>) -> Option<U>
-// The resulting functions return Some only if all arguments are 'Some'.
+/// Macro to create variants of a polymorphic function with 2 arguments
+/// If there exists a function is f_type1_type2(x: T, y: S) -> U, this
+/// creates three functions:
+/// - f_type1_type2N(x: T, y: Option<S>) -> Option<U>
+/// - f_type1N_type2(x: Option<T>, y: S) -> Option<U>
+/// - f_type1N_type2N(x: Option<T>, y: Option<S>) -> Option<U>
+///
+/// The resulting functions return Some only if all arguments are 'Some'.
 macro_rules! some_polymorphic_function2 {
     ($func_name:ident  $(< $( const $var:ident : $ty: ty),* >)?, $type_name0: ident, $arg_type0:ty, $type_name1: ident, $arg_type1:ty, $ret_type:ty) => {
         ::paste::paste! {
@@ -239,12 +339,13 @@ macro_rules! some_polymorphic_function2 {
 
 pub(crate) use some_polymorphic_function2;
 
-// If there exists a function is f_t1_t2_t3(x: T, y: S, z: V) -> U, this creates
-// seven functions:
-// - f_t1_t2_t3N(x: T, y: S, z: Option<V>) -> Option<U>
-// - f_t1_t2N_t2(x: T, y: Option<S>, z: V) -> Option<U>
-// - etc.
-// The resulting functions return Some only if all arguments are 'Some'.
+/// If there exists a function is f_t1_t2_t3(x: T, y: S, z: V) -> U, this creates
+/// seven functions:
+/// - f_t1_t2_t3N(x: T, y: S, z: Option<V>) -> Option<U>
+/// - f_t1_t2N_t2(x: T, y: Option<S>, z: V) -> Option<U>
+/// - etc.
+///
+/// The resulting functions return Some only if all arguments are 'Some'.
 macro_rules! some_polymorphic_function3 {
     ($func_name:ident,
      $type_name0: ident, $arg_type0:ty,
@@ -332,12 +433,106 @@ macro_rules! some_polymorphic_function3 {
 
 pub(crate) use some_polymorphic_function3;
 
-// If there exists a function is f___(x: T, y: S, z: V) -> U, this creates
-// seven functions:
-// - f__N(x: T, y: S, z: Option<V>) -> Option<U>
-// - f_N_(x: T, y: Option<S>, z: V) -> Option<U>
-// - etc.
-// The resulting functions return Some only if all arguments are 'Some'.
+/// If there exists a function is f_t1_t2_t3(x: T, y: S, z: V) -> Option<U>, this creates
+/// seven functions:
+/// - f_t1_t2_t3N(x: T, y: S, z: Option<V>) -> Option<U>
+/// - f_t1_t2N_t2(x: T, y: Option<S>, z: V) -> Option<U>
+/// - etc.
+// This is like some_polymorphic_function3, but the result is always Option.
+macro_rules! some_polymorphic_null_function3 {
+    ($func_name:ident $(< $( const $var : ident : $ty: ty),* >)?,
+     $type_name0: ident, $arg_type0:ty,
+     $type_name1: ident, $arg_type1:ty,
+     $type_name2: ident, $arg_type2: ty,
+     $ret_type:ty) => {
+        ::paste::paste! {
+            #[doc(hidden)]
+            pub fn [<$func_name _ $type_name0 _ $type_name1 _ $type_name2 N>] $(< $( const $var : $ty ),* >)? (
+                arg0: $arg_type0,
+                arg1: $arg_type1,
+                arg2: Option<$arg_type2>
+            ) -> Option<$ret_type> {
+                let arg2 = arg2?;
+                [<$func_name _ $type_name0 _ $type_name1 _ $type_name2>] $(:: < $($var),* >)? (arg0, arg1, arg2)
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func_name _ $type_name0 _ $type_name1 N _ $type_name2>] $(< $( const $var : $ty ),* >)? (
+                arg0: $arg_type0,
+                arg1: Option<$arg_type1>,
+                arg2: $arg_type2
+            ) -> Option<$ret_type> {
+                let arg1 = arg1?;
+                [<$func_name _ $type_name0 _ $type_name1 _ $type_name2>] $(:: < $($var),* >)? (arg0, arg1, arg2)
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func_name _ $type_name0 _ $type_name1 N _ $type_name2 N>] $(< $( const $var : $ty ),* >)? (
+                arg0: $arg_type0,
+                arg1: Option<$arg_type1>,
+                arg2: Option<$arg_type2>
+            ) -> Option<$ret_type> {
+                let arg1 = arg1?;
+                let arg2 = arg2?;
+                [<$func_name _ $type_name0 _ $type_name1 _ $type_name2>] $(:: < $($var),* >)? (arg0, arg1, arg2)
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func_name _ $type_name0 N _ $type_name1 _ $type_name2>] $(< $( const $var : $ty ),* >)? (
+                arg0: Option<$arg_type0>,
+                arg1: $arg_type1,
+                arg2: $arg_type2
+            ) -> Option<$ret_type> {
+                let arg0 = arg0?;
+                [<$func_name _ $type_name0 _ $type_name1 _ $type_name2>] $(:: < $($var),* >)? (arg0, arg1, arg2)
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func_name _ $type_name0 N _ $type_name1 _ $type_name2 N>] $(< $( const $var : $ty ),* >)? (
+                arg0: Option<$arg_type0>,
+                arg1: $arg_type1,
+                arg2: Option<$arg_type2>
+            ) -> Option<$ret_type> {
+                let arg0 = arg0?;
+                let arg2 = arg2?;
+                [<$func_name _ $type_name0 _ $type_name1 _ $type_name2>] $(:: < $($var),* >)? (arg0, arg1, arg2)
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func_name _ $type_name0 N _ $type_name1 N _ $type_name2>] $(< $( const $var : $ty ),* >)? (
+                arg0: Option<$arg_type0>,
+                arg1: Option<$arg_type1>,
+                arg2: $arg_type2
+            ) -> Option<$ret_type> {
+                let arg0 = arg0?;
+                let arg1 = arg1?;
+                [<$func_name _ $type_name0 _ $type_name1 _ $type_name2>] $(:: < $($var),* >)? (arg0, arg1, arg2)
+            }
+
+            #[doc(hidden)]
+            pub fn [<$func_name _ $type_name0 N _ $type_name1 N _ $type_name2 N>] $(< $( const $var : $ty ),* >)? (
+                arg0: Option<$arg_type0>,
+                arg1: Option<$arg_type1>,
+                arg2: Option<$arg_type2>
+            ) -> Option<$ret_type> {
+                let arg0 = arg0?;
+                let arg1 = arg1?;
+                let arg2 = arg2?;
+                [<$func_name _ $type_name0 _ $type_name1 _ $type_name2>] $(:: < $($var),* >)? (arg0, arg1, arg2)
+            }
+        }
+    };
+}
+
+pub(crate) use some_polymorphic_null_function3;
+
+/// If there exists a function is f___(x: T, y: S, z: V) -> U, this creates
+/// seven functions:
+/// - f__N(x: T, y: S, z: Option<V>) -> Option<U>
+/// - f_N_(x: T, y: Option<S>, z: V) -> Option<U>
+/// - etc.
+///
+/// The resulting functions return Some only if all arguments are 'Some'.
 macro_rules! some_function3 {
     ($func_name:ident, $arg_type0:ty, $arg_type1:ty, $arg_type2: ty, $ret_type:ty) => {
         ::paste::paste! {
@@ -393,13 +588,14 @@ macro_rules! some_function3 {
 
 pub(crate) use some_function3;
 
-// Macro to create variants of a function with 4 arguments
-// If there exists a function is f____(x: T, y: S, z: V, w: W) -> U, this
-// creates fifteen functions:
-// - f___N(x: T, y: S, z: V, w: Option<W>) -> Option<U>
-// - f__N_(x: T, y: S, z: Option<V>, w: W) -> Option<U>
-// - etc.
-// The resulting functions return Some only if all arguments are 'Some'.
+/// Macro to create variants of a function with 4 arguments
+/// If there exists a function is f____(x: T, y: S, z: V, w: W) -> U, this
+/// creates fifteen functions:
+/// - f___N(x: T, y: S, z: V, w: Option<W>) -> Option<U>
+/// - f__N_(x: T, y: S, z: Option<V>, w: W) -> Option<U>
+/// - etc.
+///
+/// The resulting functions return Some only if all arguments are 'Some'.
 macro_rules! some_function4 {
     ($func_name:ident, $arg_type0:ty, $arg_type1:ty, $arg_type2: ty, $arg_type3: ty, $ret_type:ty) => {
         ::paste::paste! {
@@ -515,14 +711,15 @@ macro_rules! some_function4 {
 
 pub(crate) use some_function4;
 
-// Macro to create variants of a function with 2 arguments
-// optimized for the implementation of arithmetic operators.
-// Assuming there exists a function is f__(x: T, y: T) -> U, this creates
-// three functions:
-// - f_tN_t(x: T, y: Option<T>) -> Option<U>
-// - f_t_tN(x: Option<T>, y: T) -> Option<U>
-// - f_tN_tN(x: Option<T>, y: Option<T>) -> Option<U>
-// The resulting functions return Some only if all arguments are 'Some'.
+/// Macro to create variants of a function with 2 arguments
+/// optimized for the implementation of arithmetic operators.
+/// Assuming there exists a function is f__(x: T, y: T) -> U, this creates
+/// three functions:
+/// - f_tN_t(x: T, y: Option<T>) -> Option<U>
+/// - f_t_tN(x: Option<T>, y: T) -> Option<U>
+/// - f_tN_tN(x: Option<T>, y: Option<T>) -> Option<U>
+///
+/// The resulting functions return Some only if all arguments are 'Some'.
 macro_rules! some_existing_operator {
     ($func_name: ident $(< $( const $var:ident : $ty: ty),* >)?, $short_name: ident, $arg_type: ty, $ret_type: ty) => {
         ::paste::paste! {
@@ -553,21 +750,22 @@ macro_rules! some_existing_operator {
 
 pub(crate) use some_existing_operator;
 
-// Macro to create variants of a function with 2 arguments
-// optimized for the implementation of arithmetic operators.
-// Assuming there exists a function is f(x: T, y: T) -> U, this creates
-// four functions:
-// - f_t_t(x: T, y: T) -> U
-// - f_tN_t(x: T, y: Option<T>) -> Option<U>
-// - f_t_tN(x: Option<T>, y: T) -> Option<U>
-// - f_tN_tN(x: Option<T>, y: Option<T>) -> Option<U>
-// The resulting functions return Some only if all arguments are 'Some'.
-//
-// Has two variants:
-// - Takes the name of the existing function, the generated functions will have
-// this prefix
-// - Takes the name of the existing function, and the prefix for the generated
-// functions
+/// Macro to create variants of a function with 2 arguments
+/// optimized for the implementation of arithmetic operators.
+/// Assuming there exists a function is f(x: T, y: T) -> U, this creates
+/// four functions:
+/// - f_t_t(x: T, y: T) -> U
+/// - f_tN_t(x: T, y: Option<T>) -> Option<U>
+/// - f_t_tN(x: Option<T>, y: T) -> Option<U>
+/// - f_tN_tN(x: Option<T>, y: Option<T>) -> Option<U>
+///
+/// The resulting functions return Some only if all arguments are 'Some'.
+///
+/// Has two variants:
+/// - Takes the name of the existing function, the generated functions will have
+///   this prefix
+/// - Takes the name of the existing function, and the prefix for the generated
+///   functions
 macro_rules! some_operator {
     ($func_name: ident $(< $( const $var:ident : $ty: ty),* >)?, $short_name: ident, $arg_type: ty, $ret_type: ty) => {
         ::paste::paste! {
@@ -595,119 +793,6 @@ macro_rules! some_operator {
 }
 
 pub(crate) use some_operator;
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn wrap_bool(b: Option<bool>) -> bool {
-    b.unwrap_or_default()
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn or_b_b<F>(left: bool, right: F) -> bool
-where
-    F: Fn() -> bool,
-{
-    left || right()
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn or_bN_b<F>(left: Option<bool>, right: F) -> Option<bool>
-where
-    F: Fn() -> bool,
-{
-    match left {
-        Some(l) => Some(l || right()),
-        None => match right() {
-            true => Some(true),
-            _ => None,
-        },
-    }
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn or_b_bN<F>(left: bool, right: F) -> Option<bool>
-where
-    F: Fn() -> Option<bool>,
-{
-    match left {
-        false => right(),
-        true => Some(true),
-    }
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn or_bN_bN<F>(left: Option<bool>, right: F) -> Option<bool>
-where
-    F: Fn() -> Option<bool>,
-{
-    match left {
-        None => match right() {
-            Some(true) => Some(true),
-            _ => None,
-        },
-        Some(false) => right(),
-        Some(true) => Some(true),
-    }
-}
-
-// OR and AND are special, they can't be generated by rules
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn and_b_b<F>(left: bool, right: F) -> bool
-where
-    F: Fn() -> bool,
-{
-    left && right()
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn and_bN_b<F>(left: Option<bool>, right: F) -> Option<bool>
-where
-    F: Fn() -> bool,
-{
-    match left {
-        Some(false) => Some(false),
-        Some(true) => Some(right()),
-        None => match right() {
-            false => Some(false),
-            _ => None,
-        },
-    }
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn and_b_bN<F>(left: bool, right: F) -> Option<bool>
-where
-    F: Fn() -> Option<bool>,
-{
-    match left {
-        false => Some(false),
-        true => right(),
-    }
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn and_bN_bN<F>(left: Option<bool>, right: F) -> Option<bool>
-where
-    F: Fn() -> Option<bool>,
-{
-    match left {
-        Some(false) => Some(false),
-        Some(true) => right(),
-        None => match right() {
-            Some(false) => Some(false),
-            _ => None,
-        },
-    }
-}
 
 #[doc(hidden)]
 #[inline(always)]
@@ -884,62 +969,6 @@ some_polymorphic_function1!(sign, u16, u16, u16);
 some_polymorphic_function1!(sign, u32, u32, u32);
 some_polymorphic_function1!(sign, u64, u64, u64);
 some_polymorphic_function1!(sign, u128, u128, u128);
-
-#[doc(hidden)]
-#[inline(always)]
-pub const fn is_true_b_(left: bool) -> bool {
-    left
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub const fn is_true_bN_(left: Option<bool>) -> bool {
-    matches!(left, Some(true))
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub fn is_false_b_(left: bool) -> bool {
-    !left
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub const fn is_false_bN_(left: Option<bool>) -> bool {
-    matches!(left, Some(false))
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub const fn is_not_true_b_(left: bool) -> bool {
-    !left
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub const fn is_not_true_bN_(left: Option<bool>) -> bool {
-    match left {
-        Some(true) => false,
-        Some(false) => true,
-        _ => true,
-    }
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub const fn is_not_false_b_(left: bool) -> bool {
-    left
-}
-
-#[doc(hidden)]
-#[inline(always)]
-pub const fn is_not_false_bN_(left: Option<bool>) -> bool {
-    match left {
-        Some(true) => true,
-        Some(false) => false,
-        _ => true,
-    }
-}
 
 #[doc(hidden)]
 #[inline(always)]
@@ -1319,10 +1348,10 @@ where
     }
 }
 
-// Semigroup for the an aggregate which computes nothing
-// Useful when the compiler removes all aggregates from an aggregate operator
-// (This is currently never used, because the compiler generates a linear aggregate
-// for this case)
+/// Semigroup for the an aggregate which computes nothing
+/// Useful when the compiler removes all aggregates from an aggregate operator
+/// (This is currently never used, because the compiler generates a linear aggregate
+/// for this case)
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct EmptySemigroup;
@@ -1424,19 +1453,4 @@ impl<T> Deref for StaticLazy<T> {
     fn deref(&self) -> &Self::Target {
         self.get()
     }
-}
-
-#[doc(hidden)]
-// If the data is Ok(None), convert it to Err, other leave it unchanged
-pub fn unwrap_sql_result<T>(data: SqlResult<Option<T>>) -> SqlResult<T> {
-    match data {
-        Err(e) => Err(e),
-        Ok(None) => Err(SqlRuntimeError::from_strng("NULL result produced")),
-        Ok(Some(data)) => Ok(data),
-    }
-}
-
-#[doc(hidden)]
-pub fn wrap_sql_result<T>(data: T) -> SqlResult<T> {
-    Ok(data)
 }

@@ -29,6 +29,8 @@
 #   OPENDERA_BOOTSTRAP_POLICY  Allow|Reject|AwaitApproval. Forwarded
 #                              as --bootstrap-policy. Default is
 #                              AwaitApproval per the engine default.
+#   OPENDERA_SILENT_BOOTSTRAP  When non-empty, forwarded as
+#                              --silent-bootstrap.
 
 set -eu
 
@@ -71,6 +73,9 @@ curl --fail --location --silent --show-error --retry 5 --retry-delay 2 \
 ARGS="--config-file $CFG_PATH --bind-address 0.0.0.0 --initial $INITIAL_STATUS --deployment-id $OPENDERA_DEPLOYMENT_ID"
 if [ -n "${OPENDERA_BOOTSTRAP_POLICY:-}" ]; then
     ARGS="$ARGS --bootstrap-policy $OPENDERA_BOOTSTRAP_POLICY"
+fi
+if [ -n "${OPENDERA_SILENT_BOOTSTRAP:-}" ]; then
+    ARGS="$ARGS --silent-bootstrap"
 fi
 
 echo "[pipeline-entrypoint] exec $BIN_PATH $ARGS"

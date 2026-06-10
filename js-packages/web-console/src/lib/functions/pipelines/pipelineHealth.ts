@@ -232,15 +232,23 @@ const formatScalar = (v: unknown) => (v == null || v === '' ? NONE : String(v))
 const formatJson = (v: unknown) =>
   v == null || v === '' ? NONE : '\n' + JSON.stringify(v, null, 2)
 
+// Render a status, always appending the desired value:"Running (desired is Stopped)".
+const formatStatusWithDesired = (current: unknown, desired: unknown) => {
+  const base = formatScalar(current)
+  return `${base}, desired is ${desired ?? `(none)`}`
+}
+
 export function formatPipelineEventDescription(e: PipelineMonitorEventSelectedInfo): string {
   return [
     `recorded_at: ${formatScalar(e.recorded_at)}`,
     `program_status: ${formatScalar(e.program_status)}`,
-    `deployment_resources_status: ${formatScalar(e.deployment_resources_status)}`,
-    `deployment_runtime_status: ${formatScalar(e.deployment_runtime_status)}`,
+    `storage_status: ${formatScalar(e.storage_status)}`,
+    `deployment_resources_status: ${formatStatusWithDesired(e.deployment_resources_status, e.deployment_resources_desired_status)}`,
+    `deployment_runtime_status: ${formatStatusWithDesired(e.deployment_runtime_status, e.deployment_runtime_desired_status)}`,
     `deployment_has_error: ${formatScalar(e.deployment_has_error)}`,
     `deployment_error.message: ${formatScalar(e.deployment_error?.message)}`,
     `deployment_error.error_code: ${formatScalar(e.deployment_error?.error_code)}`,
+    `storage_status_details: ${formatJson(e.storage_status_details)}`,
     `deployment_resources_status_details: ${formatJson(e.deployment_resources_status_details)}`,
     `deployment_runtime_status_details: ${formatJson(e.deployment_runtime_status_details)}`
   ].join('\n')
