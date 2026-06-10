@@ -17,12 +17,8 @@
 //! both endpoints respond `503 Service Unavailable` so accidental
 //! exposure on a non-cloud deployment doesn't leak cross-tenant data.
 //!
-//! Status: skeleton. The list endpoint currently returns an empty
-//! array because the admin-scoped, cross-tenant `list_all_pipelines`
-//! storage method is not yet in `crate::db::storage`. The activity
-//! stream emits heartbeats only; real `ingested` / `queried` events
-//! are emitted from the controller's hot path in a follow-up that
-//! plumbs a broadcast channel through `ServerState`.
+//! Mount via [`scope`], which is the single registration point the
+//! OpenDera fork adds to `api/main.rs`.
 
 use std::time::Duration;
 
@@ -38,6 +34,21 @@ use serde::{Deserialize, Serialize};
 use crate::api::main::ServerState;
 use crate::db::storage::Storage;
 use crate::db::types::pipeline::PipelineId;
+
+/// The internal API scope (no tenant auth; every handler checks the
+/// `OPENDERA_INTERNAL_API_KEY` bearer token itself). This is the only
+/// registration `api/main.rs` needs for the OpenDera internal API —
+/// keep new internal endpoints registered here, not in main.rs, so
+/// upstream merges touch a single line there.
+pub fn scope() -> actix_web::Scope {
+    web::scope("/internal/v0")
+        .service(list_internal_pipelines)
+        .service(activity_stream)
+        .service(list_usage)
+        .service(get_tenant_billing)
+        .service(put_tenant_billing)
+        .service(get_pipeline_deployment_config)
+}
 use crate::db::types::tenant::TenantId;
 use crate::db::types::usage::UsageDimension;
 use crate::error::ManagerError;
