@@ -88,6 +88,19 @@ deps_present() {
     [ -n "$size" ] && [ "$size" -ge "$MIN_DEPS_BYTES" ]
 }
 
+build_in_progress() {
+    # True while a pipeline compile is writing target/. Scans /proc instead
+    # of pgrep -- procps is not in the image, and a missing pgrep would make
+    # this guard silently report "no build running".
+    for f in /proc/[0-9]*/comm; do
+        read -r comm < "$f" 2>/dev/null || continue
+        case "$comm" in
+            cargo|rustc) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # Exclude per-pipeline artifacts (rebuilt every compile, ~280 MB binaries) and
 # incremental state. Keep dep rlibs + .fingerprint + cargo registry/git.
 TAR_EXCLUDES="--exclude=*feldera_pipe_* \
@@ -114,14 +127,18 @@ restore() {
 
     log "restore: downloading $(object_url "$key")"
     mkdir -p "$HOME_DIR"
-    # Stream straight from Tigris through zstd into the home dir; no temp file.
-    if $S5 cat "$(object_url "$key")" | zstd -d -T0 | tar -x -C "$HOME_DIR"; then
+    # `s5cmd cp` downloads with parallel ranged GETs; the single-stream
+    # `s5cmd cat` took 4m24s for a ~1 GB archive in production. The temp
+    # file costs transient disk equal to the archive size.
+    tmp="$HOME_DIR/.target-cache-restore.$$.tar.zst"
+    if $S5 cp "$(object_url "$key")" "$tmp" \
+        && zstd -d -T0 -c "$tmp" | tar -x -C "$HOME_DIR"; then
         echo "$key" > "$SENTINEL"
         log "restore: complete ($(du -sh "$TARGET_DIR" 2>/dev/null | cut -f1) in target/)"
     else
         log "restore: FAILED to extract snapshot -- falling back to sccache cold build"
-        return 0
     fi
+    rm -f "$tmp"
 }
 
 snapshot_once() {
@@ -131,6 +148,13 @@ snapshot_once() {
         echo "$key" > "$SENTINEL"   # keep suspend-resume fast for this key
         return 0
     fi
+    # Never tar a live target/. MIN_DEPS_BYTES is a size gate, not a
+    # completion gate: it passes a few minutes into a cold build (measured:
+    # 2.3 GB of an eventual 4.4 GB graph), and the torn snapshot would
+    # permanently cache half a dep graph for this key.
+    if build_in_progress; then
+        return 0
+    fi
     if ! deps_present; then
         return 0
     fi
@@ -138,16 +162,26 @@ snapshot_once() {
     tmp="$WORK_DIR/.snapshot.$$.tar.zst"
     log "snapshot: building $(object_url "$key") from $(du -sh "$TARGET_DIR" | cut -f1) target/"
     # shellcheck disable=SC2086
-    if tar -C "$HOME_DIR" $TAR_EXCLUDES -cf - \
+    if ! tar -C "$HOME_DIR" $TAR_EXCLUDES -cf - \
             .feldera/compiler/rust-compilation/target \
             .cargo/registry \
             .cargo/git 2>/dev/null \
-            | zstd -1 -T0 -o "$tmp" -f \
-        && $S5 cp "$tmp" "$(object_url "$key")"; then
+            | zstd -1 -T0 -o "$tmp" -f; then
+        log "snapshot: FAILED to build archive -- will retry next cycle"
+        rm -f "$tmp"
+        return 0
+    fi
+    # A compile that started while we tarred makes the archive torn too.
+    if build_in_progress; then
+        log "snapshot: discarded (compile started mid-tar) -- will retry next cycle"
+        rm -f "$tmp"
+        return 0
+    fi
+    if $S5 cp "$tmp" "$(object_url "$key")"; then
         echo "$key" > "$SENTINEL"
         log "snapshot: uploaded ($(du -sh "$tmp" | cut -f1) compressed)"
     else
-        log "snapshot: FAILED -- will retry next cycle"
+        log "snapshot: FAILED to upload -- will retry next cycle"
     fi
     rm -f "$tmp"
 }
