@@ -10,18 +10,18 @@
 //! implementation here was written from that spec only.
 //!
 //! Current capabilities: synchronous-trait facade over async `object_store`
-//! calls, single-PUT writes via the [`PutPayload`] API, range reads, list,
-//! delete, and exists. Multipart uploads, retries with backoff, and
-//! per-object KMS settings are tracked as TODOs and will be filled in
-//! during follow-up commits — none of them affect the trait shape so the
-//! skeleton is a stable target for callers.
+//! calls, single-PUT writes via the [`PutPayload`] API, multipart streaming
+//! for large files (threshold tunable via the
+//! `opendera.multipart_threshold` option), bounded retry with full-jitter
+//! exponential backoff on transient write failures, range reads, list,
+//! delete, and exists. Per-object KMS settings remain a TODO.
 
 #![warn(missing_docs)]
 
 use std::fmt::{self, Debug};
 use std::io::ErrorKind;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use feldera_storage::block::BlockLocation;
 use feldera_storage::error::StorageError;
@@ -36,14 +36,89 @@ use object_store::path::Path as ObjPath;
 use object_store::{MultipartUpload, ObjectStore, PutPayload, parse_url_opts};
 use url::Url;
 
-/// Threshold above which writes are streamed via multipart upload rather
-/// than buffered in memory for a single PUT.
+/// Default threshold above which writes are streamed via multipart upload
+/// rather than buffered in memory for a single PUT.
 ///
 /// S3 requires non-final parts to be at least 5 MiB; we pick 8 MiB to
 /// give some slack and reduce the number of part requests for typical
 /// checkpoint shard sizes. Below this threshold a single PUT is used,
 /// which is cheaper for small files (one round trip instead of three).
-const MULTIPART_THRESHOLD: usize = 8 * 1024 * 1024;
+/// Override per backend with the `opendera.multipart_threshold` option
+/// (bytes, decimal integer) in `ObjectStorageConfig::other_options`.
+const DEFAULT_MULTIPART_THRESHOLD: usize = 8 * 1024 * 1024;
+
+/// `other_options` key holding the multipart threshold override. The
+/// `opendera.` prefix namespaces our knobs apart from the keys
+/// `object_store` itself understands; prefixed keys are stripped before
+/// the remaining options are handed to [`parse_url_opts`].
+const MULTIPART_THRESHOLD_OPTION: &str = "opendera.multipart_threshold";
+
+/// S3's minimum size for non-final multipart parts. Thresholds below
+/// this are clamped up, otherwise S3 rejects the second part of any
+/// multipart upload with `EntityTooSmall`.
+const MIN_MULTIPART_THRESHOLD: usize = 5 * 1024 * 1024;
+
+/// Retry cap for individual object-store write requests (single PUT,
+/// multipart initiation, part upload, completion). `object_store`
+/// already retries individual HTTP requests internally; this outer
+/// retry catches the case where those inner retries are exhausted.
+/// Mirrors the checkpoint synchronizer's copy retry policy.
+const WRITE_MAX_ATTEMPTS: u32 = 4;
+
+/// Initial backoff between write retries. Doubles each attempt:
+/// 200 ms, 400 ms, 800 ms, with full jitter applied each step.
+const WRITE_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Decide whether an `object_store` error is worth retrying. Network
+/// glitches, server 5xx, and timeouts surface as `Generic`/`JoinError`
+/// and retry; structural failures (bad path, missing object, failed
+/// precondition, auth) fail fast.
+fn is_transient(err: &object_store::Error) -> bool {
+    !matches!(
+        err,
+        object_store::Error::NotFound { .. }
+            | object_store::Error::InvalidPath { .. }
+            | object_store::Error::NotSupported { .. }
+            | object_store::Error::AlreadyExists { .. }
+            | object_store::Error::Precondition { .. }
+            | object_store::Error::NotModified { .. }
+            | object_store::Error::NotImplemented
+            | object_store::Error::PermissionDenied { .. }
+            | object_store::Error::Unauthenticated { .. }
+            | object_store::Error::UnknownConfigurationKey { .. }
+    )
+}
+
+/// Run one blocking write attempt up to [`WRITE_MAX_ATTEMPTS`] times,
+/// sleeping with full-jitter exponential backoff between transient
+/// failures. Non-transient errors and the final attempt's error are
+/// returned to the caller unchanged.
+fn with_write_retries<T>(
+    what: &str,
+    path: &ObjPath,
+    mut attempt_once: impl FnMut() -> Result<T, object_store::Error>,
+) -> Result<T, object_store::Error> {
+    let mut backoff = WRITE_BASE_BACKOFF;
+    let mut attempt = 0;
+    loop {
+        match attempt_once() {
+            Ok(v) => return Ok(v),
+            Err(err) => {
+                attempt += 1;
+                if !is_transient(&err) || attempt >= WRITE_MAX_ATTEMPTS {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    "object store {what} for {path} attempt {attempt} failed                      (retryable): {err}; backing off up to {backoff:?}"
+                );
+                // Full-jitter backoff: random in [0, backoff].
+                let jitter_ns = rand::random::<u64>() % (backoff.as_nanos() as u64).max(1);
+                std::thread::sleep(std::time::Duration::from_nanos(jitter_ns));
+                backoff = backoff.saturating_mul(2);
+            }
+        }
+    }
+}
 
 use feldera_storage::tokio::TOKIO_DEDICATED_IO;
 
@@ -64,11 +139,33 @@ fn absolute_path(base: &ObjPath, name: &StoragePath) -> ObjPath {
     joined
 }
 
+/// Parses the `opendera.multipart_threshold` option value: a decimal
+/// byte count, clamped up to S3's 5 MiB non-final part minimum.
+fn parse_multipart_threshold(value: &str) -> Result<usize, StorageError> {
+    let bytes: usize = value.trim().parse().map_err(|_| {
+        StorageError::stdio(
+            ErrorKind::InvalidInput,
+            "opendera.multipart_threshold must be a byte count (decimal integer)",
+            value.to_string(),
+        )
+    })?;
+    if bytes < MIN_MULTIPART_THRESHOLD {
+        tracing::warn!(
+            "opendera.multipart_threshold {bytes} is below S3's 5 MiB part minimum;              clamping to {MIN_MULTIPART_THRESHOLD}"
+        );
+        return Ok(MIN_MULTIPART_THRESHOLD);
+    }
+    Ok(bytes)
+}
+
 /// `StorageBackend` implementation backed by an `object_store::ObjectStore`.
 pub struct ObjectStoreBackend {
     store: Arc<dyn ObjectStore>,
     base: ObjPath,
     usage: Arc<AtomicI64>,
+    /// Writers switch from a single PUT to multipart streaming at this
+    /// many buffered bytes. See [`DEFAULT_MULTIPART_THRESHOLD`].
+    multipart_threshold: usize,
 }
 
 impl Debug for ObjectStoreBackend {
@@ -88,22 +185,45 @@ impl ObjectStoreBackend {
             store,
             base,
             usage: Arc::new(AtomicI64::new(0)),
+            multipart_threshold: DEFAULT_MULTIPART_THRESHOLD,
         }
     }
 
+    /// Override the multipart threshold (clamped to S3's 5 MiB part
+    /// minimum in [`from_config`]; unclamped here for tests against
+    /// in-memory stores).
+    pub fn with_multipart_threshold(mut self, threshold: usize) -> Self {
+        self.multipart_threshold = threshold;
+        self
+    }
+
     /// Construct from `ObjectStorageConfig` (already in `feldera-types`).
+    ///
+    /// `other_options` keys prefixed with `opendera.` are consumed here
+    /// and stripped before the remaining options reach `object_store`:
+    ///
+    /// * `opendera.multipart_threshold` — bytes (decimal integer) at
+    ///   which writers switch to multipart upload. Clamped to S3's
+    ///   5 MiB part-size minimum.
     pub fn from_config(cfg: &ObjectStorageConfig) -> Result<Self, StorageError> {
         let url = Url::parse(&cfg.url).map_err(|_| StorageError::InvalidURL(cfg.url.clone()))?;
-        let opts: Vec<(String, String)> = cfg
-            .other_options
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let mut multipart_threshold = DEFAULT_MULTIPART_THRESHOLD;
+        let mut opts: Vec<(String, String)> = Vec::new();
+        for (k, v) in cfg.other_options.iter() {
+            if k == MULTIPART_THRESHOLD_OPTION {
+                multipart_threshold = parse_multipart_threshold(v)?;
+            } else if let Some(unknown) = k.strip_prefix("opendera.") {
+                tracing::warn!("ignoring unknown OpenDera object-store option opendera.{unknown}");
+            } else {
+                opts.push((k.clone(), v.clone()));
+            }
+        }
         let (store, base) = parse_url_opts(&url, opts)?;
         Ok(Self {
             store: Arc::from(store),
             base,
             usage: Arc::new(AtomicI64::new(0)),
+            multipart_threshold,
         })
     }
 }
@@ -118,6 +238,7 @@ impl StorageBackend for ObjectStoreBackend {
             state: WriterState::Pending(Vec::new()),
             bytes_written: 0,
             usage: self.usage.clone(),
+            multipart_threshold: self.multipart_threshold,
         }))
     }
 
@@ -236,6 +357,8 @@ struct ObjectStoreFileWriter {
     state: WriterState,
     bytes_written: u64,
     usage: Arc<AtomicI64>,
+    /// Copied from the owning backend; see [`DEFAULT_MULTIPART_THRESHOLD`].
+    multipart_threshold: usize,
 }
 
 impl Debug for ObjectStoreFileWriter {
@@ -271,7 +394,11 @@ impl ObjectStoreFileWriter {
     /// multipart part. Called whenever the buffer crosses the threshold
     /// during `write_block`.
     fn flush_part(&mut self) -> Result<(), StorageError> {
-        if let WriterState::Streaming { upload, part_buffer } = &mut self.state {
+        if let WriterState::Streaming {
+            upload,
+            part_buffer,
+        } = &mut self.state
+        {
             if part_buffer.is_empty() {
                 return Ok(());
             }
@@ -279,7 +406,11 @@ impl ObjectStoreFileWriter {
             // We hold &mut self.state, so &mut Mutex<_> already gives us
             // exclusive access — no need to lock.
             let upload = upload.get_mut().unwrap();
-            TOKIO_DEDICATED_IO.block_on(upload.put_part(payload))?;
+            // `PutPayload` clones are cheap (shared bytes), so each retry
+            // re-sends the same part.
+            with_write_retries("put_part", &self.path, || {
+                TOKIO_DEDICATED_IO.block_on(upload.put_part(payload.clone()))
+            })?;
         }
         Ok(())
     }
@@ -309,21 +440,23 @@ impl FileWriter for ObjectStoreFileWriter {
         // part.
         let should_upgrade = matches!(
             &self.state,
-            WriterState::Pending(buf) if buf.len() >= MULTIPART_THRESHOLD
+            WriterState::Pending(buf) if buf.len() >= self.multipart_threshold
         );
         if should_upgrade {
             let pending = match std::mem::replace(&mut self.state, WriterState::Done) {
                 WriterState::Pending(buf) => buf,
                 _ => unreachable!(),
             };
-            let upload = TOKIO_DEDICATED_IO.block_on(self.store.put_multipart(&self.path))?;
+            let upload = with_write_retries("put_multipart", &self.path, || {
+                TOKIO_DEDICATED_IO.block_on(self.store.put_multipart(&self.path))
+            })?;
             self.state = WriterState::Streaming {
                 upload: Mutex::new(upload),
                 part_buffer: pending,
             };
             self.flush_part()?;
         } else if let WriterState::Streaming { part_buffer, .. } = &self.state
-            && part_buffer.len() >= MULTIPART_THRESHOLD
+            && part_buffer.len() >= self.multipart_threshold
         {
             self.flush_part()?;
         }
@@ -336,7 +469,10 @@ impl FileWriter for ObjectStoreFileWriter {
         match std::mem::replace(&mut self.state, WriterState::Done) {
             WriterState::Pending(buf) => {
                 // Single-PUT path: cheaper for small files.
-                TOKIO_DEDICATED_IO.block_on(self.store.put(&self.path, PutPayload::from(buf)))?;
+                let payload = PutPayload::from(buf);
+                with_write_retries("put", &self.path, || {
+                    TOKIO_DEDICATED_IO.block_on(self.store.put(&self.path, payload.clone()))
+                })?;
             }
             WriterState::Streaming {
                 upload,
@@ -346,10 +482,14 @@ impl FileWriter for ObjectStoreFileWriter {
                 // has no minimum size), then close the upload.
                 let mut upload = upload.into_inner().unwrap();
                 if !part_buffer.is_empty() {
-                    TOKIO_DEDICATED_IO
-                        .block_on(upload.put_part(PutPayload::from(part_buffer)))?;
+                    let payload = PutPayload::from(part_buffer);
+                    with_write_retries("put_part", &self.path, || {
+                        TOKIO_DEDICATED_IO.block_on(upload.put_part(payload.clone()))
+                    })?;
                 }
-                TOKIO_DEDICATED_IO.block_on(upload.complete())?;
+                with_write_retries("complete_multipart", &self.path, || {
+                    TOKIO_DEDICATED_IO.block_on(upload.complete()).map(|_| ())
+                })?;
             }
             WriterState::Done => {
                 return Err(StorageError::stdio(
@@ -498,6 +638,122 @@ mod tests {
     use super::*;
     use feldera_storage::StorageBackend;
 
+    /// Transient failures retry up to the attempt cap and then succeed.
+    #[test]
+    fn write_retries_recover_from_transient_failures() {
+        let path = ObjPath::from("retry-test");
+        let mut calls = 0;
+        let result = with_write_retries("put", &path, || {
+            calls += 1;
+            if calls < 3 {
+                Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "synthetic transient failure".into(),
+                })
+            } else {
+                Ok(42)
+            }
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls, 3);
+    }
+
+    /// Transient failures stop retrying once the attempt cap is hit.
+    #[test]
+    fn write_retries_give_up_after_cap() {
+        let path = ObjPath::from("retry-test");
+        let mut calls = 0;
+        let result: Result<(), _> = with_write_retries("put", &path, || {
+            calls += 1;
+            Err(object_store::Error::Generic {
+                store: "test",
+                source: "always failing".into(),
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, WRITE_MAX_ATTEMPTS);
+    }
+
+    /// Non-transient errors fail fast without retrying.
+    #[test]
+    fn write_retries_fail_fast_on_structural_errors() {
+        let path = ObjPath::from("retry-test");
+        let mut calls = 0;
+        let result: Result<(), _> = with_write_retries("put", &path, || {
+            calls += 1;
+            Err(object_store::Error::NotFound {
+                path: "x".to_string(),
+                source: "gone".into(),
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    /// The `opendera.multipart_threshold` option parses, clamps to the
+    /// S3 part minimum, and rejects garbage.
+    #[test]
+    fn multipart_threshold_option_parses_and_clamps() {
+        assert_eq!(
+            parse_multipart_threshold("16777216").unwrap(),
+            16 * 1024 * 1024
+        );
+        // Below the 5 MiB S3 part minimum: clamped.
+        assert_eq!(
+            parse_multipart_threshold("1024").unwrap(),
+            MIN_MULTIPART_THRESHOLD
+        );
+        assert!(parse_multipart_threshold("not-a-number").is_err());
+    }
+
+    /// `from_config` consumes `opendera.*` options instead of passing
+    /// them to `object_store` (which would reject unknown keys), and
+    /// applies the threshold override.
+    #[test]
+    fn from_config_strips_opendera_options() {
+        let cfg = ObjectStorageConfig {
+            url: "memory:///".to_string(),
+            other_options: [(
+                MULTIPART_THRESHOLD_OPTION.to_string(),
+                "16777216".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let backend = ObjectStoreBackend::from_config(&cfg).expect("from_config");
+        assert_eq!(backend.multipart_threshold, 16 * 1024 * 1024);
+    }
+
+    /// A small custom threshold drives the writer through the
+    /// multipart path (initiate, part flushes, completion) end to end.
+    #[test]
+    fn custom_threshold_streams_multipart() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let backend = ObjectStoreBackend::new_with_store(store, ObjPath::from("pipeline-test"))
+            .with_multipart_threshold(1024);
+
+        let name: StoragePath = ObjPath::from("small-multipart.bin");
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+
+        let mut writer = backend.create_named(&name).expect("create_named");
+        for chunk in payload.chunks(512) {
+            let mut data = FBuf::new();
+            data.extend_from_slice(chunk);
+            writer.write_block(data).expect("write_block");
+        }
+        let reader = writer.complete().expect("complete");
+
+        assert_eq!(reader.get_size().unwrap(), payload.len() as u64);
+        let read = reader
+            .read_block(BlockLocation {
+                offset: 0,
+                size: payload.len(),
+            })
+            .expect("read_block");
+        assert_eq!(read.as_slice(), payload.as_slice());
+    }
+
     /// Round-trip a small payload through an in-memory object store
     /// (`object_store::memory::InMemory`) using the same code path that
     /// the S3 / GCS / Azure backends use. Verifies the trait wiring is
@@ -578,10 +834,7 @@ mod tests {
         for i in 0..10u64 {
             let offset = i * 2 * 1024 * 1024;
             let block = reader
-                .read_block(BlockLocation {
-                    offset,
-                    size: 512,
-                })
+                .read_block(BlockLocation { offset, size: 512 })
                 .expect("read_block");
             assert_eq!(block.as_slice()[0], i as u8, "chunk {i} out of order");
         }
@@ -616,14 +869,10 @@ mod tests {
             return;
         };
 
-        let prefix = format!(
-            "opendera-it/{}",
-            uuid::Uuid::now_v7().simple()
-        );
+        let prefix = format!("opendera-it/{}", uuid::Uuid::now_v7().simple());
 
         // Small file: single-PUT path.
-        let small_name: StoragePath =
-            format!("{prefix}/small.bin").as_str().into();
+        let small_name: StoragePath = format!("{prefix}/small.bin").as_str().into();
         let body = b"hello s3 integration";
         let mut w = backend.create_named(&small_name).expect("create_named");
         let mut fbuf = FBuf::new();
@@ -641,8 +890,7 @@ mod tests {
 
         // Large file: multipart path. ~12 MiB across six 2 MiB chunks
         // to cross the 8 MiB threshold and produce at least two parts.
-        let big_name: StoragePath =
-            format!("{prefix}/big.bin").as_str().into();
+        let big_name: StoragePath = format!("{prefix}/big.bin").as_str().into();
         let chunk = vec![0x42u8; 2 * 1024 * 1024];
         let mut w = backend.create_named(&big_name).expect("create_named big");
         for _ in 0..6 {
@@ -662,9 +910,9 @@ mod tests {
             .expect("list");
         assert_eq!(listed.len(), 2, "expected exactly 2 files under prefix");
 
-        backend.delete_recursive(&prefix.as_str().into()).expect(
-            "delete_recursive should remove everything under the prefix",
-        );
+        backend
+            .delete_recursive(&prefix.as_str().into())
+            .expect("delete_recursive should remove everything under the prefix");
 
         let mut listed2 = Vec::new();
         backend
@@ -672,7 +920,10 @@ mod tests {
                 listed2.push(entry.name.as_ref().to_string());
             })
             .expect("list after delete_recursive");
-        assert!(listed2.is_empty(), "prefix not empty after recursive delete");
+        assert!(
+            listed2.is_empty(),
+            "prefix not empty after recursive delete"
+        );
     }
 
     /// Build an `ObjectStoreBackend` from environment variables, or
@@ -694,10 +945,7 @@ mod tests {
                 }
             }
         }
-        let cfg = ObjectStorageConfig {
-            url,
-            other_options,
-        };
+        let cfg = ObjectStorageConfig { url, other_options };
         Some(ObjectStoreBackend::from_config(&cfg).expect("from_config"))
     }
 }
