@@ -9,6 +9,26 @@ import java.util.Set;
 /** Test various utilities functions */
 public class TestUtilities {
     @Test
+    public void testRawRustString() {
+        // Plain contents use the minimal one-hash delimiter.
+        Assert.assertEquals("r#\"hello\"#", Utilities.rawRustString("hello"));
+        // A bare quote does not require more hashes.
+        Assert.assertEquals("r#\"a\"b\"#", Utilities.rawRustString("a\"b"));
+        // '"#' inside the value would terminate a one-hash literal early;
+        // the delimiter must grow to two hashes.
+        Assert.assertEquals("r##\"a\"#b\"##", Utilities.rawRustString("a\"#b"));
+        // The longest '"#...' run wins, even at the end of the value.
+        Assert.assertEquals("r###\"a\"##\"###", Utilities.rawRustString("a\"##"));
+        // JSON-encoded quotes followed by '#' (the realistic case: raw
+        // literals carry serialized JSON).
+        Assert.assertEquals(
+                "r##\"{\"k\":\"v\"#tag\"}\"##",
+                Utilities.rawRustString("{\"k\":\"v\"#tag\"}"));
+        // Empty string.
+        Assert.assertEquals("r#\"\"#", Utilities.rawRustString(""));
+    }
+
+    @Test
     public void testExpandBraces() {
         String path = "a{b,cd,e}hi{j,k,l}z";
         List<String> expansion = Utilities.expandBraces(path);
