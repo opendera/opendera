@@ -22,7 +22,5 @@ declare module 'virtual:opendera-cloud-chrome' {
   // Null in OSS builds; populated by the cloud build via
   // OPENDERA_CLOUD_CHROME_MODULE. Props mirror the plugin's
   // TenantSwitcher.svelte signature.
-  export const TenantSwitcher:
-    | Component<{ current_tenant_id: string }>
-    | null
+  export const TenantSwitcher: Component<{ current_tenant_id: string }> | null
 }

@@ -6,7 +6,7 @@ use crate::db::types::tenant::TenantId;
 
 /// One closed usage bucket — the unit of billing-grade usage telemetry
 /// the manager records for each running pipeline. Persisted in the
-/// `usage_bucket` table by [`Storage::insert_usage_bucket`] when the
+/// `usage_bucket` table by `Storage::insert_usage_bucket` when the
 /// usage collector closes a wall-clock-aligned bucket; consumed by the
 /// cloud-side Stripe metering daemon via GET /internal/v0/usage.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

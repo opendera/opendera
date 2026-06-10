@@ -146,8 +146,13 @@ jobs:
       - run: bun install --frozen-lockfile
       # TypeScript / svelte-check is fast and high signal — hard gate.
       - run: bun run check
-      # bun run lint has been flaky on a PostCSS oddity in
-      # ConnectorErrors.svelte for weeks. Don't gate on it.
+      # The prettier half of lint is clean (the {@html}-in-<style>
+      # crasher is in .prettierignore). eslint runs again since
+      # @eslint/js was added to devDependencies, but the upstream merge
+      # to ESLint 10 + eslint-plugin-svelte 3.15 surfaced ~344 rule
+      # violations, mostly in upstream-owned components — fixing them
+      # would add merge-conflict surface for stylistic gain. Soft-gate
+      # until upstream cleans them up.
       - run: bun run lint
         continue-on-error: true
 
