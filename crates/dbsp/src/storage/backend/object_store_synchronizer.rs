@@ -152,8 +152,7 @@ fn remote_backend(sync: &SyncConfig) -> anyhow::Result<ObjectStoreBackend> {
             // object_store's GCS builder reads. `region` is meaningless
             // on GCS and is dropped silently.
             if let Some(secret) = &sync.secret_key {
-                other_options
-                    .insert("service_account_key".to_string(), secret.clone());
+                other_options.insert("service_account_key".to_string(), secret.clone());
             }
         }
         CloudKind::Azure => {
@@ -169,10 +168,7 @@ fn remote_backend(sync: &SyncConfig) -> anyhow::Result<ObjectStoreBackend> {
         }
     }
 
-    let cfg = ObjectStorageConfig {
-        url,
-        other_options,
-    };
+    let cfg = ObjectStorageConfig { url, other_options };
     ObjectStoreBackend::from_config(&cfg)
         .map_err(|e| anyhow!("failed to construct remote object store: {e}"))
 }
@@ -205,8 +201,7 @@ fn copy_file(
                     attempt = attempt + 1
                 );
                 // Full-jitter backoff: random in [0, backoff].
-                let jitter_ns =
-                    rand::random::<u64>() % (backoff.as_nanos() as u64).max(1);
+                let jitter_ns = rand::random::<u64>() % (backoff.as_nanos() as u64).max(1);
                 sleep(Duration::from_nanos(jitter_ns));
                 backoff = backoff.saturating_mul(2);
                 last_err = Some(err);
@@ -237,7 +232,10 @@ fn copy_file_once(
 }
 
 /// List every file in `src` under `prefix`. Returns relative paths.
-fn list_files(src: &Arc<dyn StorageBackend>, prefix: &StoragePath) -> anyhow::Result<Vec<StoragePath>> {
+fn list_files(
+    src: &Arc<dyn StorageBackend>,
+    prefix: &StoragePath,
+) -> anyhow::Result<Vec<StoragePath>> {
     let mut out = Vec::new();
     src.list(prefix, &mut |entry| out.push(entry.name.clone()))?;
     Ok(out)
@@ -315,10 +313,12 @@ impl CheckpointSynchronizer for ObjectStoreSynchronizer {
             .as_ref()
             .ok_or_else(|| anyhow!("pull called without start_from_checkpoint"))?
         {
-            StartFromCheckpoint::Latest => checkpoints
-                .last()
-                .ok_or_else(|| anyhow!("remote manifest has no checkpoints"))?
-                .uuid,
+            StartFromCheckpoint::Latest => {
+                checkpoints
+                    .last()
+                    .ok_or_else(|| anyhow!("remote manifest has no checkpoints"))?
+                    .uuid
+            }
             StartFromCheckpoint::Uuid(u) => *u,
         };
         let target_meta = checkpoints
@@ -355,7 +355,10 @@ mod tests {
     /// can exercise the synchronizer without touching S3.
     fn in_memory_backend(prefix: &str) -> Arc<dyn StorageBackend> {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        Arc::new(ObjectStoreBackend::new_with_store(store, ObjPath::from(prefix)))
+        Arc::new(ObjectStoreBackend::new_with_store(
+            store,
+            ObjPath::from(prefix),
+        ))
     }
 
     fn write_text(backend: &Arc<dyn StorageBackend>, path: &str, body: &[u8]) {
@@ -367,10 +370,7 @@ mod tests {
         writer.complete().expect("complete");
     }
 
-    fn cfg(
-        provider: Option<&str>,
-        endpoint: Option<&str>,
-    ) -> SyncConfig {
+    fn cfg(provider: Option<&str>, endpoint: Option<&str>) -> SyncConfig {
         SyncConfig {
             provider: provider.map(String::from),
             endpoint: endpoint.map(String::from),
@@ -419,10 +419,7 @@ mod tests {
             CloudKind::Gcs
         ));
         assert!(matches!(
-            CloudKind::detect(&cfg(
-                None,
-                Some("https://myaccount.blob.core.windows.net")
-            )),
+            CloudKind::detect(&cfg(None, Some("https://myaccount.blob.core.windows.net"))),
             CloudKind::Azure
         ));
         assert!(matches!(
@@ -524,7 +521,10 @@ mod tests {
         let synchronizer = ObjectStoreSynchronizer;
         let sync_cfg = SyncConfig {
             endpoint,
-            bucket: format!("{bucket}/opendera-sync-it/{}", uuid::Uuid::now_v7().simple()),
+            bucket: format!(
+                "{bucket}/opendera-sync-it/{}",
+                uuid::Uuid::now_v7().simple()
+            ),
             region,
             provider: Some("Minio".to_string()),
             access_key,
