@@ -33,7 +33,9 @@ use feldera_storage::{
 };
 use feldera_types::config::{ObjectStorageConfig, StorageBackendConfig, StorageConfig};
 use object_store::path::Path as ObjPath;
-use object_store::{MultipartUpload, ObjectStore, PutPayload, parse_url_opts};
+use object_store::{
+    MultipartUpload, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion, parse_url_opts,
+};
 use url::Url;
 
 /// Default threshold above which writes are streamed via multipart upload
@@ -197,6 +199,70 @@ impl ObjectStoreBackend {
         self
     }
 
+    /// Returns the current version (etag) of `name`, or `None` if the
+    /// object doesn't exist. Pair with [`Self::put_if_version`] for
+    /// optimistic-concurrency writes.
+    pub fn object_version(
+        &self,
+        name: &StoragePath,
+    ) -> Result<Option<UpdateVersion>, object_store::Error> {
+        let path = absolute_path(&self.base, name);
+        match TOKIO_DEDICATED_IO.block_on(self.store.head(&path)) {
+            Ok(meta) => Ok(Some(UpdateVersion {
+                e_tag: meta.e_tag,
+                version: meta.version,
+            })),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Conditionally overwrites `name`: the put succeeds only if the
+    /// object's version still matches `expected`, or — when `expected`
+    /// is `None` — only if the object does not exist yet. A concurrent
+    /// writer therefore surfaces as `Error::Precondition` (stale
+    /// version) or `Error::AlreadyExists` (created in between).
+    ///
+    /// Stores that don't implement conditional puts (some S3-compatible
+    /// endpoints) degrade to an unconditional put with a warning —
+    /// detection is best-effort, never an availability risk.
+    ///
+    /// Note: a retry after a transient failure whose first attempt
+    /// actually landed server-side can report a spurious conflict; the
+    /// caller should treat conflicts as "verify and re-drive", not as
+    /// data corruption.
+    pub fn put_if_version(
+        &self,
+        name: &StoragePath,
+        data: Vec<u8>,
+        expected: Option<UpdateVersion>,
+    ) -> Result<(), object_store::Error> {
+        let path = absolute_path(&self.base, name);
+        let payload = PutPayload::from(data);
+        let opts = PutOptions::from(match expected {
+            Some(version) => PutMode::Update(version),
+            None => PutMode::Create,
+        });
+        let result = with_write_retries("conditional put", &path, || {
+            TOKIO_DEDICATED_IO
+                .block_on(self.store.put_opts(&path, payload.clone(), opts.clone()))
+                .map(|_| ())
+        });
+        match result {
+            Err(object_store::Error::NotImplemented | object_store::Error::NotSupported { .. }) => {
+                tracing::warn!(
+                    "object store does not support conditional puts; writing {path}                      unconditionally (concurrent-writer detection disabled)"
+                );
+                with_write_retries("put", &path, || {
+                    TOKIO_DEDICATED_IO
+                        .block_on(self.store.put(&path, payload.clone()))
+                        .map(|_| ())
+                })
+            }
+            other => other,
+        }
+    }
+
     /// Construct from `ObjectStorageConfig` (already in `feldera-types`).
     ///
     /// `other_options` keys prefixed with `opendera.` are consumed here
@@ -275,9 +341,7 @@ impl StorageBackend for ObjectStoreBackend {
                     let full = meta.location.as_ref();
                     let rel = full.get(base_len..).unwrap_or(full).trim_start_matches('/');
                     let storage_path: StoragePath = ObjPath::from(rel);
-                    let entry = StorageFileType::File {
-                        size: meta.size,
-                    };
+                    let entry = StorageFileType::File { size: meta.size };
                     out.push((storage_path, entry));
                 }
                 Ok(out)
@@ -637,6 +701,45 @@ inventory::submit! {
 mod tests {
     use super::*;
     use feldera_storage::StorageBackend;
+
+    /// Conditional puts: create-only fails once the object exists,
+    /// version-matched updates succeed, stale versions are rejected.
+    #[test]
+    fn conditional_put_detects_concurrent_writers() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let backend = ObjectStoreBackend::new_with_store(store, ObjPath::from("pipeline-test"));
+        let name: StoragePath = ObjPath::from("manifest.json");
+
+        // Object absent: version is None and create-mode put succeeds.
+        assert!(backend.object_version(&name).unwrap().is_none());
+        backend
+            .put_if_version(&name, b"v1".to_vec(), None)
+            .expect("create");
+
+        // Create-mode put now fails: someone else got there first.
+        let err = backend
+            .put_if_version(&name, b"v1-other".to_vec(), None)
+            .expect_err("create over existing object must fail");
+        assert!(
+            matches!(err, object_store::Error::AlreadyExists { .. }),
+            "expected AlreadyExists, got {err:?}"
+        );
+
+        // Update with the current version succeeds...
+        let v1 = backend.object_version(&name).unwrap().expect("exists");
+        backend
+            .put_if_version(&name, b"v2".to_vec(), Some(v1.clone()))
+            .expect("update with current version");
+
+        // ...and re-using the now-stale version is rejected.
+        let err = backend
+            .put_if_version(&name, b"v3".to_vec(), Some(v1))
+            .expect_err("update with stale version must fail");
+        assert!(
+            matches!(err, object_store::Error::Precondition { .. }),
+            "expected Precondition, got {err:?}"
+        );
+    }
 
     /// Transient failures retry up to the attempt cap and then succeed.
     #[test]
