@@ -24,8 +24,8 @@ use actix_web::{
 use actix_web_httpauth::middleware::HttpAuthentication;
 use actix_web_static_files::ResourceFiles;
 use anyhow::Result as AnyResult;
-use futures_util::FutureExt;
 use feldera_observability as observability;
+use futures_util::FutureExt;
 use std::io::Write;
 use std::time::Duration;
 use std::{env, io, net::TcpListener, sync::Arc};

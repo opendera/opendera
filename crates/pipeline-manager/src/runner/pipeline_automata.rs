@@ -1,5 +1,4 @@
-use crate::api::activity_bus::{ActivityBus, ActivityEvent};
-use crate::api::endpoints::internal::runtime_status_to_str;
+use crate::api::activity_bus::ActivityBus;
 use crate::config::CommonConfig;
 use crate::db::error::DBError;
 use crate::db::storage::{ExtendedPipelineDescrRunner, Storage};
@@ -707,23 +706,13 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 }
             };
 
-        // Emit a `state_changed` on the activity bus when the
-        // externally observable status (the string surfaced by
-        // `/internal/v0/pipelines.observed_status`) changes. Mirrors
-        // the derivation in `list_internal_pipelines` so the cloud
-        // activity controller sees a consistent value whether it
-        // reconciles from the polling endpoint or the SSE stream.
-        let old_observed = pipeline
-            .deployment_runtime_status
-            .map(runtime_status_to_str)
-            .unwrap_or_else(|| "Unknown".to_string());
-        let new_observed = new_runtime_status
-            .map(runtime_status_to_str)
-            .unwrap_or_else(|| "Unknown".to_string());
-        if old_observed != new_observed {
-            self.activity_bus
-                .emit(ActivityEvent::state_changed(self.pipeline_id, new_observed));
-        }
+        // OpenDera cloud: notify the activity controller of observable
+        // status changes.
+        self.activity_bus.emit_state_change(
+            self.pipeline_id,
+            pipeline.deployment_runtime_status,
+            new_runtime_status,
+        );
 
         // Log the transition that occurred
         if transition != Action::Remain {
