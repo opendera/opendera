@@ -267,8 +267,17 @@ impl CheckpointSynchronizer for ObjectStoreSynchronizer {
         storage: Arc<dyn StorageBackend>,
         remote_config: SyncConfig,
     ) -> anyhow::Result<Option<CheckpointSyncMetrics>> {
-        let remote = Arc::new(remote_backend(&remote_config)?) as Arc<dyn StorageBackend>;
+        let remote_object_store = Arc::new(remote_backend(&remote_config)?);
+        let remote = remote_object_store.clone() as Arc<dyn StorageBackend>;
         let start = Instant::now();
+
+        // Capture the remote manifest's version up front: the conditional
+        // put below detects any other pusher that lands a manifest while
+        // this push is uploading checkpoint files.
+        let manifest: StoragePath = CHECKPOINT_FILE_NAME.into();
+        let expected_manifest_version = remote_object_store
+            .object_version(&manifest)
+            .context("read remote manifest version")?;
 
         // 1. Upload every file under the checkpoint's UUID directory.
         let uuid_prefix: StoragePath = checkpoint.to_string().as_str().into();
@@ -282,9 +291,25 @@ impl CheckpointSynchronizer for ObjectStoreSynchronizer {
         //    landed yet) or the new one (after all files are already
         //    uploaded). It never sees a manifest that references a
         //    half-uploaded checkpoint.
-        let manifest: StoragePath = CHECKPOINT_FILE_NAME.into();
+        //
+        //    The put is conditional on the version captured before step 1:
+        //    if another pipeline instance pushed to the same remote prefix
+        //    in the meantime (split brain), fail loudly instead of silently
+        //    overwriting its manifest.
         if storage.exists(&manifest)? {
-            total_bytes += copy_file(&storage, &remote, &manifest)?;
+            let data = storage
+                .read(&manifest)
+                .context("read local checkpoint manifest")?;
+            total_bytes += data.len() as u64;
+            remote_object_store
+                .put_if_version(&manifest, data.as_slice().to_vec(), expected_manifest_version)
+                .map_err(|e| match e {
+                    object_store::Error::Precondition { .. }
+                    | object_store::Error::AlreadyExists { .. } => anyhow!(
+                        "concurrent checkpoint push detected: the remote manifest changed                          while this push was uploading. Two pipeline instances appear to be                          pushing checkpoints to the same remote prefix; refusing to                          overwrite. Underlying error: {e}"
+                    ),
+                    e => anyhow!("upload checkpoint manifest: {e}"),
+                })?;
         }
 
         Ok(Some(metrics(start, total_bytes)))
