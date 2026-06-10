@@ -71,29 +71,28 @@ describe('categorizePipelineEvent', () => {
       })
     })
 
-    it.each<ProgramStatus>([
-      'SystemError',
-      'SqlError',
-      'RustError'
-    ])('returns major_issue for program_status=%s when no deployment error', (status) => {
-      const r = categorizePipelineEvent(makeEvent({ program_status: status }))
-      expect(r.type).toBe('major_issue')
-      expect(r.incident.programError).toBe(true)
-    })
+    it.each<ProgramStatus>(['SystemError', 'SqlError', 'RustError'])(
+      'returns major_issue for program_status=%s when no deployment error',
+      (status) => {
+        const r = categorizePipelineEvent(makeEvent({ program_status: status }))
+        expect(r.type).toBe('major_issue')
+        expect(r.incident.programError).toBe(true)
+      }
+    )
 
-    it.each<ResourcesStatus>([
-      'Provisioning',
-      'Stopping'
-    ])('returns transitioning for resources_status=%s (overrides runtime status)', (status) => {
-      // Resource transition wins over Unavailable runtime: blue, not yellow
-      const r = categorizePipelineEvent(
-        makeEvent({
-          deployment_resources_status: status,
-          deployment_runtime_status: 'Unavailable'
-        })
-      )
-      expect(r.type).toBe('transitioning')
-    })
+    it.each<ResourcesStatus>(['Provisioning', 'Stopping'])(
+      'returns transitioning for resources_status=%s (overrides runtime status)',
+      (status) => {
+        // Resource transition wins over Unavailable runtime: blue, not yellow
+        const r = categorizePipelineEvent(
+          makeEvent({
+            deployment_resources_status: status,
+            deployment_runtime_status: 'Unavailable'
+          })
+        )
+        expect(r.type).toBe('transitioning')
+      }
+    )
 
     it('returns unhealthy when runtime is Unavailable and resources are not transitioning', () => {
       const r = categorizePipelineEvent(

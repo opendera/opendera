@@ -24,7 +24,7 @@ export const randomNormalBigNumber: RandomNormalBigNumber = (function sourceRand
 
       // If available, use the second previously-generated uniform random.
       if (x != null) {
-        ;(y = x), (x = null)
+        ;((y = x), (x = null))
       }
       // Otherwise, generate a new x and y.
       else {
