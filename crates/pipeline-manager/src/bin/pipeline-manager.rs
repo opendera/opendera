@@ -19,6 +19,7 @@ use pipeline_manager::events_cleaner::events_cleaner;
 use pipeline_manager::runner::fly_runner::FlyRunner;
 use pipeline_manager::runner::local_runner::LocalRunner;
 use pipeline_manager::runner::main::runner_main;
+use pipeline_manager::tigris_gc::tigris_gc;
 use pipeline_manager::usage_collector::usage_collector;
 use pipeline_manager::{ensure_default_crypto_provider, init_fd_limit, platform_enable_unstable};
 use std::sync::Arc;
@@ -193,6 +194,7 @@ fn main() -> anyhow::Result<()> {
                                 "Starting pipeline runner: fly (org={}, region={})",
                                 fly_runner_config.org_slug, fly_runner_config.region
                             );
+                            let fly_runner_config = fly_runner_config.clone();
                             tokio::spawn(async move {
                                 runner_main::<FlyRunner>(
                                     db_clone,
@@ -228,6 +230,17 @@ fn main() -> anyhow::Result<()> {
                     tokio::spawn(async move {
                         usage_collector(db_clone, common_config_clone).await;
                     });
+
+                    // Tigris GC: hourly sweep that deletes storage prefixes
+                    // of pipelines that no longer exist (FlyRunner::clear()
+                    // is best-effort and can leave orphans behind).
+                    if matches!(runner_selection.runner_kind, RunnerKind::Fly) {
+                        let db_clone = db.clone();
+                        let fly_config_clone = fly_runner_config.clone();
+                        tokio::spawn(async move {
+                            tigris_gc(db_clone, fly_config_clone).await;
+                        });
+                    }
 
                     // The api-server blocks forever
                     pipeline_manager::api::main::run(db, common_config, api_config, activity_bus)
