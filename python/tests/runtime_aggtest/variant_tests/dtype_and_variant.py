@@ -1,5 +1,22 @@
 from tests.runtime_aggtest.aggtst_base import TstView, TstTable
 from decimal import Decimal
+from datetime import datetime, timezone
+
+
+def t(s):
+    return datetime.strptime(s, "%H:%M:%S").time()
+
+
+def d(s):
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def ts(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+
+
+def ts_tz(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc)
 
 
 # INTEGER
@@ -389,15 +406,15 @@ class varnttst_variant_to_float(TstView):
         self.data = [
             {
                 "id": 0,
-                "real1": Decimal("57681.18"),
-                "double1": Decimal("-38.2711234601246"),
+                "real1": "57681.18",
+                "double1": "-38.2711234601246",
             },
             {"id": 1, "real1": None, "double1": None},
         ]
         self.sql = """CREATE MATERIALIZED VIEW variant_to_float AS SELECT
                       id,
-                      CAST(real1_varnt AS REAL) AS real1,
-                      CAST(double1_varnt AS DOUBLE) AS double1
+                      CAST(CAST(real1_varnt AS REAL) AS VARCHAR) AS real1,
+                      CAST(CAST(double1_varnt AS DOUBLE) AS VARCHAR) AS double1
                       FROM float_to_variant"""
 
 
@@ -408,15 +425,15 @@ class varnttst_variant_to_otherfloat(TstView):
         self.data = [
             {
                 "id": 0,
-                "real_to_dbl": Decimal("57681.1796875"),
-                "dbl_to_real": Decimal("-38.271122"),
+                "real_to_dbl": "57681.1796875",
+                "dbl_to_real": "-38.271122",
             },
             {"id": 1, "real_to_dbl": None, "dbl_to_real": None},
         ]
         self.sql = """CREATE MATERIALIZED VIEW variant_to_otherfloat AS SELECT
                       id,
-                      CAST(real1_varnt AS DOUBLE) AS real_to_dbl,
-                      CAST(double1_varnt AS REAL) AS dbl_to_real
+                      CAST(CAST(real1_varnt AS DOUBLE) AS VARCHAR) AS real_to_dbl,
+                      CAST(CAST(double1_varnt AS REAL) AS VARCHAR) AS dbl_to_real
                       FROM float_to_variant"""
 
 
@@ -570,7 +587,11 @@ class varnttst_variant_to_binary(TstView):
     def __init__(self):
         # checked manually
         self.data = [
-            {"id": 0, "binary": "0c162000", "vbinary": "17382115"},
+            {
+                "id": 0,
+                "binary": bytes.fromhex("0c162000"),
+                "vbinary": bytes.fromhex("17382115"),
+            },
             {"id": 1, "binary": None, "vbinary": None},
         ]
         self.sql = """CREATE MATERIALIZED VIEW variant_to_binary AS SELECT
@@ -584,7 +605,11 @@ class varnttst_variant_to_otherbinary(TstView):
     def __init__(self):
         # checked manually
         self.data = [
-            {"id": 0, "bin_to_vbin": "0c1620", "vbin_to_bin": "17382115"},
+            {
+                "id": 0,
+                "bin_to_vbin": bytes.fromhex("0c1620"),
+                "vbin_to_bin": bytes.fromhex("17382115"),
+            },
             {"id": 1, "bin_to_vbin": None, "vbin_to_bin": None},
         ]
         self.sql = """CREATE MATERIALIZED VIEW variant_to_otherbinary AS SELECT
@@ -594,7 +619,7 @@ class varnttst_variant_to_otherbinary(TstView):
                       FROM binary_to_variant"""
 
 
-# DATE, TIME, TIMESTAMP
+# DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE
 class varnttst_time_tbl(TstTable):
     """Define the table used by the time tests"""
 
@@ -603,6 +628,7 @@ class varnttst_time_tbl(TstTable):
                       id INT,
                       datee DATE,
                       tmestmp TIMESTAMP,
+                      tmestmp_tz TIMESTAMP WITH TIME ZONE,
                       timee TIME
                       )"""
         self.data = [
@@ -610,12 +636,14 @@ class varnttst_time_tbl(TstTable):
                 "id": 0,
                 "datee": "2024-12-05",
                 "tmestmp": "2020-06-21 14:23:44",
+                "tmestmp_tz": "2020-06-21T14:23:44+00:00",
                 "timee": "18:30:45",
             },
             {
                 "id": 1,
                 "datee": None,
                 "tmestmp": None,
+                "tmestmp_tz": None,
                 "timee": None,
             },
         ]
@@ -629,12 +657,14 @@ class varnttst_time_to_variant(TstView):
                 "id": 0,
                 "datee_varnt": '"2024-12-05"',
                 "tmestmp_varnt": '"2020-06-21 14:23:44"',
+                "tmestmp_tz_varnt": '"2020-06-21 14:23:44+00:00"',
                 "timee_varnt": '"18:30:45"',
             },
             {
                 "id": 1,
                 "datee_varnt": "null",
                 "tmestmp_varnt": "null",
+                "tmestmp_tz_varnt": "null",
                 "timee_varnt": "null",
             },
         ]
@@ -642,6 +672,7 @@ class varnttst_time_to_variant(TstView):
                       id,
                       CAST(datee AS VARIANT) AS datee_varnt,
                       CAST(tmestmp AS VARIANT) AS tmestmp_varnt,
+                      CAST(tmestmp_tz AS VARIANT) AS tmestmp_tz_varnt,
                       CAST(timee AS VARIANT) AS timee_varnt
                       FROM varnt_time_tbl"""
 
@@ -652,16 +683,24 @@ class varnttst_variant_to_time(TstView):
         self.data = [
             {
                 "id": 0,
-                "datee": "2024-12-05",
-                "tmestmp": "2020-06-21T14:23:44",
-                "timee": "18:30:45",
+                "datee": d("2024-12-05"),
+                "tmestmp": ts("2020-06-21T14:23:44"),
+                "timee": t("18:30:45"),
+                "tmestmp_tz": ts_tz("2020-06-21T14:23:44.0"),
             },
-            {"id": 1, "datee": None, "tmestmp": None, "timee": None},
+            {
+                "id": 1,
+                "datee": None,
+                "tmestmp": None,
+                "tmestmp_tz": None,
+                "timee": None,
+            },
         ]
         self.sql = """CREATE MATERIALIZED VIEW variant_to_time AS SELECT
                       id,
                       CAST(datee_varnt AS DATE) AS datee,
                       CAST(tmestmp_varnt AS TIMESTAMP) AS tmestmp,
+                      CAST(tmestmp_tz_varnt AS TIMESTAMP WITH TIME ZONE) AS tmestmp_tz,
                       CAST(timee_varnt AS TIME) AS timee
                       FROM time_to_variant"""
 
@@ -766,14 +805,13 @@ class varnttst_variant_to_cmpx(TstView):
             {
                 "id": 0,
                 "arr": [12, 22],
-                "map": {"1": 22, "2": 44},
+                "map": [("1", 22), ("2", 44)],
                 "roww": {"int": 20, "var": "bye bye!"},
             },
             {"id": 1, "arr": None, "map": None, "roww": {"int": None, "var": None}},
         ]
         self.sql = """CREATE MATERIALIZED VIEW variant_to_cmpx AS SELECT
                       id,
-
                       CAST(arr_varnt AS INT ARRAY) AS arr,
                       CAST(map_varnt AS MAP<VARCHAR, INT>) AS map,
                       CAST(roww_varnt AS ROW(int INT, var VARCHAR)) AS roww

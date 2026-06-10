@@ -4,8 +4,8 @@
 use crate::{
     Date, SqlDecimal, finite_or_null,
     operators::{eq, gt, gte, lt, lte, neq},
-    plus_Date_Date_LongInterval__, sign, some_existing_operator, some_function2, some_operator,
-    some_polymorphic_function1, some_polymorphic_function2,
+    plus_Date_Date_LongInterval__, sign, some_existing_operator, some_function1, some_function2,
+    some_operator, some_polymorphic_function1, some_polymorphic_function2,
     timestamp::{extract_epoch_Date, extract_quarter_Date},
 };
 use dbsp::{algebra::F64, num_entries_scalar};
@@ -23,10 +23,10 @@ use crate::{Time, Timestamp};
 
 /// A ShortInterval can express a difference between two [Time]
 /// values, two [Date] values, or two [Timestamp] values.  The
-/// representation is a (positive or negative) number of milliseconds.
+/// representation is a (positive or negative) number of microseconds.
 /// While there are functions that can extract nanosecond-precision
 /// values from a ShortInterval, the precision is always limited to
-/// milliseconds.
+/// microseconds.
 #[derive(
     Debug,
     Default,
@@ -111,10 +111,34 @@ impl ShortInterval {
 
     /// Extract the length of the interval in nanoseconds.  The result
     /// can be negative.  The granularity of the representation is
-    /// actually milliseconds, so this function will always return a
-    /// number that is a multiple of 1 million.
+    /// actually microseconds, so this function will always return a
+    /// number that is a multiple of 1000.
     pub fn nanoseconds(&self) -> i64 {
         self.microseconds * 1_000
+    }
+
+    /// Extract the length of the interval in milliseconds.  The
+    /// result can be negative.
+    pub fn seconds(&self) -> i64 {
+        self.microseconds / 1_000_000
+    }
+
+    /// Extract the length of the interval in minutes.  The
+    /// result can be negative.
+    pub fn minutes(&self) -> i64 {
+        self.microseconds / (60 * 1_000_000)
+    }
+
+    /// Extract the length of the interval in minutes.  The
+    /// result can be negative.
+    pub fn hours(&self) -> i64 {
+        self.microseconds / (60 * 60 * 1_000_000i64)
+    }
+
+    /// Extract the length of the interval in minutes.  The
+    /// result can be negative.
+    pub fn days(&self) -> i64 {
+        self.microseconds / (24 * 60 * 60 * 1_000_000i64)
     }
 }
 
@@ -126,55 +150,53 @@ pub fn abs_ShortInterval(value: ShortInterval) -> ShortInterval {
 some_polymorphic_function1!(abs, ShortInterval, ShortInterval, ShortInterval);
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_ShortInterval_u128(value: &ShortInterval) -> u128 {
     value.microseconds as u128
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Date_u128(value: &ShortInterval) -> u128 {
     // express value in days
     (value.microseconds / 1_000_000_i64 / 86400) as u128
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Date_u64(value: &ShortInterval) -> u64 {
     // express value in days
     (value.microseconds / 1_000_000_i64 / 86400) as u64
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Timestamp_u128(value: &ShortInterval) -> u128 {
-    // express value in milliseconds
     value.microseconds as u128
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Timestamp_u64(value: &ShortInterval) -> u64 {
-    // express value in milliseconds
     value.microseconds as u64
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Time_u128(value: &ShortInterval) -> u128 {
     // express value in nanoseconds
     (value.microseconds * 1_000) as u128
 }
 
 #[doc(hidden)]
-/// This function is used in rolling window computations, which require all
-/// values to be expressed using unsigned types.
+/// This function is used in rolling window computations, to compute a window bound.
+/// Window bounds are always positive.
 pub fn to_bound_ShortInterval_Time_u64(value: &ShortInterval) -> u64 {
     // express value in nanoseconds
     (value.microseconds * 1_000) as u64
@@ -1099,17 +1121,35 @@ pub fn extract_hour_LongInterval(_value: LongInterval) -> i64 {
     0
 }
 
+#[doc(hidden)]
+pub fn long_interval_to_integer_(value: LongInterval) -> i32 {
+    value.months
+}
+
+some_function1!(long_interval_to_integer, LongInterval, i32);
+
+#[doc(hidden)]
+pub fn integer_to_long_interval_(value: i32) -> LongInterval {
+    LongInterval::from_months(value)
+}
+
+some_function1!(integer_to_long_interval, i32, LongInterval);
+
 ///////////
 
 #[doc(hidden)]
-pub fn short_interval_to_integer(value: ShortInterval) -> i64 {
+pub fn short_interval_to_integer_(value: ShortInterval) -> i64 {
     value.microseconds
 }
 
+some_function1!(short_interval_to_integer, ShortInterval, i64);
+
 #[doc(hidden)]
-pub fn integer_to_short_interval(value: i64) -> ShortInterval {
+pub fn integer_to_short_interval_(value: i64) -> ShortInterval {
     ShortInterval::from_microseconds(value)
 }
+
+some_function1!(integer_to_short_interval, i64, ShortInterval);
 
 #[doc(hidden)]
 pub fn extract_day_ShortInterval(value: ShortInterval) -> i64 {

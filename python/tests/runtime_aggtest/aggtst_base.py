@@ -124,7 +124,6 @@ class View(SqlObject):
         sorted_expected = sorted(expected, key=lambda x: str(x))
 
         if sorted_data != sorted_expected:
-            # print(f"{msg}\nExpected:\n{sorted_expected}\nReceived:\n{sorted_data}")
             raise AssertionError(
                 f"{msg}\nExpected:\n{sorted_expected}\nReceived:\n{sorted_data}"
             )
@@ -134,14 +133,19 @@ class View(SqlObject):
         if not self.local:  # If it's not a local view, perform validation
             if DEBUG:
                 print(f"Querying view `{self.name}`...")
-            data = list(pipeline.query(f"SELECT * FROM {self.name};"))
+            data = list(pipeline.query_arrow_dicts(f"SELECT * FROM {self.name};"))
             if DEBUG:
                 print(f"Received data from view `{self.name}`: \n{data}")
 
             expected = self.get_data()
 
+            # WARNING: this test will not work if some results contain NaN, which
+            # cannot be compared for equality
             tc = unittest.TestCase()
-            tc.maxDiff = None  # display the difference between expected and actual results during an assertion error, even if the difference is large
+            tc.maxDiff = (
+                None  # display the difference between expected and actual results
+            )
+            # during an assertion error, even if the difference is large
             self.assert_result(
                 data, expected, f"\nASSERTION ERROR: failed view: {self.name}"
             )

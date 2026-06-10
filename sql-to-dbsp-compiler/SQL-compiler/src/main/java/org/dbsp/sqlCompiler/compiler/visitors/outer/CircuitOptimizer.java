@@ -167,10 +167,12 @@ public class CircuitOptimizer extends Passes {
         // From now on we cannot really change the graph anymore.
 
         // this.add(new TestSerialize(compiler));
+        this.add(new CheckHints(compiler));
         this.add(new ComparatorDeclarations(compiler, new DeclareComparators(compiler)));
         this.add(new CompactNames(compiler));
         this.add(new MerkleOuter(compiler, true));
         this.add(new MerkleOuter(compiler, false));
+        this.add(new TagRegions(compiler));
         this.add(new CircuitStatistics(compiler));
     }
 

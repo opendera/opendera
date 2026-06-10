@@ -1,7 +1,7 @@
 <script lang="ts">
+  import { Tooltip } from 'common-ui'
   import Dayjs from 'dayjs'
-  import Tooltip from '$lib/components/common/Tooltip.svelte'
-  import { useElapsedTime } from '$lib/functions/format'
+  import { useElapsedTime } from '$lib/compositions/common/useElapsedTime'
   import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
   import type { CheckpointStatus } from '$lib/services/manager'
 
@@ -28,12 +28,13 @@
   )
 
   const formatPermanentError = (e: (typeof permanentErrors & {})[number]) => {
-    if (typeof e === 'string')
+    if (typeof e === 'string') {
       return e === 'StorageRequired'
         ? 'Storage must be configured'
         : e === 'EnterpriseFeature'
           ? 'Enterprise feature'
           : e
+    }
     if ('UnsupportedInputEndpoint' in e) {
       return `Input "${e.UnsupportedInputEndpoint}" does not support checkpointing`
     }
@@ -55,8 +56,9 @@
           return r
       }
     }
-    if (r && typeof r === 'object' && 'InputEndpointBarrier' in r)
+    if (r && typeof r === 'object' && 'InputEndpointBarrier' in r) {
       return `Input "${(r as { InputEndpointBarrier: string }).InputEndpointBarrier}" barrier`
+    }
     return String(r)
   }
 </script>

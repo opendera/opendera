@@ -3,7 +3,7 @@ authors = [
     "Feldera Team <dev@feldera.com>",
     "OpenDera contributors",
 ]
-version = "0.296.0"
+version = "0.307.0"
 license = "MIT"
 homepage = "https://github.com/opendera/opendera"
 repository = "https://github.com/opendera/opendera"
@@ -59,9 +59,9 @@ anyhow = "1.0.91"
 apache-avro = "0.18.0"
 arc-swap = "1.5.1"
 arcstr = "1.2.0"
-arrow = "57"
-arrow-json = "57"
-arrow-schema = "57"
+arrow = "58"
+arrow-json = "58"
+arrow-schema = "58"
 ascii_table = "=4.0.2"
 async-channel = "2.3.1"
 async-nats = "0.47.0"
@@ -105,20 +105,23 @@ crossbeam-utils = "0.8.6"
 csv = "1.2.2"
 csv-core = "0.1.10"
 dashmap = "6.1.0"
-datafusion = "51.0"
-dbsp = { path = "crates/dbsp", version = "0.296.0" }
+datafusion = "53.1"
+dbsp = { path = "crates/dbsp", version = "0.307.0" }
 dbsp_nexmark = { path = "crates/nexmark" }
 deadpool-postgres = "0.14.1"
-#deltalake = "0.30.2"
-#deltalake-catalog-unity = "0.14.1"
-#deltalake-catalog-unity = { git = "https://github.com/ryzhyk/delta-rs.git", rev = "b24e5aaec322db0f084449e5c57f97ff4526bbdc" }
-#deltalake = { git = "https://github.com/ryzhyk/delta-rs.git", rev = "b24e5aaec322db0f084449e5c57f97ff4526bbdc" }
-deltalake-catalog-unity = { git = "https://github.com/gz/delta-rs.git", rev = "c37cf6e788d653db4149b205542559cf25674002" }
-deltalake = { git = "https://github.com/gz/delta-rs.git", rev = "c37cf6e788d653db4149b205542559cf25674002" }
+# Feldera fork of delta-rs: upstream tag `rust-v0.32.3` + 2 patches, on branch
+# `v0.32.3-feldera`. When bumping the pinned revision, preserve these patches:
+#   - 7f8bb445 "Disable unsupported feature check." — relax the writer-side
+#     protocol-feature gate so we can write tables produced by newer clients.
+#   - 5b35c098 "delta-rs: round-robin pre-split unpartitioned scans into
+#     target_partitions FileGroups" — improves snapshot read parallelism for
+#     unpartitioned tables; pairs with the DataFusion knobs we tune in adapters.
+# Diff vs. upstream:
+#   https://github.com/delta-io/delta-rs/compare/rust-v0.32.3...feldera:delta-rs:v0.32.3-feldera
+deltalake = { git = "https://github.com/feldera/delta-rs.git", rev = "5b35c0988b07ab921d5eee5b8da8da55e4d65945" }
+deltalake-catalog-unity = { git = "https://github.com/feldera/delta-rs.git", rev = "5b35c0988b07ab921d5eee5b8da8da55e4d65945" }
 
-# deltalake = { git = "https://github.com/ryzhyk/delta-rs.git", rev = "06f42db5344f4ad8560af341352572488a4e6e06" }
-# deltalake-catalog-unity = { git = "https://github.com/ryzhyk/delta-rs.git", rev = "06f42db5344f4ad8560af341352572488a4e6e06" }
-delta_kernel = "0.19.0"
+delta_kernel = { package = "buoyant_kernel", version = "0.22" }
 derive_more = { version = "1.0.0" }
 directories = "6.0"
 dirs = "5.0"
@@ -128,19 +131,19 @@ erased-serde = "0.3.31"
 fake = "2.10"
 fastbloom = "0.14.0"
 fdlimit = "0.3.0"
-feldera-buffer-cache = { version = "0.296.0", path = "crates/buffer-cache" }
+feldera-buffer-cache = { version = "0.307.0", path = "crates/buffer-cache" }
 feldera-datagen = { path = "crates/datagen" }
-feldera-fxp = { version = "0.296.0", path = "crates/fxp", features = ["dbsp"] }
+feldera-fxp = { version = "0.307.0", path = "crates/fxp", features = ["dbsp"] }
 feldera-iceberg = { path = "crates/iceberg" }
-feldera-observability = { version = "0.296.0", path = "crates/feldera-observability" }
-feldera-macros = { version = "0.296.0", path = "crates/feldera-macros" }
-feldera-sqllib = { version = "0.296.0", path = "crates/sqllib" }
-feldera-storage = { version = "0.296.0", path = "crates/storage" }
-feldera-types = { version = "0.296.0", path = "crates/feldera-types" }
-feldera-rest-api = { version = "0.296.0", path = "crates/rest-api" }
-feldera-ir = { version = "0.296.0", path = "crates/ir" }
-feldera-adapterlib = { version = "0.296.0", path = "crates/adapterlib" }
-feldera-samply = { version = "0.296.0", path = "crates/samply" }
+feldera-observability = { version = "0.307.0", path = "crates/feldera-observability" }
+feldera-macros = { version = "0.307.0", path = "crates/feldera-macros" }
+feldera-sqllib = { version = "0.307.0", path = "crates/sqllib" }
+feldera-storage = { version = "0.307.0", path = "crates/storage" }
+feldera-types = { version = "0.307.0", path = "crates/feldera-types" }
+feldera-rest-api = { version = "0.307.0", path = "crates/rest-api" }
+feldera-ir = { version = "0.307.0", path = "crates/ir" }
+feldera-adapterlib = { version = "0.307.0", path = "crates/adapterlib" }
+feldera-samply = { version = "0.307.0", path = "crates/samply" }
 flate2 = "1.1.0"
 form_urlencoded = "1.2.0"
 futures = "0.3.30"
@@ -155,10 +158,12 @@ hashbrown = "0.14.2"
 hdrhist = "0.5"
 hex = "0.4.3"
 home = "=0.5.9"
-iceberg = { version = "0.8.0", features = ["storage-all"]}
-iceberg-catalog-glue = "0.8.0"
-iceberg-catalog-rest = "0.8.0"
-iceberg-datafusion = "0.8.0"
+# TODO: Use iceberg v0.10.0 when released
+iceberg = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
+iceberg-catalog-glue = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
+iceberg-catalog-rest = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
+iceberg-datafusion = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
+iceberg-storage-opendal = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3", features = ["opendal-s3", "opendal-gcs", "opendal-fs", "opendal-memory"] }
 impl-trait-for-tuples = "0.2"
 indexmap = "2.7.1"
 indicatif = "0.17.0-rc.11"
@@ -167,13 +172,14 @@ inventory = "0.3"
 itertools = "0.14.0"
 jemalloc_pprof = "0.7.0"
 json_to_table = "0.9.0"
-jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
 lexical-core = "1.0.5"
 libc = "0.2.153"
 like = "0.3.1"
 log = "0.4.20"
 md-5 = "0.10.6"
 memory-stats = { version = "1.2.0", features = ["always_use_statm"] }
+mach2 = "0.6.0"
 metrics = "0.23.0"
 metrics-exporter-prometheus = "0.15.3"
 metrics-util = "0.17.0"
@@ -187,12 +193,12 @@ num-bigint = "0.4.6"
 num-derive = "0.4.2"
 num-format = "0.4.0"
 num-traits = "0.2.19"
-object_store = "0.11.2"
+object_store = "0.12.1"
 once_cell = "1.20.2"
-openssl = "0.10.79"
+openssl = "0.10.80"
 ordered-float = { version = "4.2.0", features = ["serde"] }
 ouroboros = "0.18.4"
-parquet = "57"
+parquet = "58"
 paste = "1.0.12"
 petgraph = "0.6.0"
 pg-client-config = "0.1.2"
@@ -238,7 +244,7 @@ ryu = "1.0.20"
 schema_registry_converter = "4.2.0"
 semver = "1.0.27"
 serde = "1.0.213"
-serde_arrow = { version = "0.13.7", features = ["arrow-57"] }
+serde_arrow = { version = "0.14.1", features = ["arrow-58"] }
 serde_bytes = "0.11.15"
 serde_json = { version = "1.0.132", features = ["arbitrary_precision"] }
 serde_json_path_to_error = "0.1.5"
@@ -263,7 +269,7 @@ static-files = "0.2.3"
 static_assertions = "1.1.0"
 syn = "2.0.77"
 tabled = "0.17"
-tar = "0.4.45"
+tar = "0.4.46"
 tarpc = "0.37.0"
 tempfile = "3.21"
 termbg = "0.5.1"

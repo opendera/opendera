@@ -27,6 +27,7 @@ import org.dbsp.sqlCompiler.ir.IsNumericLiteral;
 import org.dbsp.sqlCompiler.ir.aggregate.DBSPAggregateList;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyMethodExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPBinaryExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPCastExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
@@ -38,7 +39,9 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPUnsignedUnwrapExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPUnsignedWrapExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPVariablePath;
 import org.dbsp.sqlCompiler.ir.expression.DBSPWindowBoundExpression;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU32Literal;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.DBSPTypeCode;
 import org.dbsp.sqlCompiler.ir.type.IsNumericType;
@@ -46,6 +49,8 @@ import org.dbsp.sqlCompiler.ir.type.IsTimeRelatedType;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeRawTuple;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBaseType;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBinary;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBool;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDate;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDecimal;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
@@ -53,6 +58,8 @@ import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeLongInterval;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeShortInterval;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTime;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTimestamp;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeUuid;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeTimestampTz;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
 import org.dbsp.util.Linq;
 import org.dbsp.util.Utilities;
@@ -98,6 +105,7 @@ public class RangeAggregates extends WindowAggregates {
 
         // we ignore nullability because window bounds are constants and cannot be null
         // BEWARE: this function name structure is hardwired in the monotonicity analysis
+        // NOTE: This function requires the arguments to be positive
         return "to_bound_" +
                 deltaType.withMayBeNull(false).to(DBSPTypeBaseType.class).shortName() + "_" +
                 sortType.withMayBeNull(false).to(DBSPTypeBaseType.class).shortName() + "_" +
@@ -194,6 +202,37 @@ public class RangeAggregates extends WindowAggregates {
                 sortType = DBSPTypeInteger.getType(node, INT64, originalSortType.mayBeNull);
                 convertToSigned = new DBSPUnaryExpression(
                         this.node, sortType, DBSPOpcode.SHORT_INTERVAL_TO_INTEGER, var).closure(var);
+            } else if (originalSortType.is(DBSPTypeLongInterval.class)) {
+                sortType = DBSPTypeInteger.getType(node, INT32, originalSortType.mayBeNull);
+                convertToSigned = new DBSPUnaryExpression(
+                        this.node, sortType, DBSPOpcode.LONG_INTERVAL_TO_INTEGER, var).closure(var);
+            } else if (originalSortType.is(DBSPTypeUuid.class)) {
+                if (originalSortType.mayBeNull) {
+                    // This is 128 bits, but we need one more to represent the NULL value.
+                    throw new UnimplementedException("OVER currently cannot sort on columns with type UUID NULL. Can you convert the type to UUID NOT NULL?", 457, node);
+                }
+                sortType = DBSPTypeInteger.getType(node, UINT128, originalSortType.mayBeNull);
+                convertToSigned = new DBSPUnaryExpression(
+                        this.node, sortType, DBSPOpcode.UUID_TO_INTEGER, var.applyClone()).closure(var);
+            } else if (originalSortType.is(DBSPTypeBool.class)) {
+                sortType = DBSPTypeInteger.getType(node, INT8, originalSortType.mayBeNull);
+                convertToSigned = new DBSPUnaryExpression(
+                        this.node, sortType, DBSPOpcode.BOOL_TO_INTEGER, var.applyClone()).closure(var);
+            } else if (originalSortType.is(DBSPTypeBinary.class)) {
+                DBSPTypeBinary bin = originalSortType.to(DBSPTypeBinary.class);
+                if (bin.fixed && bin.precision <= (16 / (bin.mayBeNull ? 2 : 1))) {
+                    if (bin.mayBeNull) {
+                        sortType = DBSPTypeInteger.getType(node, UINT64, originalSortType.mayBeNull);
+                        convertToSigned = new DBSPUnaryExpression(
+                                this.node, sortType, DBSPOpcode.BINARY_TO_U64, var.applyClone()).closure(var);
+                    } else {
+                        sortType = DBSPTypeInteger.getType(node, UINT128, originalSortType.mayBeNull);
+                        convertToSigned = new DBSPUnaryExpression(
+                                this.node, sortType, DBSPOpcode.BINARY_TO_U128, var.applyClone()).closure(var);
+                    }
+                } else {
+                    sortType = originalSortType;
+                }
             } else {
                 sortType = originalSortType;
             }
@@ -201,6 +240,7 @@ public class RangeAggregates extends WindowAggregates {
             if (sortType == null ||
                     !sortType.is(DBSPTypeInteger.class) &&
                     !sortType.is(DBSPTypeTimestamp.class) &&
+                    !sortType.is(DBSPTypeTimestampTz.class) &&
                     !sortType.is(DBSPTypeDate.class) &&
                     !sortType.is(DBSPTypeTime.class) &&
                     !sortType.is(DBSPTypeShortInterval.class))
@@ -282,7 +322,7 @@ public class RangeAggregates extends WindowAggregates {
             // Index the produced result
             // map_index(|(key_ts_agg)| (
             //         Tup2::new(key_ts_agg.0.0,
-            //                   UnsignedWrapper::to_signed::<i32, i32, i64, u64>(key_ts_agg.1.0, true, true)),
+            //                   UnsignedWrappers::to_signed::<i32, i32, i64, u64>(key_ts_agg.1.0, true, true)),
             //         key_ts_agg.1.1.unwrap_or_default() ))
             DBSPVariablePath var = new DBSPVariablePath("key_ts_agg",
                     new DBSPTypeRawTuple(
@@ -301,9 +341,23 @@ public class RangeAggregates extends WindowAggregates {
                 unwrap = unwrap.cast(this.node, i128, DBSPCastExpression.CastType.SqlUnsafe);
                 unwrap = new DBSPUnaryExpression(this.node, originalSortType,
                         DBSPOpcode.INTEGER_TO_DECIMAL, unwrap);
+            } else if (originalSortType.is(DBSPTypeLongInterval.class)) {
+                unwrap = new DBSPUnaryExpression(this.node, originalSortType,
+                        DBSPOpcode.INTEGER_TO_LONG_INTERVAL, unwrap);
             } else if (originalSortType.is(DBSPTypeShortInterval.class)) {
                 unwrap = new DBSPUnaryExpression(this.node, originalSortType,
                         DBSPOpcode.INTEGER_TO_SHORT_INTERVAL, unwrap);
+            } else if (originalSortType.is(DBSPTypeUuid.class)) {
+                unwrap = new DBSPUnaryExpression(this.node, originalSortType,
+                        DBSPOpcode.INTEGER_TO_UUID, unwrap);
+            } else if (originalSortType.is(DBSPTypeBool.class)) {
+                unwrap = new DBSPUnaryExpression(this.node, originalSortType,
+                        DBSPOpcode.INTEGER_TO_BOOL, unwrap);
+            } else if (originalSortType.is(DBSPTypeBinary.class)) {
+                DBSPOpcode opcode = originalSortType.mayBeNull ?
+                        DBSPOpcode.U64_TO_BINARY : DBSPOpcode.U128_TO_BINARY;
+                unwrap = new DBSPBinaryExpression(this.node, originalSortType, opcode, unwrap,
+                        new DBSPI32Literal(originalSortType.to(DBSPTypeBinary.class).precision));
             }
 
             DBSPExpression ixKey = var.field(0).deref();

@@ -13,10 +13,10 @@
 //! This crate can be integrated into an existing profiler workflow.  For
 //! example, the [Feldera incremental compute engine] runs `samply` as a
 //! subprocess, targeting itself.  While `samply` runs, Feldera uses [Capture],
-//! [Span], and [Event] to record annotations.  After `samply` completes,
-//! Feldera finishes the capture to obtain [Annotations], applies them, and then
-//! passes the postprocessed output to the user.  The annotation step is
-//! invisible to the user.
+//! [Span], [LongSpan], and [Event] to record annotations.  After `samply`
+//! completes, Feldera finishes the capture to obtain [Annotations], applies
+//! them, and then passes the postprocessed output to the user.  The annotation
+//! step is invisible to the user.
 //!
 //! Short of this kind of integration, where a process effectively profiles
 //! itself, there must be some way to enable capturing and saving profile data.
@@ -43,6 +43,7 @@ use std::{
     fmt::{Debug, Display},
     io::{Cursor, Read},
     iter::{once, repeat_n},
+    mem::swap,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -51,6 +52,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "macos")]
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crossbeam::sync::{Parker, Unparker};
 use flate2::{
     Compression,
@@ -58,23 +62,112 @@ use flate2::{
 };
 use itertools::Itertools;
 use memory_stats::memory_stats;
+#[cfg(not(target_os = "macos"))]
 use nix::time::{ClockId, clock_gettime};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use size_of::HumanBytes;
 use tracing::warn;
 
-#[derive(Copy, Clone, Debug)]
+/// Atomic `Option<Timestamp>`.
+///
+/// Treats `i64::MIN` as a niche.
+#[derive(Debug)]
+struct AtomicOptionTimestamp(AtomicI64);
+
+impl Default for AtomicOptionTimestamp {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl AtomicOptionTimestamp {
+    const fn new(value: Option<Timestamp>) -> Self {
+        Self(AtomicI64::new(match value {
+            Some(timestamp) => timestamp.0,
+            None => i64::MIN,
+        }))
+    }
+
+    fn load(&self) -> Option<Timestamp> {
+        let value = self.0.load(Ordering::Acquire);
+        (value != i64::MIN).then_some(Timestamp(value))
+    }
+
+    fn store(&self, value: Option<Timestamp>) {
+        self.0.store(
+            value.map_or(i64::MIN, |timestamp| timestamp.0),
+            Ordering::Release,
+        )
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
 struct Timestamp(
-    /// In nanoseconds in terms of `CLOCK_MONOTONIC`.
+    /// Monotonic time in nanoseconds.
+    ///
+    /// On macOS this is [`mach_absolute_time`] converted to nanoseconds via
+    /// [`mach_timebase_info`].  On other Unix platforms this is
+    /// `CLOCK_MONOTONIC`.
+    ///
+    /// [`mach_absolute_time`]: https://developer.apple.com/documentation/kernel/1462446-mach_absolute_time
+    /// [`mach_timebase_info`]: https://developer.apple.com/documentation/kernel/1462447-mach_timebase_info
     i64,
 );
 
+#[cfg(target_os = "macos")]
+fn mach_absolute_time_nanos() -> i64 {
+    use mach2::mach_time::{mach_absolute_time, mach_timebase_info, mach_timebase_info_data_t};
+    use std::sync::OnceLock;
+
+    static NANOS_PER_TICK: OnceLock<(u32, u32)> = OnceLock::new();
+    let (numer, denom) = *NANOS_PER_TICK.get_or_init(|| {
+        let mut info = mach_timebase_info_data_t { numer: 0, denom: 0 };
+        unsafe {
+            mach_timebase_info(&mut info);
+        }
+        if info.denom == 0 {
+            (1, 1)
+        } else {
+            (info.numer, info.denom)
+        }
+    });
+    let ticks = unsafe { mach_absolute_time() };
+    (ticks * u64::from(numer) / u64::from(denom)) as i64
+}
+
 impl Timestamp {
     fn now() -> Self {
-        let now = clock_gettime(ClockId::CLOCK_MONOTONIC).unwrap();
-        Self(now.tv_sec() as i64 * 1_000_000_000 + now.tv_nsec() as i64)
+        #[cfg(target_os = "macos")]
+        {
+            Self(mach_absolute_time_nanos())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let now = clock_gettime(ClockId::CLOCK_MONOTONIC).unwrap();
+            Self(now.tv_sec() as i64 * 1_000_000_000 + now.tv_nsec() as i64)
+        }
     }
+
+    /// Computes `self - other`, returning zero if `self < other`.
+    fn saturating_sub(self, other: Self) -> Duration {
+        if self.0 >= other.0 {
+            Duration::from_nanos(self.0.abs_diff(other.0))
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+
+/// Nanoseconds since the Unix epoch.
+#[cfg(target_os = "macos")]
+fn unix_epoch_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before Unix epoch")
+        .as_nanos() as i64
 }
 
 impl From<Instant> for Timestamp {
@@ -156,20 +249,19 @@ impl SpanInner {
         }
     }
 
-    #[cold]
-    fn record(self, is_span: bool) {
-        let marker = Marker {
+    fn into_marker(self, end: MarkerEnd) -> Marker {
+        Marker {
             start: self.start,
-            end: if is_span {
-                Timestamp::now()
-            } else {
-                self.start
-            },
+            end,
             category: self.category,
             name: self.name,
             tooltip: self.tooltip,
-        };
-        QUEUE.with(|queue| queue.push(marker));
+        }
+    }
+
+    #[cold]
+    fn record(self, end: MarkerEnd) {
+        QUEUE.with(|queue| queue.push(self.into_marker(end)));
     }
 }
 
@@ -187,8 +279,8 @@ impl SpanInner {
 pub struct Span(Option<SpanInner>);
 
 impl Span {
-    /// The number of bytes of memory used during capture to record a [Span] or
-    /// [Event].
+    /// The number of bytes of memory used during capture to record a [Span],
+    /// [LongSpan], or [Event].
     pub const BYTES: usize = std::mem::size_of::<Marker>();
 
     /// Constructs a new [Span] with the given name.  When the constructed
@@ -272,8 +364,92 @@ impl Span {
 impl Drop for Span {
     fn drop(&mut self) {
         if let Some(inner) = self.0.take() {
-            inner.record(true)
+            inner.record(MarkerEnd::At(Timestamp::now()))
         }
+    }
+}
+
+/// Builds a [LongSpan] for annotating a long timespan.
+pub struct LongSpanBuilder(SpanInner);
+
+impl LongSpanBuilder {
+    /// Constructs a new [LongSpanBuilder] with the given name.
+    ///
+    /// The name should ordinarily be a short static string indicating what
+    /// happens during the span.  The Firefox Profiler's marker chart view shows
+    /// all the spans in a thread with the same name and category on a single
+    /// horizontal timeline (unless that would cause overlaps).
+    #[must_use]
+    pub fn new(name: &'static str) -> Self {
+        Self(SpanInner::new(name))
+    }
+
+    /// Adds `category` to this span.
+    ///
+    /// The Firefox Profiler's marker chart view groups the markers in each
+    /// category and labels them with the category name.
+    ///
+    /// The default category is "Other".
+    #[must_use]
+    pub fn with_category(mut self, category: &'static str) -> Self {
+        self.0.category = category;
+        self
+    }
+
+    /// Adds `tooltip` to this span.
+    ///
+    /// The Firefox Profiler shows the given tooltip in the marker chart
+    /// timeline (often truncated) and on hover, and as "details" in the marker
+    /// table view.
+    #[must_use]
+    pub fn with_tooltip(mut self, tooltip: impl Into<String>) -> Self {
+        self.0.tooltip = tooltip.into();
+        self
+    }
+
+    /// Sets the starting time for this span to `start`.  The default starting
+    /// time is when the [LongSpanBuilder] was constructed, so this is only
+    /// useful if it's easier to create the span just before recording it.
+    #[must_use]
+    pub fn with_start(mut self, start: Instant) -> Self {
+        self.0.start = start.into();
+        self
+    }
+
+    /// Builds the [LongSpan].
+    #[must_use]
+    pub fn build(self) -> LongSpan {
+        let timestamp = Arc::new(AtomicOptionTimestamp::default());
+        QUEUE.with(|queue| {
+            queue.push_long_span(self.0.into_marker(MarkerEnd::Long(timestamp.clone())))
+        });
+        LongSpan(timestamp)
+    }
+}
+
+/// A relatively expensive way to annotate a longer timespan during [Capture]s.
+///
+/// `LongSpan` is much like [Span].  However, whereas [Span] is optimized to
+/// minimize time and space overhead when a capture is not active, `LongSpan`
+/// always tracks the span.  This allows it to show up in captures that start
+/// after the `LongSpan` is allocated or that end before the `LongSpan` is
+/// recorded.
+///
+/// [samply]: https://github.com/mstange/samply?tab=readme-ov-file#samply
+pub struct LongSpan(Arc<AtomicOptionTimestamp>);
+
+impl LongSpan {
+    /// Marks this `LongSpan` as complete.
+    ///
+    /// This is equivalent to dropping it.
+    pub fn complete(self) {
+        // [Drop] completes the span.
+    }
+}
+
+impl Drop for LongSpan {
+    fn drop(&mut self) {
+        self.0.store(Some(Timestamp::now()));
     }
 }
 
@@ -339,7 +515,8 @@ impl Event {
     /// Records the event.
     pub fn record(self) {
         if let Some(inner) = self.0 {
-            inner.record(false);
+            let end = MarkerEnd::At(inner.start);
+            inner.record(end);
         }
     }
 }
@@ -436,14 +613,18 @@ static CAPTURE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 /// Only one `Capture` may exist at one time.
 pub struct Capture {
     _guard: tokio::sync::MutexGuard<'static, ()>,
+    start_time: Timestamp,
     memory: Option<JoinHandle<Vec<(Timestamp, usize)>>>,
     unparker: Unparker,
     request_exit: Arc<AtomicBool>,
     block_limit: i64,
+    #[cfg(target_os = "macos")]
+    anchor: (Timestamp, i64),
 }
 
 impl Capture {
     fn new(params: CaptureOptions, guard: tokio::sync::MutexGuard<'static, ()>) -> Self {
+        let start = Timestamp::now();
         if let Some(memory_limit) = params.memory_limit {
             tracing::info!(
                 "marker capture limited to {}",
@@ -475,30 +656,76 @@ impl Capture {
                 .expect("should be able to start a capture thread")
         });
         FREE_BLOCKS.store(block_limit, Ordering::Relaxed);
+        MARKERS_EXHAUSTED.store(None);
         CAPTURING.store(true, Ordering::Release);
         Self {
+            start_time: start,
             block_limit,
             memory,
             unparker,
             request_exit,
+            #[cfg(target_os = "macos")]
+            anchor: (Timestamp::now(), unix_epoch_nanos()),
             _guard: guard,
         }
     }
 
     /// Finishes recording profile annotations and returns what was recorded.
     pub fn finish(mut self) -> Annotations {
+        let end_time = Timestamp::now();
         CAPTURING.store(false, Ordering::Release);
-        let remaining_blocks = FREE_BLOCKS.load(Ordering::Relaxed);
-        if remaining_blocks <= 0 {
-            tracing::info!("marker capture exceeded the limit");
+        let markers_exhausted = MARKERS_EXHAUSTED.load();
+        let free_blocks = FREE_BLOCKS.load(Ordering::Relaxed);
+        let used =
+            HumanBytes::from((self.block_limit - free_blocks.max(0)) as usize * BYTES_PER_BLOCK);
+        if free_blocks < 0 {
         } else {
-            let used_bytes = (self.block_limit - remaining_blocks) as usize * BYTES_PER_BLOCK;
-            tracing::info!("marker capture used {}", HumanBytes::from(used_bytes));
+            tracing::info!("marker capture used {used}");
+        }
+
+        let mut markers: HashMap<usize, (Option<String>, Blocks)> = self
+            .all_threads()
+            .into_iter()
+            .map(|thread| {
+                let mut blocks = thread.queue.take_blocks();
+
+                let long_spans = thread.queue.take_long_spans();
+                if !long_spans.is_empty() {
+                    blocks.0.push(Block(long_spans));
+                }
+
+                (thread.tid, (thread.name, blocks))
+            })
+            .collect();
+
+        if let Some(markers_exhausted) = markers_exhausted {
+            let elapsed = markers_exhausted.saturating_sub(self.start_time);
+            let tooltip = format!(
+                "marker capture exceeded the limit ({used}) after {:.1} s",
+                elapsed.as_secs_f64()
+            );
+            tracing::info!("{tooltip}");
+            let marker = Marker {
+                start: self.start_time,
+                end: MarkerEnd::At(markers_exhausted),
+                category: "profiling",
+                name: "Profiling",
+                tooltip,
+            };
+            markers
+                .entry(nix::unistd::getpid().as_raw() as usize)
+                .or_default()
+                .1
+                .0
+                .push(Block::new(marker));
         }
 
         Annotations {
-            markers: self.take_markers(),
+            end_time,
+            markers,
             memory: self.take_memory(),
+            #[cfg(target_os = "macos")]
+            anchor: self.anchor,
         }
     }
 
@@ -519,13 +746,8 @@ impl Capture {
         CAPTURING.load(Ordering::Acquire)
     }
 
-    fn take_markers(&mut self) -> HashMap<usize, (Option<String>, Blocks)> {
-        let all_threads = ALL_THREAD_MARKERS.lock().unwrap();
-        let mut markers = HashMap::new();
-        for thread in &*all_threads {
-            markers.insert(thread.tid, (thread.name.clone(), thread.queue.take()));
-        }
-        markers
+    fn all_threads(&mut self) -> Vec<ThreadMarkers> {
+        ALL_THREAD_MARKERS.lock().unwrap().clone()
     }
 
     fn take_memory(&mut self) -> Vec<(Timestamp, usize)> {
@@ -603,8 +825,11 @@ impl AnnotationOptions {
 ///
 /// Obtained from [Capture::finish].
 pub struct Annotations {
+    end_time: Timestamp,
     markers: HashMap<usize, (Option<String>, Blocks)>,
     memory: Vec<(Timestamp, usize)>,
+    #[cfg(target_os = "macos")]
+    anchor: (Timestamp, i64),
 }
 
 impl Annotations {
@@ -628,6 +853,40 @@ impl Annotations {
 
         // Deserialize.
         let mut profile = serde_json_path_to_error::from_slice::<Profile>(json)?;
+
+        // On macOS, timestamps in the samply profile are nanoseconds relative to `startTime`
+        // recorded in the profile's metadata. startTime is measured using wall-clock time,
+        // _not_ the monotonic clock time.
+        //
+        // Below `anchor_monotonic_ns` and `anchor_wall_clock_ns` represent the same point in time expressed
+        // in monotonic clock units and wall clock units respectively.
+        //
+        // `profile_start_wall_clock_ms` is the wall clock time when the profile started, extracted
+        // from the profile's metadata.
+        //
+        // `timestamp` is the event timestamp to convert to profile time.
+        //
+        // ```text
+        // -----------------|---------------------------------------|--------------------------|----------> time
+        //  (anchor_monotonic_ns, anchor_wall_clock_ns)      profile_start_wall_clock_ms   timestamp
+        // ```
+        //
+        // To convert a timestamp to relative nanoseconds expected by samply, we need to:
+        // 1. Calculate elapsed since the Timestamp recorded in anchor.
+        // 2. Add adjustment - the difference between the anchor wall-clock time and the profile start wall-clock time.
+        #[cfg(target_os = "macos")]
+        let to_profile_time = {
+            let profile_start_time_ms = profile.meta.start_time;
+            let (anchor_monotonic_ns, anchor_wall_clock_ns) = self.anchor;
+            let profile_start_wall_clock_ns = (profile_start_time_ms * 1_000_000.0) as i64;
+            let adjustment_ns = anchor_wall_clock_ns - profile_start_wall_clock_ns;
+            move |timestamp: Timestamp| {
+                Timestamp(timestamp.0 - anchor_monotonic_ns.0 + adjustment_ns)
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let to_profile_time = |timestamp: Timestamp| timestamp;
+
         if let Some(product) = options.product {
             profile.meta.product = product;
         }
@@ -708,8 +967,13 @@ impl Annotations {
                         type_: Cow::from("FelderaMarker"),
                         name: profile.shared.add_name(&marker.tooltip),
                     });
-                    thread.markers.start_time.push(marker.start);
-                    thread.markers.end_time.push(marker.end);
+                    thread
+                        .markers
+                        .start_time
+                        .push(to_profile_time(marker.start));
+                    thread.markers.end_time.push(to_profile_time(
+                        marker.end.timestamp().unwrap_or(self.end_time),
+                    ));
                     thread
                         .markers
                         .name
@@ -731,8 +995,7 @@ impl Annotations {
                         time: self
                             .memory
                             .iter()
-                            .copied()
-                            .map(|(time, _rss)| time)
+                            .map(|(time, _rss)| to_profile_time(*time))
                             .collect(),
                         time_deltas: Vec::new(),
                         number: repeat_n(0, self.memory.len()).collect(),
@@ -788,6 +1051,7 @@ impl Annotations {
             product: String,
             #[serde(rename = "oscpu")]
             os_cpu: String,
+            start_time: f64,
             categories: Vec<Category>,
             marker_schema: Vec<Value>,
             #[serde(flatten)]
@@ -884,12 +1148,64 @@ impl Annotations {
 /// Whether capturing is active.
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 
+/// End time of a marker.
+#[derive(Clone, Debug)]
+enum MarkerEnd {
+    /// A particular end time for a [Span].
+    At(Timestamp),
+
+    /// A possible end time for a [LongSpan].  If the span has not yet ended,
+    /// this is `None`.
+    Long(Arc<AtomicOptionTimestamp>),
+}
+
+impl MarkerEnd {
+    /// Returns false if this marker should be dropped because it is no longer
+    /// significant.
+    ///
+    /// `capturing` specifies whether a capture is currently running.  More
+    /// markers are relevant when a capture is running because they will be
+    /// recorded when the capture ends.
+    fn should_keep(&self, capturing: bool) -> bool {
+        if let MarkerEnd::Long(timestamp) = self {
+            if timestamp.load().is_some() {
+                // Drop it if there is no capture running, because it ended
+                // before any new capture can start.
+                capturing
+            } else if Arc::strong_count(timestamp) > 1 {
+                // There's another owner who might eventually complete this span.
+                true
+            } else {
+                // This span is orphaned and will never complete.  One could
+                // argue for keeping it.  We drop it to avoid having a kind of
+                // memory leak.
+                //
+                // We keep it if a capture is running, so that it is included in
+                // the current capture.
+                capturing
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Returns the inner timestamp, or `None` if there isn't one yet because
+    /// this is an ongoing [LongSpan].
+    fn timestamp(&self) -> Option<Timestamp> {
+        match self {
+            MarkerEnd::At(timestamp) => Some(*timestamp),
+            MarkerEnd::Long(timestamp) => timestamp.load(),
+        }
+    }
+}
+
 /// A single marker as captured.
+#[derive(Clone, Debug)]
 struct Marker {
     /// Start time.
     start: Timestamp,
     /// End time.
-    end: Timestamp,
+    end: MarkerEnd,
     /// Category (used for outer grouping).
     category: &'static str,
     /// Name (used for inner grouping).
@@ -899,6 +1215,7 @@ struct Marker {
 }
 
 /// Markers for a given thread.
+#[derive(Clone)]
 struct ThreadMarkers {
     /// The thread's tid.
     ///
@@ -913,8 +1230,8 @@ struct ThreadMarkers {
 
     /// The thread's markers.
     ///
-    /// The thread itself records markers by pushing them onto the queue.
-    /// [Capture::finish] pops them all off.
+    /// The thread itself records [Event]s and [Span]s by pushing them onto the
+    /// queue.  [Capture::finish] pops them all off.
     queue: Arc<Queue>,
 }
 
@@ -936,9 +1253,19 @@ impl ThreadMarkers {
 /// [ThreadMarkers] for every thread that has recorded a marker.
 static ALL_THREAD_MARKERS: std::sync::Mutex<Vec<ThreadMarkers>> = std::sync::Mutex::new(Vec::new());
 
+/// Number of blocks of capacity left for allocation before we stop allocating.
+///
+/// If this is below zero, then we ran out and tried to allocate more anyhow.
 static FREE_BLOCKS: AtomicI64 = AtomicI64::new(0);
+
+/// Number of [Marker]s we allocate in each [Block].
 const MARKERS_PER_BLOCK: usize = 32;
+
+/// Number of bytes we account for each [Block].
 const BYTES_PER_BLOCK: usize = MARKERS_PER_BLOCK * Span::BYTES;
+
+/// The time at which [FREE_BLOCKS] dropped below zero.
+static MARKERS_EXHAUSTED: AtomicOptionTimestamp = AtomicOptionTimestamp::new(None);
 
 struct Block(Vec<Marker>);
 impl Block {
@@ -972,7 +1299,14 @@ impl Blocks {
         } else {
             match FREE_BLOCKS.fetch_sub(1, Ordering::Relaxed) {
                 1.. => self.0.push(Block::new(marker)),
-                0 => warn!("marker capture space exhausted"),
+                0 => {
+                    // Record when marker space was exhausted.  The combination
+                    // of `load` and `store` is not an atomic transaction, but
+                    // it's good enough.
+                    if MARKERS_EXHAUSTED.load().is_none() {
+                        MARKERS_EXHAUSTED.store(Some(Timestamp::now()));
+                    }
+                }
                 _ => (),
             }
         }
@@ -983,11 +1317,48 @@ impl Blocks {
     }
 }
 
-struct Queue(std::sync::Mutex<Blocks>);
+#[derive(Debug, Default)]
+struct LongSpans {
+    markers: Vec<Marker>,
+}
+
+impl LongSpans {
+    fn push(&mut self, marker: Marker) {
+        if self.markers.len() == self.markers.capacity() {
+            // Do garbage collection.
+            let capturing = Capture::is_active();
+            self.markers
+                .retain(|marker| marker.end.should_keep(capturing));
+        }
+        self.markers.push(marker);
+    }
+
+    fn append(&mut self, other: &mut Vec<Marker>) {
+        if self.markers.is_empty() {
+            swap(&mut self.markers, other);
+        } else {
+            self.markers.append(other);
+        }
+    }
+}
+
+struct Queue {
+    /// Records [Span] and [Event] markers.
+    blocks: std::sync::Mutex<Blocks>,
+
+    /// Records [LongSpan] markers.
+    ///
+    /// These are recorded separately because they are not accounted the same
+    /// way and because they need to be garbage collected.
+    long_spans: std::sync::Mutex<LongSpans>,
+}
 
 impl Queue {
     fn new() -> Arc<Self> {
-        let queue = Arc::new(Self(Default::default()));
+        let queue = Arc::new(Self {
+            blocks: Default::default(),
+            long_spans: Default::default(),
+        });
         ALL_THREAD_MARKERS
             .lock()
             .unwrap()
@@ -995,12 +1366,35 @@ impl Queue {
         queue
     }
 
+    /// Adds `marker` if there's room with the limit.
     fn push(&self, marker: Marker) {
-        self.0.lock().unwrap().push(marker);
+        self.blocks.lock().unwrap().push(marker);
     }
 
-    fn take(&self) -> Blocks {
-        std::mem::take(&mut *self.0.lock().unwrap())
+    /// Adds `marker` to the collection of long spans.
+    fn push_long_span(&self, marker: Marker) {
+        self.long_spans.lock().unwrap().push(marker);
+    }
+
+    fn take_blocks(&self) -> Blocks {
+        std::mem::take(&mut *self.blocks.lock().unwrap())
+    }
+
+    fn take_long_spans(&self) -> Vec<Marker> {
+        let old_long_spans = std::mem::take(&mut *self.long_spans.lock().unwrap()).markers;
+
+        // Requeue the long spans that we removed that should stay in place.
+        let mut new_long_spans = Vec::with_capacity(old_long_spans.capacity());
+        for marker in &old_long_spans {
+            if marker.end.should_keep(false) {
+                new_long_spans.push(marker.clone());
+            }
+        }
+        if !new_long_spans.is_empty() {
+            self.long_spans.lock().unwrap().append(&mut new_long_spans);
+        }
+
+        old_long_spans
     }
 }
 

@@ -34,7 +34,7 @@ import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitPostfix;
 import org.dbsp.util.HashString;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.backend.MerkleOuter;
@@ -224,7 +224,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 DBSPTypeVoid.INSTANCE, body, Linq.list("#[test]"));
 
         PrintStream stream = new PrintStream(BaseSQLTests.TEST_FILE_PATH);
-        RustFileWriter writer = new RustFileWriter(new LateMaterializations(compiler)).withTest(true);
+        RustFileWriter writer = new RustFileWriter(new CircuitPostfix(compiler));
         writer.setOutputBuilder(new IndentStream(stream));
         writer.add(tester);
         writer.write(compiler);
@@ -257,7 +257,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 DBSPTypeVoid.INSTANCE, body, Linq.list("#[test]"));
 
         PrintStream outputStream = new PrintStream(BaseSQLTests.TEST_FILE_PATH, StandardCharsets.UTF_8);
-        RustFileWriter writer = new RustFileWriter(new LateMaterializations(compiler)).withTest(true);
+        RustFileWriter writer = new RustFileWriter(new CircuitPostfix(compiler));
         writer.setOutputBuilder(new IndentStream(outputStream));
         writer.add(tester);
         writer.write(compiler);
@@ -648,15 +648,6 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                     Tup2::new(Some(2), Some("Y"), ) => -1i64,
                     Tup2::new(Some(3), Some("Z"), ) => -1i64,
                 ), primaryKeys=[]]""", set);
-    }
-
-    @Test
-    public void indexTest() {
-        String sql = """
-                CREATE TABLE T(id int, v VARCHAR, z INT ARRAY);
-                CREATE VIEW V AS SELECT * FROM T;
-                CREATE INDEX IX ON V(id, v);""";
-        this.compileRustTestCase(sql);
     }
 
     @Test

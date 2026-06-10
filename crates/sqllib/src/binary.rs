@@ -527,3 +527,112 @@ pub fn xxhash_bytes_i64(source: ByteArray, seed: i64) -> i64 {
 }
 
 some_polymorphic_function2!(xxhash, bytes, ByteArray, i64, i64, i64);
+
+#[doc(hidden)]
+pub fn binary_to_u8(b: ByteArray) -> u8 {
+    assert!(b.length() <= 1);
+    b.data[0]
+}
+
+#[doc(hidden)]
+pub fn binary_to_u16(b: ByteArray) -> u16 {
+    assert!(b.length() <= 2);
+    let mut buf = [0u8; 2];
+    buf[2 - b.length()..].copy_from_slice(&b.data);
+    u16::from_be_bytes(buf)
+}
+
+#[doc(hidden)]
+pub fn binary_to_u32(b: ByteArray) -> u32 {
+    assert!(b.length() <= 4);
+    let mut buf = [0u8; 4];
+    buf[4 - b.length()..].copy_from_slice(&b.data);
+    u32::from_be_bytes(buf)
+}
+
+#[doc(hidden)]
+pub fn binary_to_u64(b: ByteArray) -> u64 {
+    assert!(b.length() <= 8);
+    let mut buf = [0u8; 8];
+    buf[8 - b.length()..].copy_from_slice(&b.data);
+    u64::from_be_bytes(buf)
+}
+
+#[doc(hidden)]
+pub fn binary_to_u128(b: ByteArray) -> u128 {
+    assert!(b.length() <= 16);
+    let mut buf = [0u8; 16];
+    buf[16 - b.length()..].copy_from_slice(&b.data);
+    u128::from_be_bytes(buf)
+}
+
+#[test]
+pub fn testBinaryToInteger() {
+    let bin = ByteArray::new(&[0x12, 0x34]);
+    assert_eq!(0x1234, binary_to_u16(bin.clone()));
+    assert_eq!(0x1234, binary_to_u32(bin.clone()));
+    assert_eq!(0x1234, binary_to_u64(bin.clone()));
+    assert_eq!(0x1234, binary_to_u128(bin));
+}
+
+// Used in range aggregates; the compiler guarantees that the ByteArray fits in 64 bits
+#[doc(hidden)]
+pub fn bytes_to_u64_(b: ByteArray) -> u64 {
+    binary_to_u64(b)
+}
+
+some_function1!(bytes_to_u64, ByteArray, u64);
+
+// Used in range aggregates; the compiler guarantees that the ByteArray fits in 128 bits
+#[doc(hidden)]
+pub fn bytes_to_u128_(b: ByteArray) -> u128 {
+    binary_to_u128(b)
+}
+
+some_function1!(bytes_to_u128, ByteArray, u128);
+
+// Used in range aggregates
+#[doc(hidden)]
+pub fn u64_to_bytes__(u: u64, precision: i32) -> ByteArray {
+    ByteArray::with_size_truncate_left(&u.to_be_bytes(), precision, true)
+}
+
+// precision can never be Option<i32>, it's a compile-time constant
+#[doc(hidden)]
+pub fn u64_to_bytes_N_(u: Option<u64>, precision: i32) -> Option<ByteArray> {
+    let u = u?;
+    Some(u64_to_bytes__(u, precision))
+}
+
+#[doc(hidden)]
+pub fn u128_to_bytes__(u: u128, precision: i32) -> ByteArray {
+    ByteArray::with_size_truncate_left(&u.to_be_bytes(), precision, true)
+}
+
+// precision can never be Option<i32>, it's a compile-time constant
+#[doc(hidden)]
+pub fn u128_to_bytes_N_(u: Option<u128>, precision: i32) -> Option<ByteArray> {
+    let u = u?;
+    Some(u128_to_bytes__(u, precision))
+}
+
+#[test]
+pub fn test_binary_to_range_key() {
+    for bin in [ByteArray::new(&[0x12, 0x34]), ByteArray::new(&[0x00, 0x00])] {
+        let u = bytes_to_u64_(bin.clone());
+        let inv = u64_to_bytes__(u, 2);
+        assert_eq!(inv, bin);
+
+        let u = bytes_to_u128_(bin.clone());
+        let inv = u128_to_bytes__(u, 2);
+        assert_eq!(inv, bin);
+
+        let u = bytes_to_u64N(Some(bin.clone()));
+        let inv = u64_to_bytes_N_(u, 2).unwrap();
+        assert_eq!(inv, bin);
+
+        let u = bytes_to_u128N(Some(bin.clone()));
+        let inv = u128_to_bytes_N_(u, 2).unwrap();
+        assert_eq!(inv, bin);
+    }
+}

@@ -9,7 +9,9 @@ use feldera_types::config::{
     ConnectorConfig, InputEndpointConfig, MultihostConfig, OutputEndpointConfig, PipelineConfig,
     PipelineConfigProgramInfo, ProgramIr, RuntimeConfig, TransportConfig,
 };
-use feldera_types::program_schema::{ProgramSchema, PropertyValue, SourcePosition, SqlIdentifier};
+use feldera_types::program_schema::{
+    ProgramSchemaPropertiesOnly, PropertyValue, SourcePosition, SqlIdentifier,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -132,6 +134,12 @@ impl SqlCompilerMessage {
             ConnectorGenerationError::ExpectedInputConnector { position, .. } => position,
             ConnectorGenerationError::ExpectedOutputConnector { position, .. } => position,
             ConnectorGenerationError::RelationConnectorNameCollision { position, .. } => position,
+            ConnectorGenerationError::InvalidProgramSchema { .. } => SourcePosition {
+                start_line_number: 0,
+                start_column: 0,
+                end_line_number: 0,
+                end_column: 0,
+            },
         };
         SqlCompilerMessage {
             start_line_number: position.start_line_number,
@@ -465,7 +473,9 @@ impl ProgramConfig {
         if has_unstable_feature("runtime_version") {
             rt
         } else if !has_unstable_feature("runtime_version") && !rt.is_platform() {
-            warn!("Runtime version {rt} specified but argument is ignored because the platform does not have the unstable feature `runtime_version` enabled.");
+            warn!(
+                "Runtime version {rt} specified but argument is ignored because the platform does not have the unstable feature `runtime_version` enabled."
+            );
             RuntimeSelector::default()
         } else {
             RuntimeSelector::default()
@@ -503,24 +513,32 @@ pub enum ConnectorGenerationError {
         value: String,
         reason: Box<String>, // Put into a Box because else the error type becomes too large according to clippy
     },
-    #[error("relation '{relation}': expected an input variant but got an output variant for connector '{connector_name}'")]
+    #[error(
+        "relation '{relation}': expected an input variant but got an output variant for connector '{connector_name}'"
+    )]
     ExpectedInputConnector {
         position: SourcePosition,
         relation: String,
         connector_name: String,
     },
-    #[error("relation '{relation}': expected an output variant but got an input variant for connector '{connector_name}'")]
+    #[error(
+        "relation '{relation}': expected an output variant but got an input variant for connector '{connector_name}'"
+    )]
     ExpectedOutputConnector {
         position: SourcePosition,
         relation: String,
         connector_name: String,
     },
-    #[error("relation '{relation}': encountered collision when using {{relation}}.{{connector_name}} as unique name: '{relation}.{connector_name}' is not unique")]
+    #[error(
+        "relation '{relation}': encountered collision when using {{relation}}.{{connector_name}} as unique name: '{relation}.{connector_name}' is not unique"
+    )]
     RelationConnectorNameCollision {
         position: SourcePosition,
         relation: String,
         connector_name: String,
     },
+    #[error("error parsing program schema: {error}")]
+    InvalidProgramSchema { error: String },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -621,10 +639,10 @@ fn determine_connector_endpoint_names(
 ///
 /// It includes information needed for Rust compilation (e.g., generated Rust code)
 /// as well as only for runtime (e.g., schema, input/output connectors).
-#[derive(Default, Deserialize, Serialize, Eq, PartialEq, Debug, Clone, ToSchema)]
+#[derive(Deserialize, Serialize, Eq, PartialEq, Debug, Clone, ToSchema)]
 pub struct ProgramInfo {
     /// Schema of the compiled SQL.
-    pub schema: ProgramSchema,
+    pub schema: serde_json::Value,
 
     /// Generated main program Rust code: main.rs
     #[serde(default)] // TODO: when a breaking migration can happen, remove this default
@@ -664,14 +682,19 @@ impl ProgramInfo {
 /// Generates the program info using the program schema.
 /// The info includes the schema and the input/output connectors derived from it.
 pub fn generate_program_info(
-    program_schema: ProgramSchema,
+    program_schema: serde_json::Value,
     main_rust: String,
     udf_stubs: String,
     dataflow: Option<Dataflow>,
 ) -> Result<ProgramInfo, ConnectorGenerationError> {
+    let program_schema_properties_only = ProgramSchemaPropertiesOnly::deserialize(&program_schema)
+        .map_err(|e| ConnectorGenerationError::InvalidProgramSchema {
+            error: e.to_string(),
+        })?;
+
     // Input connectors
     let mut input_connectors = vec![];
-    for input_relation in &program_schema.inputs {
+    for input_relation in program_schema_properties_only.inputs {
         let (connectors, origin_value) =
             parse_named_connectors(input_relation.name.clone(), &input_relation.properties)?;
         for connector in connectors {
@@ -724,7 +747,7 @@ pub fn generate_program_info(
 
     // Output connectors
     let mut output_connectors = vec![];
-    for output_relation in &program_schema.outputs {
+    for output_relation in &program_schema_properties_only.outputs {
         let (connectors, origin_value) =
             parse_named_connectors(output_relation.name.clone(), &output_relation.properties)?;
         for connector in connectors {
@@ -779,66 +802,21 @@ pub fn generate_program_info(
     })
 }
 
-/// Generates the pipeline configuration derived from the runtime configuration and the
-/// input/output connectors derived from the program schema.
+/// Generates the pipeline configuration derived from the runtime configuration.
 ///
-/// `program_info` is specified if the program was compiled by an older version of
-/// the runtime and its program info hasn't been uploaded to the compiler server.
-/// Such programs require the pipeline manager to provide program info via PipelineConfig.
-// TODO: remove the program_info parameter once we're allowed to stop supporting
-// platform versions <=0.199.0.
+/// The returned pipeline config leaves three fields empty (they will be populated later from
+/// `ProgramInfo`): `inputs`, `outputs`, `program_ir`.
+///
+/// These fields are populated when starting the pipeline: the local runner pulls program
+/// info from the compiler server and generates a config file itself. The k8s runner
+/// only distributes the subset of the pipeline config generated here via ConfigMap;
+/// the pipeline pulls the rest from the compiler server and merges the two in the startup
+/// shell script.
 pub fn generate_pipeline_config(
     pipeline_id: PipelineId,
     pipeline_name: &str,
     runtime_config: &RuntimeConfig,
-    program_info: Option<&ProgramInfo>,
 ) -> PipelineConfig {
-    let (inputs, outputs, program_ir) = if let Some(program_info) = program_info {
-        // Only keep tables and views, ignoring intermediate nodes.
-        // These are currently the only nodes used by the pipeline
-        // (to compute pipeline diffs). Including all nodes can cause the IR
-        // to exceed the maximum ConfigMap size supported by k8s (1MB).
-        let mir = program_info
-            .dataflow
-            .as_ref()
-            .map(|d| {
-                d.mir
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        if v.is_relation() {
-                            Some((k.clone(), v.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Remove inputs and outputs that do not have lateness.
-        // This field is currently only used for backfill avoidance, which only cares about
-        // relations with lateness. Including the entire schema would cause the IR to exceed the
-        // maximum ConfigMap size supported by k8s (1MB).
-        let mut program_schema = program_info.schema.clone();
-        program_schema.inputs.retain(|input| input.has_lateness());
-        program_schema
-            .outputs
-            .retain(|output| output.has_lateness());
-
-        let program_ir = ProgramIr {
-            mir,
-            program_schema,
-        };
-
-        (
-            program_info.input_connectors.clone(),
-            program_info.output_connectors.clone(),
-            Some(program_ir),
-        )
-    } else {
-        Default::default()
-    };
-
     PipelineConfig {
         name: Some(format!("pipeline-{pipeline_id}")),
         given_name: Some(pipeline_name.to_string()),
@@ -852,9 +830,9 @@ pub fn generate_pipeline_config(
         } else {
             None
         },
-        inputs,
-        outputs,
-        program_ir,
+        inputs: BTreeMap::new(),
+        outputs: BTreeMap::new(),
+        program_ir: None,
     }
 }
 
@@ -895,6 +873,7 @@ mod tests {
     fn test_connector_endpoint_name_determination() {
         // Reuse the configuration as it is not used in the function
         let config = ConnectorConfig {
+            send_snapshot: false,
             transport: TransportConfig::Datagen(DatagenInputConfig::default()),
             format: None,
             preprocessor: None,
@@ -903,6 +882,7 @@ mod tests {
             max_batch_size: Some(0),
             max_worker_batch_size: None,
             max_queued_records: 0,
+            max_queued_bytes: None,
             paused: false,
             labels: vec![],
             start_after: None,

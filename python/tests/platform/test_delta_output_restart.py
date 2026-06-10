@@ -26,11 +26,9 @@ from feldera.runtime_config import RuntimeConfig
 from feldera.testutils import (
     FELDERA_TEST_NUM_HOSTS,
     FELDERA_TEST_NUM_WORKERS,
-    unique_pipeline_name,
 )
-from tests import TEST_CLIENT, enterprise_only, skip_on_arm64
+from tests import TEST_CLIENT, enterprise_only
 from tests.utils import DeltaTestLocation
-
 
 # ─── helpers ───────────────────────────────────────────────────────────
 
@@ -91,13 +89,11 @@ def _seed_50_rows_and_suspend(name: str, loc: DeltaTestLocation):
 
 
 @enterprise_only
-@skip_on_arm64
-def test_clean_resume_preserves_table():
+def test_clean_resume_preserves_table(pipeline_name):
     """Restarting an unchanged pipeline keeps the delta table contents."""
-    name = unique_pipeline_name("delta_restart_clean")
-    loc = DeltaTestLocation.create(name)
+    loc = DeltaTestLocation.create(pipeline_name)
     try:
-        pipeline = _seed_50_rows_and_suspend(name, loc)
+        pipeline = _seed_50_rows_and_suspend(pipeline_name, loc)
 
         # Resume the SAME pipeline object — connector identity is preserved.
         pipeline.start()
@@ -105,25 +101,20 @@ def test_clean_resume_preserves_table():
 
         pipeline.input_json("t", [{"id": i} for i in range(50, 80)], wait=True)
         assert loc.row_count() == 80
-
-        pipeline.stop(force=True)
-        pipeline.clear_storage()
     finally:
         loc.cleanup()
 
 
 @enterprise_only
-@skip_on_arm64
-def test_modified_connector_re_truncates_on_resume():
+def test_modified_connector_re_truncates_on_resume(pipeline_name):
     """Changing the connector config on resume makes it a new incarnation that re-truncates."""
-    name = unique_pipeline_name("delta_restart_conn_modified")
-    loc = DeltaTestLocation.create(name)
+    loc = DeltaTestLocation.create(pipeline_name)
     try:
-        _seed_50_rows_and_suspend(name, loc)
+        _seed_50_rows_and_suspend(pipeline_name, loc)
 
         # Resume with a MODIFIED connector config (extra `checkpoint_interval` field).
         pipeline = _build_pipeline(
-            name,
+            pipeline_name,
             _sql(loc, extra_connector_options={"checkpoint_interval": 60}),
         )
         pipeline.start()
@@ -131,31 +122,66 @@ def test_modified_connector_re_truncates_on_resume():
 
         pipeline.input_json("t", [{"id": i} for i in range(50, 80)], wait=True)
         assert loc.row_count() == 30
-
-        pipeline.stop(force=True)
-        pipeline.clear_storage()
     finally:
         loc.cleanup()
 
 
 @enterprise_only
-@skip_on_arm64
-def test_modified_view_re_truncates_on_resume():
-    """Changing the view's schema on resume forces a rebuild from scratch."""
-    name = unique_pipeline_name("delta_restart_view_modified")
-    loc = DeltaTestLocation.create(name)
+def test_log_retention_properties_land_in_metadata(pipeline_name):
+    """Setting `log_retention_duration`, `enable_expired_log_cleanup`, and
+    `checkpoint_interval` on a fresh table persists the corresponding `delta.*`
+    properties in the Delta table metadata.
+
+    Mirrors `test_modified_connector_re_truncates_on_resume`: the table is created with
+    extra connector options, then we read the metadata back through `DeltaTable` and
+    assert all three properties are present.  `checkpoint_interval=1` also forces a
+    checkpoint on every commit, which is what triggers the log-cleanup hook in
+    production; we don't assert cleanup behavior here (that requires wall-clock sleep),
+    only that the properties are recorded so delta-rs sees them.
+    """
+    from deltalake import DeltaTable
+
+    loc = DeltaTestLocation.create(pipeline_name)
     try:
-        _seed_50_rows_and_suspend(name, loc)
+        pipeline = _build_pipeline(
+            pipeline_name,
+            _sql(
+                loc,
+                extra_connector_options={
+                    "log_retention_duration": "interval 7 days",
+                    "enable_expired_log_cleanup": False,
+                    "checkpoint_interval": 1,
+                },
+            ),
+        )
+        pipeline.start()
+        pipeline.input_json("t", [{"id": 1}], wait=True)
+        pipeline.checkpoint(wait=True)
+
+        dt = DeltaTable(loc.uri, storage_options=loc.delta_storage_options())
+        config = dt.metadata().configuration
+        assert config.get("delta.logRetentionDuration") == "interval 7 days", config
+        assert config.get("delta.enableExpiredLogCleanup") == "false", config
+        assert config.get("delta.checkpointInterval") == "1", config
+
+        pipeline.stop(force=False)
+    finally:
+        loc.cleanup()
+
+
+@enterprise_only
+def test_modified_view_re_truncates_on_resume(pipeline_name):
+    """Changing the view's schema on resume forces a rebuild from scratch."""
+    loc = DeltaTestLocation.create(pipeline_name)
+    try:
+        _seed_50_rows_and_suspend(pipeline_name, loc)
 
         # Resume with a MODIFIED view (adds an `extra` column).
-        pipeline = _build_pipeline(name, _sql(loc, extra_view_column=True))
+        pipeline = _build_pipeline(pipeline_name, _sql(loc, extra_view_column=True))
         pipeline.start()
         assert loc.row_count() == 0  # rebuilt empty
 
         pipeline.input_json("t", [{"id": i} for i in range(50, 80)], wait=True)
         assert loc.row_count() == 30
-
-        pipeline.stop(force=True)
-        pipeline.clear_storage()
     finally:
         loc.cleanup()

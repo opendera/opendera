@@ -4,6 +4,7 @@ use bench_common::{BenchKeyStruct, BenchTestStruct, build_indexed_batch, generat
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use dbsp_adapters::Encoder;
 use dbsp_adapters::integrated::delta_table::DeltaTableWriter;
+use feldera_adapterlib::transport::OutputBatchType;
 use feldera_types::transport::delta_table::{DeltaTableWriteMode, DeltaTableWriterConfig};
 use std::sync::Weak;
 use tempfile::TempDir;
@@ -20,6 +21,8 @@ fn create_indexed_writer(threads: usize, table_uri: &str) -> DeltaTableWriter {
         threads: Some(threads),
         object_store_config: Default::default(),
         checkpoint_interval: None,
+        log_retention_duration: None,
+        enable_expired_log_cleanup: None,
     };
     let key_schema = Some(BenchKeyStruct::relation_schema());
     let mut value_schema = BenchTestStruct::relation_schema();
@@ -32,6 +35,7 @@ fn create_indexed_writer(threads: usize, table_uri: &str) -> DeltaTableWriter {
         &value_schema,
         Weak::new(),
         false,
+        true,
     )
     .unwrap()
 }
@@ -64,7 +68,7 @@ fn bench_indexed_encode(c: &mut Criterion) {
                         (writer, table_dir)
                     },
                     |(mut writer, _table_dir)| {
-                        writer.consumer().batch_start(0);
+                        writer.consumer().batch_start(0, OutputBatchType::Delta);
                         writer.encode(batch.clone().arc_as_batch_reader()).unwrap();
                         writer.consumer().batch_end();
                     },

@@ -1,6 +1,7 @@
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
 import org.dbsp.sqlCompiler.circuit.DBSPDeclaration;
+import org.dbsp.sqlCompiler.circuit.annotation.JoinStrategy;
 import org.dbsp.sqlCompiler.circuit.annotation.OperatorHash;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateLinearPostprocessOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateOperatorBase;
@@ -8,6 +9,7 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPChainAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamAggregateOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamJoinOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
@@ -279,7 +281,7 @@ public class Regression2Tests extends SqlIoTest {
         this.statementsFailingInCompilation("""
                 CREATE MATERIALIZED VIEW v AS SELECT
                 (DATE '2020-06-21', DATE '2020-06-21' + INTERVAL '1' YEAR) CONTAINS TIME '12:00:00' AS res;""",
-                "Cannot apply 'CONTAINS' to arguments of type '<RECORDTYPE(DATE EXPR$0, DATE EXPR$1)> CONTAINS <TIME(0)>'");
+                "Cannot apply 'CONTAINS' to arguments of type '<ROW(DATE EXPR$0, DATE EXPR$1)> CONTAINS <TIME(0)>'");
     }
 
     @Test
@@ -436,11 +438,14 @@ public class Regression2Tests extends SqlIoTest {
     public void issue5541c() {
         DBSPCompiler compiler = this.testCompiler();
         compiler.options.ioOptions.quiet = false;
+        PrintStream saved = System.err;
+        System.setErr(NullPrintStream.INSTANCE);
         compiler.submitStatementsForCompilation("""
                 CREATE TABLE T(x INT, z INT, y INT);
                 CREATE LOCAL VIEW V AS SELECT SUM(x) AS sum, AVG(z) AS max, y FROM T GROUP BY y;
                 CREATE VIEW W AS SELECT sum, y FROM V;""");
         var ccs = this.getCCS(compiler);
+        System.setErr(saved);
         ccs.visit(new CircuitVisitor(ccs.compiler) {
             int aggregates;
 
@@ -519,7 +524,8 @@ public class Regression2Tests extends SqlIoTest {
             }
         });
 
-        Assert.assertTrue(found[0]);
+        // When generating code for multi crates the statics are generated differently
+        Assert.assertTrue(found[0] || cc.compiler.options.ioOptions.multiCrates());
     }
 
     @Test
@@ -1179,5 +1185,597 @@ public class Regression2Tests extends SqlIoTest {
                ---
                NULL
                (1 row)""");
+    }
+
+    @Test
+    public void missingHintArgument() {
+            this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT);
+                CREATE TABLE S(x INT);
+                CREATE VIEW V AS SELECT /*+ broadcast */ *
+                FROM T JOIN S on T.x = S.x;""", "Invalid hint: Hint 'broadcast' requires a list of arguments");
+    }
+
+    @Test
+    public void testHints() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(x INT);
+                CREATE TABLE S(x INT);
+                CREATE VIEW V AS SELECT /*+ broadcast(T), shard(S) */ * FROM T JOIN S USING (x);""");
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            boolean joinFound = false;
+
+            @Override
+            public void postorder(DBSPStreamJoinOperator join) {
+                this.joinFound = true;
+                Assert.assertEquals("[Broadcast(t), Shard(s)]", join.annotations.get(JoinStrategy.class).toString());
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertTrue(this.joinFound);
+            }
+        });
+    }
+
+    @Test
+    public void testThreeWayJoinHints() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(x INT);
+                CREATE TABLE S(x INT);
+                CREATE TABLE U(x INT);
+                CREATE VIEW V AS SELECT /*+ broadcast(T), shard(S), balance(U) */ * FROM T JOIN S USING (x) JOIN U USING (x);""");
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            int joins = 0;
+
+            @Override
+            public void postorder(DBSPStreamJoinOperator join) {
+                String strat = join.annotations.get(JoinStrategy.class).toString();
+                this.joins++;
+                Assert.assertTrue(strat.equals("[Broadcast(t), Shard(s)]") || strat.equals("[Balance(u)]"));
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(2, this.joins);
+            }
+        });
+    }
+
+    @Test
+    public void testNoMatchingTableHint() {
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT);
+                CREATE VIEW V AS SELECT /*+ broadcast(X), shard(S) */ * FROM T JOIN T AS S USING (x);""",
+                "Cannot apply hint: Hint 'broadcast(x)' specifies an input which cannot be identified among the join inputs");
+    }
+
+    @Test
+    public void testConflictingHints() {
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT);
+                CREATE VIEW V AS SELECT /*+ broadcast(T), shard(S) */ * FROM T JOIN T AS S USING (x);""",
+                "Incompatible hints: Found two conflicting hints for the same collection: Shard(s)");
+    }
+
+    @Test
+    public void testAmbiguousHint() {
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT);
+                CREATE TABLE S(x INT);
+                CREATE VIEW V AS WITH
+                TMP AS (SELECT * FROM T JOIN S USING(x))
+                SELECT /*+ broadcast(T) */ * FROM T JOIN TMP USING (X);
+                """, "Ambiguous hint: Hint 'broadcast(t)' matches 2 different collections");
+    }
+
+    @Test
+    public void issue5890() {
+        String program = """
+                CREATE TABLE T (
+                  payment_id INT,
+                  customer_id INT,
+                  amount INT,
+                  seq INT UNSIGNED
+                );
+                
+                CREATE VIEW V AS SELECT
+                  customer_id,
+                  SUM(amount) OVER (PARTITION BY customer_id ORDER BY seq) AS previous
+                FROM T;""";
+        // Validated on postgres, which is NULLS LAST, so this needs explicit NULLS FIRST
+        String data = """
+                INSERT INTO T VALUES
+                  -- Customer 1: clean increasing seq
+                  (1, 1, 10, 1),
+                  (2, 1, 20, 2),
+                  (3, 1, -5, 3),
+                  -- Customer 2: out‑of‑order seq, zero amount
+                  (4, 2, 7,  5),
+                  (5, 2, 0,  2),
+                  (6, 2, 3,  4),
+                  -- Customer 3: single row partition
+                  (7, 3, 100, 10),
+                  -- Customer 4: duplicate seq values (tests deterministic ordering)
+                  (8, 4, 1,  1),
+                  (9, 4, 2,  1),
+                  (10,4, 3,  2),
+                  -- Null seq
+                  (11,1, 3, NULL);
+                """;
+        String expected = """
+                 customer_id | previous
+                ------------------------
+                 1 	         | 3
+                 1 	         | 13
+                 1 	         | 33
+                 1 	         | 28
+                 2 	         | 0
+                 2 	         | 3
+                 2 	         | 10
+                 3 	         | 100
+                 4 	         | 3
+                 4 	         | 3
+                 4 	         | 6""";
+
+        var ccs = this.getCCS(program);
+        ccs.stepWeightOne(data, expected);
+
+        var program1 = program.replace("ORDER BY seq", "ORDER BY seq NULLS FIRST");
+        ccs = this.getCCS(program1);
+        ccs.stepWeightOne(data, expected);
+
+        var program2 = program.replace("ORDER BY seq", "ORDER BY seq NULLS LAST");
+        ccs = this.getCCS(program2);
+        String expected2 = """
+                 customer_id | previous
+                ------------------------
+                 1 	         | 10
+                 1 	         | 30
+                 1 	         | 25
+                 1 	         | 28
+                 2 	         | 0
+                 2 	         | 3
+                 2 	         | 10
+                 3 	         | 100
+                 4 	         | 3
+                 4 	         | 3
+                 4 	         | 6""";
+        ccs.stepWeightOne(data, expected2);
+    }
+
+    @Test
+    public void issue5890a() {
+        // Validated on postgres
+        // same as before, non-nullable unsigned type for seq
+        String program = """
+                CREATE TABLE T (
+                  payment_id INT,
+                  customer_id INT,
+                  amount INT,
+                  seq INT UNSIGNED NOT NULL
+                );
+                
+                CREATE VIEW V AS SELECT
+                  customer_id,
+                  SUM(amount) OVER (PARTITION BY customer_id ORDER BY seq) AS previous
+                FROM T;""";
+        // Same data as before, without the NULL value
+        String data = """
+                INSERT INTO T VALUES
+                  -- Customer 1: clean increasing seq
+                  (1, 1, 10, 1),
+                  (2, 1, 20, 2),
+                  (3, 1, -5, 3),
+                  -- Customer 2: out‑of‑order seq, zero amount
+                  (4, 2, 7,  5),
+                  (5, 2, 0,  2),
+                  (6, 2, 3,  4),
+                  -- Customer 3: single row partition
+                  (7, 3, 100, 10),
+                  -- Customer 4: duplicate seq values (tests deterministic ordering)
+                  (8, 4, 1,  1),
+                  (9, 4, 2,  1),
+                  (10,4, 3,  2);
+                """;
+        String expected = """
+                 customer_id | previous
+                ------------------------
+                 1 	         | 10
+                 1 	         | 30
+                 1 	         | 25
+                 2 	         | 0
+                 2 	         | 3
+                 2 	         | 10
+                 3 	         | 100
+                 4 	         | 3
+                 4 	         | 3
+                 4 	         | 6""";
+
+        var ccs = this.getCCS(program);
+        ccs.stepWeightOne(data, expected);
+
+        // This should make no difference, since the sorted value is not nullable
+        var program1 = program.replace("ORDER BY seq", "ORDER BY seq NULLS FIRST");
+        ccs = this.getCCS(program1);
+        ccs.stepWeightOne(data, expected);
+
+        // This should make no difference
+        var program2 = program.replace("ORDER BY seq", "ORDER BY seq NULLS LAST");
+        ccs = this.getCCS(program2);
+        ccs.stepWeightOne(data, expected);
+    }
+
+    @Test
+    public void issue5890b() {
+        // Same test as before, with descending sorting
+        String program = """
+                CREATE TABLE T (
+                  payment_id INT,
+                  customer_id INT,
+                  amount INT,
+                  seq INT UNSIGNED
+                );
+                
+                CREATE VIEW V AS SELECT
+                  customer_id,
+                  SUM(amount) OVER (PARTITION BY customer_id ORDER BY seq DESC) AS previous
+                FROM T;""";
+        // Validated on postgres
+        String data = """
+                INSERT INTO T VALUES
+                  -- Customer 1: clean increasing seq
+                  (1, 1, 10, 1),
+                  (2, 1, 20, 2),
+                  (3, 1, -5, 3),
+                  -- Customer 2: out‑of‑order seq, zero amount
+                  (4, 2, 7,  5),
+                  (5, 2, 0,  2),
+                  (6, 2, 3,  4),
+                  -- Customer 3: single row partition
+                  (7, 3, 100, 10),
+                  -- Customer 4: duplicate seq values (tests deterministic ordering)
+                  (8, 4, 1,  1),
+                  (9, 4, 2,  1),
+                  (10,4, 3,  2),
+                  -- Null seq
+                  (11,1, 3, NULL);
+                """;
+        String expected = """
+                 customer_id | previous
+                ------------------------
+                 1 	         | -5
+                 1 	         | 15
+                 1 	         | 25
+                 1 	         | 28
+                 2 	         | 7
+                 2 	         | 10
+                 2 	         | 10
+                 3 	         | 100
+                 4 	         | 3
+                 4 	         | 6
+                 4 	         | 6""";
+
+        var ccs = this.getCCS(program);
+        ccs.stepWeightOne(data, expected);
+
+        var program1 = program.replace("ORDER BY seq DESC", "ORDER BY seq DESC NULLS FIRST");
+        ccs = this.getCCS(program1);
+        String expected1 = """
+                 customer_id | previous
+                ------------------------
+                 1 	         | 3
+                 1 	         | -2
+                 1 	         | 18
+                 1 	         | 28
+                 2 	         | 7
+                 2 	         | 10
+                 2 	         | 10
+                 3 	         | 100
+                 4 	         | 3
+                 4 	         | 6
+                 4 	         | 6""";
+        ccs.stepWeightOne(data, expected1);
+
+        var program2 = program.replace("ORDER BY seq DESC", "ORDER BY seq DESC NULLS LAST");
+        ccs = this.getCCS(program2);
+        ccs.stepWeightOne(data, expected);
+    }
+
+    @Test
+    public void issue5890c() {
+        // Sort over UUID
+        // Validated on postgres
+        String program = """
+                CREATE TABLE T (
+                  payment_id INT,
+                  customer_id INT,
+                  amount INT,
+                  seq UUID NOT NULL
+                );
+                
+                CREATE VIEW V AS SELECT
+                  customer_id,
+                  SUM(amount) OVER (PARTITION BY customer_id ORDER BY seq) AS previous
+                FROM T;""";
+        // The UUID values have been chosen so that they have the same order as the previous test
+        String data = """
+                INSERT INTO T VALUES
+                  -- Customer 1: clean increasing seq
+                  (1, 1, 10, UUID '1f6c1e4b-2b8d-4c3e-9f0a-1d6b2e4c7a91'),
+                  (2, 1, 20, UUID '2d92f0c7-8a44-4e0e-bc3d-0f6b1a2c9e55'),
+                  (3, 1, -5, UUID '31c4b8f2-6d3e-4f8a-9c77-2e0b4d1f3a28'),
+                  -- Customer 2: out‑of‑order seq, zero amount
+                  (4, 2, 7,  UUID '50b7c2d1-9e3a-4c55-8d11-7a9c0e2b4f66'),
+                  (5, 2, 0,  UUID '2d92f0c7-8a44-4e0e-bc3d-0f6b1a2c9e55'),
+                  (6, 2, 3,  UUID '4e1a7c9d-3b22-4f0d-8e44-5c7a1b9f0d33'),
+                  -- Customer 3: single row partition
+                  (7, 3, 100, UUID 'a1c4b8f2-6d3e-4f8a-9c77-2e0b4d1f3a28'),
+                  -- Customer 4: duplicate seq values (tests deterministic ordering)
+                  (8, 4, 1,  UUID '1f6c1e4b-2b8d-4c3e-9f0a-1d6b2e4c7a91'),
+                  (9, 4, 2,  UUID '1f6c1e4b-2b8d-4c3e-9f0a-1d6b2e4c7a91'),
+                  (10,4, 3,  UUID '2d92f0c7-8a44-4e0e-bc3d-0f6b1a2c9e55');
+                """;
+        String expected = """
+                 customer_id | previous
+                ------------------------
+                 1 	         | 10
+                 1 	         | 30
+                 1 	         | 25
+                 2 	         | 0
+                 2 	         | 3
+                 2 	         | 10
+                 3 	         | 100
+                 4 	         | 3
+                 4 	         | 3
+                 4 	         | 6""";
+
+        var ccs = this.getCCS(program);
+        ccs.stepWeightOne(data, expected);
+
+        // This should make no difference, since the sorted value is not nullable
+        var program1 = program.replace("ORDER BY seq", "ORDER BY seq NULLS FIRST");
+        ccs = this.getCCS(program1);
+        ccs.stepWeightOne(data, expected);
+
+        // This should make no difference
+        var program2 = program.replace("ORDER BY seq", "ORDER BY seq NULLS LAST");
+        ccs = this.getCCS(program2);
+        ccs.stepWeightOne(data, expected);
+    }
+
+    @Test
+    public void issue5890d() {
+        // Sort over UUID descending
+        // Validated on postgres
+        String program = """
+                CREATE TABLE T (
+                  payment_id INT,
+                  customer_id INT,
+                  amount INT,
+                  seq UUID NOT NULL
+                );
+                
+                CREATE VIEW V AS SELECT
+                  customer_id,
+                  SUM(amount) OVER (PARTITION BY customer_id ORDER BY seq DESC) AS previous
+                FROM T;""";
+        // The UUID values have been chosen so that they have the same order as the previous test
+        String data = """
+                INSERT INTO T VALUES
+                  -- Customer 1: clean increasing seq
+                  (1, 1, 10, UUID '1f6c1e4b-2b8d-4c3e-9f0a-1d6b2e4c7a91'),
+                  (2, 1, 20, UUID '2d92f0c7-8a44-4e0e-bc3d-0f6b1a2c9e55'),
+                  (3, 1, -5, UUID '31c4b8f2-6d3e-4f8a-9c77-2e0b4d1f3a28'),
+                  -- Customer 2: out‑of‑order seq, zero amount
+                  (4, 2, 7,  UUID '50b7c2d1-9e3a-4c55-8d11-7a9c0e2b4f66'),
+                  (5, 2, 0,  UUID '2d92f0c7-8a44-4e0e-bc3d-0f6b1a2c9e55'),
+                  (6, 2, 3,  UUID '4e1a7c9d-3b22-4f0d-8e44-5c7a1b9f0d33'),
+                  -- Customer 3: single row partition
+                  (7, 3, 100, UUID 'a1c4b8f2-6d3e-4f8a-9c77-2e0b4d1f3a28'),
+                  -- Customer 4: duplicate seq values (tests deterministic ordering)
+                  (8, 4, 1,  UUID '1f6c1e4b-2b8d-4c3e-9f0a-1d6b2e4c7a91'),
+                  (9, 4, 2,  UUID '1f6c1e4b-2b8d-4c3e-9f0a-1d6b2e4c7a91'),
+                  (10,4, 3,  UUID '2d92f0c7-8a44-4e0e-bc3d-0f6b1a2c9e55');
+                """;
+        String expected = """
+                 customer_id | previous
+                ------------------------
+                 1 	         | -5
+                 1 	         | 15
+                 1 	         | 25
+                 2 	         | 7
+                 2 	         | 10
+                 2 	         | 10
+                 3 	         | 100
+                 4 	         | 3
+                 4 	         | 6
+                 4 	         | 6""";
+
+        var ccs = this.getCCS(program);
+        ccs.stepWeightOne(data, expected);
+
+        // This should make no difference, since the sorted value is not nullable
+        var program1 = program.replace("ORDER BY seq DESC", "ORDER BY seq DESC NULLS FIRST");
+        ccs = this.getCCS(program1);
+        ccs.stepWeightOne(data, expected);
+
+        // This should make no difference
+        var program2 = program.replace("ORDER BY seq DESC", "ORDER BY seq DESC NULLS LAST");
+        ccs = this.getCCS(program2);
+        ccs.stepWeightOne(data, expected);
+    }
+
+    @Test
+    public void issue5890e() {
+        String program = """
+                CREATE TABLE T (
+                  payment_id INT,
+                  customer_id INT,
+                  amount INT,
+                  seq UUID
+                );
+                
+                CREATE VIEW V AS SELECT
+                  customer_id,
+                  SUM(amount) OVER (PARTITION BY customer_id ORDER BY seq DESC) AS previous
+                FROM T;""";
+        this.statementsFailingInCompilation(program, """
+                OVER currently cannot sort on columns with type UUID NULL""");
+    }
+
+    @Test
+    public void issue6255() {
+        this.getCCS("""
+                CREATE TABLE collection_events (
+                  row_id     BIGINT,
+                  grp        VARCHAR,
+                  nums       INT ARRAY,
+                  nums2      INT ARRAY,
+                  prices     DECIMAL(10,2) ARRAY,
+                  taxes      DECIMAL(10,2) ARRAY,
+                  tags       VARCHAR ARRAY,
+                  tags2      VARCHAR ARRAY,
+                  attrs      MAP<VARCHAR, VARCHAR>,
+                  attrs2     MAP<VARCHAR, VARCHAR>,
+                  raw_json   VARCHAR,
+                  start_date DATE,
+                  end_date   DATE
+                );
+                
+                CREATE VIEW v AS
+                SELECT j.row_id, e.sku, e.qty
+                FROM (
+                  SELECT row_id,
+                         CAST(PARSE_JSON(raw_json) AS ROW(sku VARCHAR, qty INT) ARRAY) AS items
+                  FROM collection_events
+                ) j
+                , UNNEST(j.items) AS e(sku, qty);""");
+    }
+
+    @Test @Ignore("https://issues.apache.org/jira/browse/CALCITE-7536")
+    public void issue6256() {
+        this.getCC("""
+                CREATE VIEW V AS SELECT col1
+                FROM (VALUES (1)) t1(col1)
+                GROUP BY col1
+                HAVING (
+                    SELECT MAX(t2.col1) != 0
+                    FROM (VALUES (1)) t2(col1)
+                    WHERE t2.col1 = t1.col1
+                    GROUP BY t2.col1
+                    HAVING (
+                        SELECT t3.col1 != 0
+                        FROM (VALUES (1)) t3(col1)
+                        WHERE t3.col1 = MAX(t2.col1)
+                    )
+                );""");
+    }
+
+    @Test
+    public void issue4146() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(ts TIMESTAMP WITH TIME ZONE);
+                CREATE VIEW V AS SELECT * FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 America/New_York';", """
+                 r
+                ---
+                 2020-01-01 15:10:10 GMT
+                """);
+    }
+
+    @Test
+    public void issue4146a() {
+        // Validated on postgres
+        this.qs("""
+                SELECT COALESCE(NULL, TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 America/New_York');
+                 r
+                ---
+                 2020-01-01 15:10:10 UTC
+                (1 row)
+                
+                SELECT CAST(TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 America/New_York' AS VARCHAR);
+                 r
+                ---
+                 2020-01-01 15:10:10 +00:00
+                (1 row)
+                
+                SELECT EXTRACT(YEAR FROM TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 America/New_York');
+                 r
+                ---
+                 2020
+                (1 row)
+                
+                SELECT MONTH(TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 America/New_York');
+                 r
+                ---
+                 1
+                (1 row)
+                
+                SELECT TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 America/New_York' > TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 America/Los_Angeles';
+                 r
+                ---
+                 false
+                (1 row)
+                
+                SELECT TIMESTAMP WITH TIME ZONE '2020-01-01 08:10:10 America/New_York' = TIMESTAMP WITH TIME ZONE '2020-01-01 05:10:10 America/Los_Angeles';
+                 r
+                ---
+                 true
+                (1 row)
+                
+                SELECT (TIMESTAMP WITH TIME ZONE '2020-01-01 08:10:10 America/New_York' - TIMESTAMP WITH TIME ZONE '2020-01-01 05:10:10 America/Los_Angeles') SECONDS;
+                 r
+                ---
+                 0
+                (1 row)
+                
+                SELECT TIMESTAMP_TRUNC(TIMESTAMP WITH TIME ZONE '2020-01-01 08:10:10 America/New_York', HOUR);
+                 r
+                ---
+                 2020-01-01 13:00:00 GMT
+                (1 row)
+                
+                SELECT CAST(TIMESTAMP WITH TIME ZONE '2020-01-01 08:10:10 America/New_York' AS TIMESTAMP);
+                 r
+                ---
+                 2020-01-01 13:10:10
+                (1 row)
+                
+                SELECT TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 UTC' = '2020-01-01 10:10:10 UTC';
+                 r
+                ---
+                 true
+                (1 row)
+                
+                SELECT CAST(CAST(TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 UTC' AS VARCHAR) AS TIMESTAMP WITH TIME ZONE) = TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 UTC';
+                 r
+                ---
+                 true
+                (1 row)""");
+    }
+
+    @Test
+    public void testCaseTz() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(id INT, tmestmp_tz TIMESTAMP WITH TIME ZONE);
+                CREATE VIEW V AS SELECT tmestmp_tz,
+                CASE WHEN tmestmp_tz = TIMESTAMP WITH TIME ZONE '2020-06-21 14:23:44.123654 +00:00' THEN True ELSE NULL END
+                FROM T
+                WHERE id = 0;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(0, TIMESTAMP WITH TIME ZONE '2020-06-21 14:23:44.123654 +00:00')", """
+                 t | r
+                ------------
+                 2020-06-21 14:23:44.123654 UTC | true""");
+    }
+
+    @Test
+    public void testCompareTz() {
+        this.statementsFailingInCompilation(
+                "CREATE VIEW V AS SELECT TIMESTAMP '2020-01-01 10:00:00' < TIMESTAMP WITH TIME ZONE '2020-01-01 10:00:00 UTC'",
+                 "Operation < between TIMESTAMP and TIMESTAMP WITH TIME ZONE not supported");
+        this.statementsFailingInCompilation(
+                "CREATE VIEW V AS SELECT TIMESTAMP '2020-01-01 10:00:00' - TIMESTAMP WITH TIME ZONE '2020-01-01 10:00:00 UTC'",
+                "Cannot apply '-' to arguments of type '<TIMESTAMP(0)> - <TIMESTAMP_TZ(0)>'");
     }
 }

@@ -180,6 +180,18 @@ impl ProgramSchema {
     }
 }
 
+/// A version of `ProgramSchema` that contains only the name and properties of the relations
+/// by making use of `RelationPropertiesOnly` instead of `Relation` for its inputs and outputs.
+/// This is used to avoid parsing the entire `Relation` object, including SQL schema,
+/// which can change across runtime versions.
+#[derive(Debug, Deserialize)]
+pub struct ProgramSchemaPropertiesOnly {
+    #[serde(default)]
+    pub inputs: Vec<RelationPropertiesOnly>,
+    #[serde(default)]
+    pub outputs: Vec<RelationPropertiesOnly>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema, Debug, Eq, PartialEq, Clone)]
 #[cfg_attr(feature = "testing", derive(proptest_derive::Arbitrary))]
 pub struct PropertyValue {
@@ -202,6 +214,7 @@ pub struct Relation {
     pub materialized: bool,
     #[serde(default)]
     pub properties: BTreeMap<String, PropertyValue>,
+    pub primary_key: Option<Vec<String>>,
 }
 
 impl Relation {
@@ -211,6 +224,7 @@ impl Relation {
             fields: Vec::new(),
             materialized: false,
             properties: BTreeMap::new(),
+            primary_key: None,
         }
     }
 
@@ -225,6 +239,7 @@ impl Relation {
             fields,
             materialized,
             properties,
+            primary_key: None,
         }
     }
 
@@ -241,6 +256,25 @@ impl Relation {
     pub fn get_property(&self, name: &str) -> Option<&str> {
         self.properties.get(name).map(|p| p.value.as_str())
     }
+
+    pub fn with_primary_key<'a>(
+        mut self,
+        primary_key: impl IntoIterator<Item = &'a SqlIdentifier>,
+    ) -> Self {
+        self.primary_key = Some(primary_key.into_iter().map(|id| id.name()).collect());
+        self
+    }
+}
+
+/// A version of `Relation` that only contains the name and properties.
+/// This is used to avoid parsing the entire `Relation` object, including
+/// SQL schema, which can change across runtime versions.
+#[derive(Debug, Deserialize)]
+pub struct RelationPropertiesOnly {
+    #[serde(flatten)]
+    pub name: SqlIdentifier,
+    #[serde(default)]
+    pub properties: BTreeMap<String, PropertyValue>,
 }
 
 /// A SQL field.
@@ -447,6 +481,8 @@ pub enum SqlType {
     Date,
     /// SQL `TIMESTAMP` type.
     Timestamp,
+    /// SQL `TIMESTAMP WITH TIME ZONE` type.
+    TimestampTz,
     /// SQL `INTERVAL ... X` type where `X` is a unit.
     Interval(IntervalUnit),
     /// SQL `ARRAY` type.
@@ -509,6 +545,7 @@ impl<'de> Deserialize<'de> for SqlType {
             "time" => Ok(SqlType::Time),
             "date" => Ok(SqlType::Date),
             "timestamp" => Ok(SqlType::Timestamp),
+            "timestamp_tz" => Ok(SqlType::TimestampTz),
             "array" => Ok(SqlType::Array),
             "struct" => Ok(SqlType::Struct),
             "map" => Ok(SqlType::Map),
@@ -547,6 +584,7 @@ impl Serialize for SqlType {
             SqlType::Time => "TIME",
             SqlType::Date => "DATE",
             SqlType::Timestamp => "TIMESTAMP",
+            SqlType::TimestampTz => "TIMESTAMP_TZ",
             SqlType::Interval(interval_unit) => match interval_unit {
                 IntervalUnit::Day => "INTERVAL_DAY",
                 IntervalUnit::DayToHour => "INTERVAL_DAY_HOUR",
@@ -907,6 +945,19 @@ impl ColumnType {
         }
     }
 
+    pub fn timestamp_tz(nullable: bool) -> Self {
+        ColumnType {
+            typ: SqlType::TimestampTz,
+            nullable,
+            precision: None,
+            scale: None,
+            component: None,
+            fields: None,
+            key: None,
+            value: None,
+        }
+    }
+
     pub fn variant(nullable: bool) -> Self {
         ColumnType {
             typ: SqlType::Variant,
@@ -1014,6 +1065,7 @@ mod tests {
             ("Time", SqlType::Time),
             ("Date", SqlType::Date),
             ("Timestamp", SqlType::Timestamp),
+            ("Timestamp_Tz", SqlType::TimestampTz),
             ("Interval_Day", SqlType::Interval(IntervalUnit::Day)),
             (
                 "Interval_Day_Hour",
@@ -1060,8 +1112,11 @@ mod tests {
                 &sql_str_base.to_uppercase(), // UPPERCASE
             ] {
                 let value1: SqlType = serde_json::from_str(&format!("\"{}\"", sql_str))
-                    .unwrap_or_else(|_| {
-                        panic!("\"{sql_str}\" should deserialize into its SQL type")
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "\"{sql_str}\" should deserialize into its SQL type: {}",
+                            e.to_string()
+                        )
                     });
                 assert_eq!(value1, expected_value);
                 let serialized_str =

@@ -75,6 +75,7 @@ pub use ord::{
     VecWSetFactories,
 };
 
+use rkyv::bytecheck;
 use rkyv::{Deserialize, archived_root};
 
 use crate::{
@@ -131,6 +132,7 @@ impl<T> DBData for T where
 
 /// A spine that is serialized to a file.
 #[derive(rkyv::Serialize, rkyv::Deserialize, rkyv::Archive)]
+#[archive_attr(derive(rkyv::CheckBytes))]
 pub(crate) struct CommittedSpine {
     pub batches: Vec<String>,
     pub merged: Vec<(String, String)>,
@@ -230,8 +232,12 @@ pub trait Trace: BatchReader {
             Factories = Self::Factories,
         >;
 
-    /// Allocates a new empty trace.
-    fn new(factories: &Self::Factories) -> Self;
+    /// Allocates a new empty trace associated with `name`, which should
+    /// identify the operator or other origin of the trace.
+    fn new(factories: &Self::Factories, name: Arc<String>) -> Self;
+
+    /// Updates the name of the trace to `name`.
+    fn set_name(&mut self, name: Arc<String>);
 
     /// Sets a compaction frontier, i.e., a timestamp such that timestamps
     /// below the frontier are indistinguishable to DBSP, therefore any `ts`
@@ -313,6 +319,8 @@ pub trait Trace: BatchReader {
 
     /// Allows the trace to report additional metadata.
     fn metadata(&self, _meta: &mut OperatorMeta) {}
+
+    fn initiate_compaction(&self);
 }
 
 /// Where a batch is stored.
@@ -1021,11 +1029,27 @@ where
     /// Creates an empty builder with estimated capacities for keys and
     /// key-value pairs.  Only `tuple_capacity >= key_capacity` makes sense but
     /// implementations must tolerate contradictory capacity requests.
+    ///
+    /// The caller may optionally specify a preferred `location`.  The builder
+    /// should honor it if it can, but some builders only build in one specific
+    /// location.
+    fn with_capacity_in_location(
+        factories: &Output::Factories,
+        key_capacity: usize,
+        value_capacity: usize,
+        location: Option<BatchLocation>,
+    ) -> Self;
+
+    /// Creates an empty builder with estimated capacities for keys and
+    /// key-value pairs.  Only `tuple_capacity >= key_capacity` makes sense but
+    /// implementations must tolerate contradictory capacity requests.
     fn with_capacity(
         factories: &Output::Factories,
         key_capacity: usize,
         value_capacity: usize,
-    ) -> Self;
+    ) -> Self {
+        Self::with_capacity_in_location(factories, key_capacity, value_capacity, None)
+    }
 
     /// Creates an empty builder to hold the result of merging
     /// `batches`. Optionally, `location` can specify the preferred location for
@@ -1039,10 +1063,9 @@ where
         B: Batch<Key = Output::Key, Val = Output::Val, Time = Output::Time, R = Output::R>,
         I: IntoIterator<Item = &'a B> + Clone,
     {
-        let _ = location;
         let key_capacity = batches.clone().into_iter().map(|b| b.key_count()).sum();
         let value_capacity = batches.into_iter().map(|b| b.len()).sum();
-        Self::with_capacity(factories, key_capacity, value_capacity)
+        Self::with_capacity_in_location(factories, key_capacity, value_capacity, location)
     }
 
     /// Adds time-diff pair `(time, weight)`.

@@ -15,7 +15,6 @@ import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitGraph;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitRewriter;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitTransform;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.Graph;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.OptimizeWithGraph;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.expansion.DeltaExpandOperators;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
@@ -163,7 +162,7 @@ public class MonotoneAnalyzer implements CircuitTransform, IWritesLogs {
         if (debug)
             ToDot.dump(compiler, "limited.png", details, "png", result);
 
-        CircuitTransform merger = new OptimizeWithGraph(this.compiler, g -> new MergeGC(this.compiler, g));
+        CircuitTransform merger = new MergeGC(this.compiler);
         result = merger.apply(result);
         graph.apply(result);
         CheckRetain check = new CheckRetain(this.compiler, graph.getGraphs());

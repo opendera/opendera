@@ -7,6 +7,7 @@ use crate::{
 use std::{
     borrow::Cow,
     collections::{HashMap, hash_map::Entry},
+    fmt::Display,
     slice,
 };
 
@@ -188,6 +189,30 @@ impl Region {
 
         self.do_get_region(region_id.0.as_slice())
     }
+
+    fn do_get_region_ref(&self, path: &[usize]) -> &Region {
+        match path.split_first() {
+            None => self,
+            Some((id, ids)) => self.children[*id].do_get_region_ref(ids),
+        }
+    }
+
+    /// Return the number of operator nodes in the region at `region_id`.
+    ///
+    /// * `self` - must be a root region.
+    pub(super) fn node_count(&self, region_id: &RegionId) -> usize {
+        debug_assert_eq!(self.id, RegionId::root());
+        self.do_get_region_ref(region_id.0.as_slice()).nodes.len()
+    }
+
+    /// Count the number of distinct region nodes in the subtree whose name
+    /// equals `name`.
+    pub(super) fn count_regions_with_name(&self, name: &str) -> usize {
+        let own = usize::from(self.name == name);
+        self.children
+            .iter()
+            .fold(own, |acc, child| acc + child.count_regions_with_name(name))
+    }
 }
 
 pub(super) enum NodeKind {
@@ -308,7 +333,7 @@ impl Node {
 
     /// Generate unique name for the node to use as a node label in a visual
     /// graph.
-    pub(super) fn node_identifier(node_id: &GlobalNodeId) -> String {
+    pub(super) fn node_identifier(node_id: &GlobalNodeId) -> impl Display {
         node_id.node_identifier()
     }
 
@@ -318,7 +343,7 @@ impl Node {
 
         match &self.kind {
             NodeKind::Operator => Some(VisNode::Simple(SimpleNode::new(
-                Self::node_identifier(&self.id),
+                Self::node_identifier(&self.id).to_string(),
                 format!(
                     "{}{}{}",
                     label(&self.name, self.location),
@@ -335,7 +360,7 @@ impl Node {
             ))),
 
             NodeKind::StrictInput { output } => Some(VisNode::Simple(SimpleNode::new(
-                Self::node_identifier(&self.id.parent_id().unwrap().child(*output)),
+                Self::node_identifier(&self.id.parent_id().unwrap().child(*output)).to_string(),
                 format!(
                     "{}{}{}",
                     label(&self.name, self.location),
@@ -352,7 +377,7 @@ impl Node {
     fn get_graph(&self) -> Option<VisNode> {
         match &self.kind {
             NodeKind::Operator => Some(VisNode::Simple(SimpleNode::new(
-                Self::node_identifier(&self.id),
+                Self::node_identifier(&self.id).to_string(),
                 label(&self.name, self.location),
                 0f64,
             ))),
@@ -360,12 +385,12 @@ impl Node {
             NodeKind::Circuit { region, .. } => Some(VisNode::Cluster(region.get_graph(self))),
 
             NodeKind::StrictInput { .. } => Some(VisNode::Simple(SimpleNode::new(
-                Self::node_identifier(&self.id),
+                Self::node_identifier(&self.id).to_string(),
                 label(&self.name, self.location),
                 0f64,
             ))),
             NodeKind::StrictOutput => Some(VisNode::Simple(SimpleNode::new(
-                Self::node_identifier(&self.id),
+                Self::node_identifier(&self.id).to_string(),
                 format!("{}{}", label(&self.name, self.location), " (output)"),
                 0f64,
             ))),
@@ -410,6 +435,25 @@ impl CircuitGraph {
         self.nodes.node_mut(id.path().iter())
     }
 
+    /// Returns the number of operator nodes in the region identified by
+    /// `region_id` within the root circuit scope, or `None` if the region
+    /// does not exist.
+    pub(super) fn node_count_in_region(&self, region_id: &RegionId) -> Option<usize> {
+        match &self.nodes.kind {
+            NodeKind::Circuit { region, .. } => Some(region.node_count(region_id)),
+            _ => None,
+        }
+    }
+
+    /// Returns the number of distinct region nodes named `name` within the
+    /// root circuit scope.
+    pub(super) fn count_regions_with_name(&self, name: &str) -> usize {
+        match &self.nodes.kind {
+            NodeKind::Circuit { region, .. } => region.count_regions_with_name(name),
+            _ => 0,
+        }
+    }
+
     pub(super) fn add_edge(&mut self, from: &GlobalNodeId, to: &GlobalNodeId, kind: &EdgeKind) {
         match self.edges.entry(from.clone()) {
             Entry::Occupied(mut oe) => {
@@ -440,9 +484,9 @@ impl CircuitGraph {
                 // Don't draw self-loops on strict operators.
                 if from_id != &to_id {
                     edges.push(VisEdge::new(
-                        Node::node_identifier(from_id),
+                        Node::node_identifier(from_id).to_string(),
                         from_node.is_circuit(),
-                        Node::node_identifier(&to_id),
+                        Node::node_identifier(&to_id).to_string(),
                         to_node.is_circuit(),
                     ));
                 }
@@ -464,9 +508,9 @@ impl CircuitGraph {
             for (to_id, _kind) in to.iter() {
                 let to_node = self.node_ref(to_id).unwrap();
                 edges.push(VisEdge::new(
-                    Node::node_identifier(from_id),
+                    Node::node_identifier(from_id).to_string(),
                     from_node.is_circuit(),
-                    Node::node_identifier(to_id),
+                    Node::node_identifier(to_id).to_string(),
                     to_node.is_circuit(),
                 ));
             }

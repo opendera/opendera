@@ -6,6 +6,7 @@ on:
 
 jobs:
   web-console-integration-tests:
+    if: ${{ !contains(vars.CI_SKIP_JOBS, 'web-console-integration-tests') }}
     name: Web Console Integration Tests
     runs-on: [k8s-runners-amd64]
 
@@ -27,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Bun
         run: |

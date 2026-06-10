@@ -192,7 +192,7 @@ public class LowerAsof implements CircuitTransform {
                 Map<IGCOperator, DBSPConcreteAsofJoinOperator> leftGces,
                 Map<IGCOperator, DBSPConcreteAsofJoinOperator> rightGces,
                 Map<IGCOperator, IGCOperator> original) {
-            super(compiler, graphs, false);
+            super(compiler, graphs);
             this.leftGces = leftGces;
             this.rightGces = rightGces;
             this.original = original;
@@ -291,7 +291,9 @@ public class LowerAsof implements CircuitTransform {
             DBSPConcreteAsofJoinOperator result = new DBSPConcreteAsofJoinOperator(node, join.getOutputZSetType(),
                     function, leftTimestamp, rightTimestamp, join.comparator,
                     join.isMultiset, join.isLeft,
-                    leftIndex.outputPort(), rightIndex.outputPort());
+                    leftIndex.outputPort(), rightIndex.outputPort())
+                    .copyAnnotations(join)
+                    .to(DBSPConcreteAsofJoinOperator.class);
             this.map(join, result);
 
             // If there is an IntegrateTraceRetainValues operator on the left input, it needs to be moved.

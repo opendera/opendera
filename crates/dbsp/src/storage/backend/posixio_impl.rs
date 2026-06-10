@@ -19,7 +19,6 @@ use feldera_storage::{
 use feldera_types::config::{
     FileBackendConfig, StorageBackendConfig, StorageCacheConfig, StorageConfig,
 };
-use std::ffi::OsString;
 use std::fmt::Debug;
 use std::fs::{DirEntry, create_dir_all};
 use std::io::{ErrorKind, IoSlice, Write};
@@ -35,7 +34,18 @@ use std::{
         atomic::{AtomicBool, AtomicI64, Ordering},
     },
 };
-use tracing::warn;
+use tracing::{debug, warn};
+
+/// fsync the directory at `path` so a freshly-created child entry (a
+/// rename target or a new subdirectory) becomes durable. Without this,
+/// POSIX gives no guarantee that the directory entry survives a crash
+/// even if the child file itself has been fully fsynced.
+fn fsync_dir(path: &Path) -> Result<(), StorageError> {
+    let dir = File::open(path)
+        .map_err(|e| StorageError::stdio(e.kind(), "open dir for fsync", path.display()))?;
+    dir.sync_all()
+        .map_err(|e| StorageError::stdio(e.kind(), "fsync dir", path.display()))
+}
 
 pub(super) struct PosixReader {
     path: StoragePath,
@@ -495,9 +505,9 @@ impl StorageBackend for PosixBackend {
     fn list(
         &self,
         parent: &StoragePath,
-        cb: &mut dyn FnMut(&StoragePath, StorageFileType),
+        cb: &mut dyn FnMut(feldera_storage::DirEntry),
     ) -> Result<(), StorageError> {
-        fn parse_entry(entry: &DirEntry) -> Result<(OsString, StorageFileType), StorageError> {
+        fn get_file_type(entry: &DirEntry) -> Result<StorageFileType, StorageError> {
             let file_type = entry.file_type().map_err(|e| {
                 StorageError::stdio(e.kind(), "readdir type", entry.path().display())
             })?;
@@ -515,33 +525,50 @@ impl StorageBackend for PosixBackend {
             } else {
                 StorageFileType::Other
             };
-            Ok((entry.file_name(), file_type))
+            Ok(file_type)
         }
 
         let mut result = Ok(());
         let path = self.fs_path(parent);
-        for entry in path
-            .read_dir()
-            .map_err(|e| StorageError::stdio(e.kind(), "readdir", self.fs_path(parent).display()))?
-        {
-            match entry
-                .map_err(|e| StorageError::stdio(e.kind(), "readdir entry", path.display()))
-                .and_then(|entry| parse_entry(&entry))
-            {
-                Err(e) => {
-                    if e.kind() != ErrorKind::NotFound {
-                        result = Err(e)
-                    } else {
+        let entries = path.read_dir().map_err(|e| {
+            StorageError::stdio(e.kind(), "readdir", self.fs_path(parent).display())
+        })?;
+        let mut warnings = 0usize..20;
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    let entry = feldera_storage::DirEntry {
+                        name: parent
+                            .child(StoragePathPart::from(entry.file_name().as_encoded_bytes())),
+                        file_type: get_file_type(&entry),
+                    };
+                    if let Err(e) = &entry.file_type
+                        && e.kind() == ErrorKind::NotFound
+                    {
                         // Ignore NotFound error.  The file was probably
                         // `status.json.mut`, renamed by the adapters server to
                         // `status.json` between the call to readdir and the
                         // call to stat.  Don't succumb to a race for it.
+                    } else {
+                        if let Err(e) = &entry.file_type {
+                            match warnings.next_back() {
+                                Some(1..) => warn!("I/O error listing {parent}: {e}"),
+                                Some(0) => warn!(
+                                    "I/O error listing {parent} (further warnings will be at debug level): {e}"
+                                ),
+                                None => debug!("I/O error listing {parent}: {e}"),
+                            }
+                        }
+                        cb(entry);
                     }
                 }
-                Ok((name, file_type)) => cb(
-                    &parent.child(StoragePathPart::from(name.as_encoded_bytes())),
-                    file_type,
-                ),
+                Err(error) => {
+                    result = Err(StorageError::stdio(
+                        error.kind(),
+                        "readdir entry",
+                        path.display(),
+                    ));
+                }
             }
         }
         result
@@ -583,6 +610,10 @@ impl StorageBackend for PosixBackend {
 
     fn file_system_path(&self) -> Option<&Path> {
         Some(self.base.as_path())
+    }
+
+    fn fsync_dir(&self, dir: &StoragePath) -> Result<(), StorageError> {
+        fsync_dir(&self.fs_path(dir))
     }
 }
 
@@ -654,6 +685,20 @@ mod tests {
             StorageCacheConfig::default(),
             &FileBackendConfig::default(),
         ))
+    }
+
+    /// `fsync_dir` must succeed on a real directory and surface an error on
+    /// missing or non-directory paths.
+    #[test]
+    fn fsync_dir_helper() {
+        let tempdir = tempfile::tempdir().unwrap();
+        super::fsync_dir(tempdir.path()).expect("fsync on tempdir should succeed");
+
+        let missing = tempdir.path().join("does-not-exist");
+        assert!(
+            super::fsync_dir(&missing).is_err(),
+            "fsync_dir must surface a missing-dir error",
+        );
     }
 
     /// Write 10 MiB total in 1 KiB chunks.  `VectoredWrite` flushes its buffer when it

@@ -6,7 +6,6 @@
 //! that the entire configuration tree can be deserialized from a JSON file.
 
 use crate::preprocess::PreprocessorConfig;
-use crate::program_schema::ProgramSchema;
 use crate::secret_resolver::default_secrets_directory;
 use crate::transport::adhoc::AdHocInputConfig;
 use crate::transport::clock::ClockConfig;
@@ -59,7 +58,7 @@ pub struct ProgramIr {
     /// The MIR of the program.
     pub mir: HashMap<MirNodeId, MirNode>,
     /// Program schema.
-    pub program_schema: ProgramSchema,
+    pub program_schema: serde_json::Value,
 }
 
 /// Pipeline deployment configuration.
@@ -803,6 +802,28 @@ pub struct RuntimeConfig {
     /// for more details.
     pub max_rss_mb: Option<u64>,
 
+    /// DataFusion memory pool size, in MB, shared by the ad-hoc query
+    /// engine and the Delta Lake / Iceberg connectors.
+    ///
+    /// Carved out of `max_rss_mb` (falling back to
+    /// `resources.memory_mb_max`); the remainder goes to the DBSP circuit,
+    /// so the two do not double-book RAM.
+    ///
+    /// Unset: defaults to 5% of the effective budget, capped at 2 GB.
+    /// Pipelines that don't run heavy ad-hoc / Delta / Iceberg workloads
+    /// can leave this unset.
+    ///
+    /// Sort/aggregate-heavy ad-hoc queries (especially at high `workers`
+    /// counts) should set this explicitly. An under-sized pool surfaces as
+    /// `ResourcesExhausted` on the failing query — the pipeline keeps
+    /// running and only that query fails.
+    ///
+    /// No pool limit applied if no overall budget is configured.
+    ///
+    /// See [documentation on the pipeline's memory usage](https://docs.feldera.com/operations/memory)
+    /// for more details.
+    pub datafusion_memory_mb: Option<u64>,
+
     /// Number of DBSP hosts.
     ///
     /// The worker threads are evenly divided among the hosts.  For single-host
@@ -1065,6 +1086,7 @@ impl Default for RuntimeConfig {
         Self {
             workers: 8,
             max_rss_mb: None,
+            datafusion_memory_mb: None,
             hosts: 1,
             storage: Some(StorageOptions::default()),
             fault_tolerance: FtConfig::default(),
@@ -1091,6 +1113,36 @@ impl Default for RuntimeConfig {
             logging: None,
             pipeline_template_configmap: None,
         }
+    }
+}
+
+/// Upper bound on the default DataFusion pool size, in MB.
+///
+/// Spill-to-disk handles overflow; reserving more starves the circuit.
+pub const DEFAULT_DATAFUSION_MEMORY_MB_CEILING: u64 = 2048;
+
+/// Default DataFusion pool size as a percentage of the pipeline's
+/// effective memory budget. The remainder is left for the DBSP circuit.
+pub const DEFAULT_DATAFUSION_MEMORY_PERCENT: u64 = 5;
+
+impl RuntimeConfig {
+    /// Pipeline's effective memory budget in MB: `max_rss_mb`, falling back
+    /// to `resources.memory_mb_max` (the k8s pod limit).
+    pub fn effective_memory_mb(&self) -> Option<u64> {
+        self.max_rss_mb.or(self.resources.memory_mb_max)
+    }
+
+    /// Resolved DataFusion pool size in MB: explicit `datafusion_memory_mb`
+    /// if set, else 5% of the effective budget capped at
+    /// `DEFAULT_DATAFUSION_MEMORY_MB_CEILING`. `None` if no budget is
+    /// configured.
+    pub fn resolved_datafusion_memory_mb(&self) -> Option<u64> {
+        if let Some(explicit) = self.datafusion_memory_mb {
+            return Some(explicit);
+        }
+        let effective = self.effective_memory_mb()?;
+        let fraction = effective * DEFAULT_DATAFUSION_MEMORY_PERCENT / 100;
+        Some(fraction.min(DEFAULT_DATAFUSION_MEMORY_MB_CEILING))
     }
 }
 
@@ -1143,8 +1195,81 @@ impl Default for FtConfig {
 #[cfg(test)]
 mod test {
     use super::deserialize_fault_tolerance;
-    use crate::config::{FtConfig, FtModel};
+    use crate::config::{
+        DEFAULT_DATAFUSION_MEMORY_MB_CEILING, FtConfig, FtModel, ResourceConfig, RuntimeConfig,
+    };
     use serde::{Deserialize, Serialize};
+
+    #[test]
+    fn resolved_datafusion_memory_explicit_passes_through() {
+        let config = RuntimeConfig {
+            max_rss_mb: Some(8_000),
+            datafusion_memory_mb: Some(1_500),
+            ..Default::default()
+        };
+        assert_eq!(config.resolved_datafusion_memory_mb(), Some(1_500));
+    }
+
+    #[test]
+    fn resolved_datafusion_memory_unconfigured_returns_none() {
+        let config = RuntimeConfig::default();
+        assert!(config.max_rss_mb.is_none());
+        assert!(config.resources.memory_mb_max.is_none());
+        assert_eq!(config.resolved_datafusion_memory_mb(), None);
+    }
+
+    #[test]
+    fn resolved_datafusion_memory_small_budget_scales_down() {
+        // Small pipelines must provision cleanly; the default just shrinks.
+        let config = RuntimeConfig {
+            max_rss_mb: Some(256),
+            ..Default::default()
+        };
+        assert_eq!(config.resolved_datafusion_memory_mb(), Some(12));
+
+        let config = RuntimeConfig {
+            max_rss_mb: Some(512),
+            ..Default::default()
+        };
+        assert_eq!(config.resolved_datafusion_memory_mb(), Some(25));
+    }
+
+    #[test]
+    fn resolved_datafusion_memory_clamps_to_ceiling_for_large_budgets() {
+        // 5% of 64 GB = 3.2 GB, above the 2 GB ceiling.
+        let config = RuntimeConfig {
+            max_rss_mb: Some(64_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolved_datafusion_memory_mb(),
+            Some(DEFAULT_DATAFUSION_MEMORY_MB_CEILING),
+        );
+    }
+
+    #[test]
+    fn resolved_datafusion_memory_midrange_uses_five_percent() {
+        // 5% of 16 GB = 800 MB, inside the clamp range.
+        let config = RuntimeConfig {
+            max_rss_mb: Some(16_000),
+            ..Default::default()
+        };
+        assert_eq!(config.resolved_datafusion_memory_mb(), Some(800));
+    }
+
+    #[test]
+    fn resolved_datafusion_memory_falls_back_to_resources() {
+        // No max_rss_mb, but resources.memory_mb_max is set.
+        let config = RuntimeConfig {
+            max_rss_mb: None,
+            resources: ResourceConfig {
+                memory_mb_max: Some(16_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(config.resolved_datafusion_memory_mb(), Some(800));
+    }
 
     #[test]
     fn ft_config() {
@@ -1399,9 +1524,23 @@ where
     }
 }
 
-/// A data connector's configuration
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ConnectorConfig {
+    /// Send a full snapshot of a materialized view when the connector first
+    /// starts. Valid for output connectors only.
+    ///
+    /// When `true`, the pipeline emits the current contents of the view as the
+    /// initial batch the first time the connector runs. The view must be
+    /// materialized (declared with `CREATE MATERIALIZED VIEW`).
+    ///
+    /// The snapshot is sent exactly once per connector lifetime: it does not
+    /// fire again when the pipeline resumes from a checkpoint. Modifying the
+    /// connector configuration or invoking the reset API triggers a fresh
+    /// snapshot when the connector supports reset (e.g., Delta Lake in
+    /// `truncate` mode and Postgres).
+    #[serde(default)]
+    pub send_snapshot: bool,
+
     /// Transport endpoint configuration.
     pub transport: TransportConfig,
 
@@ -1461,15 +1600,14 @@ pub struct ConnectorConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_worker_batch_size: Option<u64>,
 
-    /// Backpressure threshold.
+    /// Backpressure threshold, in records.
     ///
     /// Maximal number of records queued by the endpoint before the endpoint
     /// is paused by the backpressure mechanism.
     ///
     /// For input endpoints, this setting bounds the number of records that have
     /// been received from the input transport but haven't yet been consumed by
-    /// the circuit since the circuit, since the circuit is still busy processing
-    /// previous inputs.
+    /// the circuit, since the circuit is still busy processing previous inputs.
     ///
     /// For output endpoints, this setting bounds the number of records that have
     /// been produced by the circuit but not yet sent via the output transport endpoint
@@ -1482,6 +1620,26 @@ pub struct ConnectorConfig {
     /// The default is 1 million.
     #[serde(default = "default_max_queued_records")]
     pub max_queued_records: u64,
+
+    /// Backpressure threshold, in bytes.
+    ///
+    /// Maximal number of bytes queued by the endpoint before the endpoint
+    /// is paused by the backpressure mechanism.
+    ///
+    /// For input endpoints, this setting bounds the number of bytes that have
+    /// been received from the input transport but haven't yet been consumed by
+    /// the circuit since the circuit, since the circuit is still busy processing
+    /// previous inputs.
+    ///
+    /// This setting is not yet implemented for output endpoints.
+    ///
+    /// Note that this is not a hard bound: there can be a small delay between
+    /// the backpressure mechanism is triggered and the endpoint is paused, during
+    /// which more data may be queued.
+    ///
+    /// When this is unspecified, it defaults to `1000 * max_queued_records`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_queued_bytes: Option<u64>,
 
     /// Create connector in paused state.
     ///
@@ -1509,6 +1667,7 @@ pub struct ConnectorConfig {
 impl ConnectorConfig {
     pub fn new(transport: TransportConfig, format: Option<FormatConfig>) -> Self {
         Self {
+            send_snapshot: false,
             transport,
             preprocessor: None,
             format,
@@ -1517,6 +1676,7 @@ impl ConnectorConfig {
             max_batch_size: None,
             max_worker_batch_size: None,
             max_queued_records: default_max_queued_records(),
+            max_queued_bytes: None,
             paused: false,
             labels: Vec::new(),
             start_after: None,
@@ -1542,6 +1702,18 @@ impl ConnectorConfig {
         a.paused = false;
         b.paused = false;
         a == b
+    }
+
+    /// Returns `max_queued_records` or, if it is not set, the default.
+    pub fn max_queued_records(&self) -> u64 {
+        self.max_queued_records
+    }
+
+    /// Returns `max_queued_bytes` or, if it is not set, the default based on
+    /// `max_queued_records`.
+    pub fn max_queued_bytes(&self) -> u64 {
+        self.max_queued_bytes
+            .unwrap_or_else(|| self.max_queued_records().saturating_mul(1000))
     }
 }
 
@@ -1773,5 +1945,7 @@ pub struct ResourceConfig {
     /// for the pipeline.
     /// If not set, the pipeline will be deployed in the same namespace
     /// as the control-plane.
+    // The type of this field should not be backward incompatibly changed, and its location in the
+    // runtime configuration JSON (`runtime_config.resources.namespace`) should not be changed.
     pub namespace: Option<String>,
 }

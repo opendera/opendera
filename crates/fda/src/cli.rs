@@ -352,6 +352,9 @@ pub enum PipelineAction {
         // TODO: auto-complete
         #[arg(long, short = 'b', default_value = "await_approval")]
         bootstrap_policy: String,
+        /// Bootstrap the pipeline with output connectors disabled.
+        #[arg(long, default_value_t = false)]
+        silent_bootstrap: bool,
         /// Do not dismiss any deployment error before starting.
         #[arg(long, default_value_t = false)]
         no_dismiss_error: bool,
@@ -362,6 +365,9 @@ pub enum PipelineAction {
         /// The name of the pipeline.
         #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
         name: String,
+        /// Bootstrap the pipeline with output connectors disabled.
+        #[arg(long, default_value_t = false)]
+        silent_bootstrap: bool,
     },
 
     /// Checkpoint a fault-tolerant pipeline.
@@ -415,6 +421,9 @@ pub enum PipelineAction {
         /// The bootstrap policy to use.
         #[arg(long, short = 'b', default_value = "await_approval")]
         bootstrap_policy: String,
+        /// Bootstrap the pipeline with output connectors disabled.
+        #[arg(long, default_value_t = false)]
+        silent_bootstrap: bool,
         /// Do not dismiss any deployment error before starting.
         #[arg(long, default_value_t = false)]
         no_dismiss_error: bool,
@@ -574,6 +583,15 @@ pub enum PipelineAction {
         /// The ZIP file to write the bundle to.
         #[arg(value_hint = ValueHint::FilePath, long, short = 'o')]
         output: Option<PathBuf>,
+        /// Include at most N collections, starting with the most recent.
+        /// With the default `collect=true`, `--limit 1` returns only the
+        /// bundle gathered just now. Add `--no-collect` to instead return
+        /// the N most recent previously stored collections.
+        #[arg(long, short = 'n')]
+        limit: Option<u64>,
+        /// Do not collect fresh data; return only previously stored collections.
+        #[arg(long)]
+        no_collect: bool,
         /// Skip circuit profile collection.
         #[arg(long)]
         no_circuit_profile: bool,
@@ -598,6 +616,9 @@ pub enum PipelineAction {
         /// Skip dataflow graph collection.
         #[arg(long)]
         no_dataflow_graph: bool,
+        /// Skip pipeline monitor event collection.
+        #[arg(long)]
+        no_pipeline_events: bool,
     },
     /// Enter the ad-hoc SQL shell for a pipeline.
     Shell {
@@ -614,6 +635,9 @@ pub enum PipelineAction {
         /// The bootstrap policy to use.
         #[arg(long, short = 'b', default_value = "await_approval")]
         bootstrap_policy: String,
+        /// Bootstrap the pipeline with output connectors disabled.
+        #[arg(long, default_value_t = false, requires("start"))]
+        silent_bootstrap: bool,
         /// Do not dismiss any deployment error before starting.
         #[arg(long, default_value_t = false, requires("start"))]
         no_dismiss_error: bool,
@@ -699,6 +723,33 @@ pub enum PipelineAction {
     },
     /// Initiate rebalancing.
     Rebalance {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+    },
+    /// Advance the externally-driven `NOW()` clock by `delta_ms` and
+    /// print the new value.
+    ///
+    /// Requires `dev_tweaks.now_http_driven = true` on the pipeline.
+    /// The clock is forward-only; `delta_ms = 0` reads the current value
+    /// without moving it; omitting `--delta-ms` advances by one
+    /// `clock_resolution` (one configured tick).
+    ///
+    /// The printed value is the `NOW()` the worker will emit on its
+    /// next pipeline step; ad-hoc queries against materialized views
+    /// may still observe the previous value until that step completes.
+    #[clap(aliases = &["clock-set", "set-clock"])]
+    ClockAdvance {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// Milliseconds to add to `NOW()`.  Omit to advance by one
+        /// `clock_resolution`.
+        #[arg(long)]
+        delta_ms: Option<u64>,
+    },
+    /// Initiate compaction.
+    StartCompaction {
         /// The name of the pipeline.
         #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
         name: String,

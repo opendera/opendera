@@ -136,7 +136,7 @@ impl StorageBackend for ObjectStoreBackend {
     fn list(
         &self,
         parent: &StoragePath,
-        cb: &mut dyn FnMut(&StoragePath, StorageFileType),
+        cb: &mut dyn FnMut(feldera_storage::DirEntry),
     ) -> Result<(), StorageError> {
         use futures::StreamExt;
 
@@ -162,7 +162,10 @@ impl StorageBackend for ObjectStoreBackend {
                 Ok(out)
             });
         for (path, entry) in result? {
-            cb(&path, entry);
+            cb(feldera_storage::DirEntry {
+                name: path,
+                file_type: Ok(entry),
+            });
         }
         Ok(())
     }
@@ -443,7 +446,8 @@ impl FileReader for ObjectStoreFileReader {
                 self.path.as_ref().to_string(),
             )
         })?;
-        let bytes = TOKIO_DEDICATED_IO.block_on(self.store.get_range(&self.path, start..end))?;
+        let bytes = TOKIO_DEDICATED_IO
+            .block_on(self.store.get_range(&self.path, start as u64..end as u64))?;
         let mut buf = FBuf::new();
         buf.extend_from_slice(&bytes);
         Ok(Arc::new(buf))
@@ -526,8 +530,8 @@ mod tests {
 
         let mut listed = Vec::new();
         backend
-            .list(&StoragePath::default(), &mut |p, _| {
-                listed.push(p.as_ref().to_string());
+            .list(&StoragePath::default(), &mut |entry| {
+                listed.push(entry.name.as_ref().to_string());
             })
             .expect("list");
         assert!(listed.iter().any(|p| p.contains("hello.bin")));
@@ -652,8 +656,8 @@ mod tests {
         // list + delete the prefix.
         let mut listed = Vec::new();
         backend
-            .list(&prefix.as_str().into(), &mut |p, _| {
-                listed.push(p.as_ref().to_string());
+            .list(&prefix.as_str().into(), &mut |entry| {
+                listed.push(entry.name.as_ref().to_string());
             })
             .expect("list");
         assert_eq!(listed.len(), 2, "expected exactly 2 files under prefix");
@@ -664,8 +668,8 @@ mod tests {
 
         let mut listed2 = Vec::new();
         backend
-            .list(&prefix.as_str().into(), &mut |p, _| {
-                listed2.push(p.as_ref().to_string());
+            .list(&prefix.as_str().into(), &mut |entry| {
+                listed2.push(entry.name.as_ref().to_string());
             })
             .expect("list after delete_recursive");
         assert!(listed2.is_empty(), "prefix not empty after recursive delete");

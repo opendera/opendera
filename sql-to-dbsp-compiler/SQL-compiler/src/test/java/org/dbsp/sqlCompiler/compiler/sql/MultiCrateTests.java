@@ -74,19 +74,6 @@ public class MultiCrateTests extends BaseSQLTests {
         compileToMultiCrate(file.getAbsolutePath(), check);
     }
 
-    @Test @Ignore("These tests are slow")
-    public void qaTests() throws IOException, SQLException, InterruptedException {
-        for (File c : getQATests()) {
-            String sql = Utilities.readFile(c.getPath());
-            try {
-                compileProgramToMultiCrate(sql, true);
-            } catch (UnsupportedException ex) {
-                // This is probably a file containing an ad-hoc query
-                System.out.println(c.getName() + " skipped due to unsupported features.");
-            }
-        }
-    }
-
     @Test
     public void issue4049() throws SQLException, IOException, InterruptedException {
         String sql = """
@@ -132,6 +119,15 @@ public class MultiCrateTests extends BaseSQLTests {
                  CREATE TABLE T (C0 INT NOT NULL, C1 DOUBLE NOT NULL, C2 INT, C3 INT LATENESS 2, C4 INT, C5 INT);
                  CREATE VIEW V0 AS SELECT 'x', STDDEV(C1) FROM T;
                  CREATE VIEW V1 AS SELECT * FROM T JOIN T AS R ON T.C0 = R.C3;""";
+        compileProgramToMultiCrate(sql, true);
+    }
+
+    @Test
+    public void testAggregates() throws IOException, SQLException, InterruptedException {
+        // Test designed to exercise Region annotations, which are used for global aggregates
+        String sql = """
+                 CREATE TABLE T (C0 INT);
+                 CREATE VIEW V0 AS SELECT SUM(C0) FROM T;""";
         compileProgramToMultiCrate(sql, true);
     }
 
@@ -453,5 +449,14 @@ public class MultiCrateTests extends BaseSQLTests {
         builder.append("CREATE VIEW W AS SELECT * FROM V JOIN T ON V.y = T.y;");
         File file = createInputScript(builder.toString());
         compileToMultiCrate(file.getAbsolutePath(), true, true);
+    }
+
+    @Test
+    public void testHints() throws SQLException, IOException, InterruptedException {
+        String sql = """
+                CREATE TABLE T(x INT);
+                CREATE TABLE S(x INT);
+                CREATE VIEW V AS SELECT /*+ broadcast(T), shard(S) */ * FROM T JOIN S USING (x);""";
+        compileProgramToMultiCrate(sql, true);
     }
 }

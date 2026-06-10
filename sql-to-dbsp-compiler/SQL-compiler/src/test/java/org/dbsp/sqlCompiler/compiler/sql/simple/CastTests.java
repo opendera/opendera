@@ -532,6 +532,7 @@ public class CastTests extends SqlIoTest {
                 "INTERVAL MINUTES TO SECONDS",
                 "TIME",
                 "TIMESTAMP",
+                "TIMESTAMP WITH TIME ZONE",
                 "DATE",
                 // "GEOMETRY",
                 "ROW(lf INTEGER, rf VARCHAR)",
@@ -573,6 +574,7 @@ public class CastTests extends SqlIoTest {
                 "'3:4'",   // INTERVAL MINUTES TO SECONDS
                 "'10:00:00'",  // TIME
                 "'2000-01-01 10:00:00'", // TIMESTAMP
+                "'2000-01-01 10:00:00 America/New_York'", // TIMESTAMP WITH TIME ZONE
                 "'2000-01-01'", // DATE
                 "ROW(1, 'string')", // ROW
                 "ARRAY[1, 2, 3]",   // ARRAY
@@ -592,56 +594,73 @@ public class CastTests extends SqlIoTest {
 
         // Rows and columns match the array of types above.
         final CanConvert[][] legal = {
-// To:   N, B, I8,16,32,64,U8,U6,U3,U6,De,r, d, c, v, b, vb,ym,y, m, d, h, dh,m,dm,hm, s, ds,hs,ms,t, ts,dt,ro,a, m, V, U
-/*From                                                                                                                    */
-/* N */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F },
-/* B */{ F, T, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F },
-/* I8*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*I16*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*I32*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*I64*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/* U8*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*U16*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*U32*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*U64*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/*Dec*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, F, F, F, F, T, F },
-/* r */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F, F, F, F, T, F },
-/* d */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F, F, F, F, T, F },
-/*chr*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T },
-/* v */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T },
-/* b */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T },
-/*vb */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T },
-/*ym */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F },
-/* y */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F },
-/* m */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F },
-/* d */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* h*/ { F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* dh*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* m */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* dm*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* hm*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* s */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* ds*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* hs*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* ms*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, T, F },
-/* t */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, T, F },
-/* ts*/{ F, F, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, F, F, F, T, F },
-/* dt*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, T, F },
-/*row*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F, F, T, F },
-/* a */{ F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F, T, F },
-/* m */{ F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F },
-/* V */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T },
-/* U */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T },
+//             <--integers----------->                      <-Long-> <---short------------------->
+// To:   N, B, I8,16,32,64,U8,U6,U3,U6,De,r, d, c, v, b, vb,ym,y, m, d, h, dh,m,dm,hm, s, ds,hs,ms,t, ts,tz,dt,ro,a, m, V, U
+/*From                                                                                                                       */
+/* N */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F },
+/* B */{ F, T, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F },
+/* I8*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, T, F, F, F, F, T, F },
+/*I16*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, T, F, F, F, F, T, F },
+/*I32*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, T, F, F, F, F, T, F },
+/*I64*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, T, F, F, F, F, T, F },
+/* U8*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, T, F, F, F, F, T, F },
+/*U16*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, T, F, F, F, F, T, F },
+/*U32*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, T, F, F, F, F, T, F },
+/*U64*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, T, F, F, F, F, T, F },
+/*Dec*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T, T, T, F, T, F, F, T, F, F, F, F, T, T, F, F, F, F, T, F },
+/* r */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, T, F },
+/* d */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, T, F },
+/*chr*/{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T },
+/* v */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, T, T },
+/* b */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T },
+/*vb */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T },
+/*ym */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F },
+/* y */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F },
+/* m */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F },
+/* d */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* h*/ { F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* dh*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* m */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* dm*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* hm*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* s */{ F, F, T, T, T, T, T, T, T, T, T, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* ds*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* hs*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* ms*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, T, F },
+/* t */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, F, F, F, F, T, F },
+/* ts*/{ F, F, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, T, F },
+/* tz*/{ F, F, T, T, T, T, T, T, T, T, T, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, T, F },
+/* dt*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, F, F, F, T, F },
+/*row*/{ F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F, F, T, F },
+/* a */{ F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, F, T, F },
+/* m */{ F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, F },
+/* V */{ F, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T },
+/* U */{ F, F, F, F, F, F, F, F, F, F, F, F, F, T, T, T, T, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, F, T, T },
         };
 
         Assert.assertEquals(types.length, legal.length);
         Assert.assertEquals(types.length, legal[0].length);
         StringBuilder program = new StringBuilder();
         boolean first = true;
+        program.append("CREATE LOCAL VIEW T AS SELECT ");
+        for (int i = 0; i < types.length; i++) {
+            if (!first)
+                program.append(", ");
+            first = false;
+            if (i > 0)
+                program.append("CAST(");
+            program.append(values[i]);
+            if (i > 0)
+                program.append(" AS ").append(types[i]).append(")");
+            program.append(" AS col").append(i).append("\n");
+        }
+        program.append(";\n");
+
+        first = true;
         program.append("CREATE VIEW V AS SELECT ");
         for (int i = 0; i < types.length; i++) {
             String type = types[i];
-            String value = values[i];
+            String value = "col" + i;
             if (legal[i][i] == CanConvert.F)
                 continue;
             if (!first)
@@ -649,10 +668,11 @@ public class CastTests extends SqlIoTest {
             first = false;
             program.append("CAST(").append(value).append(" AS ").append(type).append(")\n");
         }
-        program.append(";\n");
+        program.append(" FROM T;\n");
 
         for (int i = 0; i < types.length; i++) {
             String value = values[i];
+            String coli = "col" + i;
             String from = types[i];
             if (!Linq.any(legal[i], p -> p == T)) continue;
             program.append("CREATE VIEW V").append(i).append(" AS SELECT ");
@@ -679,13 +699,16 @@ public class CastTests extends SqlIoTest {
                     // Special case
                     program.append(value);
                 else
-                    program.append("CAST(").append(value).append(" AS ").append(from).append(")");
+                    program.append("CAST(").append(coli).append(" AS ").append(from).append(")");
                 program.append(" AS ").append(to).append(")");
                 program.append("\n");
             }
-            program.append(";\n");
+            program.append(" FROM T;\n");
         }
         // Disable Calcite optimizations so it doesn't do constant-folding
+        // Despite this, this program still does not generate all possible cast com
+        // binations:
+        // for some interval casts it generates reinterpret casts.
         CompilerOptions options = this.testOptions();
         options.languageOptions.optimizationLevel = 0;
         DBSPCompiler compiler = new DBSPCompiler(options);
@@ -734,5 +757,50 @@ public class CastTests extends SqlIoTest {
                  r
                 -----
                  1000""");
+    }
+
+    @Test
+    public void issue6257() {
+        // Calcite rounds by truncating, so we are tied to that behavior
+        this.qs("""
+                SELECT CAST(INTERVAL '10' DAY AS BIGINT);
+                 r
+                ---
+                 10
+                (1 row)
+                
+                SELECT SAFE_CAST(INTERVAL '1000' DAY AS TINYINT);
+                 r
+                ---
+                NULL
+                (1 row)
+                
+                SELECT CAST(INTERVAL '10.6' SECONDS AS INT);
+                 r
+                ---
+                 10
+                (1 row)
+                
+                SELECT CAST(INTERVAL '10.135' SECONDS AS DECIMAL(10, 2));
+                 r
+                ---
+                 10.13
+                (1 row)
+                
+                SELECT CAST(INTERVAL '-10.135' SECONDS AS DECIMAL(10, 2));
+                 r
+                ---
+                 -10.13
+                (1 row)
+                
+                SELECT SAFE_CAST(INTERVAL '1000.123' SECONDS AS DECIMAL(2, 2));
+                 r
+                ---
+                NULL
+                (1 row)""");
+        this.statementsFailingInCompilation("CREATE VIEW V AS SELECT CAST(INTERVAL '10' MONTHS AS DOUBLE)",
+                "Cast function cannot convert value of type INTERVAL MONTH NOT NULL to type DOUBLE NOT NULL");
+        this.statementsFailingInCompilation("CREATE VIEW V AS SELECT CAST(INTERVAL '10' SECONDS AS REAL)",
+                "Cast function cannot convert value of type INTERVAL SECOND NOT NULL to type REAL NOT NULL");
     }
 }

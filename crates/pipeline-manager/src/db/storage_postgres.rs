@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, Pool, RecyclingMethod};
 use feldera_types::config::{PipelineConfig, RuntimeConfig};
 use feldera_types::error::ErrorResponse;
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus, RuntimeStatus};
 use tokio_postgres::Row;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -761,7 +761,7 @@ impl Storage for StoragePostgres {
         tenant_id: TenantId,
         pipeline_name: &str,
         initial: RuntimeDesiredStatus,
-        bootstrap_policy: BootstrapPolicy,
+        bootstrap_config: BootstrapConfig,
         dismiss_error: bool,
     ) -> Result<PipelineId, DBError> {
         let mut client = self.pool.get().await?;
@@ -772,7 +772,7 @@ impl Storage for StoragePostgres {
             pipeline_name,
             ResourcesDesiredStatus::Provisioned,
             Some(initial),
-            Some(bootstrap_policy),
+            Some(bootstrap_config),
             dismiss_error,
         )
         .await?;
@@ -1036,6 +1036,40 @@ impl Storage for StoragePostgres {
             tenant_id,
             pipeline_id,
             version_guard,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn remain_deployment_resources_status_stopped(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        version_guard: Version,
+        deployment_error: ErrorResponse,
+    ) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+        let pipeline =
+            operations::pipeline::get_pipeline_by_id_for_monitoring(&txn, tenant_id, pipeline_id)
+                .await?;
+        operations::pipeline::set_deployment_resources_desired_status(
+            &txn,
+            tenant_id,
+            &pipeline.name,
+            ResourcesDesiredStatus::Stopped,
+            None,
+            None,
+            false,
+        )
+        .await?;
+        operations::pipeline::remain_deployment_resources_status_stopped(
+            &txn,
+            tenant_id,
+            pipeline_id,
+            version_guard,
+            deployment_error,
         )
         .await?;
         txn.commit().await?;

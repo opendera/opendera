@@ -13,17 +13,13 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateWith
 import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
-import org.dbsp.sqlCompiler.compiler.backend.rust.ToRustVisitor;
-import org.dbsp.sqlCompiler.compiler.backend.rust.multi.ProjectDeclarations;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.sql.tools.CompilerCircuitStream;
 import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
 import org.dbsp.sqlCompiler.ir.expression.DBSPApplyExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
-import org.dbsp.util.IndentStreamBuilder;
 import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -846,10 +842,7 @@ public class RegressionTests extends SqlIoTest {
         // This is not executed, since the udfs have no definitions
         var cc = this.getCC(sql);
         // Test that code generation does not crash without compiling the result
-        ToRustVisitor visitor = new ToRustVisitor(
-                cc.compiler, new IndentStreamBuilder(), cc.getCircuit().getMetadata(),
-                new ProjectDeclarations(), new LateMaterializations(cc.compiler));
-        visitor.apply(cc.getCircuit());
+        cc.getRustSources();
     }
 
     @Test
@@ -1020,11 +1013,11 @@ public class RegressionTests extends SqlIoTest {
     @Test
     public void timestamp() {
         String sql = """
-                CREATE FUNCTION MAKE_TIMESTAMP(SECONDS BIGINT) RETURNS TIMESTAMP AS
+                CREATE FUNCTION CREATE_TIMESTAMP(SECONDS BIGINT) RETURNS TIMESTAMP AS
                 TIMESTAMPADD(SECOND, SECONDS, DATE '1970-01-01');
 
                 CREATE TABLE T(c1 BIGINT);
-                CREATE VIEW sum_view AS SELECT MAKE_TIMESTAMP(c1) FROM T;
+                CREATE VIEW sum_view AS SELECT CREATE_TIMESTAMP(c1) FROM T;
                 """;
         CompilerCircuitStream ccs = this.getCCS(sql);
         ccs.step("INSERT INTO T VALUES (10000000);",

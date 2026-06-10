@@ -39,7 +39,14 @@ pub(super) enum BuildTo {
 }
 
 impl BuildTo {
-    pub fn for_capacity(key_capacity: usize, value_capacity: usize) -> Self {
+    pub fn for_capacity(
+        key_capacity: usize,
+        value_capacity: usize,
+        location: Option<BatchLocation>,
+    ) -> Self {
+        if let Some(location) = location {
+            return location.into();
+        }
         match Runtime::min_step_storage_bytes().unwrap_or(usize::MAX) {
             usize::MAX => {
                 // Storage is disabled.
@@ -112,6 +119,9 @@ pub fn pick_insert_destination<B>(batch: &B) -> BatchLocation
 where
     B: BatchReader,
 {
+    if batch.is_empty() {
+        return BatchLocation::Memory;
+    }
     match Runtime::min_insert_storage_bytes().unwrap_or(usize::MAX) {
         0 => BatchLocation::Storage,
         usize::MAX => BatchLocation::Memory,

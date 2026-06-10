@@ -20,12 +20,19 @@ use crate::{
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use dbsp::algebra::{F32, F64, HasOne, HasZero};
 use num::{One, Zero};
-use num_traits::cast::NumCast;
+use num_traits::{CheckedDiv, cast::NumCast};
 use regex::{Captures, Regex};
 use smallstr::SmallString;
-use std::{error::Error, fmt::Display, iter::once, ops::Div};
-use std::{fmt::Write, str::FromStr};
-use std::{marker::PhantomData, sync::LazyLock};
+use std::{
+    error::Error,
+    fmt::Display,
+    fmt::Write,
+    iter::once,
+    marker::PhantomData,
+    ops::{Div, Mul},
+    str::FromStr,
+    sync::LazyLock,
+};
 
 trait ToSmallString: Display {
     fn to_small_string<const N: usize>(&self) -> SmallString<[u8; N]>;
@@ -65,6 +72,7 @@ pub(crate) fn type_name(name: &'static str) -> &'static str {
         "f" => "REAL",
         "d" => "FLOAT",
         "Timestamp" => "TIMESTAMP",
+        "TimestampTz" => "TIMESTAMP WITH TIME ZONE",
         "Date" => "DATE",
         "Time" => "TIME",
         "SqlDecimal" => "DECIMAL",
@@ -97,7 +105,8 @@ pub(crate) fn rust_type_name(name: &'static str) -> &'static str {
         "u128" => "BIGINT UNSIGNED",
         "F32" => "REAL",
         "F64" => "FLOAT",
-        "Timestamp" => "Timestamp",
+        "Timestamp" => "TIMESTAMP",
+        "TimestampTz" => "TIMESTAMP WITH TIME ZONE",
         "Date" => "DATE",
         "Time" => "TIME",
         "SqlDecimal" => "DECIMAL",
@@ -302,7 +311,13 @@ cast_to_b!(u, usize);
 
 #[doc(hidden)]
 pub fn cast_to_b_s(value: SqlString) -> SqlResult<bool> {
-    Ok(value.str().to_lowercase().trim().parse().unwrap_or(false))
+    match value.str().to_lowercase().trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(SqlRuntimeError::from_string(format!(
+            "Cannot convert string '{value}' to BOOLEAN",
+        ))),
+    }
 }
 
 #[doc(hidden)]
@@ -371,6 +386,13 @@ pub fn cast_to_Date_Timestamp(value: Timestamp) -> SqlResult<Date> {
 cast_function!(Date, Date, Timestamp, Timestamp);
 
 #[doc(hidden)]
+pub fn cast_to_Date_TimestampTz(value: TimestampTz) -> SqlResult<Date> {
+    cast_to_Date_Timestamp(value.into())
+}
+
+cast_function!(Date, Date, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
 #[inline]
 pub fn cast_to_DateN_nullN(_value: Option<()>) -> SqlResult<Option<Date>> {
     Ok(None)
@@ -419,6 +441,13 @@ pub fn cast_to_Time_Timestamp(value: Timestamp) -> SqlResult<Time> {
 }
 
 cast_function!(Time, Time, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn cast_to_Time_TimestampTz(value: TimestampTz) -> SqlResult<Time> {
+    Ok(Time::from_time(value.to_dateTime().time()))
+}
+
+cast_function!(Time, Time, TimestampTz, TimestampTz);
 
 /////////// cast to SqlDecimal
 
@@ -841,7 +870,10 @@ cast_function!(d, F64, f, F32);
 #[doc(hidden)]
 pub fn cast_to_d_s(value: SqlString) -> SqlResult<F64> {
     match value.str().trim().parse::<f64>() {
-        Err(_) => Ok(F64::zero()),
+        Err(e) => Err(SqlRuntimeError::from_string(format!(
+            "Parse error during conversion of '{value}' to DOUBLE: {}",
+            e
+        ))),
         Ok(x) => Ok(F64::from(x)),
     }
 }
@@ -912,7 +944,10 @@ cast_function!(f, F32, f, F32);
 #[doc(hidden)]
 pub fn cast_to_f_s(value: SqlString) -> SqlResult<F32> {
     match value.str().trim().parse::<f32>() {
-        Err(_) => Ok(F32::zero()),
+        Err(e) => Err(SqlRuntimeError::from_string(format!(
+            "Parse error during conversion of '{value}' to REAL: {}",
+            e
+        ))),
         Ok(x) => Ok(F32::from(x)),
     }
 }
@@ -1148,6 +1183,12 @@ pub fn cast_to_s_s(value: SqlString, n_chars: i32, fixed: bool) -> SqlResult<Sql
 
 #[doc(hidden)]
 pub fn cast_to_s_Timestamp(value: Timestamp, size: i32, fixed: bool) -> SqlResult<SqlString> {
+    let result = value.to_string();
+    limit_or_size_string(&result, size, fixed)
+}
+
+#[doc(hidden)]
+pub fn cast_to_s_TimestampTz(value: TimestampTz, size: i32, fixed: bool) -> SqlResult<SqlString> {
     let result = value.to_string();
     limit_or_size_string(&result, size, fixed)
 }
@@ -1524,6 +1565,7 @@ cast_to_string!(u16, u16);
 cast_to_string!(u32, u32);
 cast_to_string!(u64, u64);
 cast_to_string!(Timestamp, Timestamp);
+cast_to_string!(TimestampTz, TimestampTz);
 cast_to_string!(Time, Time);
 cast_to_string!(Date, Date);
 cast_to_string!(bytes, ByteArray);
@@ -1717,103 +1759,143 @@ pub fn cast_to_i64_Weight(w: Weight) -> SqlResult<i64> {
     Ok(w as i64)
 }
 
+// Creates a cast function from an interval to an integer
+macro_rules! cast_interval_to_integer {
+    ($result_type: ty, $type_name: ident, $arg_type: ty, $intermediate_type: ty, $method: ident) => {
+        ::paste::paste! {
+            #[doc(hidden)]
+            pub fn [<cast_to_ $result_type _ $type_name >](value: $arg_type) -> SqlResult<$result_type> {
+                [< cast_to_ $result_type _ $intermediate_type >]( value. $method() )
+            }
+
+            cast_function!($result_type, $result_type, $type_name, $arg_type);
+        }
+    }
+}
+
+cast_interval_to_integer!(i8, LongInterval_YEARS, LongInterval, i32, years);
+cast_interval_to_integer!(i16, LongInterval_YEARS, LongInterval, i32, years);
+cast_interval_to_integer!(i32, LongInterval_YEARS, LongInterval, i32, years);
+cast_interval_to_integer!(i64, LongInterval_YEARS, LongInterval, i32, years);
+cast_interval_to_integer!(u8, LongInterval_YEARS, LongInterval, i32, years);
+cast_interval_to_integer!(u16, LongInterval_YEARS, LongInterval, i32, years);
+cast_interval_to_integer!(u32, LongInterval_YEARS, LongInterval, i32, years);
+cast_interval_to_integer!(u64, LongInterval_YEARS, LongInterval, i32, years);
+
+cast_interval_to_integer!(i8, LongInterval_MONTHS, LongInterval, i32, months);
+cast_interval_to_integer!(i16, LongInterval_MONTHS, LongInterval, i32, months);
+cast_interval_to_integer!(i32, LongInterval_MONTHS, LongInterval, i32, months);
+cast_interval_to_integer!(i64, LongInterval_MONTHS, LongInterval, i32, months);
+cast_interval_to_integer!(u8, LongInterval_MONTHS, LongInterval, i32, months);
+cast_interval_to_integer!(u16, LongInterval_MONTHS, LongInterval, i32, months);
+cast_interval_to_integer!(u32, LongInterval_MONTHS, LongInterval, i32, months);
+cast_interval_to_integer!(u64, LongInterval_MONTHS, LongInterval, i32, months);
+
+cast_interval_to_integer!(i8, ShortInterval_SECONDS, ShortInterval, i64, seconds);
+cast_interval_to_integer!(i16, ShortInterval_SECONDS, ShortInterval, i64, seconds);
+cast_interval_to_integer!(i32, ShortInterval_SECONDS, ShortInterval, i64, seconds);
+cast_interval_to_integer!(i64, ShortInterval_SECONDS, ShortInterval, i64, seconds);
+cast_interval_to_integer!(u8, ShortInterval_SECONDS, ShortInterval, i64, seconds);
+cast_interval_to_integer!(u16, ShortInterval_SECONDS, ShortInterval, i64, seconds);
+cast_interval_to_integer!(u32, ShortInterval_SECONDS, ShortInterval, i64, seconds);
+cast_interval_to_integer!(u64, ShortInterval_SECONDS, ShortInterval, i64, seconds);
+
+cast_interval_to_integer!(i8, ShortInterval_MINUTES, ShortInterval, i64, minutes);
+cast_interval_to_integer!(i16, ShortInterval_MINUTES, ShortInterval, i64, minutes);
+cast_interval_to_integer!(i32, ShortInterval_MINUTES, ShortInterval, i64, minutes);
+cast_interval_to_integer!(i64, ShortInterval_MINUTES, ShortInterval, i64, minutes);
+cast_interval_to_integer!(u8, ShortInterval_MINUTES, ShortInterval, i64, minutes);
+cast_interval_to_integer!(u16, ShortInterval_MINUTES, ShortInterval, i64, minutes);
+cast_interval_to_integer!(u32, ShortInterval_MINUTES, ShortInterval, i64, minutes);
+cast_interval_to_integer!(u64, ShortInterval_MINUTES, ShortInterval, i64, minutes);
+
+cast_interval_to_integer!(i8, ShortInterval_HOURS, ShortInterval, i64, hours);
+cast_interval_to_integer!(i16, ShortInterval_HOURS, ShortInterval, i64, hours);
+cast_interval_to_integer!(i32, ShortInterval_HOURS, ShortInterval, i64, hours);
+cast_interval_to_integer!(i64, ShortInterval_HOURS, ShortInterval, i64, hours);
+cast_interval_to_integer!(u8, ShortInterval_HOURS, ShortInterval, i64, hours);
+cast_interval_to_integer!(u16, ShortInterval_HOURS, ShortInterval, i64, hours);
+cast_interval_to_integer!(u32, ShortInterval_HOURS, ShortInterval, i64, hours);
+cast_interval_to_integer!(u64, ShortInterval_HOURS, ShortInterval, i64, hours);
+
+cast_interval_to_integer!(i8, ShortInterval_DAYS, ShortInterval, i64, days);
+cast_interval_to_integer!(i16, ShortInterval_DAYS, ShortInterval, i64, days);
+cast_interval_to_integer!(i32, ShortInterval_DAYS, ShortInterval, i64, days);
+cast_interval_to_integer!(i64, ShortInterval_DAYS, ShortInterval, i64, days);
+cast_interval_to_integer!(u8, ShortInterval_DAYS, ShortInterval, i64, days);
+cast_interval_to_integer!(u16, ShortInterval_DAYS, ShortInterval, i64, days);
+cast_interval_to_integer!(u32, ShortInterval_DAYS, ShortInterval, i64, days);
+cast_interval_to_integer!(u64, ShortInterval_DAYS, ShortInterval, i64, days);
+
 #[doc(hidden)]
-pub fn cast_to_i8_LongInterval_YEARS(value: LongInterval) -> SqlResult<i8> {
-    cast_to_i8_i32(value.years())
+pub fn cast_to_SqlDecimal_LongInterval_YEARS<const P: usize, const S: usize>(
+    value: LongInterval,
+) -> SqlResult<SqlDecimal<P, S>> {
+    cast_to_SqlDecimal_i32::<P, S>(value.years())
 }
 
 #[doc(hidden)]
-pub fn cast_to_i8_LongInterval_MONTHS(value: LongInterval) -> SqlResult<i8> {
-    cast_to_i8_i32(value.months())
+pub fn cast_to_SqlDecimal_LongInterval_MONTHS<const P: usize, const S: usize>(
+    value: LongInterval,
+) -> SqlResult<SqlDecimal<P, S>> {
+    cast_to_SqlDecimal_i32::<P, S>(value.months())
+}
+
+cast_function!(SqlDecimal <const P: usize, const S: usize>, SqlDecimal<P, S>, LongInterval_YEARS, LongInterval);
+cast_function!(SqlDecimal <const P: usize, const S: usize>, SqlDecimal<P, S>, LongInterval_MONTHS, LongInterval);
+
+fn convert_to_SqlDecimal_ShortInterval<const P: usize, const S: usize>(
+    value: ShortInterval,
+    divider: i64,
+) -> SqlResult<SqlDecimal<P, S>> {
+    let v = DynamicDecimal::from(value.microseconds());
+    let num = DynamicDecimal::from(divider);
+    let div = match v.checked_div(&num) {
+        None => Err(SqlRuntimeError::from_string(format!(
+            "Error converting {value} to DECIMAL",
+        )))?,
+        Some(result) => result,
+    };
+    feldera_fxp::Fixed::<P, S>::try_from(div).map_err(|e| {
+        SqlRuntimeError::from_string(format!(
+            "Overflow during conversion of {value} to DECIMAL: {}",
+            e
+        ))
+    })
 }
 
 #[doc(hidden)]
-pub fn cast_to_i16_LongInterval_YEARS(value: LongInterval) -> SqlResult<i16> {
-    cast_to_i16_i32(value.years())
+pub fn cast_to_SqlDecimal_ShortInterval_SECONDS<const P: usize, const S: usize>(
+    value: ShortInterval,
+) -> SqlResult<SqlDecimal<P, S>> {
+    convert_to_SqlDecimal_ShortInterval::<P, S>(value, 1_000_000)
 }
 
 #[doc(hidden)]
-pub fn cast_to_i16_LongInterval_MONTHS(value: LongInterval) -> SqlResult<i16> {
-    cast_to_i16_i32(value.months())
+pub fn cast_to_SqlDecimal_ShortInterval_MINUTES<const P: usize, const S: usize>(
+    value: ShortInterval,
+) -> SqlResult<SqlDecimal<P, S>> {
+    convert_to_SqlDecimal_ShortInterval::<P, S>(value, 60 * 1_000_000)
 }
 
 #[doc(hidden)]
-pub fn cast_to_i32_LongInterval_YEARS(value: LongInterval) -> SqlResult<i32> {
-    Ok(value.years())
+pub fn cast_to_SqlDecimal_ShortInterval_HOURS<const P: usize, const S: usize>(
+    value: ShortInterval,
+) -> SqlResult<SqlDecimal<P, S>> {
+    convert_to_SqlDecimal_ShortInterval::<P, S>(value, 60 * 60 * 1_000_000i64)
 }
 
 #[doc(hidden)]
-pub fn cast_to_i32_LongInterval_MONTHS(value: LongInterval) -> SqlResult<i32> {
-    Ok(value.months())
+pub fn cast_to_SqlDecimal_ShortInterval_DAYS<const P: usize, const S: usize>(
+    value: ShortInterval,
+) -> SqlResult<SqlDecimal<P, S>> {
+    convert_to_SqlDecimal_ShortInterval::<P, S>(value, 24 * 60 * 60 * 1_000_000i64)
 }
 
-#[doc(hidden)]
-pub fn cast_to_i64_LongInterval_YEARS(value: LongInterval) -> SqlResult<i64> {
-    Ok(value.years() as i64)
-}
-
-#[doc(hidden)]
-pub fn cast_to_i64_LongInterval_MONTHS(value: LongInterval) -> SqlResult<i64> {
-    Ok(value.months() as i64)
-}
-
-#[doc(hidden)]
-pub fn cast_to_u8_LongInterval_YEARS(value: LongInterval) -> SqlResult<u8> {
-    cast_to_u8_i32(value.years())
-}
-
-#[doc(hidden)]
-pub fn cast_to_u8_LongInterval_MONTHS(value: LongInterval) -> SqlResult<u8> {
-    cast_to_u8_i32(value.months())
-}
-
-#[doc(hidden)]
-pub fn cast_to_u16_LongInterval_YEARS(value: LongInterval) -> SqlResult<u16> {
-    cast_to_u16_i32(value.years())
-}
-
-#[doc(hidden)]
-pub fn cast_to_u16_LongInterval_MONTHS(value: LongInterval) -> SqlResult<u16> {
-    cast_to_u16_i32(value.months())
-}
-
-#[doc(hidden)]
-pub fn cast_to_u32_LongInterval_YEARS(value: LongInterval) -> SqlResult<u32> {
-    cast_to_u32_i32(value.years())
-}
-
-#[doc(hidden)]
-pub fn cast_to_u32_LongInterval_MONTHS(value: LongInterval) -> SqlResult<u32> {
-    cast_to_u32_i32(value.months())
-}
-
-#[doc(hidden)]
-pub fn cast_to_u64_LongInterval_YEARS(value: LongInterval) -> SqlResult<u64> {
-    cast_to_u64_i32(value.years())
-}
-
-#[doc(hidden)]
-pub fn cast_to_u64_LongInterval_MONTHS(value: LongInterval) -> SqlResult<u64> {
-    cast_to_u64_i32(value.months())
-}
-
-cast_function!(i8, i8, LongInterval_MONTHS, LongInterval);
-cast_function!(i8, i8, LongInterval_YEARS, LongInterval);
-cast_function!(i16, i16, LongInterval_MONTHS, LongInterval);
-cast_function!(i16, i16, LongInterval_YEARS, LongInterval);
-cast_function!(i32, i32, LongInterval_MONTHS, LongInterval);
-cast_function!(i32, i32, LongInterval_YEARS, LongInterval);
-cast_function!(i64, i64, LongInterval_MONTHS, LongInterval);
-cast_function!(i64, i64, LongInterval_YEARS, LongInterval);
-
-cast_function!(u8, u8, LongInterval_MONTHS, LongInterval);
-cast_function!(u8, u8, LongInterval_YEARS, LongInterval);
-cast_function!(u16, u16, LongInterval_MONTHS, LongInterval);
-cast_function!(u16, u16, LongInterval_YEARS, LongInterval);
-cast_function!(u32, u32, LongInterval_MONTHS, LongInterval);
-cast_function!(u32, u32, LongInterval_YEARS, LongInterval);
-cast_function!(u64, u64, LongInterval_MONTHS, LongInterval);
-cast_function!(u64, u64, LongInterval_YEARS, LongInterval);
+cast_function!(SqlDecimal <const P: usize, const S: usize>, SqlDecimal<P, S>, ShortInterval_SECONDS, ShortInterval);
+cast_function!(SqlDecimal <const P: usize, const S: usize>, SqlDecimal<P, S>, ShortInterval_MINUTES, ShortInterval);
+cast_function!(SqlDecimal <const P: usize, const S: usize>, SqlDecimal<P, S>, ShortInterval_HOURS, ShortInterval);
+cast_function!(SqlDecimal <const P: usize, const S: usize>, SqlDecimal<P, S>, ShortInterval_DAYS, ShortInterval);
 
 //////// casts to Short interval
 
@@ -1834,13 +1916,38 @@ pub fn cast_to_ShortInterval_DAYS_i32(value: i32) -> SqlResult<ShortInterval> {
 
 #[doc(hidden)]
 pub fn cast_to_ShortInterval_DAYS_i64(value: i64) -> SqlResult<ShortInterval> {
-    let val = value.checked_mul(86400 * 1000);
+    let val = value.checked_mul(86400 * 1000 * 1000);
     match val {
         None => Err(SqlRuntimeError::from_string(format!(
             "Overflow during conversion of {value} to INTERVAL DAYS"
         ))),
-        Some(value) => Ok(ShortInterval::from_milliseconds(value)),
+        Some(value) => Ok(ShortInterval::from_microseconds(value)),
     }
+}
+
+fn convert_to_ShortInterval_SqlDecimal<const P: usize, const S: usize>(
+    value: SqlDecimal<P, S>,
+    multiplier: i64,
+    kind: &'static str,
+) -> SqlResult<ShortInterval> {
+    let dd = DynamicDecimal::from(value);
+    let mul = DynamicDecimal::from(multiplier);
+    let val = dd.mul(mul);
+    i64::try_from(val)
+        .map(ShortInterval::from_microseconds)
+        .map_err(|e| {
+            SqlRuntimeError::from_string(format!(
+                "Overflow during conversion of {value} to INTERVAL {}: {}",
+                kind, e
+            ))
+        })
+}
+
+#[doc(hidden)]
+pub fn cast_to_ShortInterval_DAYS_SqlDecimal<const P: usize, const S: usize>(
+    value: SqlDecimal<P, S>,
+) -> SqlResult<ShortInterval> {
+    convert_to_ShortInterval_SqlDecimal::<P, S>(value, 86400i64 * 1000 * 1000, "DAYS")
 }
 
 #[doc(hidden)]
@@ -1873,6 +1980,13 @@ pub fn cast_to_ShortInterval_HOURS_i64(value: i64) -> SqlResult<ShortInterval> {
 }
 
 #[doc(hidden)]
+pub fn cast_to_ShortInterval_HOURS_SqlDecimal<const P: usize, const S: usize>(
+    value: SqlDecimal<P, S>,
+) -> SqlResult<ShortInterval> {
+    convert_to_ShortInterval_SqlDecimal::<P, S>(value, 3600i64 * 1000 * 1000, "DAYS")
+}
+
+#[doc(hidden)]
 #[inline]
 pub fn cast_to_ShortInterval_MINUTES_i8(value: i8) -> SqlResult<ShortInterval> {
     cast_to_ShortInterval_MINUTES_i64(value as i64)
@@ -1902,6 +2016,13 @@ pub fn cast_to_ShortInterval_MINUTES_i64(value: i64) -> SqlResult<ShortInterval>
 }
 
 #[doc(hidden)]
+pub fn cast_to_ShortInterval_MINUTES_SqlDecimal<const P: usize, const S: usize>(
+    value: SqlDecimal<P, S>,
+) -> SqlResult<ShortInterval> {
+    convert_to_ShortInterval_SqlDecimal::<P, S>(value, 60 * 1_000_000, "MINUTES")
+}
+
+#[doc(hidden)]
 #[inline]
 pub fn cast_to_ShortInterval_SECONDS_i8(value: i8) -> SqlResult<ShortInterval> {
     cast_to_ShortInterval_SECONDS_i64(value as i64)
@@ -1928,6 +2049,13 @@ pub fn cast_to_ShortInterval_SECONDS_i64(value: i64) -> SqlResult<ShortInterval>
         ))),
         Some(value) => Ok(ShortInterval::from_milliseconds(value)),
     }
+}
+
+#[doc(hidden)]
+pub fn cast_to_ShortInterval_SECONDS_SqlDecimal<const P: usize, const S: usize>(
+    value: SqlDecimal<P, S>,
+) -> SqlResult<ShortInterval> {
+    convert_to_ShortInterval_SqlDecimal::<P, S>(value, 1_000_000, "SECONDS")
 }
 
 #[doc(hidden)]
@@ -2082,35 +2210,41 @@ cast_function!(ShortInterval_DAYS, ShortInterval, i8, i8);
 cast_function!(ShortInterval_DAYS, ShortInterval, i16, i16);
 cast_function!(ShortInterval_DAYS, ShortInterval, i32, i32);
 cast_function!(ShortInterval_DAYS, ShortInterval, i64, i64);
-cast_function!(ShortInterval_HOURS, ShortInterval, i8, i8);
-cast_function!(ShortInterval_HOURS, ShortInterval, i16, i16);
-cast_function!(ShortInterval_HOURS, ShortInterval, i32, i32);
-cast_function!(ShortInterval_HOURS, ShortInterval, i64, i64);
-cast_function!(ShortInterval_MINUTES, ShortInterval, i8, i8);
-cast_function!(ShortInterval_MINUTES, ShortInterval, i16, i16);
-cast_function!(ShortInterval_MINUTES, ShortInterval, i32, i32);
-cast_function!(ShortInterval_MINUTES, ShortInterval, i64, i64);
-cast_function!(ShortInterval_SECONDS, ShortInterval, i8, i8);
-cast_function!(ShortInterval_SECONDS, ShortInterval, i16, i16);
-cast_function!(ShortInterval_SECONDS, ShortInterval, i32, i32);
-cast_function!(ShortInterval_SECONDS, ShortInterval, i64, i64);
-
 cast_function!(ShortInterval_DAYS, ShortInterval, u8, u8);
 cast_function!(ShortInterval_DAYS, ShortInterval, u16, u16);
 cast_function!(ShortInterval_DAYS, ShortInterval, u32, u32);
 cast_function!(ShortInterval_DAYS, ShortInterval, u64, u64);
+cast_function!(ShortInterval_DAYS <const P: usize, const S: usize>, ShortInterval, SqlDecimal, SqlDecimal<P, S>);
+
+cast_function!(ShortInterval_HOURS, ShortInterval, i8, i8);
+cast_function!(ShortInterval_HOURS, ShortInterval, i16, i16);
+cast_function!(ShortInterval_HOURS, ShortInterval, i32, i32);
+cast_function!(ShortInterval_HOURS, ShortInterval, i64, i64);
 cast_function!(ShortInterval_HOURS, ShortInterval, u8, u8);
 cast_function!(ShortInterval_HOURS, ShortInterval, u16, u16);
 cast_function!(ShortInterval_HOURS, ShortInterval, u32, u32);
 cast_function!(ShortInterval_HOURS, ShortInterval, u64, u64);
+cast_function!(ShortInterval_HOURS <const P: usize, const S: usize>, ShortInterval, SqlDecimal, SqlDecimal<P, S>);
+
+cast_function!(ShortInterval_MINUTES, ShortInterval, i8, i8);
+cast_function!(ShortInterval_MINUTES, ShortInterval, i16, i16);
+cast_function!(ShortInterval_MINUTES, ShortInterval, i32, i32);
+cast_function!(ShortInterval_MINUTES, ShortInterval, i64, i64);
 cast_function!(ShortInterval_MINUTES, ShortInterval, u8, u8);
 cast_function!(ShortInterval_MINUTES, ShortInterval, u16, u16);
 cast_function!(ShortInterval_MINUTES, ShortInterval, u32, u32);
 cast_function!(ShortInterval_MINUTES, ShortInterval, u64, u64);
+cast_function!(ShortInterval_MINUTES <const P: usize, const S: usize>, ShortInterval, SqlDecimal, SqlDecimal<P, S>);
+
+cast_function!(ShortInterval_SECONDS, ShortInterval, i8, i8);
+cast_function!(ShortInterval_SECONDS, ShortInterval, i16, i16);
+cast_function!(ShortInterval_SECONDS, ShortInterval, i32, i32);
+cast_function!(ShortInterval_SECONDS, ShortInterval, i64, i64);
 cast_function!(ShortInterval_SECONDS, ShortInterval, u8, u8);
 cast_function!(ShortInterval_SECONDS, ShortInterval, u16, u16);
 cast_function!(ShortInterval_SECONDS, ShortInterval, u32, u32);
 cast_function!(ShortInterval_SECONDS, ShortInterval, u64, u64);
+cast_function!(ShortInterval_SECONDS <const P: usize, const S: usize>, ShortInterval, SqlDecimal, SqlDecimal<P, S>);
 
 //////// casts to ShortIntervalN
 
@@ -2159,6 +2293,14 @@ pub fn cast_to_LongInterval_YEARS_i64(value: i64) -> SqlResult<LongInterval> {
 }
 
 #[doc(hidden)]
+pub fn cast_to_LongInterval_YEARS_SqlDecimal<const P: usize, const S: usize>(
+    value: SqlDecimal<P, S>,
+) -> SqlResult<LongInterval> {
+    let value = cast_to_i32_SqlDecimal::<P, S>(value)?;
+    cast_to_LongInterval_YEARS_i32(value)
+}
+
+#[doc(hidden)]
 #[inline]
 pub fn cast_to_LongInterval_MONTHS_i8(value: i8) -> SqlResult<LongInterval> {
     cast_to_LongInterval_MONTHS_i32(value as i32)
@@ -2186,6 +2328,14 @@ pub fn cast_to_LongInterval_MONTHS_i64(value: i64) -> SqlResult<LongInterval> {
             )));
         }
     };
+    cast_to_LongInterval_MONTHS_i32(value)
+}
+
+#[doc(hidden)]
+pub fn cast_to_LongInterval_MONTHS_SqlDecimal<const P: usize, const S: usize>(
+    value: SqlDecimal<P, S>,
+) -> SqlResult<LongInterval> {
+    let value = cast_to_i32_SqlDecimal::<P, S>(value)?;
     cast_to_LongInterval_MONTHS_i32(value)
 }
 
@@ -2269,25 +2419,27 @@ cast_function!(LongInterval_YEARS, LongInterval, i8, i8);
 cast_function!(LongInterval_YEARS, LongInterval, i16, i16);
 cast_function!(LongInterval_YEARS, LongInterval, i32, i32);
 cast_function!(LongInterval_YEARS, LongInterval, i64, i64);
-cast_function!(LongInterval_MONTHS, LongInterval, i8, i8);
-cast_function!(LongInterval_MONTHS, LongInterval, i16, i16);
-cast_function!(LongInterval_MONTHS, LongInterval, i32, i32);
-cast_function!(LongInterval_MONTHS, LongInterval, i64, i64);
-
 cast_function!(LongInterval_YEARS, LongInterval, u8, u8);
 cast_function!(LongInterval_YEARS, LongInterval, u16, u16);
 cast_function!(LongInterval_YEARS, LongInterval, u32, u32);
 cast_function!(LongInterval_YEARS, LongInterval, u64, u64);
+cast_function!(LongInterval_YEARS <const P: usize, const S: usize>, LongInterval, SqlDecimal, SqlDecimal<P, S>);
+
+cast_function!(LongInterval_MONTHS, LongInterval, i8, i8);
+cast_function!(LongInterval_MONTHS, LongInterval, i16, i16);
+cast_function!(LongInterval_MONTHS, LongInterval, i32, i32);
+cast_function!(LongInterval_MONTHS, LongInterval, i64, i64);
 cast_function!(LongInterval_MONTHS, LongInterval, u8, u8);
 cast_function!(LongInterval_MONTHS, LongInterval, u16, u16);
 cast_function!(LongInterval_MONTHS, LongInterval, u32, u32);
 cast_function!(LongInterval_MONTHS, LongInterval, u64, u64);
+cast_function!(LongInterval_MONTHS <const P: usize, const S: usize>, LongInterval, SqlDecimal, SqlDecimal<P, S>);
 
 #[doc(hidden)]
 pub fn cast_to_LongInterval_YEARS_s(value: SqlString) -> SqlResult<LongInterval> {
     match value.str().parse::<i32>() {
         Err(e) => Err(SqlRuntimeError::from_string(format!(
-            "Error converting {value} to INTERVAL YEARS: {}",
+            "Error converting '{value}' to INTERVAL YEARS: {}",
             e
         ))),
         Ok(years) => cast_to_LongInterval_YEARS_i32(years),
@@ -2304,7 +2456,7 @@ pub fn cast_to_LongInterval_YEARS_TO_MONTHS_s(value: SqlString) -> SqlResult<Lon
         let mut years = match yearcap.parse::<i32>() {
             Err(e) => {
                 return Err(SqlRuntimeError::from_string(format!(
-                    "Error converting {value} to INTERVAL YEARS TO MONTHS: {}",
+                    "Error converting '{value}' to INTERVAL YEARS TO MONTHS: {}",
                     e
                 )));
             }
@@ -2322,7 +2474,7 @@ pub fn cast_to_LongInterval_YEARS_TO_MONTHS_s(value: SqlString) -> SqlResult<Lon
                     Ok(months) => months,
                     Err(e) => {
                         return Err(SqlRuntimeError::from_string(format!(
-                            "Error converting {value} to INTERVAL YEARS TO MONTHS: {}",
+                            "Error converting '{value}' to INTERVAL YEARS TO MONTHS: {}",
                             e
                         )));
                     }
@@ -2347,7 +2499,7 @@ pub fn cast_to_LongInterval_MONTHS_s(value: SqlString) -> SqlResult<LongInterval
     match value.str().parse::<i32>() {
         Ok(months) => cast_to_LongInterval_MONTHS_i32(months),
         Err(e) => Err(SqlRuntimeError::from_string(format!(
-            "Error converting {value} to INTERVAL MONTHS: {}",
+            "Error converting '{value}' to INTERVAL MONTHS: {}",
             e
         ))),
     }
@@ -2411,7 +2563,7 @@ pub fn cast_to_ShortInterval_DAYS_s(value: SqlString) -> SqlResult<ShortInterval
     match value.str().parse::<i64>() {
         Ok(value) => cast_to_ShortInterval_DAYS_i64(value),
         Err(e) => Err(SqlRuntimeError::from_string(format!(
-            "Error converting {value} to INTERVAL DAYS: {}",
+            "Error converting '{value}' to INTERVAL DAYS: {}",
             e
         ))),
     }
@@ -2422,7 +2574,7 @@ pub fn cast_to_ShortInterval_HOURS_s(value: SqlString) -> SqlResult<ShortInterva
     match value.str().parse::<i64>() {
         Ok(value) => cast_to_ShortInterval_HOURS_i64(value),
         Err(e) => Err(SqlRuntimeError::from_string(format!(
-            "Error converting {value} to INTERVAL HOURS: {}",
+            "Error converting '{value}' to INTERVAL HOURS: {}",
             e
         ))),
     }
@@ -2441,7 +2593,7 @@ pub fn cast_to_ShortInterval_DAYS_TO_HOURS_s(value: SqlString) -> SqlResult<Shor
         let days = match daycap.parse::<i64>() {
             Err(e) => {
                 return Err(SqlRuntimeError::from_string(format!(
-                    "Error converting {value} to INTERVAL DAYS TO HOURS: {}",
+                    "Error converting '{value}' to INTERVAL DAYS TO HOURS: {}",
                     e
                 )));
             }
@@ -2451,7 +2603,7 @@ pub fn cast_to_ShortInterval_DAYS_TO_HOURS_s(value: SqlString) -> SqlResult<Shor
         let hours = match hourcap.parse::<i64>() {
             Err(e) => {
                 return Err(SqlRuntimeError::from_string(format!(
-                    "Error converting {value} to INTERVAL DAYS TO HOURS: {}",
+                    "Error converting '{value}' to INTERVAL DAYS TO HOURS: {}",
                     e
                 )));
             }
@@ -2527,10 +2679,10 @@ pub fn cast_to_ShortInterval_DAYS_TO_MINUTES_s(value: SqlString) -> SqlResult<Sh
 }
 
 #[doc(hidden)]
-pub fn cast_to_GeoPoint_s(_value: SqlString) -> SqlResult<GeoPoint> {
-    Err(SqlRuntimeError::from_strng(
-        "String cannot be cast to ST_POINT",
-    ))
+pub fn cast_to_GeoPoint_s(value: SqlString) -> SqlResult<GeoPoint> {
+    Err(SqlRuntimeError::from_string(format!(
+        "String '{value}' cannot be cast to ST_POINT"
+    )))
 }
 
 cast_function!(GeoPoint, GeoPoint, s, SqlString);
@@ -2836,14 +2988,9 @@ cast_function!(
 #[doc(hidden)]
 pub fn cast_to_Timestamp_s(value: SqlString) -> SqlResult<Timestamp> {
     if let Ok(v) = NaiveDateTime::parse_from_str(value.str(), "%Y-%m-%d %H:%M:%S%.f") {
-        // round the number of microseconds
-        let nanos = v.and_utc().timestamp_subsec_nanos();
-        let nanos = (nanos + 500) / 1000;
-        let result =
-            Timestamp::from_microseconds(v.and_utc().timestamp() * 1_000_000 + (nanos as i64));
         //println!("Parsed successfully {} using {} into {:?} ({})",
         //         value, "%Y-%m-%d %H:%M:%S%.f", result, result.microseconds());
-        return Ok(result);
+        return Ok(Timestamp::from_naiveDateTime(v));
     }
 
     // Try just a date.
@@ -2857,7 +3004,7 @@ pub fn cast_to_Timestamp_s(value: SqlString) -> SqlResult<Timestamp> {
     }
 
     Err(SqlRuntimeError::from_string(format!(
-        "Failed to parse '{value}' as a Timestamp"
+        "Failed to parse '{value}' as a TIMESTAMP"
     )))
 }
 
@@ -2894,6 +3041,14 @@ pub fn cast_to_Timestamp_Timestamp(value: Timestamp) -> SqlResult<Timestamp> {
 }
 
 cast_function!(Timestamp, Timestamp, Timestamp, Timestamp);
+
+#[doc(hidden)]
+#[inline]
+pub fn cast_to_Timestamp_TimestampTz(value: TimestampTz) -> SqlResult<Timestamp> {
+    Ok(value.into())
+}
+
+cast_function!(Timestamp, Timestamp, TimestampTz, TimestampTz);
 
 #[doc(hidden)]
 pub fn cast_to_Timestamp_i64(value: i64) -> SqlResult<Timestamp> {
@@ -3032,6 +3187,172 @@ cast_ts!(u16, u16);
 cast_ts!(u8, u8);
 cast_ts!(f, F32);
 cast_ts!(d, F64);
+
+//////// casts to TimestampTz
+
+#[doc(hidden)]
+pub fn cast_to_TimestampTz_s(value: SqlString) -> SqlResult<TimestampTz> {
+    parse_timestamp_tz(value.str())
+}
+
+cast_function!(TimestampTz, TimestampTz, s, SqlString);
+
+#[doc(hidden)]
+pub fn cast_to_TimestampTz_Date(value: Date) -> SqlResult<TimestampTz> {
+    Ok(value.to_timestamp().into())
+}
+
+cast_function!(TimestampTz, TimestampTz, Date, Date);
+
+#[doc(hidden)]
+pub fn cast_to_TimestampTz_Time(value: Time) -> SqlResult<TimestampTz> {
+    cast_to_Timestamp_Time(value).map(|x| x.into())
+}
+
+cast_function!(TimestampTz, TimestampTz, Time, Time);
+
+#[doc(hidden)]
+#[inline]
+pub fn cast_to_TimestampTzN_nullN(_value: Option<()>) -> SqlResult<Option<TimestampTz>> {
+    Ok(None)
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn cast_to_TimestampTz_TimestampTz(value: TimestampTz) -> SqlResult<TimestampTz> {
+    Ok(value)
+}
+
+cast_function!(TimestampTz, TimestampTz, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
+#[inline]
+pub fn cast_to_TimestampTz_Timestamp(value: Timestamp) -> SqlResult<TimestampTz> {
+    Ok(value.into())
+}
+
+cast_function!(TimestampTz, TimestampTz, Timestamp, Timestamp);
+
+#[doc(hidden)]
+pub fn cast_to_TimestampTz_i64(value: i64) -> SqlResult<TimestampTz> {
+    cast_to_Timestamp_i64(value).map(|x| x.into())
+}
+
+cast_function!(TimestampTz, TimestampTz, i64, i64);
+
+#[doc(hidden)]
+pub fn cast_to_TimestampTz_SqlDecimal<const P: usize, const S: usize>(
+    value: SqlDecimal<P, S>,
+) -> SqlResult<TimestampTz> {
+    cast_to_Timestamp_SqlDecimal::<P, S>(value).map(|x| x.into())
+}
+
+cast_function!(TimestampTz <const P: usize, const S: usize>, TimestampTz, SqlDecimal, SqlDecimal<P, S>);
+
+#[doc(hidden)]
+pub fn cast_to_TimestampTz_u64(value: u64) -> SqlResult<TimestampTz> {
+    let result: Result<i64, _> = value.try_into();
+    match result {
+        Err(e) => Err(SqlRuntimeError::from_string(format!(
+            "Error converting {value} to TIMESTAMP WITH TIME ZONE: {}",
+            e
+        ))),
+        Ok(result) => Ok(TimestampTz::from_milliseconds(result)),
+    }
+}
+
+cast_function!(TimestampTz, TimestampTz, u64, u64);
+
+#[doc(hidden)]
+#[inline]
+pub fn cast_to_i64_TimestampTz(value: TimestampTz) -> SqlResult<i64> {
+    Ok(value.milliseconds())
+}
+
+cast_function!(i64, i64, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
+pub fn cast_to_u64_TimestampTz(value: TimestampTz) -> SqlResult<u64> {
+    cast_to_u64_Timestamp(value.into())
+}
+
+cast_function!(u64, u64, TimestampTz, TimestampTz);
+
+#[doc(hidden)]
+pub fn cast_to_SqlDecimal_TimestampTz<const P: usize, const S: usize>(
+    value: TimestampTz,
+) -> SqlResult<SqlDecimal<P, S>> {
+    cast_to_SqlDecimal_Timestamp(value.into())
+}
+
+#[doc(hidden)]
+pub fn cast_to_SqlDecimalN_TimestampTz<const P: usize, const S: usize>(
+    value: TimestampTz,
+) -> SqlResult<Option<SqlDecimal<P, S>>> {
+    r2o(cast_to_SqlDecimal_TimestampTz::<P, S>(value))
+}
+
+#[doc(hidden)]
+pub fn cast_to_SqlDecimal_TimestampTzN<const P: usize, const S: usize>(
+    value: Option<TimestampTz>,
+) -> SqlResult<SqlDecimal<P, S>> {
+    match value {
+        None => Err(cast_null("DECIMAL")),
+        Some(value) => cast_to_SqlDecimal_TimestampTz::<P, S>(value),
+    }
+}
+
+#[doc(hidden)]
+pub fn cast_to_SqlDecimalN_TimestampTzN<const P: usize, const S: usize>(
+    value: Option<TimestampTz>,
+) -> SqlResult<Option<SqlDecimal<P, S>>> {
+    match value {
+        None => Ok(None),
+        Some(value) => cast_to_SqlDecimalN_TimestampTz::<P, S>(value),
+    }
+}
+
+macro_rules! cast_ts_tz {
+    ($type_name: ident, $arg_type: ty) => {
+        ::paste::paste! {
+            #[doc(hidden)]
+                        pub fn [<cast_to_TimestampTz_ $type_name>](value: $arg_type) -> SqlResult<TimestampTz> {
+                match [< cast_to_i64_ $type_name >](value) {
+                    Ok(value) => cast_to_TimestampTz_i64(value),
+                    Err(e) => Err(SqlRuntimeError::from_string(format!(
+                        "Error converting {value} to TIMESTAMP WITH TIME ZONE: {}",
+                        e
+                    ))),
+                }
+            }
+
+            cast_function!(TimestampTz, TimestampTz, $type_name, $arg_type);
+
+            #[doc(hidden)]
+                        pub fn [<cast_to_ $type_name _TimestampTz>](value: TimestampTz) -> SqlResult<$arg_type> {
+                match cast_to_i64_TimestampTz(value) {
+                    Ok(value) => [< cast_to_ $type_name _i64 >] (value),
+                    Err(e) => Err(SqlRuntimeError::from_string(format!(
+                        "Error converting {value} to TIMESTAMP WITH TIME ZONE: {}",
+                        e
+                    ))),
+                }
+            }
+
+            cast_function!($type_name, $arg_type, TimestampTz, TimestampTz);
+        }
+    };
+}
+
+// the 64-bit variants are defined separately
+cast_ts_tz!(i32, i32);
+cast_ts_tz!(i16, i16);
+cast_ts_tz!(i8, i8);
+cast_ts_tz!(u32, u32);
+cast_ts_tz!(u16, u16);
+cast_ts_tz!(u8, u8);
+cast_ts_tz!(f, F32);
+cast_ts_tz!(d, F64);
 
 //////////////////// Other casts
 
@@ -3453,6 +3774,7 @@ cast_variant!(Date, Date, Date);
 cast_variant!(Time, Time, Time);
 cast_variant!(Uuid, Uuid, Uuid);
 cast_variant!(Timestamp, Timestamp, Timestamp);
+cast_variant!(TimestampTz, TimestampTz, TimestampTz);
 cast_variant!(ShortInterval_DAYS, ShortInterval, ShortInterval);
 cast_variant!(ShortInterval_HOURS, ShortInterval, ShortInterval);
 cast_variant!(ShortInterval_DAYS_TO_HOURS, ShortInterval, ShortInterval);

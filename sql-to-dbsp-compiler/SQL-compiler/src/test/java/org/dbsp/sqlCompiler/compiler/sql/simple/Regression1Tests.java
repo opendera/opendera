@@ -90,11 +90,11 @@ public class Regression1Tests extends SqlIoTest {
                 CAST(ABS(yr0) AS BIGINT), CAST(ABS(yr1) AS BIGINT),
                 CAST(ABS(d0) AS BIGINT), CAST(ABS(d1) AS BIGINT)
                 FROM intervalv;""");
-        ccs.step("INSERT INTO tbl VALUES(TIMESTAMP '2020-01-01 00:00:00', TIMESTAMP '2019-01-01 00:00:00')",
+        ccs.stepWeightOne("INSERT INTO tbl VALUES(TIMESTAMP '2020-01-01 00:00:00', TIMESTAMP '2019-01-01 00:00:00')",
                 """
-                  v0 | v1 |  v2  |  v3  | weight
-                 ----------------------------
-                   5 |  6 | 1998 | 2363 | 1""");
+                  v0 | v1 |  v2  |  v3
+                 ----------------------
+                   5 |  6 | 1998 | 2363""");
     }
 
     @Test
@@ -274,10 +274,10 @@ public class Regression1Tests extends SqlIoTest {
                 TIMESTAMPDIFF(MINUTE, TIMESTAMP '2020-06-21 14:23:44.123', TIMESTAMP '2022-01-22 20:24:44.332') AS min1,
                 TIMESTAMPDIFF(SECOND, TIMESTAMP '2020-06-21 14:23:44.123', TIMESTAMP '2022-01-22 20:24:44.332') AS sec1
                 FROM t;""");
-        ccs.step("INSERT INTO T VALUES(TIMESTAMP '2020-06-21 14:23:44.123');", """
-                 min | sec | min1 | sec1 | weight
-                --------------------------------------------
-                 835561 | 50133660 | 835561 | 50133660 | 1""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(TIMESTAMP '2020-06-21 14:23:44.123');", """
+                 min | sec | min1 | sec1
+                ----------------------------------------
+                 835561 | 50133660 | 835561 | 50133660""");
 
         ccs = this.getCCS("""
                 CREATE TABLE t(tmestmp TIMESTAMP);
@@ -288,10 +288,10 @@ public class Regression1Tests extends SqlIoTest {
                 TIMESTAMPDIFF(MINUTE, '2020-06-21 14:23:44.123'::TIMESTAMP, '2022-01-22 20:24:44.332'::TIMESTAMP) AS min1,
                 TIMESTAMPDIFF(SECOND, '2020-06-21 14:23:44.123'::TIMESTAMP, '2022-01-22 20:24:44.332'::TIMESTAMP) AS sec1
                 FROM t;""");
-        ccs.step("INSERT INTO T VALUES(TIMESTAMP '2020-06-21 14:23:44.123');", """
-                 min | sec | min1 | sec1 | weight
-                --------------------------------------------
-                 835561 | 50133660 | 835561 | 50133660 | 1""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(TIMESTAMP '2020-06-21 14:23:44.123');", """
+                 min | sec | min1 | sec1
+                ----------------------------------------
+                 835561 | 50133660 | 835561 | 50133660""");
     }
 
     @Test
@@ -1651,47 +1651,79 @@ public class Regression1Tests extends SqlIoTest {
               true
              (1 row)
              
-             SELECT 't'::BOOLEAN;
-              r
-             ---
-              false
-             (1 row)
-             
-             SELECT '1'::BOOLEAN;
-              r
-             ---
-              false
-             (1 row)
-             
-             SELECT '0'::BOOLEAN;
-              r
-             ---
-              false
-             (1 row)
-             
-             SELECT 'yes'::BOOLEAN;
-              r
-             ---
-              false
-             (1 row)
-             
-             SELECT ''::BOOLEAN;
-              r
-             ---
-              false
-             (1 row)
-             
-             SELECT 'NULL'::BOOLEAN;
-              r
-             ---
-              false
-             (1 row)
-             
              SELECT NULL::BOOLEAN;
               r
              ---
              NULL
+             (1 row)
+             
+             SELECT SAFE_CAST('TRUE' AS BOOLEAN);
+              r
+             ---
+              true
+             (1 row)
+             
+             SELECT SAFE_CAST('true' AS BOOLEAN);
+              r
+             ---
+              true
+             (1 row)
+             
+             SELECT SAFE_CAST('TrUe' AS BOOLEAN);
+              r
+             ---
+              true
+             (1 row)
+             
+             SELECT SAFE_CAST('t' AS BOOLEAN);
+              r
+             ---
+             NULL
+             (1 row)
+             
+             SELECT SAFE_CAST('no' AS BOOLEAN);
+              r
+             ---
+             NULL
+             (1 row)
+             
+             SELECT SAFE_CAST('N' AS BOOLEAN);
+              r
+             ---
+             NULL
+             (1 row)
+             
+             SELECT SAFE_CAST('1' AS BOOLEAN);
+              r
+             ---
+             NULL
+             (1 row)
+             
+             SELECT SAFE_CAST('0' AS BOOLEAN);
+              r
+             ---
+             NULL
+             (1 row)
+             
+             SELECT SAFE_CAST('yes' AS BOOLEAN);
+              r
+             ---
+             NULL
+             (1 row)
+             
+             SELECT SAFE_CAST(NULL AS BOOLEAN);
+              r
+             ---
+             NULL
              (1 row)""");
+
+        this.qf("SELECT 't'::BOOLEAN", "Cannot convert string");
+        this.qf("SELECT 'no'::BOOLEAN", "Cannot convert string");
+        this.qf("SELECT '1'::BOOLEAN", "Cannot convert string");
+        this.qf("SELECT '0'::BOOLEAN", "Cannot convert string");
+        this.qf("SELECT 'yes'::BOOLEAN", "Cannot convert string");
+        this.qf("SELECT ''::BOOLEAN", "Cannot convert string '' to BOOLEAN");
+        this.qf("SELECT 'NULL'::BOOLEAN", "Cannot convert string 'NULL' to BOOLEAN");
     }
 
     @Test

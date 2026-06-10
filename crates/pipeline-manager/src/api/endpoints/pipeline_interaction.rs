@@ -14,7 +14,9 @@ use actix_web::{
     web::{self, Data as WebData, ReqData},
     HttpRequest, HttpResponse,
 };
-use feldera_types::query_params::{MetricsParameters, SamplyProfileGetParams, SamplyProfileParams};
+use feldera_types::query_params::{
+    ApproveParameters, MetricsParameters, SamplyProfileGetParams, SamplyProfileParams,
+};
 use feldera_types::{program_schema::SqlIdentifier, query_params::ActivateParams};
 use std::time::Duration;
 use tracing::{debug, info};
@@ -175,9 +177,10 @@ pub(crate) async fn http_input(
 /// table or view.  The stream is configurable two ways:
 ///
 /// - Simple configuration of the format may be provided using query parameters.
-///   Use `format` to specify `csv` or `json` output and, for `json` only, `array`
-///   to specify whether to group updates into JSON arrays.  Specify
-///   `backpressure` to specify behavior when the HTTP client cannot keep up.
+///   Specify `backpressure` to specify behavior when the HTTP client cannot
+///   keep up.  Use `format` to specify `csv` or `json` output.  For `json`
+///   output format, `update_format` and `json_flavor` may be provided (with the
+///   same possible values as in JSON format configuration for connectors).
 ///
 /// - Comprehensive configuration may be provided by providing a connector
 ///   configuration as a JSON body.  In this case, no query parameters are
@@ -195,6 +198,7 @@ pub(crate) async fn http_input(
         ("table_name" = String, Path,
             description = "SQL table name. Unquoted SQL names have to be capitalized. Quoted SQL names have to exactly match the case from the SQL program."),
         ("format" = String, Query, description = "Output data format, either 'csv' or 'json'."),
+        ("send_snapshot" = Option<bool>, Query, description = "Set to `true` to send a full snapshot of a materialized view before streaming incremental updates. The default is `false`. Works on a paused pipeline: the snapshot is delivered from the latest cached view state without requiring the pipeline to be running."),
         ("array" = Option<bool>, Query, description = "Set to `true` to group updates in this stream into JSON arrays (used in conjunction with `format=json`). The default value is `false`"),
         ("backpressure" = Option<bool>, Query, description = r#"Apply backpressure on the pipeline when the HTTP client cannot receive data fast enough.
         When this flag is set to false (the default), the HTTP connector drops data chunks if the client is not keeping up with its output.  This prevents a slow HTTP client from slowing down the entire pipeline.
@@ -513,149 +517,6 @@ pub(crate) async fn get_pipeline_output_connector_status(
             Method::GET,
             &format!("output_endpoints/{encoded_endpoint_name}/stats"),
             "",
-            None,
-            None,
-        )
-        .await?;
-
-    Ok(response)
-}
-
-/// Reset Output Connector
-///
-/// Reset an output connector configured in `snapshot_and_follow` mode.
-///
-/// This clears buffered output, asks the sink to reset itself, and then replays
-/// a full snapshot before resuming incremental updates.
-#[utoipa::path(
-    context_path = "/v0",
-    security(("JSON web token (JWT) or API key" = [])),
-    params(
-        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
-        ("view_name" = String, Path, description = "SQL view name"),
-        ("connector_name" = String, Path, description = "Output connector name"),
-    ),
-    responses(
-        (status = OK
-            , description = "Output connector reset request has been processed"),
-        (status = NOT_FOUND
-            , body = ErrorResponse
-            , description = "Pipeline, view and/or output connector with that name does not exist"
-            , examples(
-                ("Pipeline with that name does not exist" = (value = json!(examples::error_unknown_pipeline_name()))),
-            )
-        ),
-        (status = BAD_REQUEST
-            , body = ErrorResponse
-            , description = "The output connector does not support reset"),
-        (status = SERVICE_UNAVAILABLE
-            , body = ErrorResponse
-            , examples(
-                ("Pipeline is not deployed" = (value = json!(examples::error_pipeline_interaction_not_deployed()))),
-                ("Pipeline is currently unavailable" = (value = json!(examples::error_pipeline_interaction_currently_unavailable()))),
-                ("Disconnected during response" = (value = json!(examples::error_pipeline_interaction_disconnected()))),
-                ("Response timeout" = (value = json!(examples::error_pipeline_interaction_timeout())))
-            )
-        ),
-        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
-    ),
-    tag = "Output Connectors"
-)]
-#[post("/pipelines/{pipeline_name}/views/{view_name}/connectors/{connector_name}/reset")]
-pub(crate) async fn post_pipeline_output_connector_reset(
-    state: WebData<ServerState>,
-    client: WebData<awc::Client>,
-    tenant_id: ReqData<TenantId>,
-    path: web::Path<(String, String, String)>,
-) -> Result<HttpResponse, ManagerError> {
-    let (pipeline_name, view_name, connector_name) = path.into_inner();
-
-    let actual_view_name = SqlIdentifier::from(&view_name).name();
-    let endpoint_name = format!("{actual_view_name}.{connector_name}");
-    let encoded_endpoint_name = urlencoding::encode(&endpoint_name).to_string();
-
-    let response = state
-        .runner
-        .forward_http_request_to_pipeline_by_name(
-            client.as_ref(),
-            *tenant_id,
-            &pipeline_name,
-            Method::POST,
-            &format!("output_endpoints/{encoded_endpoint_name}/reset"),
-            "",
-            None,
-            None,
-        )
-        .await?;
-
-    if response.status() == StatusCode::OK {
-        info!(
-            pipeline = %pipeline_name,
-            pipeline_id = "N/A",
-            tenant = %tenant_id.0,
-            "Connector action: reset on view '{view_name}' on connector '{connector_name}'"
-        );
-    }
-
-    Ok(response)
-}
-
-/// Check Reset Status
-///
-/// Check the status of a reset token returned by the output connector
-/// reset endpoint.
-#[utoipa::path(
-    context_path = "/v0",
-    security(("JSON web token (JWT) or API key" = [])),
-    params(
-        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
-        ("token" = String, Query, description = "Reset token returned by the output connector reset endpoint."),
-    ),
-    responses(
-        (status = OK
-            , description = "Reset token status has been retrieved"),
-        (status = NOT_FOUND
-            , body = ErrorResponse
-            , description = "Pipeline with that name does not exist"
-            , example = json!(examples::error_unknown_pipeline_name())),
-        (status = BAD_REQUEST
-            , body = ErrorResponse
-            , description = "An invalid reset token was provided"),
-        (status = GONE
-            , body = ErrorResponse
-            , description = "Reset token was created by a previous incarnation of the pipeline; the server cannot validate the reset across incarnations. Reissue the reset."),
-        (status = SERVICE_UNAVAILABLE
-            , body = ErrorResponse
-            , examples(
-                ("Pipeline is not deployed" = (value = json!(examples::error_pipeline_interaction_not_deployed()))),
-                ("Pipeline is currently unavailable" = (value = json!(examples::error_pipeline_interaction_currently_unavailable()))),
-                ("Disconnected during response" = (value = json!(examples::error_pipeline_interaction_disconnected()))),
-                ("Response timeout" = (value = json!(examples::error_pipeline_interaction_timeout())))
-            )
-        ),
-        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
-    ),
-    tag = "Output Connectors"
-)]
-#[get("/pipelines/{pipeline_name}/reset_status")]
-pub(crate) async fn reset_status(
-    state: WebData<ServerState>,
-    client: WebData<awc::Client>,
-    tenant_id: ReqData<TenantId>,
-    path: web::Path<String>,
-    request: HttpRequest,
-) -> Result<HttpResponse, ManagerError> {
-    let pipeline_name = path.into_inner();
-
-    let response = state
-        .runner
-        .forward_http_request_to_pipeline_by_name(
-            client.as_ref(),
-            *tenant_id,
-            &pipeline_name,
-            Method::GET,
-            "reset_status",
-            request.query_string(),
             None,
             None,
         )
@@ -1189,6 +1050,58 @@ pub(crate) async fn post_pipeline_rebalance(
             &pipeline_name,
             Method::POST,
             "rebalance",
+            "",
+            Some(Duration::from_secs(120)),
+            None,
+        )
+        .await
+}
+
+/// Initiate compaction.
+///
+/// Initiate immediate compaction of the pipeline's state.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    params(
+        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+    ),
+    responses(
+        (status = OK
+            , description = "Compaction started successfully"),
+        (status = NOT_FOUND
+            , description = "Pipeline with that name does not exist"
+            , body = ErrorResponse
+            , example = json!(examples::error_unknown_pipeline_name())),
+        (status = SERVICE_UNAVAILABLE
+            , body = ErrorResponse
+            , examples(
+                ("Pipeline is not deployed" = (value = json!(examples::error_pipeline_interaction_not_deployed()))),
+                ("Pipeline is currently unavailable" = (value = json!(examples::error_pipeline_interaction_currently_unavailable()))),
+                ("Disconnected during response" = (value = json!(examples::error_pipeline_interaction_disconnected()))),
+                ("Response timeout" = (value = json!(examples::error_pipeline_interaction_timeout())))
+            )
+        ),
+        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
+    ),
+    tag = "Pipeline Lifecycle"
+)]
+#[post("/pipelines/{pipeline_name}/start_compaction")]
+pub(crate) async fn post_pipeline_start_compaction(
+    state: WebData<ServerState>,
+    client: WebData<awc::Client>,
+    tenant_id: ReqData<TenantId>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, ManagerError> {
+    let pipeline_name = path.into_inner();
+    state
+        .runner
+        .forward_http_request_to_pipeline_by_name(
+            client.as_ref(),
+            *tenant_id,
+            &pipeline_name,
+            Method::POST,
+            "start_compaction",
             "",
             Some(Duration::from_secs(120)),
             None,
@@ -1889,6 +1802,7 @@ pub(crate) async fn post_pipeline_activate(
     security(("JSON web token (JWT) or API key" = [])),
     params(
         ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+        ApproveParameters,
     ),
     responses(
         (status = ACCEPTED
@@ -1917,7 +1831,7 @@ pub(crate) async fn post_pipeline_approve(
     _client: WebData<awc::Client>,
     tenant_id: ReqData<TenantId>,
     path: web::Path<String>,
-    request: HttpRequest,
+    query: web::Query<ApproveParameters>,
 ) -> Result<HttpResponse, ManagerError> {
     {
         let pipeline_name = path.into_inner();
@@ -1929,7 +1843,11 @@ pub(crate) async fn post_pipeline_approve(
                 &pipeline_name,
                 Method::POST,
                 "approve",
-                request.query_string(),
+                if query.into_inner().silent_bootstrap {
+                    "silent_bootstrap=true"
+                } else {
+                    ""
+                },
                 None,
                 None,
             )
@@ -2310,4 +2228,70 @@ pub(crate) async fn commit_transaction(
         .await?;
 
     Ok(response)
+}
+
+/// Advance Clock
+///
+/// Moves `NOW()` forward by a specified amount. Returns the
+/// current clock time of the circuit.
+///
+/// Requires `dev_tweaks.now_http_driven = true` on the pipeline.
+///
+/// Forward-only: `delta_ms` is `u64`, so negative bodies are rejected at
+/// JSON parse time.  `delta_ms = null` or omitted advances by one
+/// `clock_resolution`.  Non-zero values round up to the next
+/// `clock_resolution` boundary, so a sub-resolution delta still moves
+/// the clock by one full tick.
+///
+/// The returned `now_ms` is the value the worker will emit on its next
+/// pipeline step; queries against materialized views may observe the
+/// previous `NOW()` until that step completes.  Callers that need
+/// read-after-write semantics should poll the view.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    params(
+        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+    ),
+    request_body(
+        content = ClockAdvanceRequest,
+        content_type = "application/json",
+        description = "Milliseconds to add to NOW(); zero reads the current value, null/omitted: advance by one clock_resolution."),
+    responses(
+        (status = OK
+            , description = "Clock advanced successfully; body contains the new NOW()."
+            , content_type = "application/json"
+            , body = ClockAdvanceResponse),
+        (status = BAD_REQUEST
+            , description = "Clock not in http-driven mode, or malformed body."
+            , body = ErrorResponse),
+        (status = SERVICE_UNAVAILABLE
+            , description = "Pipeline is not running."
+            , body = ErrorResponse),
+    ),
+    tag = "Metrics & Debugging"
+)]
+#[post("/pipelines/{pipeline_name}/clock/advance")]
+pub(crate) async fn clock_advance(
+    state: WebData<ServerState>,
+    client: WebData<awc::Client>,
+    tenant_id: ReqData<TenantId>,
+    path: web::Path<String>,
+    request: HttpRequest,
+    body: web::Payload,
+) -> Result<HttpResponse, ManagerError> {
+    let pipeline_name = path.into_inner();
+
+    state
+        .runner
+        .forward_streaming_http_request_to_pipeline_by_name(
+            client.as_ref(),
+            *tenant_id,
+            &pipeline_name,
+            "clock/advance",
+            request,
+            body,
+            None,
+        )
+        .await
 }

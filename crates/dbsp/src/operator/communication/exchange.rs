@@ -8,13 +8,13 @@
 use crate::{
     NumEntries, WeakRuntime,
     circuit::{
-        Host, LocalStoreMarker, OwnershipPreference, Runtime, Scope,
+        GlobalNodeId, Host, LocalStoreMarker, OwnershipPreference, Runtime, Scope,
         metadata::{
             BatchSizeStats, EXCHANGE_DESERIALIZATION_TIME_SECONDS, EXCHANGE_DESERIALIZED_BYTES,
             EXCHANGE_WAIT_TIME_SECONDS, INPUT_BATCHES_STATS, MetaItem, OUTPUT_BATCHES_STATS,
             OperatorLocation, OperatorMeta,
         },
-        operator_traits::{Operator, SinkOperator, SourceOperator},
+        operator_traits::{Operator, OperatorName, SinkOperator, SourceOperator},
         runtime::{WorkerLocation, WorkerLocations},
         tokio::TOKIO,
     },
@@ -135,25 +135,22 @@ struct ByteBoundedSender {
 }
 
 impl ByteBoundedSender {
-    /// Sends a message and blocks until there is room in the channel.  Returns
-    /// an error if there is no receiver left.
+    /// Sends a message and returns:
     ///
-    /// This simple implementation isn't going to work well if there are lots of
-    /// senders running in parallel, since it doesn't prevent starvation.
-    pub async fn send(&self, message: ExchangeMessage) -> Result<(), SendError<ExchangeMessage>> {
+    /// - `Ok(None)` if the message fit within the channel's bound.
+    ///
+    /// - `Ok(Some(bound))` if the message overfills the channel's bound.  The
+    ///   caller should call `bound.wait()` to wait for the channel to drain
+    ///   before sending another message.
+    ///
+    /// - `Err(error)` if there is no receiver left.
+    pub fn send(
+        &self,
+        message: ExchangeMessage,
+    ) -> Result<Option<Arc<ByteBound>>, SendError<ExchangeMessage>> {
         let len = message.data.len().try_into().unwrap();
         self.tx.send(message)?;
-        let remaining = self.bound.remaining.fetch_sub(len, Ordering::AcqRel) - len;
-        if remaining < 0 {
-            loop {
-                let notified = self.bound.notify.notified();
-                if self.bound.remaining.load(Ordering::Acquire) >= 0 {
-                    break;
-                }
-                notified.await;
-            }
-        }
-        Ok(())
+        Ok(self.bound.reserve(len))
     }
 }
 
@@ -178,9 +175,28 @@ impl ByteBoundedReceiver {
     }
 }
 
-struct ByteBound {
+pub struct ByteBound {
     remaining: AtomicIsize,
     notify: Notify,
+}
+
+impl ByteBound {
+    /// Subtracts `len` from the channel's remaining capacity.  If the channel
+    /// is overfilled, returns a clone of this `ByteBound` to allow the caller
+    /// to wait for it to drain.
+    fn reserve(self: &Arc<Self>, len: isize) -> Option<Arc<Self>> {
+        let remaining = self.remaining.fetch_sub(len, Ordering::AcqRel) - len;
+        (remaining < 0).then(|| self.clone())
+    }
+
+    /// Waits until this channel's capacity is no longer overfilled.
+    pub async fn wait(&self) {
+        while let notified = self.notify.notified()
+            && self.remaining.load(Ordering::Acquire) < 0
+        {
+            notified.await;
+        }
+    }
 }
 
 /// Returns a pair of multi-producer, single-consumer channel sender and
@@ -202,6 +218,7 @@ fn byte_bounded_channel(limit: usize) -> (ByteBoundedSender, ByteBoundedReceiver
 }
 
 struct ExchangeMessage {
+    global_node_id: Arc<String>,
     exchange_id: ExchangeId,
     sender: usize,
     data: Vec<FBuf>,
@@ -277,9 +294,9 @@ impl ExchangeClient {
                 .with_category("Exchange")
                 .with_tooltip(|| {
                     format!(
-                        "send {} for exchange {}",
+                        "{} send {}",
+                        &message.global_node_id,
                         HumanBytes::from(size),
-                        message.exchange_id
                     )
                 });
             while !bufs.is_empty() {
@@ -292,21 +309,30 @@ impl ExchangeClient {
         }
     }
 
-    pub async fn send(&self, exchange_id: ExchangeId, sender: usize, data: Vec<FBuf>) {
+    pub fn send(
+        &self,
+        global_node_id: Arc<String>,
+        exchange_id: ExchangeId,
+        sender: usize,
+        data: Vec<FBuf>,
+    ) -> Option<Arc<ByteBound>> {
         self.tx
             .send(ExchangeMessage {
+                global_node_id,
                 exchange_id,
                 sender,
                 data,
             })
-            .await
-            .expect("remote exchange failed");
+            .expect("remote exchange failed")
     }
 }
 
+/// Uniquely identifies an `Exchange` or `ShardedAccumulator` within a circuit.
 pub type ExchangeId = u32;
 
 pub trait ExchangeDelivery {
+    fn name(&self) -> Arc<String>;
+
     fn received<'a>(
         &'a self,
         sender: usize,
@@ -405,21 +431,22 @@ impl ExchangeServer {
 
                 bytes += padded_len;
             }
-            Span::new("receive")
-                .with_start(start)
-                .with_category("Exchange")
-                .with_tooltip(|| {
-                    format!(
-                        "exchange {exchange_id} receive {} from worker {sender}",
-                        HumanBytes::from(bytes),
-                    )
-                })
-                .record();
 
             let receiver = self
                 .directory
                 .get(exchange_id)
                 .expect("should have exchange for received data");
+            Span::new("receive")
+                .with_start(start)
+                .with_category("Exchange")
+                .with_tooltip(|| {
+                    format!(
+                        "{} receive {} from worker {sender}",
+                        receiver.name(),
+                        HumanBytes::from(bytes),
+                    )
+                })
+                .record();
             receiver.received(sender, data).await;
         }
         Ok(())
@@ -587,7 +614,11 @@ impl<T> Mailbox<T> {
 /// the previous round.  Likewise, the receive operation can proceed once all
 /// incoming values are ready for the current round.
 pub(crate) struct Exchange<T> {
+    /// Unique identifier within the circuit.
     exchange_id: ExchangeId,
+
+    /// Identifies the `ExchangeReceiver` operator for use in profile data.
+    name: OperatorName,
 
     /// The number of communicating peers.
     npeers: usize,
@@ -725,6 +756,7 @@ where
 
         let exchange = Arc::new(Self {
             exchange_id,
+            name: OperatorName::new("ExchangeReceiver"),
             npeers,
             local_workers: layout.local_workers(),
             clients,
@@ -746,8 +778,7 @@ where
         exchange
     }
 
-    #[allow(dead_code)]
-    fn exchange_id(&self) -> ExchangeId {
+    pub fn exchange_id(&self) -> ExchangeId {
         self.exchange_id
     }
 
@@ -869,12 +900,14 @@ where
 
     pub(crate) async fn send_all_with_serializer<F>(
         self: &Arc<Self>,
+        global_node_id: &Arc<String>,
         data: impl Iterator<Item = T>,
         mut serialize: F,
     ) where
         F: FnMut(T) -> FBuf + Send + Sync,
     {
         self.send_all(
+            global_node_id,
             data.zip(WorkerLocations::new())
                 .map(|(data, location)| match location {
                     WorkerLocation::Local => Mailbox::Plain(data),
@@ -906,7 +939,11 @@ where
     /// # Panics
     ///
     /// Panics if `data` yields fewer than `self.npeers` items.
-    pub(crate) async fn send_all(self: &Arc<Self>, mut data: impl Iterator<Item = Mailbox<T>>) {
+    pub(crate) async fn send_all(
+        self: &Arc<Self>,
+        global_node_id: &Arc<String>,
+        mut data: impl Iterator<Item = Mailbox<T>>,
+    ) {
         let sender = Runtime::worker_index();
 
         self.wait_for_ready_to_send(sender).await;
@@ -923,7 +960,6 @@ where
                     }
                 }
                 WorkerLocation::Remote => {
-                    let mut serialized_bytes = 0;
                     let items = receivers
                         .clone()
                         .map(|_| {
@@ -932,16 +968,18 @@ where
                                 .into_tx()
                                 .expect("remote mailboxes should always be serialized")
                         })
-                        .inspect(|serialized| {
-                            serialized_bytes += serialized.len();
-                        })
                         .collect_vec();
-                    let this = self.clone();
-                    this.clients
-                        .connect(receivers.start)
-                        .await
-                        .send(this.exchange_id, sender, items)
-                        .await;
+
+                    // We discard the return value that could allow us to wait
+                    // for the channel tx buffer to drain, because exchange is
+                    // synchronous, meaning that it will drain before we send
+                    // the next message.
+                    let _ = self.clients.connect(receivers.start).await.send(
+                        global_node_id.clone(),
+                        self.exchange_id,
+                        sender,
+                        items,
+                    );
                 }
             }
         }
@@ -988,6 +1026,10 @@ impl<T> ExchangeDelivery for Exchange<T>
 where
     T: Clone + Debug + Send + 'static,
 {
+    fn name(&self) -> Arc<String> {
+        self.name.get()
+    }
+
     fn received<'a>(
         &'a self,
         sender: usize,
@@ -1191,6 +1233,7 @@ pub struct ExchangeSender<D, T, L>
 where
     T: Send + 'static + Clone,
 {
+    global_node_id: Arc<String>,
     location: OperatorLocation,
     partition: L,
     outputs: Vec<Mailbox<T>>,
@@ -1220,6 +1263,7 @@ where
         partition: L,
     ) -> Self {
         Self {
+            global_node_id: Arc::new(format!("ExchangeSender {}", exchange.exchange_id)),
             location,
             partition,
             outputs: Vec::with_capacity(Runtime::num_workers()),
@@ -1240,6 +1284,10 @@ where
 {
     fn name(&self) -> Cow<'static, str> {
         Cow::from("ExchangeSender")
+    }
+
+    fn init(&mut self, global_id: &GlobalNodeId) {
+        self.global_node_id = Arc::new(format!("ExchangeSender {}", global_id.node_identifier()));
     }
 
     fn metadata(&self, meta: &mut OperatorMeta) {
@@ -1292,7 +1340,7 @@ where
             Mailbox::Plain(item) => Mailbox::Plain((item, self.flushed)),
         });
 
-        self.exchange.send_all(data).await;
+        self.exchange.send_all(&self.global_node_id, data).await;
 
         self.flushed = false;
     }
@@ -1380,6 +1428,10 @@ where
 {
     fn name(&self) -> Cow<'static, str> {
         Cow::from("ExchangeReceiver")
+    }
+
+    fn init(&mut self, global_id: &GlobalNodeId) {
+        self.exchange.name.init(global_id);
     }
 
     fn location(&self) -> OperatorLocation {
@@ -1609,6 +1661,7 @@ mod tests {
     use std::{
         iter::{repeat, zip},
         net::TcpListener,
+        sync::Arc,
     };
 
     /// Number of rounds for exchange.
@@ -1625,9 +1678,10 @@ mod tests {
         TOKIO.block_on(async {
             let sender = Runtime::worker_index();
             let n_workers = Runtime::num_workers();
+            let global_node_id = Arc::new(String::from("test_global_node_id"));
             for round in 0..ROUNDS {
                 exchange
-                    .send_all_with_serializer(repeat((sender, round)), |data| {
+                    .send_all_with_serializer(&global_node_id, repeat((sender, round)), |data| {
                         to_bytes(&data).unwrap()
                     })
                     .await;

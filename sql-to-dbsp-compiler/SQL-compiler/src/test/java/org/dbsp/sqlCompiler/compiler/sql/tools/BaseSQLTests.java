@@ -29,10 +29,11 @@ import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.backend.rust.RustFileWriter;
 import org.dbsp.sqlCompiler.compiler.backend.rust.RustWriter;
 import org.dbsp.sqlCompiler.compiler.backend.rust.StubsWriter;
+import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCrates;
 import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCratesWriter;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.SqlToRelCompiler;
 import org.dbsp.sqlCompiler.compiler.sql.MultiCrateTests;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.LateMaterializations;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitPostfix;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.LowerCircuitVisitor;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.monotonicity.MonotoneAnalyzer;
 import org.dbsp.sqlCompiler.ir.DBSPFunction;
@@ -97,6 +98,13 @@ public class BaseSQLTests {
 
     public CompilerCircuitStream getCCS(DBSPCompiler compiler) {
         return new CompilerCircuitStream(compiler, this);
+    }
+
+    public DBSPCompiler chattyCompiler() {
+        DBSPCompiler compiler = this.testCompiler();
+        compiler.options.languageOptions.throwOnError = false;
+        compiler.options.ioOptions.quiet = false;
+        return compiler;
     }
 
     public CompilerCircuit getCC(String sql) {
@@ -257,34 +265,6 @@ public class BaseSQLTests {
         return file;
     }
 
-    /** Enumerate the SQL files in the QA repository.
-     * The assumption is that this repository has been checked out in parallel with feldera. */
-    public static List<File> getQATests() {
-        List<File> result = new ArrayList<>();
-        String dir = "../../../feldera-qa";
-        File file = new File(dir);
-        if (file.exists()) {
-            File[] directories = file.listFiles();
-            if (directories == null)
-                return result;
-            Arrays.sort(directories);
-            for (File d: directories) {
-                File[] files = d.listFiles();
-                if (files == null)
-                    continue;
-                for (File c: files) {
-                    // The following eliminate some fda scripts
-                    if (c.getName().contains("adhoc")) continue;
-                    if (c.getName().matches("query.*view.sql")) continue;
-                    if (c.getName().endsWith(".sql")) {
-                        result.add(c);
-                    }
-                }
-            }
-        }
-        return result;
-    }
-
     public static File createInputScript(String contents) throws IOException {
         File result = File.createTempFile("script", ".sql", new File(RUST_DIRECTORY));
         return createInputFile(result, contents);
@@ -318,24 +298,33 @@ public class BaseSQLTests {
         HashMap<Long, DBSPFunction> inputFunctions = new HashMap<>();
         PrintStream outputStream = null;
         RustWriter writer;
-        String directory;
+        final String directory;
+        final String executionDirectory;
         Path stubsDir;
         String testCrate = "";
 
         if (!multiCrates) {
             outputStream = new PrintStream(Files.newOutputStream(getTestFilePath()));
             // We do not need to run the LateMaterializations
-            writer = new RustFileWriter(new LateMaterializations(compiler)).withTest(true);
+            writer = new RustFileWriter(new CircuitPostfix(compiler));
             writer.setOutputBuilder(new IndentStream(outputStream));
             directory = RUST_DIRECTORY;
+            executionDirectory = ".";
             stubsDir = Paths.get(directory);
             createEmptyStubs();
         } else {
             directory = RUST_MULTI_DIRECTORY;
+            executionDirectory = "../..";
             MultiCratesWriter multiWriter = new MultiCratesWriter(directory, "x", true);
             testCrate = MultiCratesWriter.getTestName();
             writer = multiWriter;
             stubsDir = multiWriter.stubsDirectory();
+
+            // Make sure there is no stray udf.rs file from a previous test
+            Path path = Paths.get(BaseSQLTests.RUST_MULTI_DIRECTORY + "/crates",
+                    MultiCrates.FILE_PREFIX + "x_globals", "src", DBSPCompiler.UDF_FILE_NAME);
+            File udfFile = path.toFile();
+            Utilities.deleteFile(udfFile, true);
         }
         StubsWriter stubsWriter = new StubsWriter(stubsDir.resolve(DBSPCompiler.STUBS_FILE_NAME));
 
@@ -347,7 +336,7 @@ public class BaseSQLTests {
                         " are not compiled with the same options: "
                         + test.ccs.compiler.options.diff(compiler.options));
             test.ccs.circuit.setName("circuit" + testNumber);
-            List<DBSPFunction> testers = test.createTesterCode(testNumber, RUST_DIRECTORY, inputFunctions);
+            List<DBSPFunction> testers = test.createTesterCode(testNumber, directory, executionDirectory, inputFunctions);
             writer.add(test.ccs.circuit);
             if (multiCrates) {
                 stubsWriter.add(test.ccs.circuit);
@@ -362,7 +351,7 @@ public class BaseSQLTests {
             testNumber++;
         }
         writer.write(compiler);
-        if (outputStream !=null)
+        if (outputStream != null)
             outputStream.close();
         stubsWriter.write(compiler);
         if (!skipRust) {
@@ -408,11 +397,15 @@ public class BaseSQLTests {
         testsToRun.add(test);
     }
 
-    public CompilerOptions testOptions() {
-        CompilerOptions options = new CompilerOptions();
+    void ciOptions(CompilerOptions options) {
         if (Utilities.inCI())
             // Set to compile to multiple crates
             options.ioOptions.crates = "x";
+    }
+
+    public CompilerOptions testOptions() {
+        CompilerOptions options = new CompilerOptions();
+        this.ciOptions(options);
         options.ioOptions.testing = true;
         options.languageOptions.throwOnError = true;
         options.languageOptions.generateInputForEveryTable = true;

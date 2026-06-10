@@ -3,7 +3,7 @@ use crate::db::types::monitor::{
     ExtendedPipelineMonitorEvent, PipelineMonitorEvent, PipelineMonitorEventId,
 };
 use crate::db::types::pipeline::{
-    parse_string_as_bootstrap_policy, parse_string_as_runtime_desired_status,
+    parse_string_as_bootstrap_config, parse_string_as_runtime_desired_status,
     parse_string_as_runtime_status, ExtendedPipelineDescr, ExtendedPipelineDescrEventInfo,
     ExtendedPipelineDescrMonitoring, PipelineId,
 };
@@ -17,7 +17,7 @@ use crate::db::types::utils::{
 use crate::db::types::version::Version;
 use chrono::{DateTime, Utc};
 use feldera_types::error::ErrorResponse;
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus, RuntimeStatus};
 use tokio_postgres::Row;
 use tracing::error;
 use uuid::Uuid;
@@ -37,7 +37,7 @@ pub const PIPELINE_COLUMNS_ALL: &str =
      ";
 
 pub const PIPELINE_COLUMNS_MONITORING: &str =
-    "p.id, p.name, p.description, p.created_at, p.version, p.platform_version,
+    "p.id, p.name, p.description, p.created_at, p.version, p.platform_version, p.runtime_config,
      p.program_config, p.program_version, p.program_status, p.program_status_since,
      p.deployment_error, p.deployment_location, p.refresh_version,
      p.storage_status, p.storage_status_details, p.deployment_id, p.deployment_initial,
@@ -91,7 +91,7 @@ pub fn parse_pipeline_row_all(row: &Row) -> Result<ExtendedPipelineDescr, DBErro
         storage_status_details: parse_from_row_storage_status_details(row)?,
         deployment_id: parse_from_row_deployment_id(row),
         deployment_initial: parse_from_row_deployment_initial(row)?,
-        bootstrap_policy: parse_from_row_bootstrap_policy(row)?,
+        bootstrap_policy: parse_from_row_bootstrap_config(row)?,
         deployment_resources_status: parse_from_row_deployment_resources_status(row)?,
         deployment_resources_status_since: parse_from_row_deployment_resources_status_since(row),
         deployment_resources_status_details: parse_from_row_deployment_resources_status_details(row)?,
@@ -118,6 +118,7 @@ pub fn parse_pipeline_row_monitoring(row: &Row) -> Result<ExtendedPipelineDescrM
         created_at: parse_from_row_created_at(row),
         version: parse_from_row_version(row),
         platform_version: parse_from_row_platform_version(row),
+        runtime_config: parse_from_row_runtime_config(row)?,
         program_config: parse_from_row_program_config(row)?,
         program_version: parse_from_row_program_version(row),
         program_status: parse_from_row_program_status(row)?,
@@ -129,7 +130,7 @@ pub fn parse_pipeline_row_monitoring(row: &Row) -> Result<ExtendedPipelineDescrM
         storage_status_details: parse_from_row_storage_status_details(row)?,
         deployment_id: parse_from_row_deployment_id(row),
         deployment_initial: parse_from_row_deployment_initial(row)?,
-        bootstrap_policy: parse_from_row_bootstrap_policy(row)?,
+        bootstrap_policy: parse_from_row_bootstrap_config(row)?,
         deployment_resources_status: parse_from_row_deployment_resources_status(row)?,
         deployment_resources_status_since: parse_from_row_deployment_resources_status_since(row),
         deployment_resources_desired_status: parse_from_row_deployment_resources_desired_status(row)?,
@@ -454,10 +455,10 @@ fn parse_from_row_ram_mb(row: &Row) -> Option<i32> {
     row.get("ram_mb")
 }
 
-fn parse_from_row_bootstrap_policy(row: &Row) -> Result<Option<BootstrapPolicy>, DBError> {
+fn parse_from_row_bootstrap_config(row: &Row) -> Result<Option<BootstrapConfig>, DBError> {
     Ok(match row.get::<_, Option<String>>("bootstrap_policy") {
         None => None,
-        Some(s) => Some(parse_string_as_bootstrap_policy(s)?),
+        Some(s) => Some(parse_string_as_bootstrap_config(s)?),
     })
 }
 
@@ -671,6 +672,7 @@ mod tests {
             created_at: Default::default(),
             version: Version(1),
             platform_version: "".to_string(),
+            runtime_config: Default::default(),
             program_config: Default::default(),
             program_version: Version(2),
             program_status: ProgramStatus::Pending,

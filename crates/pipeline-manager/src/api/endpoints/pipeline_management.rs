@@ -26,8 +26,9 @@ use chrono::{DateTime, Utc};
 use feldera_types::adapter_stats::PipelineStatsErrorsResponse;
 use feldera_types::config::{InputEndpointConfig, OutputEndpointConfig, RuntimeConfig};
 use feldera_types::error::ErrorResponse;
-use feldera_types::program_schema::ProgramSchema;
-use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus};
+use feldera_types::runtime_status::{
+    BootstrapConfig, BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus,
+};
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -44,7 +45,7 @@ pub mod pipeline_events;
 #[derive(Deserialize, Serialize, ToSchema, Eq, PartialEq, Debug, Clone)]
 pub struct PartialProgramInfo {
     /// Schema of the compiled SQL.
-    pub schema: ProgramSchema,
+    pub schema: serde_json::Value,
 
     /// Generated user defined function (UDF) stubs Rust code: stubs.rs
     pub udf_stubs: String,
@@ -340,7 +341,8 @@ pub struct PipelineSelectedInfoInternal {
     pub deployment_runtime_status_since: Option<DateTime<Utc>>,
     pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
     pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
-    pub bootstrap_policy: Option<BootstrapPolicy>,
+    #[serde(flatten, default)]
+    pub bootstrap_config: BootstrapConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connectors: Option<ConnectorStats>,
 }
@@ -404,7 +406,7 @@ impl PipelineSelectedInfoInternal {
             deployment_runtime_desired_status: extended_pipeline.deployment_runtime_desired_status,
             deployment_runtime_desired_status_since: extended_pipeline
                 .deployment_runtime_desired_status_since,
-            bootstrap_policy: extended_pipeline.bootstrap_policy,
+            bootstrap_config: extended_pipeline.bootstrap_policy.unwrap_or_default(),
             connectors: None,
         }
     }
@@ -463,7 +465,7 @@ impl PipelineSelectedInfoInternal {
             deployment_runtime_desired_status: extended_pipeline.deployment_runtime_desired_status,
             deployment_runtime_desired_status_since: extended_pipeline
                 .deployment_runtime_desired_status_since,
-            bootstrap_policy: extended_pipeline.bootstrap_policy,
+            bootstrap_config: extended_pipeline.bootstrap_policy.unwrap_or_default(),
             connectors: None,
         }
     }
@@ -520,6 +522,7 @@ pub enum PipelineFieldSelector {
     /// - `deployment_runtime_desired_status`
     /// - `deployment_runtime_desired_status_since`
     /// - `bootstrap_policy`
+    /// - `silent_bootstrap`
     All,
     /// Select only the fields required to know the status of a pipeline.
     ///
@@ -554,6 +557,7 @@ pub enum PipelineFieldSelector {
     /// - `deployment_runtime_desired_status`
     /// - `deployment_runtime_desired_status_since`
     /// - `bootstrap_policy`
+    /// - `silent_bootstrap`
     Status,
     /// Select the fields included in `Status` plus aggregated connector error statistics.
     ///
@@ -678,8 +682,12 @@ pub struct PostStartPipelineParameters {
     /// become `standby`, `paused` or `running` (only valid values).
     #[serde(default = "default_pipeline_start_desired")]
     initial: String,
+    /// Bootstrap policy.
     #[serde(default)]
     bootstrap_policy: BootstrapPolicy,
+    /// Bootstrap the pipeline with output connectors disabled.
+    #[serde(default)]
+    silent_bootstrap: bool,
     #[serde(default = "default_pipeline_start_dismiss_error")]
     dismiss_error: bool,
 }
@@ -1354,8 +1362,14 @@ pub(crate) async fn post_pipeline_start(
     let PostStartPipelineParameters {
         initial,
         bootstrap_policy,
+        silent_bootstrap,
         dismiss_error,
     } = query.into_inner();
+
+    let bootstrap_config = BootstrapConfig {
+        bootstrap_policy: Some(bootstrap_policy),
+        silent_bootstrap,
+    };
 
     let pipeline_id = match initial.as_str() {
         "standby" => {
@@ -1367,7 +1381,7 @@ pub(crate) async fn post_pipeline_start(
                     *tenant_id,
                     &pipeline_name,
                     RuntimeDesiredStatus::Standby,
-                    bootstrap_policy,
+                    bootstrap_config,
                     dismiss_error,
                 )
                 .await?
@@ -1381,7 +1395,7 @@ pub(crate) async fn post_pipeline_start(
                     *tenant_id,
                     &pipeline_name,
                     RuntimeDesiredStatus::Paused,
-                    bootstrap_policy,
+                    bootstrap_config,
                     dismiss_error,
                 )
                 .await?
@@ -1395,7 +1409,7 @@ pub(crate) async fn post_pipeline_start(
                     *tenant_id,
                     &pipeline_name,
                     RuntimeDesiredStatus::Running,
-                    bootstrap_policy,
+                    bootstrap_config,
                     dismiss_error,
                 )
                 .await?

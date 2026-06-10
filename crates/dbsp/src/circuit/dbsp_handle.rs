@@ -502,6 +502,11 @@ impl CircuitConfig {
         self
     }
 
+    pub fn with_streaming_exchange(mut self, enabled: bool) -> Self {
+        self.dev_tweaks.streaming_exchange = Some(enabled);
+        self
+    }
+
     pub fn with_splitter_chunk_size_records(mut self, records: u64) -> Self {
         self.dev_tweaks.splitter_chunk_size_records = Some(records);
         self
@@ -855,6 +860,12 @@ impl Runtime {
                             return;
                         }
                     }
+                    Ok(Command::StartCompaction) => {
+                        circuit.start_compaction();
+                        if status_sender.send(Ok(Response::Unit)).is_err() {
+                            return;
+                        }
+                    }
                     // Nothing to do: do some housekeeping and relinquish the CPU if there's none
                     // left.
                     Err(TryRecvError::Empty) => {
@@ -947,6 +958,7 @@ enum Command {
     GetCurrentBalancerPolicy(String),
     Rebalance,
     SetAutoRebalance(bool),
+    StartCompaction,
 }
 
 impl Debug for Command {
@@ -988,6 +1000,7 @@ impl Debug for Command {
             Command::SetAutoRebalance(enable) => {
                 f.debug_tuple("SetAutoRebalance").field(enable).finish()
             }
+            Command::StartCompaction => write!(f, "StartCompaction"),
         }
     }
 }
@@ -1389,20 +1402,6 @@ impl DBSPHandle {
         Ok(progress)
     }
 
-    pub fn set_replay_step_size(&mut self, step_size: usize) {
-        if let Some(handle) = self.runtime.as_ref() {
-            handle.runtime().set_replay_step_size(step_size);
-        }
-    }
-
-    pub fn get_replay_step_size(&self) -> usize {
-        if let Some(handle) = self.runtime.as_ref() {
-            handle.runtime().get_replay_step_size()
-        } else {
-            0
-        }
-    }
-
     /// The circuit has been resumed from a checkpoint and is currently bootstrapping the modified part of the circuit.
     pub fn bootstrap_in_progress(&self) -> bool {
         self.bootstrap_info.is_some()
@@ -1719,6 +1718,11 @@ impl DBSPHandle {
         self.broadcast_command(Command::Rebalance, |_, _| {})?;
         Ok(())
     }
+
+    pub fn start_compaction(&mut self) -> Result<(), DbspError> {
+        self.broadcast_command(Command::StartCompaction, |_, _| {})?;
+        Ok(())
+    }
 }
 
 impl Drop for DBSPHandle {
@@ -1781,6 +1785,12 @@ impl<'a> CheckpointBuilder<'a> {
     /// commit it later.
     pub fn prepare(self) -> Result<CheckpointCommitter, DbspError> {
         let checkpointer = self.handle.checkpointer()?.clone();
+
+        // Write an empty catalog before the UUID directory is created by
+        // operators.  This prevents read_checkpoints from seeing orphaned UUID
+        // directories during the first checkpoint commit on fresh storage.
+        checkpointer.lock().unwrap().ensure_catalog_exists()?;
+
         let uuid = Uuid::now_v7();
         let checkpoint_dir = Checkpointer::checkpoint_dir(uuid);
         let mut readers = Vec::new();
@@ -1960,7 +1970,7 @@ pub(crate) mod tests {
             if Runtime::worker_index() == 0 {
                 let runtime = Runtime::runtime().unwrap();
                 let panic_tx = panic_tx.clone();
-                runtime.tokio_merger_runtime().spawn(async move {
+                runtime.tokio_merger_runtime().unwrap().spawn(async move {
                     TOKIO_WORKER_INDEX
                         .scope(0, async move {
                             let _ = std::panic::catch_unwind(|| {
@@ -1997,6 +2007,75 @@ pub(crate) mod tests {
         } else {
             panic!();
         }
+    }
+
+    /// Regression test for the deadlock in `RuntimeHandle::join` (commit 1 of
+    /// PR #6331) where the `MutexGuard` from `tokio_merger_runtime.lock()` was
+    /// held across the `drop` of the runtime, and for the panic on
+    /// `.expect("tokio merger runtime has been shut down")` (commit 2 of the
+    /// same PR) that the early-return in `MergeJob::run` replaced.
+    ///
+    /// Spawns a tokio merger task that hammers `Runtime::tokio_merger_runtime`
+    /// in a tight loop, then drops the `DBSPHandle` on a side thread and
+    /// asserts that:
+    /// - the drop completes within a timeout (regressing commit 1 would deadlock
+    ///   the blocking pool against the held mutex), and
+    /// - the task exits cleanly via the `None` arm (regressing commit 2 would
+    ///   panic on `.expect()` and the clean-exit signal would never arrive).
+    #[test]
+    fn test_drop_does_not_deadlock_with_active_merger_lookup() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (task_done_tx, task_done_rx) = std::sync::mpsc::channel();
+        let (handle, _) = Runtime::init_circuit(1, move |circuit| {
+            let (_stream, _input_handle) = circuit.add_input_map::<u64, u64, i64, _>(|v, u| {
+                *v = ((*v as i64) + *u) as u64;
+            });
+            if Runtime::worker_index() == 0 {
+                let runtime = Runtime::runtime().unwrap();
+                let ready_tx = ready_tx.clone();
+                let task_done_tx = task_done_tx.clone();
+                runtime.tokio_merger_runtime().unwrap().spawn(async move {
+                    TOKIO_WORKER_INDEX
+                        .scope(0, async move {
+                            let _ = ready_tx.send(());
+                            // Hammer the accessor. Each batch of sync calls
+                            // maximizes the chance of landing inside `lock()`
+                            // when `RuntimeHandle::join` would (with the bug)
+                            // hold the mutex across the runtime drop. Exits
+                            // when the accessor returns `None` after `take()`.
+                            'outer: loop {
+                                for _ in 0..1000 {
+                                    if runtime.tokio_merger_runtime().is_none() {
+                                        break 'outer;
+                                    }
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                            let _ = task_done_tx.send(());
+                        })
+                        .await;
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("merger task did not start");
+
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(handle);
+            let _ = drop_done_tx.send(());
+        });
+
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("DBSPHandle::drop deadlocked");
+        task_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("merger task did not exit cleanly via the None arm");
     }
 
     // Kill the runtime.

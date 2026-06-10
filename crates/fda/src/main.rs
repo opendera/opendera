@@ -8,6 +8,7 @@ use feldera_rest_api::types::*;
 use feldera_rest_api::*;
 use feldera_types::config::{FtModel, RuntimeConfig, StorageOptions};
 use feldera_types::error::ErrorResponse;
+use feldera_types::transport::clock::ClockAdvanceRequest;
 use futures_util::StreamExt;
 use json_to_table::json_to_table;
 use log::{debug, error, info, trace, warn};
@@ -742,6 +743,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             no_wait,
             initial,
             bootstrap_policy,
+            silent_bootstrap,
             no_dismiss_error,
         } => {
             if initial != "standby" && initial != "paused" && initial != "running" {
@@ -862,6 +864,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .pipeline_name(name.clone())
                 .initial(&initial)
                 .bootstrap_policy(&bootstrap_policy)
+                .silent_bootstrap(silent_bootstrap)
                 .dismiss_error(false) // It has already been separately dismissed
                 .send()
                 .await
@@ -957,10 +960,14 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 );
             }
         }
-        PipelineAction::Approve { name } => {
+        PipelineAction::Approve {
+            name,
+            silent_bootstrap,
+        } => {
             let response = client
                 .post_pipeline_approve()
                 .pipeline_name(name.clone())
+                .silent_bootstrap(silent_bootstrap)
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
@@ -1029,6 +1036,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             no_wait,
             initial,
             bootstrap_policy,
+            silent_bootstrap,
             no_dismiss_error,
         } => {
             let current_status = client
@@ -1076,6 +1084,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     no_wait,
                     initial,
                     bootstrap_policy,
+                    silent_bootstrap,
                     no_dismiss_error,
                 },
                 client,
@@ -1574,6 +1583,8 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
         PipelineAction::SupportBundle {
             name,
             output,
+            limit,
+            no_collect,
             no_circuit_profile,
             no_heap_profile,
             no_metrics,
@@ -1582,10 +1593,17 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             no_pipeline_config,
             no_system_config,
             no_dataflow_graph,
+            no_pipeline_events,
         } => {
             let mut request = client.get_pipeline_support_bundle().pipeline_name(&name);
 
             // Add query parameters for disabled collections
+            if let Some(limit) = limit {
+                request = request.limit(limit);
+            }
+            if no_collect {
+                request = request.collect(false);
+            }
             if no_circuit_profile {
                 request = request.circuit_profile(false);
             }
@@ -1609,6 +1627,9 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             }
             if no_dataflow_graph {
                 request = request.dataflow_graph(false);
+            }
+            if no_pipeline_events {
+                request = request.pipeline_events(false);
             }
 
             let response = request
@@ -1663,6 +1684,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             start,
             initial,
             bootstrap_policy,
+            silent_bootstrap,
             no_dismiss_error,
         } => {
             let client2 = client.clone();
@@ -1675,6 +1697,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         no_wait: false,
                         initial,
                         bootstrap_policy,
+                        silent_bootstrap,
                         no_dismiss_error,
                     },
                     client,
@@ -1909,6 +1932,55 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 ))
                 .unwrap();
             println!("Initiated rebalancing for pipeline {name}.");
+        }
+        PipelineAction::ClockAdvance { name, delta_ms } => {
+            let response = client
+                .clock_advance()
+                .pipeline_name(name.clone())
+                .body(ClockAdvanceRequest { delta_ms })
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to advance clock",
+                    1,
+                ))
+                .unwrap();
+            let body = response.into_inner();
+            match format {
+                OutputFormat::Text => {
+                    println!("NOW() = {} ({} ms)", body.now, body.now_ms);
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&body)
+                            .expect("failed to serialize clock advance response")
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "Unsupported output format, falling back to text: {}",
+                        format
+                    );
+                    println!("NOW() = {} ({} ms)", body.now, body.now_ms);
+                    std::process::exit(1);
+                }
+            }
+        }
+        PipelineAction::StartCompaction { name } => {
+            client
+                .post_pipeline_start_compaction()
+                .pipeline_name(name.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to initiate compaction",
+                    1,
+                ))
+                .unwrap();
+            println!("Initiated compaction for pipeline {name}.");
         }
         PipelineAction::Bench { args } => bench::bench(client, format, args).await,
         PipelineAction::DismissError { name } => {
@@ -2752,7 +2824,8 @@ fn init_logging(default_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .without_time(),
+                .without_time()
+                .with_writer(std::io::stderr),
         )
         .try_init();
 }

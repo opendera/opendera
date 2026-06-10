@@ -44,6 +44,7 @@ use uuid::Uuid;
 pub const fn input_adhoc_arrow_serde_config() -> &'static SqlSerdeConfig {
     &SqlSerdeConfig {
         timestamp_format: TimestampFormat::String("%FT%T%.f"),
+        timestamp_tz_format: TimestampFormat::String("%FT%T%.f%Z"),
         time_format: TimeFormat::String("%T"),
         date_format: DateFormat::String("%Y-%m-%d"),
         decimal_format: DecimalFormat::String,
@@ -57,6 +58,7 @@ pub const fn input_adhoc_arrow_serde_config() -> &'static SqlSerdeConfig {
 pub const fn output_adhoc_arrow_serde_config() -> &'static SqlSerdeConfig {
     &SqlSerdeConfig {
         timestamp_format: TimestampFormat::MicrosSinceEpoch,
+        timestamp_tz_format: TimestampFormat::MicrosSinceEpoch,
         time_format: TimeFormat::NanosSigned,
         date_format: DateFormat::String("%Y-%m-%d"),
         decimal_format: DecimalFormat::String,
@@ -324,7 +326,7 @@ struct AdHocQueryExecution {
     projected_schema: Arc<Schema>,
     readers: Vec<Arc<dyn SerBatchReader>>,
     projection: Option<Vec<usize>>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     children: Vec<Arc<dyn ExecutionPlan>>,
 }
 
@@ -344,12 +346,12 @@ impl AdHocQueryExecution {
         let num_partitions = readers.as_ref().map(|r| r.len()).unwrap_or(1);
         let eq_props = EquivalenceProperties::new(projected_schema.clone());
         let partitioning = Partitioning::UnknownPartitioning(num_partitions);
-        let plan_properties = PlanProperties::new(
+        let plan_properties = Arc::new(PlanProperties::new(
             eq_props,
             partitioning,
             EmissionType::Both,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             name,
@@ -393,7 +395,7 @@ impl ExecutionPlan for AdHocQueryExecution {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

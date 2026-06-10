@@ -1,7 +1,7 @@
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
-import org.checkerframework.checker.nullness.qual.Nullable;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPFlatMapIndexOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainValuesOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPMapIndexOperator;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
@@ -15,9 +15,11 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
 import org.dbsp.sqlCompiler.ir.type.DBSPTypeCode;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
+import org.dbsp.util.NullPrintStream;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.PrintStream;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Random;
@@ -470,6 +472,8 @@ public class IncrementalRegression2Tests extends SqlIoTest {
 
     @Test
     public void issue5935() {
+        PrintStream savedErr = System.err;
+        System.setErr(NullPrintStream.INSTANCE);
         var ccs = this.getCCS("""
                 CREATE TABLE orders (
                     order_id              INT NOT NULL PRIMARY KEY,
@@ -497,6 +501,7 @@ public class IncrementalRegression2Tests extends SqlIoTest {
                 LEFT JOIN customers AS sc
                     ON o.shipping_customer_id = sc.customer_id
                 ORDER BY o.order_id;""");
+        System.setErr(savedErr);
         // Validated on Postgres
         ccs.stepWeightOne("""
                 INSERT INTO CUSTOMERS VALUES
@@ -720,5 +725,81 @@ public class IncrementalRegression2Tests extends SqlIoTest {
                  id | bid | sum | weight
                 -------------------------
                  0  | 0   | 0 | -1""");
+    }
+
+
+    @Test
+    public void issue6350a() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T (
+                   id UUID,
+                   ts TIMESTAMP NOT NULL LATENESS INTERVAL 3 DAYS,
+                   ea VARCHAR
+                );
+                
+                CREATE VIEW V AS
+                SELECT
+                  me.id,
+                  me.ts,
+                  ARRAY_TO_STRING(ARRAY_AGG(prev.ea), ' '),
+                  COUNT(prev.ea),
+                  MAX(prev.ts)
+                FROM T AS me
+                JOIN T AS prev
+                  ON prev.id = me.id
+                 AND prev.ts BETWEEN me.ts - INTERVAL '3' HOURS AND me.ts
+                GROUP BY me.id, me.ts;""");
+        // There should be two retain_values operators
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            int retains = 0;
+
+            @Override
+            public void postorder(DBSPIntegrateTraceRetainValuesOperator node) {
+                this.retains++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(2, this.retains);
+            }
+        });
+    }
+
+    @Test
+    public void issue6350b() {
+        // swap two fields in the table compared with issue6350a; this used to cause a crash in the compiler
+        var ccs = this.getCCS("""
+                CREATE TABLE T (
+                   id UUID,
+                   ea VARCHAR,
+                   ts TIMESTAMP NOT NULL LATENESS INTERVAL 3 DAYS
+                );
+                
+                CREATE VIEW V AS
+                SELECT
+                  me.id,
+                  me.ts,
+                  ARRAY_TO_STRING(ARRAY_AGG(prev.ea), ' '),
+                  COUNT(prev.ea),
+                  MAX(prev.ts)
+                FROM T AS me
+                JOIN T AS prev
+                  ON prev.id = me.id
+                 AND prev.ts BETWEEN me.ts - INTERVAL '3' HOURS AND me.ts
+                GROUP BY me.id, me.ts;""");
+        // There should be two retain_values operators
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            int retains = 0;
+
+            @Override
+            public void postorder(DBSPIntegrateTraceRetainValuesOperator node) {
+                this.retains++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(2, this.retains);
+            }
+        });
     }
 }
