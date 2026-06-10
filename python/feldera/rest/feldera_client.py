@@ -1205,13 +1205,19 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         end = time.monotonic() + timeout if timeout else None
 
         def generator():
-            # Using the default chunk size below makes `iter_lines` extremely
-            # inefficient when dealing with long lines.
-            for chunk in resp.iter_lines(chunk_size=50000000):
-                if end and time.monotonic() > end:
-                    break
-                if chunk:
-                    yield json.loads(chunk, parse_float=Decimal)
+            # The finally block also runs when the consumer abandons the
+            # generator (GeneratorExit), so the HTTP connection is never
+            # leaked by callers that stop iterating early.
+            try:
+                # Using the default chunk size below makes `iter_lines` extremely
+                # inefficient when dealing with long lines.
+                for chunk in resp.iter_lines(chunk_size=50000000):
+                    if end and time.monotonic() > end:
+                        break
+                    if chunk:
+                        yield json.loads(chunk, parse_float=Decimal)
+            finally:
+                resp.close()
 
         return generator
 
@@ -1238,9 +1244,12 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         )
 
         chunk: bytes
-        for chunk in resp.iter_lines(chunk_size=50000000):
-            if chunk:
-                yield chunk.decode("utf-8")
+        try:
+            for chunk in resp.iter_lines(chunk_size=50000000):
+                if chunk:
+                    yield chunk.decode("utf-8")
+        finally:
+            resp.close()
 
     def query_as_hash(self, pipeline_name: str, query: str) -> str:
         """
@@ -1291,13 +1300,14 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         if path.suffix != ext:
             path = path.with_suffix(ext)
 
-        file = open(path, "wb")
-
         chunk: bytes
-        for chunk in resp.iter_content(chunk_size=1024):
-            if chunk:
-                file.write(chunk)
-        file.close()
+        try:
+            with open(path, "wb") as file:
+                for chunk in resp.iter_content(chunk_size=1024):
+                    if chunk:
+                        file.write(chunk)
+        finally:
+            resp.close()
 
     def query_as_arrow(
         self, pipeline_name: str, query: str
@@ -1352,9 +1362,12 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             stream=True,
         )
 
-        for chunk in resp.iter_lines(chunk_size=1024):
-            if chunk:
-                yield json.loads(chunk, parse_float=Decimal)
+        try:
+            for chunk in resp.iter_lines(chunk_size=1024):
+                if chunk:
+                    yield json.loads(chunk, parse_float=Decimal)
+        finally:
+            resp.close()
 
     def query_as_json(
         self, pipeline_name: str, query: str

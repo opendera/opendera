@@ -330,8 +330,17 @@ class Pipeline:
             raise RuntimeError("Pipeline must be running or paused to listen to output")
 
         event = Event()
+
+        def log_error(exception: Exception):
+            # Surface callback-runner failures instead of swallowing them:
+            # the runner thread dies on error, and a silent default makes
+            # that look like the stream simply went quiet.
+            logging.error(
+                "foreach_chunk handler for view %s failed: %s", view_name, exception
+            )
+
         handler = CallbackRunner(
-            self.client, self.name, view_name, callback, lambda exception: None, event
+            self.client, self.name, view_name, callback, log_error, event
         )
         handler.start()
         event.wait()
