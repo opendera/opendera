@@ -14,9 +14,9 @@ use apache_avro::{
 };
 use dbsp::operator::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
-use opendera_adapterlib::{ConnectorMetadata, catalog::AvroSchemaRefs};
-use opendera_sqllib::Variant;
-use opendera_types::{
+use feldera_adapterlib::{ConnectorMetadata, catalog::AvroSchemaRefs};
+use feldera_sqllib::Variant;
+use feldera_types::{
     format::avro::{AvroParserConfig, AvroUpdateFormat},
     program_schema::Relation,
     serde_with_context::{

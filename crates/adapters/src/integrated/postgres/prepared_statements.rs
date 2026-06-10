@@ -1,9 +1,9 @@
 use super::error::BackoffError;
-use itertools::Itertools;
-use opendera_types::{
+use feldera_types::{
     program_schema::Relation,
     transport::postgres::{PostgresWriteMode, PostgresWriterConfig},
 };
+use itertools::Itertools;
 use postgres::Statement;
 
 #[derive(Debug, Default)]

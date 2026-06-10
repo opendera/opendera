@@ -1,6 +1,6 @@
-# opendera-buffer-cache
+# feldera-buffer-cache
 
-`opendera-buffer-cache` provides thread-safe in-memory caches used by Feldera's storage layer:
+`feldera-buffer-cache` provides thread-safe in-memory caches used by Feldera's storage layer:
 
 `S3FifoCache` wraps `quick_cache`'s SOSP'23 S3-FIFO implementation behind a
 Feldera-oriented API:
@@ -15,7 +15,7 @@ DBSP circuits.
 ## API sketch
 
 ```rust
-use opendera_buffer_cache::{CacheEntry, LruCache};
+use feldera_buffer_cache::{CacheEntry, LruCache};
 
 #[derive(Clone)]
 struct Page(Vec<u8>);

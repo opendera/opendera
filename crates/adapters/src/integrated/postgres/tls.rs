@@ -1,5 +1,5 @@
 use anyhow::{Context, Result as AnyResult};
-use opendera_types::transport::postgres::PostgresTlsConfig;
+use feldera_types::transport::postgres::PostgresTlsConfig;
 use openssl::{
     pkey::PKey,
     rsa::Rsa,

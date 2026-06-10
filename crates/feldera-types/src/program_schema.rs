@@ -1,4 +1,4 @@
-pub use opendera_ir::SourcePosition;
+pub use feldera_ir::SourcePosition;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

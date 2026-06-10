@@ -18,7 +18,7 @@ use crate::{
     circuit_cache_key,
     storage::file::to_bytes,
 };
-use opendera_storage::{FileCommitter, StoragePath};
+use feldera_storage::{FileCommitter, StoragePath};
 use size_of::{Context, SizeOf};
 use std::sync::Arc;
 use std::{borrow::Cow, mem::replace};

@@ -65,7 +65,6 @@ pub async fn set_tenant_stripe_customer_id(
     let stmt = txn
         .prepare_cached("UPDATE tenant SET stripe_customer_id = $2 WHERE id = $1")
         .await?;
-    txn.execute(&stmt, &[&tenant_id.0, &stripe_customer_id])
-        .await?;
+    txn.execute(&stmt, &[&tenant_id.0, &stripe_customer_id]).await?;
     Ok(())
 }

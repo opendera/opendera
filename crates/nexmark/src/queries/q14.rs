@@ -1,7 +1,7 @@
 use super::NexmarkStream;
 use crate::model::Event;
 use dbsp::{OrdZSet, RootCircuit, Stream};
-use opendera_macros::IsNone;
+use feldera_macros::IsNone;
 use rkyv::{Archive, Deserialize, Serialize};
 use rust_decimal::Decimal;
 use size_of::SizeOf;

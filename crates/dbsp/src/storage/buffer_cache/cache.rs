@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use enum_map::{Enum, EnumMap};
-use opendera_buffer_cache::{
+use feldera_buffer_cache::{
     BufferCacheBuilder, CacheEntry, LruCache, SharedBufferCache, ThreadType,
 };
-use opendera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
+use feldera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
 

@@ -1,4 +1,4 @@
-use opendera_ir::{MirNode, MirNodeId};
+use feldera_ir::{MirNode, MirNodeId};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display};
 use utoipa::ToSchema;

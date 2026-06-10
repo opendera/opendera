@@ -38,7 +38,7 @@ use crate::{
     },
 };
 use async_stream::stream;
-use opendera_storage::{FileCommitter, StoragePath, fbuf::FBuf};
+use feldera_storage::{FileCommitter, StoragePath, fbuf::FBuf};
 use rkyv::AlignedVec;
 use serde::{Deserialize, Serialize};
 use std::{

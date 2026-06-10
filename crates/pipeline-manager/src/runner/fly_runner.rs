@@ -26,7 +26,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::spawn;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -44,8 +44,8 @@ use crate::runner::error::RunnerError;
 use crate::runner::fly_image_registry::FlyImagePusher;
 use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
 use crate::runner::pipeline_logs::{LogMessage, LogsSender};
-use opendera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
-use opendera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
+use feldera_types::config::{PipelineConfig, StorageCacheConfig, StorageConfig};
+use feldera_types::runtime_status::{BootstrapPolicy, RuntimeDesiredStatus};
 
 const FLY_API_BASE: &str = "https://api.machines.dev";
 
@@ -173,10 +173,7 @@ impl FlyRunner {
             "OPENDERA_DEPLOYMENT_ID".into(),
             json!(deployment_id.to_string()),
         );
-        env.insert(
-            "AWS_ENDPOINT_URL_S3".into(),
-            json!(self.config.tigris_endpoint),
-        );
+        env.insert("AWS_ENDPOINT_URL_S3".into(), json!(self.config.tigris_endpoint));
         env.insert("AWS_REGION".into(), json!("auto"));
         // When the per-pipeline binary isn't baked into the image
         // (image_registry path), the worker container has to fetch it
@@ -359,9 +356,7 @@ impl FlyRunner {
                     memory_mb: self.config.default_machine_memory_mb,
                 },
                 services: vec![],
-                restart: RestartPolicy {
-                    policy: "on-failure",
-                },
+                restart: RestartPolicy { policy: "on-failure" },
             },
         };
         let url = format!("{FLY_API_BASE}/v1/apps/{app_name}/machines");
@@ -409,8 +404,13 @@ impl FlyRunner {
             .map_err(|e| Self::provision_err(format!("fly: parse machine: {e}")))
     }
 
-    async fn stop_machine(&self, app_name: &str, machine_id: &str) -> Result<(), ManagerError> {
-        let url = format!("{FLY_API_BASE}/v1/apps/{app_name}/machines/{machine_id}/stop");
+    async fn stop_machine(
+        &self,
+        app_name: &str,
+        machine_id: &str,
+    ) -> Result<(), ManagerError> {
+        let url =
+            format!("{FLY_API_BASE}/v1/apps/{app_name}/machines/{machine_id}/stop");
         let res = self
             .client
             .post(url)
@@ -427,8 +427,14 @@ impl FlyRunner {
         Ok(())
     }
 
-    async fn destroy_machine(&self, app_name: &str, machine_id: &str) -> Result<(), ManagerError> {
-        let url = format!("{FLY_API_BASE}/v1/apps/{app_name}/machines/{machine_id}?force=true");
+    async fn destroy_machine(
+        &self,
+        app_name: &str,
+        machine_id: &str,
+    ) -> Result<(), ManagerError> {
+        let url = format!(
+            "{FLY_API_BASE}/v1/apps/{app_name}/machines/{machine_id}?force=true"
+        );
         let res = self
             .client
             .delete(url)
@@ -714,9 +720,7 @@ impl PipelineExecutor for FlyRunner {
             .cached
             .clone()
             .ok_or_else(|| Self::provision_err("provision was not called"))?;
-        let m = self
-            .get_machine(&handle.app_name, &handle.machine_id)
-            .await?;
+        let m = self.get_machine(&handle.app_name, &handle.machine_id).await?;
         match m.state.as_str() {
             "started" => Ok(ProvisionStatus::Provisioned {
                 location: format!(
@@ -727,9 +731,11 @@ impl PipelineExecutor for FlyRunner {
                 ),
                 details: serde_json::to_value(&m).unwrap_or_default(),
             }),
-            "created" | "starting" | "stopped" | "suspended" => Ok(ProvisionStatus::Ongoing {
-                details: serde_json::to_value(&m).unwrap_or_default(),
-            }),
+            "created" | "starting" | "stopped" | "suspended" => {
+                Ok(ProvisionStatus::Ongoing {
+                    details: serde_json::to_value(&m).unwrap_or_default(),
+                })
+            }
             "failed" => Err(Self::provision_err(format!(
                 "fly: machine entered failed state: {:?}",
                 m
@@ -747,9 +753,7 @@ impl PipelineExecutor for FlyRunner {
             Some(h) => h.clone(),
             None => return Ok(json!({ "state": "not_provisioned" })),
         };
-        let m = self
-            .get_machine(&handle.app_name, &handle.machine_id)
-            .await?;
+        let m = self.get_machine(&handle.app_name, &handle.machine_id).await?;
         Ok(json!({
             "state": m.state,
             "private_ip": m.private_ip,
@@ -758,8 +762,7 @@ impl PipelineExecutor for FlyRunner {
 
     async fn stop(&mut self) -> Result<(), ManagerError> {
         if let Some(handle) = self.cached.clone() {
-            self.stop_machine(&handle.app_name, &handle.machine_id)
-                .await?;
+            self.stop_machine(&handle.app_name, &handle.machine_id).await?;
         }
         // The Fly Machine is no longer producing fresh logs; tear
         // down the streamer so we don't keep polling a stopped
@@ -797,7 +800,7 @@ impl FlyRunner {
     /// the worker speak the same storage protocol.
     async fn clear_tigris_prefix(&self) -> Result<(), ManagerError> {
         use futures::StreamExt;
-        use object_store::{parse_url_opts, path::Path as ObjPath, ObjectStore};
+        use object_store::{ObjectStore, parse_url_opts, path::Path as ObjPath};
 
         // Compose the Tigris URL pointed at this pipeline's prefix and
         // parse it through object_store. Credentials are inherited
@@ -822,7 +825,8 @@ impl FlyRunner {
         let mut stream = store.list(Some(&base));
         let mut to_delete: Vec<ObjPath> = Vec::new();
         while let Some(item) = stream.next().await {
-            let meta = item.map_err(|e| Self::provision_err(format!("fly: list tigris: {e}")))?;
+            let meta = item
+                .map_err(|e| Self::provision_err(format!("fly: list tigris: {e}")))?;
             to_delete.push(meta.location);
         }
         for path in to_delete {
@@ -849,7 +853,10 @@ impl FlyRunner {
     ///   at a few minutes, after which the client must reconnect).
     /// - Exits cleanly when the returned [`oneshot::Sender`] is
     ///   triggered (via `stop_log_streaming` / `Drop`).
-    fn start_log_streaming(&self, handle: &MachineHandle) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    fn start_log_streaming(
+        &self,
+        handle: &MachineHandle,
+    ) -> (oneshot::Sender<()>, JoinHandle<()>) {
         let (terminate_tx, mut terminate_rx) = oneshot::channel::<()>();
         let client = self.client.clone();
         let auth = self.auth_header();
@@ -870,7 +877,11 @@ impl FlyRunner {
                     return;
                 }
 
-                let req = client.get(&url).header("Authorization", &auth).send().await;
+                let req = client
+                    .get(&url)
+                    .header("Authorization", &auth)
+                    .send()
+                    .await;
                 let mut resp = match req {
                     Ok(r) if r.status().is_success() => r,
                     Ok(r) => {

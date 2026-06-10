@@ -16,7 +16,7 @@ use dbsp::{
     circuit::{LayoutError, circuit_builder::BootstrapInfo},
     storage::backend::StorageError,
 };
-use opendera_types::{
+use feldera_types::{
     error::{DetailedError, ErrorResponse},
     runtime_status::RuntimeDesiredStatus,
     suspend::SuspendError,

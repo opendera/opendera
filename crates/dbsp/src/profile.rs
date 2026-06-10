@@ -15,7 +15,7 @@ use crate::{
     },
     monitor::{TraceMonitor, visual_graph::Graph},
 };
-use opendera_buffer_cache::ThreadType;
+use feldera_buffer_cache::ThreadType;
 use serde::Serialize;
 use size_of::HumanBytes;
 use std::{

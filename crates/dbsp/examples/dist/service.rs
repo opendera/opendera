@@ -1,6 +1,6 @@
 use dbsp::circuit::Layout;
 use dbsp::utils::Tup2;
-use opendera_macros::IsNone;
+use feldera_macros::IsNone;
 use rkyv::Archive;
 use size_of::SizeOf;
 

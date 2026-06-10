@@ -7,16 +7,16 @@ use super::{
 use crate::Runtime;
 use crate::circuit::metrics::{FILES_CREATED, FILES_DELETED};
 use crate::storage::{buffer_cache::FBuf, init};
-use opendera_storage::metrics::{
+use feldera_storage::metrics::{
     READ_BLOCKS_BYTES, READ_LATENCY_MICROSECONDS, SYNC_LATENCY_MICROSECONDS, WRITE_BLOCKS_BYTES,
     WRITE_LATENCY_MICROSECONDS,
 };
-use opendera_storage::tokio::TOKIO;
-use opendera_storage::{
+use feldera_storage::tokio::TOKIO;
+use feldera_storage::{
     FileCommitter, StorageBackend, StorageBackendFactory, StorageFileType, StoragePath,
     StoragePathPart, append_to_path, default_read_async,
 };
-use opendera_types::config::{
+use feldera_types::config::{
     FileBackendConfig, StorageBackendConfig, StorageCacheConfig, StorageConfig,
 };
 use std::ffi::OsString;
@@ -640,8 +640,8 @@ inventory::submit! {
 
 #[cfg(test)]
 mod tests {
-    use opendera_storage::StorageBackend;
-    use opendera_types::config::{FileBackendConfig, StorageCacheConfig};
+    use feldera_storage::StorageBackend;
+    use feldera_types::config::{FileBackendConfig, StorageCacheConfig};
     use std::{path::Path, sync::Arc};
 
     use crate::storage::backend::tests::{random_sizes, test_backend};

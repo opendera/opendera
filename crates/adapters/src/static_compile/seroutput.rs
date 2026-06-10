@@ -31,11 +31,11 @@ use dbsp::{
     typed_batch::{DynBatchReader, DynSpine, DynTrace, Spine, TypedBatch},
 };
 use erased_serde::{Serialize as ErasedSerialize, Serializer as ErasedSerializer};
-use opendera_storage::tokio::TOKIO;
-use opendera_types::serde_with_context::serialize::{
+use feldera_storage::tokio::TOKIO;
+use feldera_types::serde_with_context::serialize::{
     SerializeFieldsWithContextWrapper, SerializeWithContextWrapper,
 };
-use opendera_types::{
+use feldera_types::{
     format::csv::CsvParserConfig,
     serde_with_context::{SerializeWithContext, SqlSerdeConfig},
 };
