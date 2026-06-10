@@ -1660,6 +1660,7 @@ impl StoragePostgres {
     pub async fn run_migrations(&self) -> Result<(), DBError> {
         debug!("Applying database migrations if needed...");
         let mut client = self.pool.get().await?;
+        self.fixup_renumbered_migrations(&client).await?;
         let report = embedded::migrations::runner()
             .run_async(&mut **client)
             .await?;
@@ -1685,6 +1686,43 @@ impl StoragePostgres {
             default_tenant.provider,
         )
         .await?;
+        Ok(())
+    }
+
+    /// Drops refinery history rows for the OpenDera migrations that were
+    /// renumbered from V34–V36 to V100–V102 (to keep the V34+ range free
+    /// for upstream feldera migrations).
+    ///
+    /// Matching on (version, name) ensures a future *upstream* V34 row is
+    /// never touched. After the old rows are gone, refinery re-applies
+    /// V100–V102 on databases that had the old numbering; their DDL is
+    /// idempotent (`IF NOT EXISTS`) so the re-apply is a no-op that just
+    /// records fresh history rows. Fresh databases have no history table
+    /// yet, which the `to_regclass` guard handles.
+    ///
+    /// This must run before the refinery runner: with the old rows
+    /// present, refinery would abort on a missing migration file for
+    /// applied versions 34–36.
+    async fn fixup_renumbered_migrations(
+        &self,
+        client: &deadpool_postgres::Object,
+    ) -> Result<(), DBError> {
+        client
+            .batch_execute(
+                r#"
+                DO $$
+                BEGIN
+                    IF to_regclass('refinery_schema_history') IS NOT NULL THEN
+                        DELETE FROM refinery_schema_history
+                        WHERE (version, name) IN ((34, 'tenant_stripe_customer_id'),
+                                                  (35, 'pipeline_fly_handle'),
+                                                  (36, 'usage_buckets'));
+                    END IF;
+                END
+                $$;
+                "#,
+            )
+            .await?;
         Ok(())
     }
 

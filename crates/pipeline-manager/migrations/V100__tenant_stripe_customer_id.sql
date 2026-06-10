@@ -9,5 +9,13 @@
 -- Nullable so existing self-hosted deployments aren't forced into a
 -- billing relationship.
 
+--
+-- NOTE: originally shipped as V34. Renumbered to V100 (commit on
+-- 2026-06-10) to leave the V34+ range free for upstream feldera
+-- migrations. `run_migrations` deletes the old (V34, 'tenant_stripe_customer_id')
+-- refinery_schema_history row before refinery runs, and the DDL below
+-- is idempotent, so databases that applied the old number re-apply
+-- this as a no-op.
+
 ALTER TABLE tenant
-    ADD COLUMN stripe_customer_id varchar NULL;
+    ADD COLUMN IF NOT EXISTS stripe_customer_id varchar NULL;

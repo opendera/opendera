@@ -685,6 +685,63 @@ async fn tenant_creation() {
     assert_ne!(tenant_id_3, tenant_id_5);
 }
 
+/// A database that applied the OpenDera migrations under their original
+/// V34–V36 numbering must transparently upgrade to the renumbered
+/// V100–V102 on the next `run_migrations` (old history rows are dropped
+/// and the idempotent migrations re-apply as no-ops).
+#[tokio::test]
+async fn migration_renumber_fixup() {
+    let handle = test_setup().await;
+
+    // Simulate the pre-renumber state by rewriting the refinery history
+    // rows back to the old version numbers.
+    let client = handle.db.pool.get().await.unwrap();
+    client
+        .batch_execute(
+            "UPDATE refinery_schema_history SET version = 34 WHERE name = 'tenant_stripe_customer_id';
+             UPDATE refinery_schema_history SET version = 35 WHERE name = 'pipeline_fly_handle';
+             UPDATE refinery_schema_history SET version = 36 WHERE name = 'usage_buckets';",
+        )
+        .await
+        .unwrap();
+    drop(client);
+
+    // Without the fixup, refinery would abort on missing migration files
+    // for applied versions 34–36.
+    handle.db.run_migrations().await.unwrap();
+
+    let client = handle.db.pool.get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT version FROM refinery_schema_history
+             WHERE name IN ('tenant_stripe_customer_id', 'pipeline_fly_handle', 'usage_buckets')
+             ORDER BY version",
+            &[],
+        )
+        .await
+        .unwrap();
+    let versions: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(versions, vec![100, 101, 102]);
+
+    // The re-applied DDL must have left the schema intact: the columns
+    // and table the three migrations create still exist.
+    client
+        .query("SELECT stripe_customer_id FROM tenant LIMIT 1", &[])
+        .await
+        .unwrap();
+    client
+        .query(
+            "SELECT fly_app, fly_machine_id, tier, ram_mb FROM pipeline LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .query("SELECT count(*) FROM usage_bucket", &[])
+        .await
+        .unwrap();
+}
+
 /// Creation, deletion and validation of API keys.
 #[tokio::test]
 async fn api_key_store_and_validation() {

@@ -19,8 +19,16 @@
 -- `ram_mb` mirrors Fly's per-machine guest RAM, surfaced for tier-
 -- mismatch detection by the right-sizing recommender.
 
+--
+-- NOTE: originally shipped as V35. Renumbered to V101 (commit on
+-- 2026-06-10) to leave the V34+ range free for upstream feldera
+-- migrations. `run_migrations` deletes the old (V35, 'pipeline_fly_handle')
+-- refinery_schema_history row before refinery runs, and the DDL below
+-- is idempotent, so databases that applied the old number re-apply
+-- this as a no-op.
+
 ALTER TABLE pipeline
-    ADD COLUMN fly_app varchar NULL,
-    ADD COLUMN fly_machine_id varchar NULL,
-    ADD COLUMN tier varchar NULL,
-    ADD COLUMN ram_mb integer NULL;
+    ADD COLUMN IF NOT EXISTS fly_app varchar NULL,
+    ADD COLUMN IF NOT EXISTS fly_machine_id varchar NULL,
+    ADD COLUMN IF NOT EXISTS tier varchar NULL,
+    ADD COLUMN IF NOT EXISTS ram_mb integer NULL;
