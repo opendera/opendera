@@ -121,10 +121,7 @@ fn pull_and_gc(
 }
 
 /// One-shot pull. Calls `pull_and_gc` once and returns.
-pub fn pull_once(
-    storage: &CircuitStorageConfig,
-    sync: &SyncConfig,
-) -> Result<(), ControllerError> {
+pub fn pull_once(storage: &CircuitStorageConfig, sync: &SyncConfig) -> Result<(), ControllerError> {
     pull_and_gc(storage.backend.clone(), sync, &mut uuid::Uuid::nil())?;
     Ok(())
 }
