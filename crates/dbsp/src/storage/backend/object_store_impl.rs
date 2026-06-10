@@ -250,7 +250,7 @@ impl StorageBackend for ObjectStoreBackend {
             path,
             relative: name.clone(),
             id: next_file_id(),
-            size: meta.size as u64,
+            size: meta.size,
         }))
     }
 
@@ -276,7 +276,7 @@ impl StorageBackend for ObjectStoreBackend {
                     let rel = full.get(base_len..).unwrap_or(full).trim_start_matches('/');
                     let storage_path: StoragePath = ObjPath::from(rel);
                     let entry = StorageFileType::File {
-                        size: meta.size as u64,
+                        size: meta.size,
                     };
                     out.push((storage_path, entry));
                 }
