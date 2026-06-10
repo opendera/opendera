@@ -232,6 +232,25 @@ public class Utilities {
          return "\"" + escape(value, unicodeBraces) + "\"";
     }
 
+    /** Wrap a string in a Rust raw string literal (r#"..."#), using
+     * enough '#' marks that no '"#...' sequence inside the value can
+     * terminate the literal early. Raw strings cannot represent every
+     * value with a fixed delimiter, so the delimiter length is one more
+     * than the longest run of '#'s that follows a '"' in the value. */
+    public static String rawRustString(String value) {
+        int hashes = 1;
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) != '"')
+                continue;
+            int run = 0;
+            while (i + 1 + run < value.length() && value.charAt(i + 1 + run) == '#')
+                run++;
+            hashes = Math.max(hashes, run + 1);
+        }
+        String delimiter = "#".repeat(hashes);
+        return "r" + delimiter + "\"" + value + "\"" + delimiter;
+    }
+
     /** Parse and validate a JSON text string, returning either the parsed object or an error to show to the user */
     public static Result<JsonNode> validateJson(String body) {
         try {
