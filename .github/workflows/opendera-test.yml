@@ -96,6 +96,40 @@ jobs:
       - run: cargo test --workspace --exclude dbsp_adapters --no-fail-fast
         continue-on-error: true
 
+  # The object-store backend + checkpoint synchronizer have env-gated
+  # integration tests (#[ignore]) that need a real S3-compatible
+  # endpoint. Run them against a throwaway MinIO. Local repro recipe is
+  # documented on the tests themselves (object_store_impl.rs /
+  # object_store_synchronizer.rs).
+  object-store-minio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO + create test bucket
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          until curl -sf http://localhost:9000/minio/health/ready >/dev/null; do sleep 1; done
+          docker run --rm --network host --entrypoint /bin/sh minio/mc -c \
+            "mc alias set local http://localhost:9000 minioadmin minioadmin && mc mb local/opendera-test"
+      # Infra-dependent per the policy above: surface failures in the
+      # log without gating merges on MinIO/docker behavior.
+      - name: S3 integration tests (backend + synchronizer)
+        continue-on-error: true
+        env:
+          OPENDERA_S3_TEST_URL: s3://opendera-test/
+          OPENDERA_S3_TEST_OPTS: endpoint=http://localhost:9000,access_key_id=minioadmin,secret_access_key=minioadmin,region=us-east-1,allow_http=true
+          OPENDERA_S3_TEST_BUCKET: opendera-test
+          OPENDERA_S3_TEST_ENDPOINT: http://localhost:9000
+          OPENDERA_S3_TEST_REGION: us-east-1
+          OPENDERA_S3_TEST_ACCESS_KEY: minioadmin
+          OPENDERA_S3_TEST_SECRET_KEY: minioadmin
+        run: cargo test -p dbsp storage::backend::object_store -- --ignored --nocapture
+
   web-console:
     runs-on: ubuntu-latest
     defaults:

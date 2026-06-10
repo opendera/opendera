@@ -132,6 +132,12 @@ fn remote_backend(sync: &SyncConfig) -> anyhow::Result<ObjectStoreBackend> {
     let mut other_options = std::collections::BTreeMap::new();
     if let Some(endpoint) = &sync.endpoint {
         other_options.insert("endpoint".to_string(), endpoint.clone());
+        // object_store refuses plain-HTTP endpoints unless explicitly
+        // allowed; local MinIO and in-cluster S3 gateways are commonly
+        // served without TLS.
+        if endpoint.starts_with("http://") {
+            other_options.insert("allow_http".to_string(), "true".to_string());
+        }
     }
     match kind {
         CloudKind::S3 => {
