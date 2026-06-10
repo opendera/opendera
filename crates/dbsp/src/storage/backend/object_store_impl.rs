@@ -205,7 +205,7 @@ impl ObjectStoreBackend {
     }
 
     /// Override the multipart threshold (clamped to S3's 5 MiB part
-    /// minimum in [`from_config`]; unclamped here for tests against
+    /// minimum in [`Self::from_config`]; unclamped here for tests against
     /// in-memory stores).
     pub fn with_multipart_threshold(mut self, threshold: usize) -> Self {
         self.multipart_threshold = threshold;
