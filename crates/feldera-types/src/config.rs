@@ -26,7 +26,7 @@ use crate::transport::redis::RedisOutputConfig;
 use crate::transport::s3::S3InputConfig;
 use crate::transport::url::UrlInputConfig;
 use core::fmt;
-use opendera_ir::{MirNode, MirNodeId};
+use feldera_ir::{MirNode, MirNodeId};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;

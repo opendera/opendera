@@ -126,7 +126,7 @@ FROM
         """
 
         udfs = """
-use opendera_sqllib::F32;
+use feldera_sqllib::F32;
 use crate::*;
 
 pub fn bool2bool(i: Option<bool>) -> Result<Option<bool>, Box<dyn std::error::Error>> {

@@ -8,7 +8,7 @@ use actix_web::{
     HttpResponse,
 };
 use awc::body::MessageBody as _;
-use opendera_types::runtime_status::RuntimeStatus;
+use feldera_types::runtime_status::RuntimeStatus;
 
 /// List All Metrics
 ///

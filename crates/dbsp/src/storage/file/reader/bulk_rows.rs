@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use opendera_storage::{error::StorageError, fbuf::FBuf};
+use feldera_storage::{error::StorageError, fbuf::FBuf};
 
 use crate::{
     dynamic::DataTrait,

@@ -1,4 +1,4 @@
-use opendera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
+use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
 use proptest::collection::vec;
 use proptest::prelude::*;
 use std::{hash::Hasher, path::Path};

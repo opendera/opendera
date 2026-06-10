@@ -19,19 +19,19 @@ use apache_avro::{
 use dbsp::trace::BatchReaderFactories;
 use dbsp::typed_batch::{DynSpineSnapshot, SpineSnapshot as TypedSpineSnapshot, TypedBatch};
 use dbsp::{DBData, IndexedZSetReader, OrdIndexedZSet, OrdZSet, ZWeight, utils::Tup2};
-use itertools::Itertools;
-use opendera_sqllib::{ByteArray, Uuid, Variant};
-use opendera_types::{
+use feldera_sqllib::{ByteArray, Uuid, Variant};
+use feldera_types::{
     deserialize_table_record,
     format::avro::{AvroEncoderConfig, AvroEncoderKeyMode},
     program_schema::{ColumnType, Field, Relation, SqlIdentifier},
     serde_with_context::{DeserializeWithContext, SerializeWithContext, SqlSerdeConfig},
     serialize_table_record,
 };
-use opendera_types::{
+use feldera_types::{
     format::avro::{AvroParserConfig, AvroUpdateFormat},
     serialize_struct,
 };
+use itertools::Itertools;
 use proptest::prelude::*;
 use proptest::proptest;
 use rand::rngs::StdRng;

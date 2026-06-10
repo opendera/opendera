@@ -105,10 +105,10 @@ public final class CrateGenerator {
                 derive_more = { workspace = true }
                 dbsp = { workspace = true }
                 dbsp_adapters = { workspace = true }
-                opendera-macros = { workspace = true }
-                opendera-adapterlib = { workspace = true }
-                opendera-types = { workspace = true }
-                opendera-sqllib = { workspace = true }
+                feldera-macros = { workspace = true }
+                feldera-adapterlib = { workspace = true }
+                feldera-types = { workspace = true }
+                feldera-sqllib = { workspace = true }
                 serde = { workspace = true }
                 compare = { workspace = true }
                 size-of = { workspace = true }

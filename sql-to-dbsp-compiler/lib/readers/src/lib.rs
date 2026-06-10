@@ -13,7 +13,7 @@ use dbsp::{
     zset, DBData, DBWeight, OrdZSet,
 };
 use derive_more::{From, Into, Neg, Sub};
-use opendera_sqllib::{WSet, Weight};
+use feldera_sqllib::{WSet, Weight};
 use paste::paste;
 use rkyv::Archive;
 use serde::{Deserialize, Serialize};
@@ -44,7 +44,7 @@ where
 }
 
 #[cfg(test)]
-opendera_macros::declare_tuple! {
+feldera_macros::declare_tuple! {
     Tuple3<T0, T1, T2>
 }
 

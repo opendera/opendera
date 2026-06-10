@@ -7,9 +7,9 @@ use actix_web::HttpRequest;
 use core::str;
 use dbsp::operator::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
-use opendera_adapterlib::ConnectorMetadata;
-use opendera_sqllib::Variant;
-use opendera_types::{
+use feldera_adapterlib::ConnectorMetadata;
+use feldera_sqllib::Variant;
+use feldera_types::{
     format::raw::{RawParserConfig, RawParserMode},
     serde_with_context::{SqlSerdeConfig, serde_config::BinaryFormat},
 };
@@ -343,13 +343,13 @@ impl<'de> Deserializer<'de> for RawDeserializer<'de> {
 mod test {
     use crate::FormatConfig;
     use crate::test::{MockUpdate, mock_parser_pipeline};
-    use opendera_adapterlib::ConnectorMetadata;
-    use opendera_adapterlib::{
+    use feldera_adapterlib::ConnectorMetadata;
+    use feldera_adapterlib::{
         format::{InputBuffer, ParseError, Parser},
         transport::InputConsumer,
     };
-    use opendera_sqllib::{ByteArray, SqlString, Variant};
-    use opendera_types::{
+    use feldera_sqllib::{ByteArray, SqlString, Variant};
+    use feldera_types::{
         deserialize_table_record,
         format::raw::{RawParserConfig, RawParserMode},
         program_schema::{ColumnType, Field, Relation, SqlIdentifier},

@@ -521,7 +521,7 @@ impl CommonConfig {
                 .expect(
                     "server configuration should be built using the certificate and private key",
                 );
-            opendera_observability::fips::log_rustls_fips_status(
+            feldera_observability::fips::log_rustls_fips_status(
                 "HTTPS server config",
                 server_config.fips(),
             );
@@ -588,7 +588,7 @@ impl CommonConfig {
             let config = ClientConfig::builder()
                 .with_root_certificates(root_cert_store)
                 .with_no_client_auth();
-            opendera_observability::fips::log_rustls_fips_status(
+            feldera_observability::fips::log_rustls_fips_status(
                 "HTTPS client config",
                 config.fips(),
             );
@@ -1209,7 +1209,7 @@ impl LocalRunnerConfig {
     /// Location for pipeline port file
     pub(crate) fn port_file_path(&self, pipeline_id: PipelineId) -> PathBuf {
         self.pipeline_dir(pipeline_id)
-            .join(opendera_types::transport::http::SERVER_PORT_FILE)
+            .join(feldera_types::transport::http::SERVER_PORT_FILE)
     }
 }
 
@@ -1258,11 +1258,7 @@ pub struct FlyRunnerConfig {
     /// Container image to run for pipeline workers
     /// (e.g. `ghcr.io/opendera/pipeline-runtime:latest`).
     #[serde(default)]
-    #[arg(
-        long = "fly-pipeline-image",
-        env = "FLY_PIPELINE_IMAGE",
-        default_value = ""
-    )]
+    #[arg(long = "fly-pipeline-image", env = "FLY_PIPELINE_IMAGE", default_value = "")]
     pub pipeline_image: String,
 
     /// Default machine CPU kind (`performance` or `shared`).
@@ -1292,11 +1288,7 @@ pub struct FlyRunnerConfig {
 
     /// Tigris endpoint URL (Fly's S3-compatible no-egress storage).
     #[serde(default)]
-    #[arg(
-        long = "fly-tigris-endpoint",
-        env = "TIGRIS_ENDPOINT",
-        default_value = ""
-    )]
+    #[arg(long = "fly-tigris-endpoint", env = "TIGRIS_ENDPOINT", default_value = "")]
     pub tigris_endpoint: String,
 
     /// Tigris bucket used as the pipeline checkpoint root.
@@ -1419,14 +1411,8 @@ impl FlyRunnerConfig {
         let required = [
             ("--fly-api-token / FLY_API_TOKEN", &self.api_token),
             ("--fly-org-slug / FLY_ORG_SLUG", &self.org_slug),
-            (
-                "--fly-pipeline-image / FLY_PIPELINE_IMAGE",
-                &self.pipeline_image,
-            ),
-            (
-                "--fly-tigris-endpoint / TIGRIS_ENDPOINT",
-                &self.tigris_endpoint,
-            ),
+            ("--fly-pipeline-image / FLY_PIPELINE_IMAGE", &self.pipeline_image),
+            ("--fly-tigris-endpoint / TIGRIS_ENDPOINT", &self.tigris_endpoint),
             ("--fly-tigris-bucket / TIGRIS_BUCKET", &self.tigris_bucket),
         ];
         for (name, value) in required {

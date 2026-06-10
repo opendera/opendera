@@ -4,7 +4,7 @@ use std::fmt::Display;
 use std::path::PathBuf;
 
 use crate::make_client;
-use opendera_rest_api::types::{
+use feldera_rest_api::types::{
     ClusterMonitorEventFieldSelector, CompilationProfile, PipelineMonitorEventFieldSelector,
 };
 

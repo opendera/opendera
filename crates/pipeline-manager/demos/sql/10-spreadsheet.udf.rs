@@ -1,4 +1,4 @@
-use opendera_sqllib::*;
+use feldera_sqllib::*;
 
 use std::sync::Arc;
 use std::collections::{BTreeMap, VecDeque};

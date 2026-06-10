@@ -3,20 +3,7 @@ use anyhow::{anyhow, bail, Error as AnyError, Result as AnyResult};
 use chrono::{DateTime, Utc};
 use datafusion::prelude::{DataFrame, SQLOptions, SessionContext};
 use dbsp::circuit::tokio::TOKIO;
-use futures_util::StreamExt;
-use iceberg::CatalogBuilder;
-use iceberg::{io::FileIO, spec::TableMetadata, table::Table as IcebergTable, Catalog, TableIdent};
-use iceberg_catalog_glue::{
-    GlueCatalogBuilder, AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME,
-    AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_URI,
-    GLUE_CATALOG_PROP_WAREHOUSE,
-};
-use iceberg_catalog_rest::{
-    RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
-};
-use iceberg_datafusion::IcebergStaticTableProvider;
-use log::{debug, info, trace};
-use opendera_adapterlib::{
+use feldera_adapterlib::{
     catalog::{ArrowStream, InputCollectionHandle},
     errors::journal::ControllerError,
     format::ParseError,
@@ -30,11 +17,24 @@ use opendera_adapterlib::{
     },
     PipelineState,
 };
-use opendera_types::{
+use feldera_types::{
     config::FtModel,
     program_schema::Relation,
     transport::iceberg::{IcebergCatalogType, IcebergReaderConfig},
 };
+use futures_util::StreamExt;
+use iceberg::CatalogBuilder;
+use iceberg::{io::FileIO, spec::TableMetadata, table::Table as IcebergTable, Catalog, TableIdent};
+use iceberg_catalog_glue::{
+    GlueCatalogBuilder, AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME,
+    AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_URI,
+    GLUE_CATALOG_PROP_WAREHOUSE,
+};
+use iceberg_catalog_rest::{
+    RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
+};
+use iceberg_datafusion::IcebergStaticTableProvider;
+use log::{debug, info, trace};
 use std::{sync::Arc, thread};
 use tokio::{
     select,

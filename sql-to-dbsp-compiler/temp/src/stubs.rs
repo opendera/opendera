@@ -6,5 +6,5 @@
 
 #![allow(non_snake_case)]
 
-use opendera_sqllib::*;
+use feldera_sqllib::*;
 use crate::*;

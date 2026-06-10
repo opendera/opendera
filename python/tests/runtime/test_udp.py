@@ -50,11 +50,11 @@ SELECT * FROM t;
         udfs = """
 use tracing::info;
 use std::sync::{Arc, Mutex};
-use opendera_adapterlib::format::{ParseError, Splitter};
-use opendera_adapterlib::preprocess::{
+use feldera_adapterlib::format::{ParseError, Splitter};
+use feldera_adapterlib::preprocess::{
     Preprocessor, PreprocessorCreateError, PreprocessorFactory,
 };
-use opendera_types::preprocess::PreprocessorConfig;
+use feldera_types::preprocess::PreprocessorConfig;
 
 pub struct LoggerPreprocessor {
    count: Arc<Mutex<u64>>,
