@@ -1258,7 +1258,11 @@ pub struct FlyRunnerConfig {
     /// Container image to run for pipeline workers
     /// (e.g. `ghcr.io/opendera/pipeline-runtime:latest`).
     #[serde(default)]
-    #[arg(long = "fly-pipeline-image", env = "FLY_PIPELINE_IMAGE", default_value = "")]
+    #[arg(
+        long = "fly-pipeline-image",
+        env = "FLY_PIPELINE_IMAGE",
+        default_value = ""
+    )]
     pub pipeline_image: String,
 
     /// Default machine CPU kind (`performance` or `shared`).
@@ -1288,7 +1292,11 @@ pub struct FlyRunnerConfig {
 
     /// Tigris endpoint URL (Fly's S3-compatible no-egress storage).
     #[serde(default)]
-    #[arg(long = "fly-tigris-endpoint", env = "TIGRIS_ENDPOINT", default_value = "")]
+    #[arg(
+        long = "fly-tigris-endpoint",
+        env = "TIGRIS_ENDPOINT",
+        default_value = ""
+    )]
     pub tigris_endpoint: String,
 
     /// Tigris bucket used as the pipeline checkpoint root.
@@ -1411,8 +1419,14 @@ impl FlyRunnerConfig {
         let required = [
             ("--fly-api-token / FLY_API_TOKEN", &self.api_token),
             ("--fly-org-slug / FLY_ORG_SLUG", &self.org_slug),
-            ("--fly-pipeline-image / FLY_PIPELINE_IMAGE", &self.pipeline_image),
-            ("--fly-tigris-endpoint / TIGRIS_ENDPOINT", &self.tigris_endpoint),
+            (
+                "--fly-pipeline-image / FLY_PIPELINE_IMAGE",
+                &self.pipeline_image,
+            ),
+            (
+                "--fly-tigris-endpoint / TIGRIS_ENDPOINT",
+                &self.tigris_endpoint,
+            ),
             ("--fly-tigris-bucket / TIGRIS_BUCKET", &self.tigris_bucket),
         ];
         for (name, value) in required {

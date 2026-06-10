@@ -24,8 +24,8 @@ use actix_web::{
 use actix_web_httpauth::middleware::HttpAuthentication;
 use actix_web_static_files::ResourceFiles;
 use anyhow::Result as AnyResult;
-use futures_util::FutureExt;
 use feldera_observability as observability;
+use futures_util::FutureExt;
 use std::io::Write;
 use std::time::Duration;
 use std::{env, io, net::TcpListener, sync::Arc};
@@ -575,10 +575,10 @@ fn build_app(
         Some(auth_configuration) => {
             let auth_middleware = HttpAuthentication::with_fn(crate::auth::auth_validator);
             app.app_data(auth_configuration.clone())
-                .service(api_scope(api_config).wrap(auth_middleware).wrap(cors))
+                .service(api_scope().wrap(auth_middleware).wrap(cors))
         }
         None => app.service(
-            api_scope(api_config)
+            api_scope()
                 .wrap_fn(|req, srv| {
                     let req = crate::auth::tag_with_default_tenant_id(req);
                     srv.call(req)
@@ -587,12 +587,9 @@ fn build_app(
         ),
     };
 
-    // Internal API consumed by the cloud activity controller. Mounted
-    // outside `/v0` and outside any tenant-auth middleware; it
-    // authenticates separately via a shared bearer token. Registered
-    // before `public_scope` (which has a catch-all empty-prefix
-    // sub-scope that would shadow it).
-    let app = app.service(internal_scope());
+    // OpenDera internal API (cloud activity controller). Must register
+    // before `public_scope`, whose catch-all sub-scope would shadow it.
+    let app = app.service(endpoints::internal::scope());
 
     // `public_scope` MUST be the last `.service()` registered: it contains an
     // empty-prefix sub-scope (the catch-all that serves the bundled
@@ -600,18 +597,6 @@ fn build_app(
     // after it. The `public_scope_shadows_anything_registered_after_it` test
     // pins this contract.
     app.service(public_scope(api_config))
-}
-
-/// The internal API scope (no tenant auth; uses
-/// `OPENDERA_INTERNAL_API_KEY` bearer-token check inside each handler).
-fn internal_scope() -> Scope {
-    web::scope("/internal/v0")
-        .service(endpoints::internal::list_internal_pipelines)
-        .service(endpoints::internal::activity_stream)
-        .service(endpoints::internal::list_usage)
-        .service(endpoints::internal::get_tenant_billing)
-        .service(endpoints::internal::put_tenant_billing)
-        .service(endpoints::internal::get_pipeline_deployment_config)
 }
 
 // Unauthenticated public endpoints and static UI assets. CORS is scoped to
@@ -626,26 +611,25 @@ fn internal_scope() -> Scope {
 fn public_scope(api_config: &ApiServerConfig) -> Scope {
     let openapi = ApiDoc::openapi();
 
-    let scope = web::scope("")
+    web::scope("")
         .service(
             web::scope("/config")
                 .wrap(api_config.cors())
                 .service(endpoints::config::get_config_authentication),
         )
         .service(SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-doc/openapi.json", openapi))
-        .service(healthz);
-
-    scope.service(
-        web::scope("")
-            .wrap(middleware::from_fn(add_cache_headers))
-            .service(ResourceFiles::new("/", generate()).resolve_not_found_to_root()),
-    )
+        .service(healthz)
+        .service(
+            web::scope("")
+                .wrap(middleware::from_fn(add_cache_headers))
+                .service(ResourceFiles::new("/", generate()).resolve_not_found_to_root()),
+        )
 }
 
 // The scope for all authenticated API endpoints
-fn api_scope(api_config: &ApiServerConfig) -> Scope {
+fn api_scope() -> Scope {
     // Make APIs available under the /v0/ prefix
-    let scope = web::scope("/v0")
+    web::scope("/v0")
         // Pipeline management endpoints
         .service(endpoints::pipeline_management::list_pipelines)
         .service(endpoints::pipeline_management::get_pipeline)
@@ -711,10 +695,7 @@ fn api_scope(api_config: &ApiServerConfig) -> Scope {
         // Cluster health check
         .service(endpoints::cluster::list_cluster_events)
         .service(endpoints::cluster::get_cluster_event)
-        .service(endpoints::cluster::get_cluster_health);
-
-    let _ = api_config; // cloud_mode no longer toggles any /v0 routes here
-    scope
+        .service(endpoints::cluster::get_cluster_health)
 }
 
 struct SecurityAddon;
@@ -933,7 +914,11 @@ Version: {} v{}{}
 ",
             url,
             url,
-            "Open source",
+            if cfg!(feature = "feldera-enterprise") {
+                "Enterprise"
+            } else {
+                "Open source"
+            },
             env!("CARGO_PKG_VERSION"),
             if env!("FELDERA_PLATFORM_VERSION_SUFFIX").is_empty() {
                 "".to_string()

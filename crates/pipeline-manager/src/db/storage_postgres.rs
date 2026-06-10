@@ -314,12 +314,16 @@ impl Storage for StoragePostgres {
         let raw = row.and_then(|r| r.get::<_, Option<String>>("deployment_config"));
         match raw {
             None => Ok(None),
-            Some(s) => Ok(Some(serde_json::from_str::<serde_json::Value>(&s).map_err(
-                |e| DBError::InvalidJsonData {
-                    data: s.clone(),
-                    error: format!("unable to deserialize deployment_config as JSON due to: {e}"),
-                },
-            )?)),
+            Some(s) => Ok(Some(
+                serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
+                    DBError::InvalidJsonData {
+                        data: s.clone(),
+                        error: format!(
+                            "unable to deserialize deployment_config as JSON due to: {e}"
+                        ),
+                    }
+                })?,
+            )),
         }
     }
 

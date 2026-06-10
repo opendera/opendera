@@ -129,6 +129,10 @@ tikv-jemallocator = { workspace = true, features = ["profiling", "unprefixed_mal
 
 [features]
 default = ["postgresql_embedded"]
+# Inert in OpenDera: never enabled, no license/enterprise code remains.
+# Declared so upstream cfg-gated hunks stay textually identical and
+# merge cleanly.
+feldera-enterprise = []
 runtime-version = []
 fips = ["rustls/fips"]
 

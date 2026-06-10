@@ -17,20 +17,13 @@
 //! both endpoints respond `503 Service Unavailable` so accidental
 //! exposure on a non-cloud deployment doesn't leak cross-tenant data.
 //!
-//! Status: skeleton. The list endpoint currently returns an empty
-//! array because the admin-scoped, cross-tenant `list_all_pipelines`
-//! storage method is not yet in `crate::db::storage`. The activity
-//! stream emits heartbeats only; real `ingested` / `queried` events
-//! are emitted from the controller's hot path in a follow-up that
-//! plumbs a broadcast channel through `ServerState`.
+//! Mount via [`scope`], which is the single registration point the
+//! OpenDera fork adds to `api/main.rs`.
 
 use std::time::Duration;
 
 use actix_web::{
-    HttpRequest, HttpResponse, Responder, get, put,
-    http::header,
-    web,
-    web::Data as WebData,
+    get, http::header, put, web, web::Data as WebData, HttpRequest, HttpResponse, Responder,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -38,6 +31,21 @@ use serde::{Deserialize, Serialize};
 use crate::api::main::ServerState;
 use crate::db::storage::Storage;
 use crate::db::types::pipeline::PipelineId;
+
+/// The internal API scope (no tenant auth; every handler checks the
+/// `OPENDERA_INTERNAL_API_KEY` bearer token itself). This is the only
+/// registration `api/main.rs` needs for the OpenDera internal API —
+/// keep new internal endpoints registered here, not in main.rs, so
+/// upstream merges touch a single line there.
+pub fn scope() -> actix_web::Scope {
+    web::scope("/internal/v0")
+        .service(list_internal_pipelines)
+        .service(activity_stream)
+        .service(list_usage)
+        .service(get_tenant_billing)
+        .service(put_tenant_billing)
+        .service(get_pipeline_deployment_config)
+}
 use crate::db::types::tenant::TenantId;
 use crate::db::types::usage::UsageDimension;
 use crate::error::ManagerError;
@@ -99,7 +107,9 @@ pub async fn list_internal_pipelines(
     }
 
     let db = state.db.lock().await;
-    let rows = db.list_pipelines_across_all_tenants_for_monitoring().await?;
+    let rows = db
+        .list_pipelines_across_all_tenants_for_monitoring()
+        .await?;
     let pipelines: Vec<PipelineSummary> = rows
         .into_iter()
         .map(|(tenant_id, descr)| PipelineSummary {
@@ -414,7 +424,9 @@ mod tests {
         // 1. Env var unset: fail-closed with 503 regardless of header.
         // SAFETY: env mutation is single-threaded here because all the
         // tests in this module live in one #[test] function.
-        unsafe { std::env::remove_var(INTERNAL_API_KEY_ENV); }
+        unsafe {
+            std::env::remove_var(INTERNAL_API_KEY_ENV);
+        }
         let req = test::TestRequest::default()
             .insert_header((header::AUTHORIZATION, "Bearer anything"))
             .to_http_request();
@@ -422,7 +434,9 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 503);
 
         // 2. Env var set: matching bearer succeeds.
-        unsafe { std::env::set_var(INTERNAL_API_KEY_ENV, "test-secret"); }
+        unsafe {
+            std::env::set_var(INTERNAL_API_KEY_ENV, "test-secret");
+        }
         let req = test::TestRequest::default()
             .insert_header((header::AUTHORIZATION, "Bearer test-secret"))
             .to_http_request();
@@ -448,6 +462,8 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 401);
 
         // Clean up so we don't poison other tests in the same process.
-        unsafe { std::env::remove_var(INTERNAL_API_KEY_ENV); }
+        unsafe {
+            std::env::remove_var(INTERNAL_API_KEY_ENV);
+        }
     }
 }

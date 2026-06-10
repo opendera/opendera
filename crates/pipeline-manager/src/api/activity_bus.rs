@@ -13,16 +13,32 @@
 //! The event shape mirrors the `ActivityEvent` discriminated union in
 //! opendera-cloud/activity-controller/src/manager-client.ts.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::db::storage::Storage;
+use crate::db::storage_postgres::StoragePostgres;
 use crate::db::types::pipeline::PipelineId;
+use crate::db::types::tenant::TenantId;
+use feldera_types::runtime_status::RuntimeStatus;
 
 /// Bus capacity. Sized for ~10 seconds of activity at 100 events/s
 /// per pipeline across hundreds of pipelines; well within memory.
 const ACTIVITY_BUS_CAPACITY: usize = 4096;
+
+/// How long a pipeline name -> id resolution stays cached for hot-path
+/// emission. Pipeline ids are stable across renames, so a stale entry
+/// only matters if a pipeline is deleted and re-created under the same
+/// name within the TTL; the activity controller reconciles against
+/// `GET /internal/v0/pipelines` on every poll cycle, so a few seconds
+/// of events keyed to the old id are harmless.
+const NAME_CACHE_TTL: Duration = Duration::from_secs(10);
 
 /// Discriminated union over the lifecycle events the cloud-side
 /// activity controller cares about.
@@ -95,18 +111,97 @@ impl ActivityEvent {
     }
 }
 
+/// Hot-path event kinds that are emitted for a pipeline addressed by
+/// its (tenant, name) pair rather than its id.
+#[derive(Copy, Clone, Debug)]
+pub enum ActivityEventKind {
+    Ingested,
+    Queried,
+    Woke,
+}
+
+/// Cache entry map for hot-path pipeline name -> id resolution.
+type NameCache = HashMap<(TenantId, String), (PipelineId, Instant)>;
+
 /// Sender half of the activity bus. Cheap to clone (it's an `Arc`
 /// internally); the convention is to clone into `ServerState` once
 /// and pass references everywhere else.
 #[derive(Clone)]
 pub struct ActivityBus {
     inner: broadcast::Sender<ActivityEvent>,
+    /// TTL cache for hot-path name -> id resolution; see
+    /// [`ActivityBus::emit_for_pipeline_name`].
+    name_cache: Arc<StdMutex<NameCache>>,
 }
 
 impl ActivityBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(ACTIVITY_BUS_CAPACITY);
-        Self { inner: tx }
+        Self {
+            inner: tx,
+            name_cache: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Hot-path emission for handlers that only know the pipeline by
+    /// name. Resolves the name to the stable pipeline id (cached for
+    /// [`NAME_CACHE_TTL`] to avoid a database round-trip per ingest /
+    /// query call), then emits the event. Best-effort: resolution
+    /// failures are logged at debug and swallowed, because dropping an
+    /// activity event must never fail the user's request.
+    pub async fn emit_for_pipeline_name(
+        &self,
+        db: &tokio::sync::Mutex<StoragePostgres>,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        kind: ActivityEventKind,
+    ) {
+        let id = match self.resolve_cached(db, tenant_id, pipeline_name).await {
+            Some(id) => id,
+            None => return,
+        };
+        let event = match kind {
+            ActivityEventKind::Ingested => ActivityEvent::ingested(id),
+            ActivityEventKind::Queried => ActivityEvent::queried(id),
+            ActivityEventKind::Woke => ActivityEvent::woke(id),
+        };
+        self.emit(event);
+    }
+
+    /// Looks up `(tenant_id, pipeline_name)` in the TTL cache, falling
+    /// back to the database and refreshing the entry on miss.
+    async fn resolve_cached(
+        &self,
+        db: &tokio::sync::Mutex<StoragePostgres>,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+    ) -> Option<PipelineId> {
+        let key = (tenant_id, pipeline_name.to_string());
+        if let Some((id, inserted)) = self.name_cache.lock().unwrap().get(&key).copied() {
+            if inserted.elapsed() < NAME_CACHE_TTL {
+                return Some(id);
+            }
+        }
+        match db
+            .lock()
+            .await
+            .get_pipeline_for_monitoring(tenant_id, pipeline_name)
+            .await
+        {
+            Ok(p) => {
+                self.name_cache
+                    .lock()
+                    .unwrap()
+                    .insert(key, (p.id, Instant::now()));
+                Some(p.id)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "activity emit: failed to resolve {pipeline_name} for tenant {tenant_id}: {e}; skipping"
+                );
+                None
+            }
+        }
     }
 
     /// Fire-and-forget event emit. Returns silently if there are no
@@ -123,19 +218,44 @@ impl ActivityBus {
         self.inner.subscribe()
     }
 
+    /// Emits `state_changed` iff the externally observable status
+    /// string differs between `old` and `new`. The string mirrors the
+    /// `observed_status` derivation in `list_internal_pipelines`, so
+    /// the cloud activity controller sees consistent values whether it
+    /// reconciles from the polling endpoint or the SSE stream.
+    pub fn emit_state_change(
+        &self,
+        pipeline_id: PipelineId,
+        old: Option<RuntimeStatus>,
+        new: Option<RuntimeStatus>,
+    ) {
+        let to_observed = |s: Option<RuntimeStatus>| {
+            s.map(crate::api::endpoints::internal::runtime_status_to_str)
+                .unwrap_or_else(|| "Unknown".to_string())
+        };
+        let new_observed = to_observed(new);
+        if to_observed(old) != new_observed {
+            self.emit(ActivityEvent::state_changed(pipeline_id, new_observed));
+        }
+    }
+
     /// Internal helper for callers that want to construct an event
     /// with a non-`Utc::now()` timestamp (replay, deterministic tests).
-    pub fn emit_with_ts(
-        &self,
-        kind: &str,
-        pipeline_id: Uuid,
-        ts: DateTime<Utc>,
-    ) {
+    pub fn emit_with_ts(&self, kind: &str, pipeline_id: Uuid, ts: DateTime<Utc>) {
         let pid = pipeline_id.to_string();
         let event = match kind {
-            "ingested" => ActivityEvent::Ingested { pipeline_id: pid, ts },
-            "queried" => ActivityEvent::Queried { pipeline_id: pid, ts },
-            "woke" => ActivityEvent::Woke { pipeline_id: pid, ts },
+            "ingested" => ActivityEvent::Ingested {
+                pipeline_id: pid,
+                ts,
+            },
+            "queried" => ActivityEvent::Queried {
+                pipeline_id: pid,
+                ts,
+            },
+            "woke" => ActivityEvent::Woke {
+                pipeline_id: pid,
+                ts,
+            },
             _ => return,
         };
         self.emit(event);

@@ -1,5 +1,5 @@
 // API to read from tables/views and write into tables using HTTP
-use crate::api::activity_bus::ActivityEvent;
+use crate::api::activity_bus::ActivityEventKind;
 use crate::api::error::ApiError;
 use crate::api::examples;
 use crate::api::main::ServerState;
@@ -22,47 +22,6 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 pub mod support_bundle;
-
-/// Hot-path activity emission. Resolves `pipeline_name` to the
-/// pipeline's UUID so the cloud activity controller can key off the
-/// stable id, then fires the right `ActivityEvent` variant. Best-
-/// effort: emission failures are silenced because dropping an
-/// activity event must never fail an ingest/query/resume call.
-async fn emit_pipeline_activity(
-    state: &WebData<ServerState>,
-    tenant_id: TenantId,
-    pipeline_name: &str,
-    kind: ActivityEventKind,
-) {
-    let id = match state
-        .db
-        .lock()
-        .await
-        .get_pipeline_for_monitoring(tenant_id, pipeline_name)
-        .await
-    {
-        Ok(p) => p.id,
-        Err(e) => {
-            tracing::debug!(
-                "activity emit: failed to resolve {pipeline_name} for tenant {tenant_id}: {e}; skipping"
-            );
-            return;
-        }
-    };
-    let event = match kind {
-        ActivityEventKind::Ingested => ActivityEvent::ingested(id),
-        ActivityEventKind::Queried => ActivityEvent::queried(id),
-        ActivityEventKind::Woke => ActivityEvent::woke(id),
-    };
-    state.activity_bus.emit(event);
-}
-
-#[derive(Copy, Clone)]
-enum ActivityEventKind {
-    Ingested,
-    Queried,
-    Woke,
-}
 
 /// Insert Data
 ///
@@ -157,13 +116,16 @@ pub(crate) async fn http_input(
         )
         .await?;
 
-    // Emit Ingested only on a successful forward. The DB lookup
-    // here resolves the human-readable pipeline name into the UUID
-    // the cloud-side activity controller keys off. TODO: refactor
-    // forward_streaming_http_request_to_pipeline_by_name to return
-    // the resolved id so we don't double-lookup.
+    // Emit Ingested only on a successful forward (OpenDera cloud).
     if response.status().is_success() {
-        emit_pipeline_activity(&state, *tenant_id, &pipeline_name, ActivityEventKind::Ingested)
+        state
+            .activity_bus
+            .emit_for_pipeline_name(
+                &state.db,
+                *tenant_id,
+                &pipeline_name,
+                ActivityEventKind::Ingested,
+            )
             .await;
     }
     Ok(response)
@@ -1699,7 +1661,15 @@ pub(crate) async fn post_pipeline_resume(
     if response.status() == StatusCode::ACCEPTED {
         // Wake event for the cloud activity controller; resets the
         // pipeline's idle-timer in its in-memory state.
-        emit_pipeline_activity(&state, *tenant_id, &pipeline_name, ActivityEventKind::Woke).await;
+        state
+            .activity_bus
+            .emit_for_pipeline_name(
+                &state.db,
+                *tenant_id,
+                &pipeline_name,
+                ActivityEventKind::Woke,
+            )
+            .await;
         info!(
             pipeline = %pipeline_name,
             pipeline_id = "N/A",
@@ -1940,7 +1910,15 @@ pub(crate) async fn pipeline_adhoc_sql(
     // of whether the response 200'd — a 4xx that came back from the
     // pipeline still indicates the pipeline was alive enough to
     // respond, so the wake-reset is correct either way.
-    emit_pipeline_activity(&state, *tenant_id, &pipeline_name, ActivityEventKind::Queried).await;
+    state
+        .activity_bus
+        .emit_for_pipeline_name(
+            &state.db,
+            *tenant_id,
+            &pipeline_name,
+            ActivityEventKind::Queried,
+        )
+        .await;
 
     if request_is_websocket(&request) {
         state
