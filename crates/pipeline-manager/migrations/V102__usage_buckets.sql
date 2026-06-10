@@ -21,6 +21,14 @@
 -- dim takes one of: 'ingestion_gb', 'storage_gb_month', 'fcu_hour',
 -- 'query_tb' (the JSON snake_case variants of the UsageDimension enum).
 
+--
+-- NOTE: originally shipped as V36. Renumbered to V102 (commit on
+-- 2026-06-10) to leave the V34+ range free for upstream feldera
+-- migrations. `run_migrations` deletes the old (V36, 'usage_buckets')
+-- refinery_schema_history row before refinery runs, and the DDL below
+-- is idempotent, so databases that applied the old number re-apply
+-- this as a no-op.
+
 CREATE TABLE IF NOT EXISTS usage_bucket (
     pipeline_id uuid NOT NULL,
     tenant_id uuid NOT NULL,
