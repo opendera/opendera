@@ -60,11 +60,24 @@ const MULTIPART_THRESHOLD_OPTION: &str = "opendera.multipart_threshold";
 /// multipart upload with `EntityTooSmall`.
 const MIN_MULTIPART_THRESHOLD: usize = 5 * 1024 * 1024;
 
+/// Maximum number of multipart part uploads in flight per writer.
+/// Bounds both memory (each in-flight part holds its payload, so worst
+/// case is `MAX_IN_FLIGHT_PARTS * multipart_threshold` bytes) and the
+/// number of concurrent requests against the store.
+const MAX_IN_FLIGHT_PARTS: usize = 4;
+
 /// Retry cap for individual object-store write requests (single PUT,
-/// multipart initiation, part upload, completion). `object_store`
+/// multipart initiation, final part, completion). `object_store`
 /// already retries individual HTTP requests internally; this outer
 /// retry catches the case where those inner retries are exhausted.
 /// Mirrors the checkpoint synchronizer's copy retry policy.
+///
+/// Non-final parts are NOT retried at this layer: they upload
+/// concurrently, and a re-`put_part` is assigned a fresh (later) part
+/// number, which would splice the retried bytes after parts that
+/// logically follow them. A non-final part that fails after
+/// `object_store`'s internal retries fails the whole write instead;
+/// the checkpoint layer re-drives whole files.
 const WRITE_MAX_ATTEMPTS: u32 = 4;
 
 /// Initial backoff between write retries. Doubles each attempt:
@@ -404,6 +417,11 @@ enum WriterState {
     Streaming {
         upload: Mutex<Box<dyn MultipartUpload>>,
         part_buffer: Vec<u8>,
+        /// Part uploads spawned onto [`TOKIO_DEDICATED_IO`] and not yet
+        /// awaited, oldest first. Capped at [`MAX_IN_FLIGHT_PARTS`];
+        /// `flush_part` awaits the oldest when full and `complete`
+        /// drains the rest.
+        in_flight: Vec<tokio::task::JoinHandle<Result<(), object_store::Error>>>,
     },
     /// `complete()` has been called and the writer is consumed.
     Done,
@@ -461,22 +479,41 @@ impl ObjectStoreFileWriter {
         if let WriterState::Streaming {
             upload,
             part_buffer,
+            in_flight,
         } = &mut self.state
         {
             if part_buffer.is_empty() {
                 return Ok(());
             }
+            while in_flight.len() >= MAX_IN_FLIGHT_PARTS {
+                await_part(in_flight.remove(0), &self.path)?;
+            }
             let payload = PutPayload::from(std::mem::take(part_buffer));
             // We hold &mut self.state, so &mut Mutex<_> already gives us
-            // exclusive access — no need to lock.
-            let upload = upload.get_mut().unwrap();
-            // `PutPayload` clones are cheap (shared bytes), so each retry
-            // re-sends the same part.
-            with_write_retries("put_part", &self.path, || {
-                TOKIO_DEDICATED_IO.block_on(upload.put_part(payload.clone()))
-            })?;
+            // exclusive access — no need to lock. `put_part` returns a
+            // `'static` future; spawning it onto the IO runtime makes the
+            // upload progress concurrently with buffering the next part.
+            let fut = upload.get_mut().unwrap().put_part(payload);
+            in_flight.push(TOKIO_DEDICATED_IO.spawn(fut));
         }
         Ok(())
+    }
+}
+
+/// Waits for one spawned part upload. A part that failed after
+/// `object_store`'s internal retries fails the write — see the note on
+/// [`WRITE_MAX_ATTEMPTS`] for why non-final parts cannot be re-put.
+fn await_part(
+    handle: tokio::task::JoinHandle<Result<(), object_store::Error>>,
+    path: &ObjPath,
+) -> Result<(), StorageError> {
+    match TOKIO_DEDICATED_IO.block_on(handle) {
+        Ok(result) => Ok(result?),
+        Err(join_err) => Err(StorageError::stdio(
+            std::io::ErrorKind::Other,
+            "multipart part upload task failed",
+            format!("{}: {join_err}", path.as_ref()),
+        )),
     }
 }
 
@@ -517,6 +554,7 @@ impl FileWriter for ObjectStoreFileWriter {
             self.state = WriterState::Streaming {
                 upload: Mutex::new(upload),
                 part_buffer: pending,
+                in_flight: Vec::new(),
             };
             self.flush_part()?;
         } else if let WriterState::Streaming { part_buffer, .. } = &self.state
@@ -541,9 +579,17 @@ impl FileWriter for ObjectStoreFileWriter {
             WriterState::Streaming {
                 upload,
                 part_buffer,
+                in_flight,
             } => {
+                // Wait for every spawned part upload to land before the
+                // final part and completion.
+                for handle in in_flight {
+                    await_part(handle, &self.path)?;
+                }
                 // Upload any remaining bytes as the final part (last part
-                // has no minimum size), then close the upload.
+                // has no minimum size), then close the upload. The outer
+                // retry is order-safe here: every earlier part has been
+                // awaited, so a re-put part number still sorts last.
                 let mut upload = upload.into_inner().unwrap();
                 if !part_buffer.is_empty() {
                     let payload = PutPayload::from(part_buffer);
@@ -580,7 +626,15 @@ impl Drop for ObjectStoreFileWriter {
         // If the writer is dropped without completing, abort any
         // in-flight multipart upload to avoid leaking S3 storage charges
         // for orphaned parts.
-        if let WriterState::Streaming { upload, .. } = &mut self.state {
+        if let WriterState::Streaming {
+            upload, in_flight, ..
+        } = &mut self.state
+        {
+            // Cancel outstanding part uploads first; their tasks hold
+            // payload buffers and would otherwise race the abort.
+            for handle in in_flight.drain(..) {
+                handle.abort();
+            }
             // &mut Mutex gives exclusive access; no lock needed.
             let upload = upload.get_mut().unwrap();
             if let Err(err) = TOKIO_DEDICATED_IO.block_on(upload.abort()) {
