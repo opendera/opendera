@@ -145,7 +145,7 @@ impl ActivityBus {
 
     /// Hot-path emission for handlers that only know the pipeline by
     /// name. Resolves the name to the stable pipeline id (cached for
-    /// [`NAME_CACHE_TTL`] to avoid a database round-trip per ingest /
+    /// `NAME_CACHE_TTL` (10s) to avoid a database round-trip per ingest /
     /// query call), then emits the event. Best-effort: resolution
     /// failures are logged at debug and swallowed, because dropping an
     /// activity event must never fail the user's request.
