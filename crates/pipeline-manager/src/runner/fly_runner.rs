@@ -112,11 +112,89 @@ struct MachineConfig {
     restart: RestartPolicy,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 struct GuestConfig {
     cpu_kind: String,
     cpus: u32,
     memory_mb: u32,
+}
+
+/// Fly Machines sizing rules (https://fly.io/docs/machines/guides-examples/machine-sizing/):
+/// shared-CPU machines come in 1/2/4/6/8-CPU presets with up to
+/// 2048 MiB per CPU; performance machines allow up to 8192 MiB per
+/// CPU. Requests outside these envelopes are normalized, not
+/// rejected — a pipeline asking for 3 GiB on shared CPUs gets a
+/// 2-CPU machine, not an error.
+const FLY_SHARED_CPU_PRESETS: [u32; 5] = [1, 2, 4, 6, 8];
+const FLY_MEMORY_MB_PER_SHARED_CPU: u32 = 2048;
+const FLY_MEMORY_MB_PER_PERFORMANCE_CPU: u32 = 8192;
+const FLY_MIN_MEMORY_MB: u32 = 256;
+const FLY_MAX_PERFORMANCE_CPUS: u32 = 16;
+
+/// Derive the Machine guest size from the pipeline's
+/// `runtime_config.resources`, falling back to the configured
+/// `FLY_DEFAULT_MACHINE_*` values. `memory_mb_max` and
+/// `cpu_cores_max` are honored; out-of-envelope requests are
+/// normalized to the nearest valid Fly size (see the FLY_* sizing
+/// constants) rather than rejected, so a resize can never strand a
+/// pipeline in an unprovisionable state.
+fn derive_guest_config(
+    config: &crate::config::FlyRunnerConfig,
+    runtime_config: &serde_json::Value,
+) -> GuestConfig {
+    let resources = runtime_config.get("resources");
+    let requested_memory = resources
+        .and_then(|r| r.get("memory_mb_max"))
+        .and_then(Value::as_u64)
+        .filter(|v| *v > 0)
+        .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+    let requested_cpus = resources
+        .and_then(|r| r.get("cpu_cores_max"))
+        .and_then(Value::as_f64)
+        .filter(|v| *v > 0.0)
+        .map(|v| v.ceil() as u32);
+
+    let cpu_kind = config.default_machine_cpu_kind.clone();
+    let mut memory_mb = requested_memory
+        .unwrap_or(config.default_machine_memory_mb)
+        .max(FLY_MIN_MEMORY_MB);
+    let mut cpus = requested_cpus.unwrap_or(config.default_machine_cpus).max(1);
+
+    if cpu_kind == "performance" {
+        cpus = cpus
+            .max(memory_mb.div_ceil(FLY_MEMORY_MB_PER_PERFORMANCE_CPU))
+            .min(FLY_MAX_PERFORMANCE_CPUS);
+        let max_memory = FLY_MAX_PERFORMANCE_CPUS * FLY_MEMORY_MB_PER_PERFORMANCE_CPU;
+        if memory_mb > max_memory {
+            warn!(
+                "fly: memory_mb_max {memory_mb} exceeds performance-cpu ceiling; clamping to {max_memory}"
+            );
+            memory_mb = max_memory;
+        }
+    } else {
+        // shared (default): snap the CPU count up to a preset large
+        // enough for the requested memory.
+        let max_preset = *FLY_SHARED_CPU_PRESETS.last().unwrap();
+        let max_memory = max_preset * FLY_MEMORY_MB_PER_SHARED_CPU;
+        if memory_mb > max_memory {
+            warn!(
+                "fly: memory_mb_max {memory_mb} exceeds shared-cpu ceiling; clamping to {max_memory}"
+            );
+            memory_mb = max_memory;
+        }
+        cpus = cpus.max(memory_mb.div_ceil(FLY_MEMORY_MB_PER_SHARED_CPU));
+        cpus = FLY_SHARED_CPU_PRESETS
+            .iter()
+            .copied()
+            .find(|p| *p >= cpus)
+            .unwrap_or(max_preset);
+    }
+
+    GuestConfig {
+        cpu_kind,
+        cpus,
+        memory_mb,
+    }
 }
 
 #[derive(Serialize)]
@@ -341,6 +419,7 @@ impl FlyRunner {
         program_binary_url: Option<&str>,
         deployment_initial: RuntimeDesiredStatus,
         bootstrap_config: Option<BootstrapConfig>,
+        guest: GuestConfig,
     ) -> Result<MachineResponse, ManagerError> {
         let body = CreateMachineBody {
             name: &self.machine_name(),
@@ -357,11 +436,7 @@ impl FlyRunner {
                     deployment_initial,
                     bootstrap_config,
                 ),
-                guest: GuestConfig {
-                    cpu_kind: self.config.default_machine_cpu_kind.clone(),
-                    cpus: self.config.default_machine_cpus,
-                    memory_mb: self.config.default_machine_memory_mb,
-                },
+                guest,
                 services: vec![],
                 restart: RestartPolicy {
                     policy: "on-failure",
@@ -638,11 +713,17 @@ impl PipelineExecutor for FlyRunner {
         program_binary_url: &str,
         _program_info_url: &str,
         _program_version: Version,
-        _runtime_config: &serde_json::Value,
+        runtime_config: &serde_json::Value,
     ) -> Result<(), ManagerError> {
         let _ = &self.common_config;
 
         let app_name = self.app_name_for(*deployment_id);
+        let guest = derive_guest_config(&self.config, runtime_config);
+        info!(
+            pipeline_id = %self.pipeline_id,
+            "fly: machine size {}x{} {}MB",
+            guest.cpu_kind, guest.cpus, guest.memory_mb
+        );
         self.ensure_app(&app_name).await?;
 
         // Secrets must be set on the App before the Machine starts,
@@ -695,6 +776,7 @@ impl PipelineExecutor for FlyRunner {
                         env_url,
                         deployment_initial,
                         bootstrap_config,
+                        guest,
                     )
                     .await?;
                 info!(
@@ -1030,6 +1112,88 @@ mod tests {
     use super::*;
     use crate::config::default_secret_env_suffixes;
     use crate::db::types::pipeline::PipelineId;
+
+    fn test_config(args: &[&str]) -> FlyRunnerConfig {
+        use clap::Parser;
+        let mut argv = vec!["fly-runner-test"];
+        argv.extend_from_slice(args);
+        FlyRunnerConfig::parse_from(argv)
+    }
+
+    #[test]
+    fn guest_config_defaults_when_resources_absent() {
+        let cfg = test_config(&[]);
+        let guest = derive_guest_config(&cfg, &serde_json::json!({}));
+        assert_eq!(guest.cpus, cfg.default_machine_cpus);
+        assert_eq!(guest.memory_mb, cfg.default_machine_memory_mb);
+        assert_eq!(guest.cpu_kind, cfg.default_machine_cpu_kind);
+        // Null / malformed resources behave like absent ones.
+        let guest =
+            derive_guest_config(&cfg, &serde_json::json!({"resources": null}));
+        assert_eq!(guest.memory_mb, cfg.default_machine_memory_mb);
+        let guest = derive_guest_config(
+            &cfg,
+            &serde_json::json!({"resources": {"memory_mb_max": "notanumber"}}),
+        );
+        assert_eq!(guest.memory_mb, cfg.default_machine_memory_mb);
+    }
+
+    #[test]
+    fn guest_config_honors_resources() {
+        let cfg = test_config(&[]);
+        let guest = derive_guest_config(
+            &cfg,
+            &serde_json::json!({"resources": {"memory_mb_max": 1024, "cpu_cores_max": 1}}),
+        );
+        assert_eq!(guest.cpus, 1);
+        assert_eq!(guest.memory_mb, 1024);
+        // Fractional cores round up.
+        let guest = derive_guest_config(
+            &cfg,
+            &serde_json::json!({"resources": {"cpu_cores_max": 1.5}}),
+        );
+        assert_eq!(guest.cpus, 2);
+    }
+
+    #[test]
+    fn guest_config_normalizes_to_fly_shared_envelope() {
+        // Note: the config default is "performance"; prod (opendera-cloud
+        // fly.toml) runs shared, so pin it here.
+        let cfg = test_config(&["--fly-default-machine-cpu-kind", "shared"]);
+        // 3 GiB on shared CPUs needs 2 CPUs (2 GiB per shared CPU).
+        let guest = derive_guest_config(
+            &cfg,
+            &serde_json::json!({"resources": {"memory_mb_max": 3072, "cpu_cores_max": 1}}),
+        );
+        assert_eq!(guest.cpus, 2);
+        assert_eq!(guest.memory_mb, 3072);
+        // 5 CPUs isn't a shared preset — snaps up to 6.
+        let guest = derive_guest_config(
+            &cfg,
+            &serde_json::json!({"resources": {"cpu_cores_max": 5}}),
+        );
+        assert_eq!(guest.cpus, 6);
+        // Absurd memory clamps to the largest shared preset envelope.
+        let guest = derive_guest_config(
+            &cfg,
+            &serde_json::json!({"resources": {"memory_mb_max": 999999}}),
+        );
+        assert_eq!(guest.memory_mb, 8 * 2048);
+        assert_eq!(guest.cpus, 8);
+    }
+
+    #[test]
+    fn guest_config_performance_kind() {
+        let cfg = test_config(&["--fly-default-machine-cpu-kind", "performance"]);
+        let guest = derive_guest_config(
+            &cfg,
+            &serde_json::json!({"resources": {"memory_mb_max": 16384, "cpu_cores_max": 1}}),
+        );
+        assert_eq!(guest.cpu_kind, "performance");
+        // 16 GiB needs 2 performance CPUs (8 GiB per CPU).
+        assert_eq!(guest.cpus, 2);
+        assert_eq!(guest.memory_mb, 16384);
+    }
 
     #[test]
     fn machine_size_default_supports_suspend() {
