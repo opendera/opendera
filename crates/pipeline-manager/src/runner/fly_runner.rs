@@ -1128,8 +1128,7 @@ mod tests {
         assert_eq!(guest.memory_mb, cfg.default_machine_memory_mb);
         assert_eq!(guest.cpu_kind, cfg.default_machine_cpu_kind);
         // Null / malformed resources behave like absent ones.
-        let guest =
-            derive_guest_config(&cfg, &serde_json::json!({"resources": null}));
+        let guest = derive_guest_config(&cfg, &serde_json::json!({"resources": null}));
         assert_eq!(guest.memory_mb, cfg.default_machine_memory_mb);
         let guest = derive_guest_config(
             &cfg,
